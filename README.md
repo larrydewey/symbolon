@@ -28,7 +28,7 @@ before sharing anything in this repository.**
 
 ## Documents
 
-- [SPEC.md](SPEC.md) -- the formal specification (draft 1).
+- [SPEC.md](SPEC.md) -- the formal specification (draft 2, with its red-team audit in Appendix A).
 - [PRIOR-ART.md](PRIOR-ART.md) -- what already exists, component by
   component, with sources, and an honest account of what may be new.
 - [NOTICE.md](NOTICE.md) -- confidentiality and intellectual-property notes.
