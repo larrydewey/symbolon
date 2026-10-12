@@ -57,7 +57,8 @@ never leaves the principal locked out.
 24. Security considerations
 25. Privacy considerations
 26. Credential rotation
-27. Open issues
+27. Formal verification
+28. Open issues
 
 ---
 
@@ -329,7 +330,7 @@ The threshold protocol MUST:
   aborts can leak share material in some protocols.
 
 Candidate families are the oblivious-transfer-based DKLs line and the
-CGGMP line; the choice is open (Section 27). Published attacks on
+CGGMP line; the choice is open (Section 28). Published attacks on
 deployed threshold ECDSA libraries came from omitted or weakened proofs and
 parameter checks; the implementation requirements in Section 23 exist
 because of them.
@@ -551,7 +552,7 @@ The tweak `τ` MUST stay unpredictable to every party without `cc`.
 ECDSA under additively related keys has known related-key pitfalls when an
 adversary can predict or choose the tweak; the construction relies on `τ`
 being a pseudorandom function output under `cc`, and its proof is an open
-item (Section 27, A-10).
+item (Sections 27.3 C-01 and 28, A-10).
 
 In signing, the designated device party adds `τ` to its additive share
 inside the protocol; no other party learns `τ` or `P`. Because the tweak
@@ -650,7 +651,7 @@ an old epoch and is useless for every credential at every RP (G4). The
 chain code is not secret from D, so after removing a *device* the quorum
 MUST also rotate the chain code for *new* credentials and SHOULD mark
 existing credentials for re-registration at the next sign-in (Section
-26.5, Section 27), since D could link them. Vault keys are rotated (Section 18.6).
+26.5, Section 28), since D could link them. Vault keys are rotated (Section 18.6).
 
 ### 11.3 Re-share and refresh
 
@@ -1223,6 +1224,9 @@ quotes, the attestation verifier, provenance records, and the `display`,
 | G17 | Head exchange; witnesses | 20 |
 | G18 | Rotation triggers, two-phase change, recipes, rollover | 26 |
 
+Each row is a design argument until the lemmas of Section 27.3 that cover
+it are verified; this table is not a claim of security.
+
 ### 24.2 Residual risks
 
 - Cosigner plus one compromised, unlocked device meets `t = 2`.
@@ -1476,7 +1480,123 @@ and the few that need the principal (with the one action each needs).
 
 ---
 
-## 27. Open issues
+## 27. Formal verification
+
+No security property of this specification may be claimed until it is
+proven as this section requires. "Proven" always means *proven under a
+stated model and stated assumptions*; every claim names its lemma, its
+model and what the model leaves out.
+
+### 27.1 Method: three layers
+
+| Layer | Establishes | Tools | Status of the tools |
+|---|---|---|---|
+| 1. Symbolic | The protocol logic: an adversary controlling the network and the compromised parties cannot reach a bad state. Primitives are ideal. | **Tamarin** (primary); **ProVerif** (cross-check, and privacy properties stated as observational equivalence) | The tools used for TLS 1.3, 5G authentication and Apple's iMessage PQ3 |
+| 2. Computational | Primitives and constructions are secure against any efficient adversary, with concrete probability bounds. | **CryptoVerif** (automated); **EasyCrypt** (interactive); CV2EC to carry CryptoVerif assumptions into EasyCrypt; paper proofs where a published proof exists | Peer-reviewed tools; CV2EC presented at CSF 2024 |
+| 3. Implementation | The code behaves as the model. | Test vectors generated from the models, differential testing against a reference, fuzzing, the constant-time gate (Section 23.3) | Evidence, not proof: Resid has no verified compiler |
+
+Tamarin is primary because Symbolon is stateful (epochs, delays, vetoes,
+leases, duress windows), which Tamarin's multiset rewriting and induction
+handle directly, and because it has machine-checked proofs of a deployed
+protocol with unbounded loops (PQ3).
+
+### 27.2 The adversary in the models
+
+- Dolev-Yao network: the adversary reads, drops, replays, reorders and
+  forges every message, including everything the sync service stores
+  (A1, A3).
+- Compromise rules, each a separate rule the adversary may fire at any
+  time, so that each lemma states exactly which compromises it tolerates:
+  `RevealShare(party, epoch)`, `RevealDK(device)`, `StealKit`,
+  `CorruptCosigner`, `CorruptWitness(w)`, `CorruptGuardian(g)`,
+  `Coerce(device, duration)`, `MaliciousRP`.
+- Time: Tamarin has no clock. Delays are modelled as orderings: a
+  `recover` takes effect only after an event `DelayElapsed(e)` that the
+  model allows only after `WitnessTime(e)` from a majority of witnesses
+  and after every honest device has had a `Notified(e)` step it can follow
+  with a veto. This abstracts, and depends on, Section 13.4's polling
+  rule; the assumption is stated in each lemma that uses it.
+
+### 27.3 Properties and their lemmas
+
+Each row is one or more lemmas in the models. "Tolerates" lists the
+compromise rules under which the lemma must hold.
+
+| ID | Property | Tolerates | Layer, tool |
+|---|---|---|---|
+| L-01 | **Log integrity.** Every head an honest party accepts extends the head it accepted before; no event is accepted that the signing rules of 8.2 did not authorize. | `RevealDK` of fewer than `policy[1]` devices, `CorruptWitness` minority | 1, Tamarin |
+| L-02 | **Fork detection.** If two honest parties accept different events at one sequence and later contact each other or a common honest witness, both raise a fork alarm. | sync service | 1, Tamarin |
+| L-03 | **No single-party signing.** A passkey signature under `P` exists only if `t` parties of one epoch took part. | any `t - 1` of `RevealShare`, `CorruptCosigner` | 1, Tamarin (threshold signing abstracted as an ideal functionality, 27.4) |
+| L-04 | **Revocation.** After a `reshare` that excludes party D completes, no signature at any RP uses D's share. | `RevealShare(D, old epoch)` | 1, Tamarin |
+| L-05 | **Kit isolation (A-02).** With a cosigner, the kit takes part in a signature only after a path-1 `recover` took effect. | `StealKit` + `RevealDK` + `RevealShare` of one device | 1, Tamarin |
+| L-06 | **Offline currency (A-03).** At every epoch the kit can obtain a share of the current epoch. | sync service (availability assumed) | 1, Tamarin |
+| L-07 | **Recovery safety (G10).** A `recover` takes effect only if every honest device of the preceding quorum was notified and did not veto within the delay, or the contest rule of 13.4 resolved it. | sync service, `StealKit`, `CorruptGuardian` minority, `CorruptWitness` minority | 1, Tamarin |
+| L-08 | **Recovery liveness.** A principal holding the kit, with honest witnesses and cosigner, recovers within four times the delay against an adversary holding at most one device. | `RevealDK` + `RevealShare` of one device | 1, Tamarin |
+| L-09 | **Contest outcome (A-20).** The contest rule's results are exactly those stated in 13.4, including the undecidable one-device-versus-kit case. | as L-07 | 1, Tamarin (a lemma that the stated losing case is reachable, so the documentation of the limit is itself checked) |
+| L-10 | **Duress containment (G11).** During a duress window no re-share, enrollment, recovery or policy change involving the duress device succeeds, and no signature is produced for a credential outside the subset. | `Coerce`, sync service | 1, Tamarin |
+| L-11 | **Duress unobservability (A-05).** A coercer observing the coerced device, the sync service and the RPs cannot distinguish a duress unlock from a normal one. | `Coerce`, sync service, `MaliciousRP` | 1, ProVerif (observational equivalence); Tamarin diff mode as cross-check |
+| L-12 | **Cosigner blindness (G12).** The cosigner cannot distinguish two sessions for the same credential from sessions for two credentials, nor learn an RP identity. | `CorruptCosigner` | 1, ProVerif (equivalence) |
+| L-13 | **Vault integrity (G6, G7).** An honest device accepts a vault state only if it equals, item for item, a state written by a device of its current quorum, at a version no lower than any it accepted; no moved, swapped, deleted, injected or rolled-back item is accepted. | sync service, `RevealDK` of a removed device | 1, Tamarin |
+| L-14 | **No downgrade (G8).** No honest device decrypts or encrypts under parameters other than suite 1's. | sync service | 1, Tamarin |
+| L-15 | **Authenticated sharing (G5).** An honest member opens a shared key only if it was wrapped by a device in the sender's verified log, and wraps only to keys in a recipient's verified log. | sync service, key substitution | 1, Tamarin |
+| L-16 | **Credential-ID binding (A-12).** No assertion is produced for RP B from a credential registered at RP A. | `MaliciousRP` | 1, Tamarin |
+| L-17 | **Never locked out (G18).** In the two-phase change, at every step the vault holds a password the site's model accepts, under any interleaving of crashes, network loss and concurrent devices honoring the lease. | site and network faults | 1, Tamarin (the site modelled as a password store with a change endpoint) |
+| L-18 | **Continuity-token unlinkability.** Redemptions at two RPs cannot be linked within the issuer's anonymity set; issuance does not depend on duress. | `MaliciousRP`, curious issuer with a single logged key | 1, ProVerif (equivalence) |
+| L-19 | **Update acceptance.** An honest device installs only a build that is threshold-signed and present in the log. | minority of release keys | 1, Tamarin |
+| C-01 | **Tweak lemma (A-10).** ECDSA under `x + τ` with `τ` a PRF output under `cc` is unforgeable for an adversary without `cc`, given signing oracles for other tweaks. | -- | 2, paper proof or EasyCrypt |
+| C-02 | **Vault construction.** The key derivation and AEAD of 18.1-18.3 give authenticated encryption with key separation per (vault, item, field, version). | -- | 2, CryptoVerif |
+| C-03 | **Threshold ECDSA.** The chosen protocol's published security proof covers the variant implemented, including the designated party's tweak and output delivery to one party (6.2). | -- | 2, the paper's proof; any deviation needs its own proof |
+| C-04 | **Credential-ID MAC.** HMAC truncation to 16 bytes gives the binding L-16 assumes. | -- | 2, standard PRF argument (paper) |
+
+### 27.4 Abstractions
+
+- The threshold ECDSA protocol appears in the symbolic models as an ideal
+  functionality: it outputs a signature under `X + τ` exactly when `t`
+  parties of one epoch request it with the same `m`, delivers it only to
+  the initiator, and reveals `x` only if `t` shares are revealed. C-03
+  justifies this.
+- HPKE, AEAD, signatures and hashes are ideal (perfect) in layer 1 and
+  justified by their standard proofs in layer 2.
+- Out of every model: the user interface, page content and recipes beyond
+  their slot and origin rules, side channels (covered by Section 23.3's
+  constant-time gate, not by proof), the operating system, and hardware
+  roots of trust (assumed per Section 3.2).
+
+### 27.5 Deliverables and acceptance
+
+- Models live in the repository under `models/`, one file per area
+  (`log.spthy`, `recovery.spthy`, `duress.spthy`, `vault.spthy`,
+  `sharing.spthy`, `rotation.spthy`, `blindness.pv`, `unobservable.pv`),
+  with the tool versions pinned.
+- Every lemma is listed in `models/STATUS.md` as **verified**, **falsified**
+  (with the attack trace and the specification change it led to), or
+  **not yet attempted**. A falsified lemma blocks the release that claims
+  it.
+- A continuous-integration job re-runs every model on each change to the
+  specification or the models; a lemma that regresses fails the build.
+- Every security claim in documentation cites its lemma IDs. A claim with
+  no verified lemma is not made.
+- Each model ships with sanity lemmas (`exists-trace`) showing that the
+  honest protocol can complete, so a verified safety lemma cannot be
+  vacuous.
+- Before any release that claims security, the models and the
+  specification are reviewed by a party independent of their authors.
+
+### 27.6 Order of work
+
+1. `log.spthy` and `recovery.spthy`: L-01, L-05 to L-09. The red-team round
+   found three critical holes in this area.
+2. `duress.spthy`, `blindness.pv`, `unobservable.pv`: L-10 to L-12.
+3. `vault.spthy`, `sharing.spthy`: L-13 to L-16, the malicious-server
+   classes.
+4. `rotation.spthy`: L-17.
+5. C-01, C-02, C-04; choose the threshold protocol by the strength of the
+   proof for C-03.
+6. L-02, L-03, L-04, L-18, L-19.
+
+---
+
+## 28. Open issues
 
 1. Choice of threshold ECDSA protocol (DKLs line vs. CGGMP line), and an
    audited implementation strategy.
@@ -1487,8 +1607,8 @@ and the few that need the principal (with the one action each needs).
    to the cosigner's operator as well as to the coercer.
 4. Witness and issuer ecosystem; relation to IETF keytrans.
 5. OS credential-provider availability per platform (not yet verified).
-6. Formal models (Tamarin/ProVerif) of Sections 8, 10-14 and 18 before any
-   claim of security.
+6. The verification programme of Section 27 (L-01 to L-19, C-01 to C-04)
+   before any claim of security.
 7. Legal review of duress (Section 14.4).
 8. Defining capability sets in provenance records precisely enough for
    Section 17.4 to be a sound policy, not a label.
@@ -1520,7 +1640,7 @@ conditions, or endangers the principal), Medium, Low.
 | A-07 | High | Delays were measured by an advisory, signer-chosen time. | Witness time, majority of witnesses (8.3, 13.4). |
 | A-08 | Medium | Assertion flags unspecified; UV could be asserted without verification. | Truthful BE/BS/UV/UP (10.4). |
 | A-09 | High | Recipes: a compromised repository or recipe could direct secrets into visible fields, visit added origins, or click destructive controls; the AI fallback was available for every item. | Threshold-signed, logged recipes with a hold; origin intersection; typed slots; destructive list; fallback off by default and never for high-value items (26.4). |
-| A-10 | Medium | Additive tweaks have related-key pitfalls; no analysis. | Requirement that `τ` stay unpredictable; proof listed as open (10.3, 27). |
+| A-10 | Medium | Additive tweaks have related-key pitfalls; no analysis. | Requirement that `τ` stay unpredictable; proof listed as open (10.3, 27.3 C-01, 28). |
 | A-11 | Medium | PCR-bound seals break on firmware updates, locking the principal out of a device. | `PolicyAuthorize` only; recovery path, never a weaker seal (9.1). |
 | A-12 | High | A relying party could replay another relying party's credential ID; the encrypted ID was not bound to the request's RP ID. | MAC'd credential ID checked against the request's RP ID (10.3). |
 | A-13 | Medium | Verifier-constrained release checked one entry point's capabilities, which shared state bypasses; it risked being presented as a guarantee. | Whole-program capability set, declassification points, secret typing, marked experimental (17.4). |
