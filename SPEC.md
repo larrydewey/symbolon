@@ -54,7 +54,8 @@ against a malicious server.
 23. Implementation requirements (Resid)
 24. Security considerations
 25. Privacy considerations
-26. Open issues
+26. Credential rotation
+27. Open issues
 
 ---
 
@@ -239,6 +240,11 @@ P-256 base point, `q` its order.
   are released only to verifiers meeting the principal's handling policy.
   (A10)
 - **G17 Fork detection.** (A1)
+- **G18 Rotation without the principal.** Every secret the agent holds,
+  inside the agent and at relying parties, is rotated by the agent when
+  rotation is due, without the principal's involvement except where a
+  relying party demands a factor the agent cannot supply; no rotation can
+  leave the principal without a working credential. (A1, A4, A6)
 
 ---
 
@@ -312,7 +318,7 @@ The threshold protocol MUST:
   or weakening a proof for speed is forbidden.
 
 Candidate families are the oblivious-transfer-based DKLs line and the
-CGGMP line; the choice is open (Section 26). Published attacks on
+CGGMP line; the choice is open (Section 27). Published attacks on
 deployed threshold ECDSA libraries came from omitted or weakened proofs and
 parameter checks; the implementation requirements in Section 23 exist
 because of them.
@@ -551,7 +557,7 @@ an old epoch and is useless for every credential at every RP (G4). The
 chain code is not secret from D, so after removing a *device* the quorum
 MUST also rotate the chain code for *new* credentials and SHOULD mark
 existing credentials for re-registration at the next sign-in (Section
-26), since D could link them. Vault keys are rotated (Section 18.6).
+26.5, Section 27), since D could link them. Vault keys are rotated (Section 18.6).
 
 ### 11.3 Re-share and refresh
 
@@ -1006,6 +1012,8 @@ check, and MUST be fuzzed on every message parser.
 | Pairings and BBS | Section 17.3 |
 | Capability sets in provenance records, per entry point, verifiable remotely | Section 17.4 |
 | A GUI library (planned, not started) | Section 22.2 |
+| A browser-automation driver for recipes (CDP or extension-driven) and a recipe interpreter | Section 26.3 |
+| Pwned Passwords range client (SHA-1 exists; needs `network` module) | Section 26.1 |
 | Targets beyond Linux and Android | platform coverage |
 
 Present: ECDSA P-256 (RFC 6979), HPKE, AES-GCM, ChaCha20-Poly1305, HKDF,
@@ -1036,6 +1044,7 @@ quotes, the attestation verifier, provenance records, and the `display`,
 | G15 | Secret types, ct gate, secret mode, mlock | 23.3 |
 | G16 | Selective disclosure; verifier-constrained release | 17 |
 | G17 | Head exchange; witnesses | 20 |
+| G18 | Rotation triggers, two-phase change, recipes, rollover | 26 |
 
 ### 24.2 Residual risks
 
@@ -1069,7 +1078,173 @@ quotes, the attestation verifier, provenance records, and the `display`,
 
 ---
 
-## 26. Open issues
+## 26. Credential rotation
+
+The principal never has to change a credential. The agent rotates every
+secret it holds -- inside the agent and at relying parties -- when
+rotation is due, and no rotation may leave the principal without a
+working credential (G18). Where a relying party demands a factor the agent
+cannot supply (a code sent by SMS or email), the agent batches such
+requests into one prompt; this is the only case in which the principal is
+involved.
+
+### 26.1 When rotation is due
+
+Rotation is driven by evidence, not by calendar. Routine periodic changes
+of passwords are not required by NIST SP 800-63B-4, which calls for a
+change when compromise is evident, and they add risk (lockouts) without
+benefit for unique random secrets. Triggers:
+
+| Trigger | Rotates |
+|---|---|
+| A device is removed from the quorum (Section 11.2) | Shares (re-share), chain code for new credentials, vault keys, **every legacy password and TOTP seed the removed device could decrypt** |
+| A party is suspected compromised | As above, plus re-registration of Threshold credentials (26.5) |
+| A password appears in a breach corpus (k-anonymity range query, e.g. Pwned Passwords; only a 5-hex-digit SHA-1 prefix leaves the agent) | That password |
+| A relying party is reported breached | Every credential for that relying party |
+| A password is weak or reused (imported vaults) | That password, once |
+| End of a duress window (Section 14) | Everything the duress profile exposed |
+| The principal asks | The selection |
+| Policy schedule (OPTIONAL, off by default) | High-value items the principal marks |
+
+Proactive refresh of shares (every 30 days, Section 11.3) is scheduled,
+since it is invisible to relying parties and cannot lock anyone out.
+
+### 26.2 Passkeys: rotation without relying parties
+
+For Threshold credentials, all secret material is the shares. Refresh and
+re-share (Section 11.3) replace every share while the public key, and so
+every relying party's record, stays the same. This is complete rotation of
+the secret for every passkey at once, with no relying-party involvement
+and no possibility of lockout: the new shares are verified to produce a
+signature under `X` before the old ones are deleted.
+
+A relying party's record needs to change only if the root key itself may
+be exposed (at least `t` parties compromised) or credentials must become
+unlinkable to a removed device (Section 11.2). Then 26.5 applies.
+
+### 26.3 Passwords: the two-phase change
+
+A legacy password at a relying party is changed by the following
+protocol, whose invariant is that **at every moment the vault holds a
+password the site accepts**:
+
+1. **Prepare.** Generate the new password under the site's rules (from
+   the recipe, 26.4). Write a new item version holding both `current = old`
+   and `pending = new` to the vault, with a new vault head, synchronized to
+   at least one other device before step 2.
+2. **Change.** Run the site's change procedure (26.4), filling the old and
+   new passwords and any TOTP code from the vault.
+3. **Verify.** In a fresh session, sign in with `pending`. Success:
+   write `current = new`, keep `old` in the item's history (at least 3
+   versions, encrypted like any field), new head. Failure: sign in with
+   `old`; if that succeeds, the change did not happen -- drop `pending`,
+   record the failure, retry later. If neither works, keep both, mark the
+   item "unresolved", and notify the principal; never delete either.
+4. **Clean up.** Close sessions opened by the procedure.
+
+A change interrupted at any step resumes at step 3 on the next run, so a
+crash or lost network never strands the principal.
+
+### 26.4 Recipes
+
+There is no standard API for changing a password; the W3C "well-known URL
+for changing passwords" (`/.well-known/change-password`, a Working Draft)
+only locates the page. The agent therefore drives each site's own pages
+with a **recipe**: a declarative, signed, versioned description of the
+change procedure.
+
+```cddl
+recipe = COSE_Sign1 over {
+  1 => tstr,                                 ; registrable domain
+  2 => uint,                                 ; version
+  3 => password-rules,                       ; length, classes, forbidden characters
+  4 => [+ step],
+  5 => [* tstr],                             ; origins the procedure may visit (same site only)
+}
+
+step = [0, url: tstr]                        ; navigate (must be in field 5)
+     / [1, selector: tstr, value: slot]      ; fill
+     / [2, selector: tstr]                   ; click
+     / [3, condition]                        ; expect: URL, element, or text present/absent
+     / [4, passkey-register: true]           ; run the site's passkey registration (26.6)
+
+slot = "username" / "old" / "new" / "totp"
+```
+
+Rules:
+
+- Recipes come from a curated repository and are verified against its
+  signing key before use; the agent pins the key.
+- A recipe can name only slots, never values. The agent substitutes values
+  at fill time, into fields on origins in field 5 only, after checking the
+  current top-level origin as the browser reports it.
+- The procedure runs in an isolated browser profile with no other site
+  data, under the agent's `process` and `network` authority, in a
+  component that holds no secret except the slots of the item being
+  changed.
+- A recipe whose expectations fail aborts at that step; 26.3's invariant
+  then holds.
+
+**Recipe-less sites (OPTIONAL).** An automated agent MAY attempt the
+change from the site's page structure. It MUST NOT see secret values: it
+operates on slot placeholders, and the agent performs the substitution
+under the same origin checks. Page content is untrusted input to such an
+agent (prompt injection), so it may only issue the step kinds above, on
+the item's own site. Commercial attempts at this exist and are still
+unreliable (Chrome's experimental assistant-driven change, 2026).
+
+### 26.5 Re-registering Threshold credentials
+
+When a relying party's record must change (26.2), the agent creates a new
+credential under a new chain code (or a new root key after a full
+compromise) and retires the old one:
+
+1. **Rollover extension (preferred, relying-party opt-in).** In an
+   ordinary assertion the authenticator includes an extension output
+   `symbolonRollover = {credentialId', P'}` inside `authenticatorData`, so
+   the assertion's signature under the old key `P` vouches for `P'`. A
+   relying party that supports it stores `P'` as pending, promotes it at
+   its first successful use and then deletes `P`; one that does not ignores
+   it. This needs browser pass-through of the extension and relying-party
+   support; until then, method 2 applies.
+2. **Recipe.** A recipe's `passkey-register` step runs the site's own
+   registration ceremony (which WebAuthn requires the relying party to
+   start) from its account-security page, then deletes the old passkey
+   there, verifying sign-in with the new one first, as in 26.3.
+3. **At next sign-in.** Where neither is possible, the agent re-registers
+   when the site next offers passkey creation and asks the principal only
+   if the site requires a step it cannot perform.
+
+The agent keeps signing with the old credential until the new one is
+verified.
+
+### 26.6 Migrating to passkeys
+
+Whenever a site that has a legacy password supports passkeys, rotation
+prefers migration: register a Threshold passkey (26.5 method 2), verify
+it, then, where the site allows, remove the password or set it to a long
+random value the agent holds and never uses.
+
+### 26.7 Other credentials
+
+| Credential | Rotation |
+|---|---|
+| DPoP and session keys (Section 16) | New key per session or per refresh-token lifetime; automatic. |
+| SSH keys | New key; the agent updates `authorized_keys` on hosts it is permitted to reach and on code hosts through their APIs, verifies login with the new key, then removes the old (two-phase, as 26.3). |
+| API tokens issued by services with token APIs | Through the service's API, two-phase; otherwise by recipe. |
+| TOTP seeds | By recipe (re-enroll the authenticator), two-phase: the new seed is verified with a code before the old one is removed. |
+| Recovery codes issued by sites | Regenerated by recipe after any use or exposure. |
+| Vault keys, chain code, shares, DEKs | Sections 18.6, 11.2, 11.3; DEKs on every refresh. |
+
+### 26.8 Accounting
+
+Every rotation is recorded in the vault (what, when, why, result), and
+the agent shows a single status: credentials current, credentials pending,
+and the few that need the principal (with the one action each needs).
+
+---
+
+## 27. Open issues
 
 1. Choice of threshold ECDSA protocol (DKLs line vs. CGGMP line), and an
    audited implementation strategy.
@@ -1085,3 +1260,7 @@ quotes, the attestation verifier, provenance records, and the `display`,
 7. Legal review of duress (Section 14.4).
 8. Defining capability sets in provenance records precisely enough for
    Section 17.4 to be a sound policy, not a label.
+9. Recipe repository governance: who signs recipes, review, and how
+   quickly a broken recipe is withdrawn.
+10. Standardizing a machine-readable password-change endpoint and the
+    rollover extension (26.5) with browser vendors and the W3C.
