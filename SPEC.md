@@ -24,8 +24,10 @@ the parties to it enforce the log's policy: revocation, recovery delays
 with veto, and a duress mode that cannot be turned into lasting control.
 Around this core the specification defines continuity proofs for relying
 parties that want them, minimal and verifier-constrained disclosure of
-attributes, hardware-bound sessions, and a legacy password vault built
-against a malicious server.
+attributes, hardware-bound sessions, a legacy password vault built
+against a malicious server, and automatic rotation of every credential,
+inside the agent and at relying parties, by a two-phase protocol that
+never leaves the principal locked out.
 
 ## Table of contents
 

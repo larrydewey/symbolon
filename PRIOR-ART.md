@@ -30,6 +30,11 @@ one. Section numbers refer to SPEC.md draft 1.
 | 18 | Malicious-server anti-patterns in password managers | Scarlata, Torrisi, Backendal, Paterson (USENIX Security 2026) | [ePrint 2026/058](https://eprint.iacr.org/2026/058) |
 | 19 | Key transparency | IETF keytrans | [architecture -09](https://datatracker.ietf.org/doc/html/draft-ietf-keytrans-architecture-09) |
 | 22.2 | Clickjacking of autofill extensions | DEF CON 33 (Tóth) | [The Hacker News](https://thehackernews.com/2025/08/dom-based-extension-clickjacking.html) |
+| 26.1 | Change passwords on evidence of compromise, not periodically | NIST SP 800-63B-4 (secondary summaries) | [Enzoic](https://www.enzoic.com/blog/nist-sp-800-63b-rev4/), [Sakimura](https://www.sakimura.org/en/2025/10/7710/) |
+| 26.4 | Locating a site's change-password page | W3C "A Well-Known URL for Changing Passwords" (Working Draft, June 2024) | [W3C](https://www.w3.org/TR/change-password-url/) |
+| 26.4 | Automated password change on sites | Chrome automatic change of compromised passwords on supported sites; Gemini-driven change in Canary (Aug 2026, failing in tests); Dashlane and LastPass changers (launch reported; current status unconfirmed) | [Android Authority](https://androidauthority.com/chrome-canary-gemini-change-bad-passwords-3698237), [Shelly Palmer](https://shellypalmer.com/2025/09/google-chromes-ai-makeover-ten-new-features-that-could-change-how-you-browse/), [blog-nouvelles-technologies](https://www.blog-nouvelles-technologies.fr/?p=58569) |
+| 26.4 | Automated rotation with check-out/verify | Enterprise privileged-access management (general knowledge; not searched) | -- |
+| 26.5 | Key rollover signed by the old key | ACME account key rollover, RFC 8555 §7.3.5 (general knowledge; not searched) | -- |
 | 22.3 | Credential exchange | FIDO CXP/CXF drafts | [CXP draft](https://fidoalliance.org/specs/cx/cxp-v1.0-wd-20241003.html) |
 | 23.2 | Security properties as types | Resid's `Trust` / `Verified(Claims)` (public, MIT) | [Resid](https://github.com/larrydewey/Resid) |
 
