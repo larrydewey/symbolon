@@ -2,59 +2,55 @@
 
 Compiled 2026-10-12 from web searches and the Resid repository. This is a
 starting point for a professional prior-art search, not a substitute for
-one. Every mechanism in SPEC.md is listed with the closest known prior work.
+one. Section numbers refer to SPEC.md draft 1.
 
-## Component by component
+## Mechanism by mechanism
 
-| SPEC section | Mechanism | Closest prior art | Source |
+| SPEC | Mechanism | Closest prior art | Source |
 |---|---|---|---|
-| 8 | Append-only signed key-event log with pre-rotation (digest of the next keys committed in the current event); witnesses | KERI (Smith): pre-rotation, key event receipt logs, witnesses | [arXiv 1907.02143](https://arxiv.org/pdf/1907.02143), [draft-ssmith-keri](https://datatracker.ietf.org/doc/html/draft-ssmith-keri), [ToIP KERI v1.1 (2026-01-21)](https://trustoverip.org/wp-content/uploads/KERI-V1.1-2026-01-21.pdf) |
-| 8, 10 | Per-device keys in a signature chain; paper keys as backup devices; existing device provisions a new one over a server relay authenticated by a shared offline secret; per-user key rolled on revocation | Keybase sigchain, paper keys, KEX, PUK | [Keybase KEX](https://book.keybase.io/docs/crypto/key-exchange), [Keybase PUK](https://book.keybase.io/docs/teams/puk), [Keybase account](https://book.keybase.io/account) |
-| 9 | Password stretched locally with Argon2id | Bitwarden (Argon2id option, OWASP parameters) | [Bitwarden KDF algorithms](https://bitwarden.com/help/kdf-algorithms/) |
-| 9.3 | Password never reaches the server; uncrackable verifier | 1Password Two-Secret Key Derivation + SRP; OPAQUE (RFC 9807) | [1Password SRP](https://1password.com/blog/developers-how-we-use-srp-and-you-can-too), [1Password white paper](https://1password.com/files/1password-white-paper.pdf), [RFC 9807](https://www.rfc-editor.org/rfc/rfc9807.html) |
-| 10, 11, 18 | Device-bound keys in the TPM; access only from devices meeting a posture policy | Beyond Identity (vendor claims) | [Device Trust](https://www.beyondidentity.com/products/device-trust), [Binding identity to device](https://www.beyondidentity.com/resource/binding-identity-to-device) |
-| 11 | Origin-bound public-key authentication; device-bound vs synced passkeys | WebAuthn / FIDO2; NIST SP 800-63-4 (July 2025) | [arXiv 2501.07380](https://arxiv.org/html/2501.07380v1), [Thoughtworks Radar](https://www.thoughtworks.com/radar/techniques/passkeys) |
-| 11, 18 | Authenticator attestation; enterprise attestation with per-device serial | WebAuthn attestation formats (packed, tpm) | [Yubico guidance](https://developers.yubico.com/Passkeys/Passkey_relying_party_implementation_guidance/Attestation), [w3c/webauthn PR 1954](https://github.com/w3c/webauthn/pull/1954/files) |
-| 12.1 | Browser session cookies bound to a TPM key | Chrome DBSC (Chrome 146, Windows, April 2026) | [Google](https://blog.google/security/protecting-cookies-with-device-bound-session-credentials/), [Help Net Security](https://helpnetsecurity.com/2026/04/10/google-chrome-device-bound-session-credentials) |
-| 12.2 | Sender-constrained OAuth tokens | DPoP, RFC 9449 | [RFC 9449](https://rfc-editor.org/rfc/rfc9449) |
-| 13 | Selective disclosure; unlinkable presentations | SD-JWT, ISO mdoc, EUDI wallet; BBS (draft-irtf-cfrg-bbs-signatures-12, Sept 2026); device-bound anonymous credentials | [BBS draft](https://www.ietf.org/archive/id/draft-irtf-cfrg-bbs-signatures-12.html), [EUDI privacy analysis](https://orbilu.uni.lu/handle/10993/66335), [AEPD](https://www.aepd.es/en/press-and-communication/blog/eidas2-the-eudi-wallet-and-the-gdpr-ii), [ePrint 2025/1995](https://eprint.iacr.org/2025/1995.pdf) |
-| 14 | Vault design against a malicious server: whole-vault integrity, key separation, no downgrade, authenticated keys | The anti-patterns are catalogued in Scarlata, Torrisi, Backendal, Paterson (USENIX Security 2026); the paper discusses mitigations | [ePrint 2026/058](https://eprint.iacr.org/2026/058), [USENIX](https://www.usenix.org/conference/usenixsecurity26/presentation/scarlata) |
-| 14.4 | Merkle tree commitment with domain-separated leaves | Certificate Transparency (RFC 9162) | -- |
-| 15 | Authenticated public keys for sharing; key transparency | IETF keytrans (draft-ietf-keytrans-architecture-09, June 2026); Dashlane evaluating key transparency | [keytrans architecture](https://datatracker.ietf.org/doc/html/draft-ietf-keytrans-architecture-09), [Dashlane](https://www.dashlane.com/blog/zero-knowledge-malicious-server) |
-| 17.3 | Guardian / social recovery, threshold approvals, Shamir backups | Ethereum social-recovery wallets; SLIP-39; SoK on web authentication with E2EE | [arXiv 2406.18226](https://arxiv.org/pdf/2406.18226) |
-| 17.4 | Recovery delay with veto | Social-recovery wallets commonly use timelocks (not verified in a primary source this session) | -- |
-| 17.5 | PIN-protected backup with guess limit in attested enclaves | Signal SVR3 (OSDI 2024) | [OSDI 24](https://www.usenix.org/conference/osdi24/presentation/connell), [ePrint 2024/887](https://eprint.iacr.org/2024/887) |
-| 19.2 | Fill only after gesture outside the page | Mitigations for DOM-based extension clickjacking (DEF CON 33) | [The Hacker News](https://thehackernews.com/2025/08/dom-based-extension-clickjacking.html) |
-| 20.2 | Security properties as types (opaque "verified" types) | Language-based security in general; Resid's own `Trust` / `Verified(Claims)` (public, MIT) | [Resid](https://github.com/larrydewey/Resid) |
+| 8 | Append-only signed key-event log; pre-rotation; witnesses | KERI | [arXiv 1907.02143](https://arxiv.org/pdf/1907.02143), [draft-ssmith-keri](https://datatracker.ietf.org/doc/html/draft-ssmith-keri), [ToIP KERI v1.1](https://trustoverip.org/wp-content/uploads/KERI-V1.1-2026-01-21.pdf) |
+| 8, 11 | Per-device keys in a signature chain; backup keys as devices; provisioning over an untrusted relay | Keybase sigchain, paper keys, KEX, PUK | [KEX](https://book.keybase.io/docs/crypto/key-exchange), [PUK](https://book.keybase.io/docs/teams/puk), [account](https://book.keybase.io/account) |
+| 9 | Local Argon2id; password never sent to server | Bitwarden; 1Password 2SKD + SRP; OPAQUE (RFC 9807) | [Bitwarden KDF](https://bitwarden.com/help/kdf-algorithms/), [1Password SRP](https://1password.com/blog/developers-how-we-use-srp-and-you-can-too), [RFC 9807](https://www.rfc-editor.org/rfc/rfc9807.html) |
+| 10 | Passkey whose key is split between parties (two-party ECDSA) | Larch: two-party FIDO2 signing with a log server, ~150 ms; stateless two-party ECDSA for FIDO2 with a helper ("passkeys_mpc"), ~100 ms | [Larch, OSDI 2023](https://www.usenix.org/conference/osdi23/presentation/dauterman), [ePrint 2025/1475](https://eprint.iacr.org/2025/1475.pdf) |
+| 10, 11 | t-of-n threshold ECDSA, resharing to new thresholds, proactive refresh | MPC wallets (DKLs19/DKLs23, CGGMP21); Web3Auth resharing | [Web3Auth](https://web3auth.io/docs/infrastructure/mpc-architecture), [cheatsheet](https://cheatsheets.davidveksler.com/mpc-wallet-architecture.html), [arXiv 2607.08226](https://arxiv.org/pdf/2607.08226), [USPTO 12580774](https://image-ppubs.uspto.gov/dirsearch-public/print/downloadPdf/12580774) |
+| 10.3 | Additive, unhardened key derivation from a chain code | BIP32 non-hardened derivation (general knowledge; not searched this session) | -- |
+| 11, 12 | Logging every login so a compromised device leaves evidence; server blind to the RP | Larch | [Larch](https://www.usenix.org/conference/osdi23/presentation/dauterman) |
+| 5.2, 10 | Device-bound vs synced passkeys; providers as single point of failure | Büttner & Gruschka 2025; W3C devicePubKey / supplementalPubKeys (2023) | [arXiv 2501.07380](https://arxiv.org/html/2501.07380v1), [W3C PR](https://lists.w3.org/Archives/Public/public-webauthn/2023Nov/0093.html), [diff](https://github.com/w3c/webauthn/commit/431fd4edfa285d253472afe279b7ef5e9455b8f4.diff) |
+| 11 | RP-side revocation signals | WebAuthn Signal API (per RP, RP-initiated) | [Chrome docs](https://developer.chrome.com/docs/identity/webauthn-signal-api) |
+| 13 | Guardian recovery, Shamir backups, timelocks | Social-recovery wallets; SLIP-39; SoK web authentication and recovery (PoPETs 2025) | [PoPETs 2025](https://www.petsymposium.org/popets/2025/popets-2025-0113.php), [arXiv 2406.18226](https://arxiv.org/pdf/2406.18226) |
+| 13 | Backup credentials registered in advance for WebAuthn recovery | ARKG (Yubico proposal; later analyses) | [ePrint 2023/1575](https://eprint.iacr.org/2023/1575) |
+| 13 | PIN-protected backup with guess limits in attested enclaves | Signal SVR3 | [OSDI 2024](https://www.usenix.org/conference/osdi24/presentation/connell) |
+| 14 | Duress passwords, silent alarms | Stefanov & Atallah 2010; PAM Duress; ITU survey; coercion-resistant authentication | [ITU](https://pure.itu.dk/en/publications/the-password-you-hope-you-never-use-use-cases-for-duress-authenti/), [MIT Tech Review](https://www.technologyreview.com/s/601445/how-to-make-passwords-that-cannot-be-compromised-by-torture-or-coercion), [Bitwarden forum](https://community.bitwarden.com/t/plausible-deniability-a-way-to-offer-more-protection-over-passwords/11425?page=2) |
+| 14 | Decoy (honey) vaults and attacks distinguishing them | Kamouflage, NoCrack, honey encryption; USENIX Security 2025 classifier attacks | [USENIX Sec 2025](https://www.usenix.org/conference/usenixsecurity25/presentation/cheng-haibo), [USENIX Sec 2021](https://www.usenix.org/conference/usenixsecurity21/presentation/cheng-haibo) |
+| 15 | Unlinkable tokens from attestation or authentication | Privacy Pass (RFC 9576-9578) | [RFC 9576](https://datatracker.ietf.org/doc/rfc9576/) |
+| 15 | Unlinkable revocation for FIDO and anonymous credentials | Verheul 2016; Braavos accumulators; TU Wien thesis on FIDO | [ePrint 2016/217](https://eprint.iacr.org/2016/217), [ePrint 2017/043](https://eprint.iacr.org/2017/043), [TU Wien](https://repositum.tuwien.at/handle/20.500.12708/2174) |
+| 16 | Hardware-bound browser sessions; sender-constrained tokens | Chrome DBSC (April 2026); DPoP (RFC 9449) | [Google](https://blog.google/security/protecting-cookies-with-device-bound-session-credentials/), [RFC 9449](https://rfc-editor.org/rfc/rfc9449) |
+| 17.1-17.3 | Selective disclosure, unlinkability | SD-JWT, mdoc, EUDI wallet critiques; BBS draft; device-bound anonymous credentials | [BBS -12](https://www.ietf.org/archive/id/draft-irtf-cfrg-bbs-signatures-12.html), [EUDI analysis](https://orbilu.uni.lu/handle/10993/66335), [AEPD](https://www.aepd.es/en/press-and-communication/blog/eidas2-the-eudi-wallet-and-the-gdpr-ii), [ePrint 2025/1995](https://eprint.iacr.org/2025/1995.pdf) |
+| 17.4 | Releasing data only to attested, verified code | Project Oak transparent release; in-enclave privacy-policy checking; semantic remote attestation (2004, general knowledge) | [Google](https://security.googleblog.com/2023/06/bringing-transparency-to-confidential.html), [arXiv 2007.10513](https://arxiv.org/pdf/2007.10513) |
+| 18 | Malicious-server anti-patterns in password managers | Scarlata, Torrisi, Backendal, Paterson (USENIX Security 2026) | [ePrint 2026/058](https://eprint.iacr.org/2026/058) |
+| 19 | Key transparency | IETF keytrans | [architecture -09](https://datatracker.ietf.org/doc/html/draft-ietf-keytrans-architecture-09) |
+| 22.2 | Clickjacking of autofill extensions | DEF CON 33 (Tóth) | [The Hacker News](https://thehackernews.com/2025/08/dom-based-extension-clickjacking.html) |
+| 22.3 | Credential exchange | FIDO CXP/CXF drafts | [CXP draft](https://fidoalliance.org/specs/cx/cxp-v1.0-wd-20241003.html) |
+| 23.2 | Security properties as types | Resid's `Trust` / `Verified(Claims)` (public, MIT) | [Resid](https://github.com/larrydewey/Resid) |
 
-Patents surfaced by one search (none covered the combination; not read in
-full): [US9769167B2](https://patents.google.com/patent/US9769167B2/en),
-[US8667265B1](https://patents.google.com/patent/US8667265),
-[WO2016154001A1](https://patents.google.com/patent/WO2016154001A1/en),
-USPTO "Binding with cryptographic key attestation"
-([11750384](https://image-ppubs.uspto.gov/dirsearch-public/print/downloadPdf/11750384),
-[12113898](https://image-ppubs.uspto.gov/dirsearch-public/print/downloadPdf/12113898)).
+## Assessment
 
-## What may be new
+Every mechanism has prior art. The searches found no single source
+combining:
 
-Every individual mechanism above has prior art. Candidates for novelty lie
-in specific combinations and in the enforcement method, and each needs a
-professional search:
+1. a passkey held as a t-of-n threshold key across the principal's own
+   devices, recovery kit and a blind cosigner, with re-sharing used as
+   revocation at every RP and recovery that needs no RP flow (SPEC 10-13);
+2. a cosigner that enforces the principal's own key-event-log policy
+   (revocation, recovery delay, duress) while blind to the RP (SPEC 12, 14);
+3. duress realized as a genuine subset plus containment of durable
+   changes through the quorum (SPEC 14);
+4. release gated on compiler-checked capability sets carried in an
+   attested provenance record (SPEC 17.4).
 
-1. Recovery that restores *identity* through guardian approvals over a
-   pre-rotated key-event log, separately from *data*, which guardians can
-   restore only through opt-in shares released after an unvetoed delay
-   (SPEC 17.3-17.4).
-2. Enrollment of a new device gated on attestation of both the hardware
-   key and the agent's build provenance, verified by an existing device
-   against the principal's own policy (SPEC 10.1, 18).
-3. A password vault whose head is signed by keys reached only from the
-   owner's key-event log, with parameters fixed by format version
-   (SPEC 14.4 with 8).
-4. Enforcing the malicious-server anti-patterns as compile-time type and
-   capability errors in the implementation language (SPEC 20.1-20.2). Note
-   that Resid, which already contains the pattern, is public.
-
-Under U.S. law (KSR v. Teleflex), a combination of known elements that
-yields predictable results is likely obvious, so items 1-3 are uncertain.
-Software claims also face eligibility review under Alice v. CLS Bank.
+Absence from these searches is weak evidence. Each item is a combination
+of known techniques, and under U.S. law (KSR v. Teleflex) a combination of
+known elements with predictable results is likely obvious; software claims
+also face eligibility review (Alice v. CLS Bank). Items 2 and 3 are the
+least obviously anticipated. A professional search would be needed before
+relying on any of them.
