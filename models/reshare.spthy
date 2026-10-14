@@ -1,0 +1,113 @@
+theory SymbolonLogReshare
+begin
+
+/*
+ * Symbolon identity log, log integrity (SPEC Sections 8, 20.3, 20.4).
+ * This model carries only the sanity lemma for the quorum-change setup.
+ * Safety lemmas for quorum change (L-01 reshare, L-03, L-04) are
+ * not yet attempted.
+ */
+
+builtins: signing, hashing
+functions: succ/1
+
+/* ---------- Setup ---------- */
+
+rule Inception:
+    let pa = pk(~ka)
+        pb = pk(~kb)
+        g  = h(<'E0', pa, pb, pk(~w)>)
+    in
+    [ Fr(~ka), Fr(~kb), Fr(~w) ]
+  --[ Inception(g, pa, pb), MadeKey(g, pa), MadeKey(g, pb) ]->
+    [ !Genesis(g, pa, pb)
+    , !WitnessQuorum(g, ~w), !WitnessPk(g, pk(~w))
+    , !DevKey(g, ~ka), !DevKey(g, ~kb)
+    , !Seen(g, succ('0'), g)
+    , Slot(g, 'i1'), Slot(g, 'i2'), Slot(g, 'i3')
+    , Slot(g, 'a1'), Slot(g, 'a2')
+    , Out(<'log', g, pa, pb, pk(~w)>) ]
+
+rule NewParty:
+    [ !Genesis(g, pa, pb), Fr(~p) ]
+  --[ Start(~p, g), Installs(~p, g, pa, pb) ]->
+    [ Head(~p, g, succ('0'), g, pa, pb) ]
+
+/* ---------- The principal's intentions ---------- */
+
+rule IntendEvent:
+    [ !Genesis(g, pa, pb), Fr(~x), Slot(g, 'i1') ]
+  --[ Intend(g, <'ev', ~x>) ]->
+    [ !Intent(g, <'ev', ~x>), Out(<'ev', ~x>) ]
+
+/* ---------- Devices sign intended events ---------- */
+
+rule DeviceSign:
+    let m = <'event', g, succ(n), hd, body> in
+    [ !DevKey(g, k), !Seen(g, n, hd), !Intent(g, body) ]
+  --[ DeviceSigned(pk(k), m) ]->
+    [ Out(<'sig', m, sign(m, k)>) ]
+
+/* ---------- Witnesses ---------- */
+
+rule WitnessCosign:
+    let m = <'event', g, succ(n), hd, body> in
+    [ !WitnessQuorum(g, w), !Seen(g, n, hd), !DevKey(g, ka), !DevKey(g, kb)
+    , In(<m, sa, sb>) ]
+  --[ Eq(verify(sa, m, pk(ka)), true), Eq(verify(sb, m, pk(kb)), true)
+    , WSign(g, succ(n), h(m)) ]->
+    [ Out(<'cos', m, sign(<'wit', g, succ(n), h(m)>, w)>) ]
+
+/* ---------- Verification and acceptance ---------- */
+
+rule CheckHead:
+    let m = <'event', g, succ(n), hd, <'ev', x>> in
+    [ Head(p, g, n, hd, qa, qb), !DevKey(g, ka), !DevKey(g, kb)
+    , !WitnessPk(g, wq), In(<m, sa, sb, cw>) ]
+  --[ Eq(pk(ka), qa), Eq(pk(kb), qb)
+    , Eq(verify(sa, m, qa), true), Eq(verify(sb, m, qb), true)
+    , Eq(verify(cw, <'wit', g, succ(n), h(m)>, wq), true)
+    , CosignOK(g, succ(n), h(m)) ]->
+    [ Head(p, g, n, hd, qa, qb), Cosigned(g, succ(n), m, qa, qb) ]
+
+rule AcceptEvent:
+    let m = <'event', g, succ(n), hd, <'ev', x>>
+        d = h(m)
+    in
+    [ Head(p, g, n, hd, qa, qb)[-], Cosigned(g, succ(n), m, qa, qb)[-]
+    , Slot(g, 'a1') ]
+  --[ Accept(p, g, succ(n), d, <'ev', x>, qa, qb)
+    , AcceptPrev(p, g, succ(n), d, hd) ]->
+    [ Head(p, g, succ(n), d, qa, qb), !Accepted(p, g, succ(n), d)
+    , !Seen(g, succ(n), d) ]
+
+/* ---------- Compromise (27.2): device keys ---------- */
+
+rule RevealDK:
+    [ !DevKey(g, k) ]
+  --[ RevealDK(pk(k)) ]->
+    [ Out(k) ]
+
+/* ---------- Sanity (27.5): the honest protocol completes ---------- */
+
+lemma sanity_reshare_setup:
+  exists-trace
+  "Ex g pa pb #i. Inception(g, pa, pb) @ #i"
+
+/* ---------- Restrictions ---------- */
+
+restriction Equality:
+  "All x y #i. Eq(x, y) @ #i ==> x = y"
+
+restriction Inequality:
+  "All x #i. Neq(x, x) @ #i ==> F"
+
+restriction WitnessOneDigest:
+  "All g n d1 d2 #i #j. WSign(g, n, d1) @ #i & WSign(g, n, d2) @ #j
+     ==> d1 = d2"
+
+restriction MaxParties:
+  "All p1 g1 #i p2 g2 #j p3 g3 #k. Start(p1, g1) @ #i & Start(p2, g2) @ #j
+     & Start(p3, g3) @ #k & #i < #j & #j < #k ==> F"
+
+end

@@ -35,7 +35,7 @@ one. Section numbers refer to SPEC.md draft 1.
 | 26.4 | Automated password change on sites | Chrome automatic change of compromised passwords on supported sites; Gemini-driven change in Canary (Aug 2026, failing in tests); Dashlane and LastPass changers (launch reported; current status unconfirmed) | [Android Authority](https://androidauthority.com/chrome-canary-gemini-change-bad-passwords-3698237), [Shelly Palmer](https://shellypalmer.com/2025/09/google-chromes-ai-makeover-ten-new-features-that-could-change-how-you-browse/), [blog-nouvelles-technologies](https://www.blog-nouvelles-technologies.fr/?p=58569) |
 | 26.4 | Automated rotation with check-out/verify | Enterprise privileged-access management (general knowledge; not searched) | -- |
 | 26.5 | Key rollover signed by the old key | ACME account key rollover, RFC 8555 §7.3.5 (general knowledge; not searched) | -- |
-| 22.3 | Credential exchange | FIDO CXP/CXF drafts | [CXP draft](https://fidoalliance.org/specs/cx/cxp-v1.0-wd-20241003.html) |
+| 22.3 | Migration and credential exchange | FIDO CXP/CXF drafts | [CXP draft](https://fidoalliance.org/specs/cx/cxp-v1.0-wd-20241003.html) |
 | 23.2 | Security properties as types | Resid's `Trust` / `Verified(Claims)` (public, MIT) | [Resid](https://github.com/larrydewey/Resid) |
 
 ## Assessment

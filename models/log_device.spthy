@@ -1,0 +1,223 @@
+theory SymbolonLogDevice
+begin
+
+/*
+ * Symbolon identity log, log integrity (SPEC Sections 8, 20.3, 20.4).
+ * Lemma: L-01 (SPEC 27.3) with the device-key compromise of SPEC 27.2
+ * active. No other compromise rule is active here; the
+ * compromise cases of SPEC 27.2 are separate models, one per rule, so that
+ * each lemma states exactly which compromises it tolerates:
+ *
+ *   log.spthy          this file, no compromise: L-01 core
+ *   log_device.spthy   + RevealDK: L01_authorized
+ *   reshare.spthy      + quorum changes: reshare.spthy's own lemmas
+ *   log_witness.spthy  + CorruptWitness: H_cosign_origin
+ *   fork.spthy         two parties: L-02
+ *
+ * Abstractions (each is a limit on what the lemmas below establish):
+ *  - One quorum at a time holds exactly two device keys and policy[1] = 2;
+ *    an authority event needs signatures from both. The cosigner, kit and
+ *    guardians do not sign log events here.
+ *  - Event bodies are an opaque authority event <'ev', x>. Quorum changes
+ *    are in reshare.spthy, which also carries the lemma for a quorum the
+ *    adversary itself created; delayed (single-signer) events, recover and
+ *    veto are in recovery.spthy (L-07..L-09).
+ *  - Witnesses: see the Witnesses section. An honest party accepts a head
+ *    only with co-signatures of a majority (two distinct) of them.
+ *    SPEC 20.3 makes this MUST only for recover/delayed/reshare and SHOULD
+ *    for other heads; this model assumes the SHOULD is followed.
+ *  - Signatures and hashes are ideal (27.4). Sequence numbers are Tamarin
+ *    succ(.) terms (the natural-numbers builtin crashes Maude 3.5.1 here).
+ *    The suite field is omitted (L-14, vault.spthy).
+ *  - An honest device signs only bodies the principal intends (Intend) and
+ *    only at the head it holds, but it may sign several intended bodies at
+ *    one head (two devices proposing concurrently), which is how forks
+ *    arise without any key compromise. That case is in fork.spthy.
+ *  - Heads hold the pks of their quorum and each key is tied to !DevKey by
+ *    Eq, since !DevKey holds the raw key. Without that tie the premises are
+ *    unsatisfiable and no honest acceptance exists.
+ *  - Bounded traces: the slots issued at inception cap each trace at three
+ *    intentions and two acceptances, and MaxParties caps it at two parties.
+ *    The lemmas
+ *    are established for those traces only; unbounded extension of a log is
+ *    not established here (STATUS.md).
+ *
+ * Timing: every lemma in this file verifies in under a minute with
+ * +RTS -M8g. A run that reaches minutes is a regression.
+ */
+
+builtins: signing, hashing
+functions: succ/1
+
+/* ---------- Setup ---------- */
+
+// Inception E0: two device keys and three witnesses. The genesis digest
+// stands for H(E0) = log-id. Each signer starts at the genesis head.
+rule Inception:
+    let pa = pk(~ka)
+        pb = pk(~kb)
+        g  = h(<'E0', pa, pb, pk(~w)>)
+    in
+    [ Fr(~ka), Fr(~kb), Fr(~w) ]
+  --[ Inception(g, pa, pb), MadeKey(g, pa), MadeKey(g, pb) ]->
+    [ !Genesis(g, pa, pb)
+    , !WitnessQuorum(g, ~w), !WitnessPk(g, pk(~w))
+    , !DevKey(g, ~ka), !DevKey(g, ~kb)
+    , !DevHead(g, ~ka, succ('0'), g), !DevHead(g, ~kb, succ('0'), g)
+    , !WitHead(g, succ('0'), g)
+    // Slots bound the trace: three intentions, two acceptances. The
+    // MaxParties restriction is cheaper for parties than a slot would be,
+    // but restriction checking is per state and the intents and
+    // acceptances are what actually branch.
+    , Slot(g, 'i1'), Slot(g, 'i2'), Slot(g, 'i3')
+    , Slot(g, 'a1'), Slot(g, 'a2')
+    , Out(<'log', g, pa, pb, pk(~w)>) ]
+
+// An honest party (device, cosigner, any verifier) anchored at E0.
+// Anchoring at a later head is SPEC 11.1 step 4; not modelled.
+rule NewParty:
+    [ !Genesis(g, pa, pb), Fr(~p) ]
+  --[ Start(~p, g), Installs(~p, g, pa, pb) ]->
+    [ Head(~p, g, succ('0'), g, pa, pb) ]
+
+/* ---------- The principal's intentions ---------- */
+
+rule IntendEvent:
+    [ !Genesis(g, pa, pb), Fr(~x), Slot(g, 'i1') ]
+  --[ Intend(g, <'ev', ~x>) ]->
+    [ !Intent(g, <'ev', ~x>), Out(<'ev', ~x>) ]
+
+/* ---------- Devices sign intended events ----------
+   A device signs a body only if the principal intends it, and only at the
+   head it holds (SPEC 8.2). It signs whichever of the intended bodies it
+   is shown at that head, which over-approximates honest behaviour (devices
+   that track their own head sign less) and keeps the search finite.
+
+   A signature is published together with the message it covers. The
+   sequence-number function succ is a free function (see the header), so the
+   adversary has no deduction rule of its own for it and cannot invent a
+   sequence number; publishing the message is how it learns one. Without
+   this the adversary cannot assemble the tuple CheckHead consumes, and no
+   honest acceptance is reachable at all. */
+
+rule DeviceSign:
+    let m = <'event', g, succ(n), hd, body> in
+    [ !DevKey(g, k), !DevHead(g, k, n, hd), !Intent(g, body) ]
+  --[ DeviceSigned(pk(k), m) ]->
+    [ Out(<'sig', m, sign(m, k)>) ]
+
+/* ---------- Witnesses ----------
+   The policy's three witnesses and the "majority co-signs" rule are
+   abstracted as one witness-quorum signer per log: honest exactly when at
+   most one of the three witnesses is corrupted, in which case a majority
+   co-signs at most one digest per (log, seq) (20.3). The corrupted case is
+   CorruptWitnessMajority in log_witness.spthy.
+
+   A witness co-signs the next head over the one it holds, and only after
+   seeing it signed by two distinct device keys of the log (SPEC 20.3). */
+
+rule WitnessCosign:
+    let m = <'event', g, succ(n), hd, body> in
+    [ !WitnessQuorum(g, w), !WitHead(g, n, hd), !DevKey(g, ka), !DevKey(g, kb)
+    , In(<m, sa, sb>) ]
+  --[ Eq(verify(sa, m, pk(ka)), true), Eq(verify(sb, m, pk(kb)), true)
+    , WSign(g, succ(n), h(m)) ]->
+    [ Out(<'cos', m, sign(<'wit', g, succ(n), h(m)>, w)>) ]
+
+/* ---------- Verification and acceptance (8.3) ---------- */
+
+// Checking the next head: the two device signatures of this party's own
+// quorum, and a witness-quorum co-signature on (log, seq, digest). The
+// token names the keys that signed, so an acceptance consumes only a head
+// checked under its own quorum, and one check feeds one acceptance.
+rule CheckHead:
+    let m = <'event', g, succ(n), hd, <'ev', x>> in
+    [ Head(p, g, n, hd, qa, qb), !DevKey(g, ka), !DevKey(g, kb)
+    , !WitnessPk(g, wq), In(<m, sa, sb, cw>) ]
+  --[ Eq(pk(ka), qa), Eq(pk(kb), qb)
+    , Eq(verify(sa, m, qa), true), Eq(verify(sb, m, qb), true)
+    , Eq(verify(cw, <'wit', g, succ(n), h(m)>, wq), true)
+    , CosignOK(g, succ(n), h(m)) ]->
+    [ Head(p, g, n, hd, qa, qb), Cosigned(g, succ(n), m, qa, qb) ]
+
+// Accept the checked head. An authority event keeps the quorum.
+rule AcceptEvent:
+    let m = <'event', g, succ(n), hd, <'ev', x>>
+        d = h(m)
+    in
+    [ Head(p, g, n, hd, qa, qb)[-], Cosigned(g, succ(n), m, qa, qb)[-]
+    , Slot(g, 'a1') ]
+  --[ Accept(p, g, succ(n), d, <'ev', x>, qa, qb)
+    , AcceptPrev(p, g, succ(n), d, hd) ]->
+    [ Head(p, g, succ(n), d, qa, qb), !Accepted(p, g, succ(n), d) ]
+
+/* ---------- Compromise (27.2): device keys ---------- */
+
+// Any number of device keys may be revealed. The lemmas below say how many
+// they tolerate: policy[1] = 2, so a quorum is lost at two keys.
+rule RevealDK:
+    [ !DevKey(g, k) ]
+  --[ RevealDK(pk(k)) ]->
+    [ Out(k) ]
+
+/* ---------- Restrictions ---------- */
+
+restriction Equality:
+  "All x y #i. Eq(x, y) @ #i ==> x = y"
+
+restriction Inequality:
+  "All x #i. Neq(x, x) @ #i ==> F"
+
+// SPEC 20.3: an honest witness majority co-signs one digest per (log, seq).
+restriction WitnessOneDigest:
+  "All g n d1 d2 #i #j. WSign(g, n, d1) @ #i & WSign(g, n, d2) @ #j
+     ==> d1 = d2"
+
+// At most two parties. The strict ordering matters: without it the three
+// timepoints may all denote the same event and the bound holds nothing.
+restriction MaxParties:
+  "All p1 g1 #i p2 g2 #j p3 g3 #k. Start(p1, g1) @ #i & Start(p2, g2) @ #j
+     & Start(p3, g3) @ #k & #i < #j & #j < #k ==> F"
+
+/* ---------- Sanity (27.5): the honest protocol completes ---------- */
+
+lemma sanity_event_accepted:
+  exists-trace
+  "Ex p g n d b qa qb #i. Accept(p, g, n, d, b, qa, qb) @ #i
+     & not (Ex k #r. RevealDK(k) @ #r)"
+
+/* ---------- L-01 Log integrity ---------- */
+
+// Authorization (8.2): an accepted event was intended by the principal,
+// unless both device keys of the quorum the party used were revealed. The
+// quorum a compromised quorum installs is covered by reshare.spthy;
+// witnesses do not authorize and their corruption is not modelled here.
+lemma L01_authorized [hide_lemma=H_accept_cosigned]:
+  "All p g n d b qa qb #i. Accept(p, g, n, d, b, qa, qb) @ #i ==>
+       (Ex #j. Intend(g, b) @ #j & #j < #i)
+     | (Ex #r1 #r2. RevealDK(qa) @ #r1 & RevealDK(qb) @ #r2
+          & (#r1 < #i | #r1 = #i) & (#r2 < #i | #r2 = #i))"
+
+// Uniqueness: an honest party never accepts two heads at one sequence.
+lemma L01_one_head_per_seq [use_induction]:
+  "All p g n d1 d2 b1 b2 qa qb ra rb #i #j.
+       Accept(p, g, n, d1, b1, qa, qb) @ #i
+     & Accept(p, g, n, d2, b2, ra, rb) @ #j
+     ==> #i = #j"
+
+// Extension: every accepted head's predecessor is the head the party held
+// immediately before (the previous acceptance, or genesis).
+lemma L01_extends_previous [use_induction]:
+  "All p g n d hd #j. AcceptPrev(p, g, n, d, hd) @ #j ==>
+       ((n = succ(succ('0')) ==> hd = g)
+      & (hd = g ==> n = succ(succ('0')))
+      & (not (hd = g) ==> Ex nprev h0 #i. AcceptPrev(p, g, nprev, hd, h0) @ #i & #i < #j & n = succ(nprev)))"
+
+
+// Every acceptance was preceded by the check of a witness co-signature on
+// that head, and every co-signature came from this log's witness quorum.
+lemma H_accept_cosigned [reuse]:
+  "All p g n d b qa qb #i. Accept(p, g, n, d, b, qa, qb) @ #i ==>
+     Ex #j. CosignOK(g, n, d) @ #j & #j < #i"
+
+end

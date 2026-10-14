@@ -1128,12 +1128,93 @@ frame origin) as the browser or OS reports it. No fill on in-page clicks;
 no fill into frames of another origin. The clipboard is avoided; where
 used, content is marked sensitive and cleared within 30 seconds.
 
-### 22.3 Credential exchange
+### 22.3 Migration and credential exchange
 
-The agent implements FIDO CXP/CXF (when final) for **import**, converting
-imported keys to the Synced profile and offering re-registration as
-Threshold. Threshold credentials are **not exportable** (Section 10.3); an
-export produces a list of RPs to re-register at, never a private key.
+A principal arrives with credentials held elsewhere: a password manager,
+a platform's passkey provider, a browser, hardware security keys, an
+authenticator app. Symbolon MUST be adoptable without the principal
+re-entering anything and without any relying party's involvement, and MUST
+NOT lock the principal in.
+
+**Sources.** In order of preference:
+
+1. **FIDO Credential Exchange (CXP/CXF).** From any provider that
+   implements it, the agent imports passwords, passkeys, TOTP seeds, notes
+   and the other CXF item kinds over the CXP channel, without a plaintext
+   file.
+2. **The source's own export format.** Until CXP is widely available, the
+   agent reads the documented export of each widely used manager (CSV and
+   JSON exports, KeePass KDBX, browser password CSV). Each format has one
+   importer in the core, with no `filesystem` or `network` authority of its
+   own; the bridge hands it the file's bytes. The agent then offers to
+   overwrite and delete the export file and says that a plaintext export
+   may persist in backups or the source's download history.
+3. **Re-registration.** Passkeys a provider will not export (platform
+   providers without CXP, and every hardware-bound key) cannot be moved.
+   The agent records the relying party as *to migrate* and registers a
+   Threshold passkey there by recipe or at next sign-in (Section 26.5,
+   methods 2 and 3). Hardware security keys are left registered as
+   additional credentials unless the principal removes them.
+
+**Import is untrusted input** (the file or provider may be compromised or
+malformed):
+
+- importers are fuzzed (Section 23.3), bound in size, and refuse rather
+  than repair a malformed record;
+- an imported item becomes an ordinary vault item only through a vault
+  update the importing device signs (Section 18.4); nothing imported
+  changes the identity log, the quorum or the policy;
+- origins in imported items are **unconfirmed** until the principal
+  consents to a fill at that origin (Section 22.2). An unconfirmed origin
+  is not used to fill without consent and is not part of the intersection
+  a recipe may visit (Section 26.4), so a crafted import cannot widen where
+  a recipe or a fill may go;
+- imported passkeys become Synced-profile keys (Section 5.2) and are
+  marked for re-registration as Threshold; imported TOTP seeds, SSH keys
+  and attribute credentials keep their kind; each item records its source
+  and import time in the vault.
+
+**Procedure.**
+
+1. **Import** from the sources above into a new vault version.
+2. **Assess.** Breached, weak and reused passwords are flagged (Section
+   26.1); the principal is asked once to mark high-value items and,
+   optionally, to choose the duress subset (Section 14.2).
+3. **Coexist.** Until the principal retires the source, both stores may
+   be in use. During coexistence the agent MUST NOT rotate an imported
+   item at its relying party (rotation would leave the source holding a
+   dead password the principal may still use), except with the principal's
+   per-item or blanket consent. A repeated import merges by item: an
+   incoming record that differs from the vault's is written as a new item
+   version with the vault's previous value kept in history; nothing is
+   silently overwritten or dropped.
+4. **Upgrade.** In order of the value marks: register a Threshold passkey
+   where the site supports passkeys and retire the password (Section 26.6),
+   replace imported passkeys with Threshold ones (Section 26.5), and
+   rotate passwords the source held (Section 26.3), each verified before
+   the old credential is dropped.
+5. **Retire the source.** The agent shows which items are still only in
+   the source's form (not yet rotated or re-registered). Secrets the source
+   held stay exposed to it, and to its sync service, until they are
+   rotated; the agent says so and schedules their rotation once the
+   principal confirms retirement.
+
+**Organizational and shared vaults** (team or family plans) migrate into
+shared collections (Section 19): one member imports and the collection's
+key is wrapped to the members' log-verified keys. Membership is not
+imported from the source; each member is added from their own log.
+
+**Identity providers and credential services** (single sign-on, enterprise
+identity providers, account-recovery services) need no special path: the
+principal registers a Threshold passkey at the identity provider as at any
+relying party, and removes the old factors as that provider's policy
+allows. Accounts that sign in through an identity provider follow it.
+
+**Export.** Leaving Symbolon is supported by the same mechanisms: Synced
+keys, passwords, TOTP seeds, notes and attribute credentials export
+through CXP/CXF. Threshold credentials are **not exportable** (Section
+10.3); an export lists the relying parties at which to register the new
+provider's credential, never a private key.
 
 ### 22.4 Applications
 
@@ -1543,6 +1624,7 @@ compromise rules under which the lemma must hold.
 | L-17 | **Never locked out (G18).** In the two-phase change, at every step the vault holds a password the site's model accepts, under any interleaving of crashes, network loss and concurrent devices honoring the lease. | site and network faults | 1, Tamarin (the site modelled as a password store with a change endpoint) |
 | L-18 | **Continuity-token unlinkability.** Redemptions at two RPs cannot be linked within the issuer's anonymity set; issuance does not depend on duress. | `MaliciousRP`, curious issuer with a single logged key | 1, ProVerif (equivalence) |
 | L-19 | **Update acceptance.** An honest device installs only a build that is threshold-signed and present in the log. | minority of release keys | 1, Tamarin |
+| L-20 | **Import containment (22.3).** An imported item enters the vault only as a device-signed item version; no import changes the log, quorum or policy; an imported origin is never filled or visited by a recipe before the principal consents at it; a merge never removes a value from item history. | malicious import source, sync service | 1, Tamarin |
 | C-01 | **Tweak lemma (A-10).** ECDSA under `x + τ` with `τ` a PRF output under `cc` is unforgeable for an adversary without `cc`, given signing oracles for other tweaks. | -- | 2, paper proof or EasyCrypt |
 | C-02 | **Vault construction.** The key derivation and AEAD of 18.1-18.3 give authenticated encryption with key separation per (vault, item, field, version). | -- | 2, CryptoVerif |
 | C-03 | **Threshold ECDSA.** The chosen protocol's published security proof covers the variant implemented, including the designated party's tweak and output delivery to one party (6.2). | -- | 2, the paper's proof; any deviation needs its own proof |
@@ -1566,7 +1648,7 @@ compromise rules under which the lemma must hold.
 
 - Models live in the repository under `models/`, one file per area
   (`log.spthy`, `recovery.spthy`, `duress.spthy`, `vault.spthy`,
-  `sharing.spthy`, `rotation.spthy`, `blindness.pv`, `unobservable.pv`),
+  `sharing.spthy`, `rotation.spthy`, `fork.spthy`, `blindness.pv`, `unobservable.pv`),
   with the tool versions pinned.
 - Every lemma is listed in `models/STATUS.md` as **verified**, **falsified**
   (with the attack trace and the specification change it led to), or
@@ -1592,7 +1674,7 @@ compromise rules under which the lemma must hold.
 4. `rotation.spthy`: L-17.
 5. C-01, C-02, C-04; choose the threshold protocol by the strength of the
    proof for C-03.
-6. L-02, L-03, L-04, L-18, L-19.
+6. L-02, L-03, L-04, L-18, L-19, L-20.
 
 ---
 
@@ -1607,7 +1689,7 @@ compromise rules under which the lemma must hold.
    to the cosigner's operator as well as to the coercer.
 4. Witness and issuer ecosystem; relation to IETF keytrans.
 5. OS credential-provider availability per platform (not yet verified).
-6. The verification programme of Section 27 (L-01 to L-19, C-01 to C-04)
+6. The verification programme of Section 27 (L-01 to L-20, C-01 to C-04)
    before any claim of security.
 7. Legal review of duress (Section 14.4).
 8. Defining capability sets in provenance records precisely enough for

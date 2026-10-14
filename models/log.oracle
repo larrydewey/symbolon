@@ -1,0 +1,26 @@
+#!/usr/bin/env python3
+# Goal ranking for log.spthy (tamarin-prover --heuristic=o --oracle=log.oracle).
+# Tamarin passes the lemma name as argv[1] and the goals on stdin as
+# "<index>: <goal>"; we print the index of the goal to solve next.
+import sys
+
+goals = [l.rstrip("\n") for l in sys.stdin if ":" in l]
+
+def rank(g):
+    body = g.split(":", 1)[1]
+    if "Installs(" in body or "Intend" in body or "MadeKey" in body:
+        return 0
+    if "!KU( ~" in body or "RevealDK" in body:
+        return 1
+    if "!KU( sign(<'event'" in body:
+        return 2
+    if "!DevKey" in body or "!Intent" in body or "!Genesis" in body:
+        return 3
+    if "Head(" in body or "Cosigned" in body or "WitnessPk" in body \
+       or "!KU( sign(<'wit'" in body:
+        return 9
+    return 5
+
+if goals:
+    best = min(goals, key=rank)
+    print(best.split(":", 1)[0].strip())
