@@ -1,7 +1,8 @@
 // Organizations from the command line (SPEC 29): `symbolon device org ...`.
 //
 //   org new DIR NAME                 PIN; founds an organization; prints "ORG-ID FOUNDER"
-//   org join DIR ORG-ID FOUNDER      PIN; this device's organization (from its invite)
+//   org join DIR ORG-ID FOUNDER [CODE]   PIN; this device's organization; CODE answers an invite
+//   org invite DIR EXT-ID NAME [GROUP,...]   PIN; an invite for one person; prints "CODE ID"
 //   org show DIR                     "org ID NAME-HEX", "version V gov G", "role R", policy, recovery
 //   org members DIR                  "LOG NAME-HEX EXT-HEX|- owner|admin|member GROUP-IDS|-"
 //   org add DIR LOG NAME [EXT-ID]    PIN; an owner or administrator adds a person
@@ -12,7 +13,14 @@
 //   org group add|remove DIR GROUP LOG    PIN
 //   org groups DIR                   "GROUP-ID NAME-HEX PEOPLE"
 //   org folder new DIR NAME GROUP[,GROUP...]   PIN; a group folder; prints its id
-//   org sync DIR                     PIN; an owner or administrator re-keys the group folders people left
+//   org sync DIR                     PIN; an owner or administrator adds those who answered invites,
+//                                    then re-keys the group folders people left
+//   org recovery on DIR K DELAY ADMIN-LOG,...   PIN; an owner turns on opt-in recovery (SPEC 29.8)
+//   org recovery off DIR             PIN
+//   org escrow DIR CID               PIN; a work folder you own, escrowed to the recovery key
+//   org recover request|approve|open DIR CID   PIN; recovery administrators open a work folder
+//   org export DIR [--https URL [--token T]] [--syslog HOST:PORT] [--ca FILE]   verified audit events to a SIEM
+//   org console DIR PORT             a read-only page on 127.0.0.1 for owners and administrators
 //   org audit DIR                    "TIME LOG SEQ ACTION OBJECT DETAIL-HEX" per verified event
 //
 // Group folders are then used like any shared folder: `device vault ...
@@ -28,20 +36,28 @@ import "device.resid";
 import "serials.resid";
 import "orgtypes.resid";
 import "orgcore.resid";
+import "auditlog.resid";
 import "sharetypes.resid";
 import "sharecli.resid";
+import "scim.resid";
 import "vaultcli.resid";
 import "crypto.resid";
 import "ecdsa.resid";
 import "cbor.resid";
 import "cose.resid";
+import "tlsclient.resid";
+import "../browser/json.resid";
+import "random.resid";
+import "hpkeg.resid";
+import "hpke.resid";
+import "shamir.resid";
 
 pub OrgPolicy default_policy() {
     return OrgPolicy {.min_pin_len = 6, .allow_biometric = true, .allow_duress = true, .allow_offline_copy = true, .max_offline_days = 0,
                       .allow_personal_export = true, .require_attestation = [], .password_rules = ""};
 }
 
-OrgRecovery no_recovery() { return OrgRecovery {.on = false, .public_key = [], .threshold = 0, .admins = [], .delay_sec = 0}; }
+OrgRecovery no_recovery() { return OrgRecovery {.on = false, .public_key = [], .threshold = 0, .admins = [], .delay_sec = 0, .since = (UInt(64))0, .owner = []}; }
 
 // ─── Signing and storing ────────────────────────────────────────
 
@@ -63,7 +79,7 @@ Result(Org, Str) sign_org(Ctx x, List(Int) id, UInt(64) version, UInt(64) gov_ve
 
 @requires(network, clock(readonly), declassify)
 Result(Int, Str) put_blob(Ctx x, Str name, List(Int) b, Str what) {
-    if (b.len() == 0 || !blob_put(relay_ep(x.c), name, b)) { return Err("the server refused the " + what); }
+    if (b.len() == 0 || !blob_put(x.ep, name, b)) { return Err("the server refused the " + what); }
     return Ok(0);
 }
 
@@ -81,17 +97,29 @@ Result(Int, Str) store_org(Str dir, Ctx x, OrgState st, UInt(64) gv, List(OrgMem
 // A new governance version (an owner only), then the membership record under it.
 @requires(filesystem, network, device, declassify, clock, environment)
 Result(Int, Str) store_gov(Str dir, Ctx x, OrgState st, List(List(Int)) owners, List(OrgAdmin) admins, OrgPolicy p, Str action, Str detail) {
+    return store_gov_r(dir, x, st, owners, admins, p, st.gov.recovery, action, detail);
+}
+
+@requires(filesystem, network, device, declassify, clock, environment)
+Result(Int, Str) store_gov_r(Str dir, Ctx x, OrgState st, List(List(Int)) owners, List(OrgAdmin) admins, OrgPolicy p, OrgRecovery rec, Str action, Str detail) {
     if (!is_owner(st.gov, x.c.log_id)) { return Err("only an owner changes roles and policy"); }
     if (owners.len() == 0) { return Err("an organization needs an owner"); }
     OrgGov g = sign_gov(x, OrgGov {.org_id = st.gov.org_id, .version = st.gov.version + (UInt(64))1, .founder = st.gov.founder, .nonce = st.gov.nonce, .name = st.gov.name,
-                                   .owners = owners, .admins = admins, .policy = p, .recovery = st.gov.recovery, .log_sequence = (UInt(64))0, .signer_log = [], .signer = [], .sig = []})?;
+                                   .owners = owners, .admins = admins, .policy = p, .recovery = rec, .log_sequence = (UInt(64))0, .signer_log = [], .signer = [], .sig = []})?;
     Int put = put_blob(x, gov_blob(g.org_id, g.version), cbor_or_empty(to_cbor(g)), "governance record")?;
     _ = filesystem.write_all(dir + "/org.gov", f"{g.version}");
     return store_org(dir, x, st, g.version, st.org.members, st.org.groups, action, detail);
 }
 
 // This device unlocked, with its organization verified.
-type OrgCtx = { Ctx x; OrgState st; };
+pub type OrgCtx = { Ctx x; OrgState st; };
+
+// This device signed in at the relay now (founding, joining).
+@requires(filesystem, network, device, declassify, clock, environment)
+Result(Ctx, Str) signed_in_ctx(Str dir, Ctx x) {
+    Int ok = relay_sign_in(dir, x.c, x.u)?;
+    return Ok(Ctx {.c = x.c, .u = x.u, .vh = x.vh, .pin = x.pin, .ep = relay_at(dir, x.c)});
+}
 
 @requires(filesystem, network, device, declassify, clock, provision, environment)
 Result(OrgCtx, Str) org_unlocked(Str dir) {
@@ -110,8 +138,9 @@ pub Int org_new(Str dir, Str name) { return done(found(dir, name)); }
 @requires(filesystem, network, device, declassify, clock, provision, environment)
 Result(Int, Str) found(Str dir, Str name) {
     if (!label_ok(name)) { return Err("a name of 1-64 characters"); }
-    Ctx x = unlocked(dir)?;
+    Ctx x0 = unlocked(dir)?;
     if (match org_ref(dir) { Some(_) => true, None => false }) { return Err("this device is already in an organization"); }
+    Ctx x = signed_in_ctx(dir, x0)?;
     List(Int) nonce = random_bytes(16);
     List(Int) id = org_id_of(x.c.log_id, nonce);
     OrgGov g = sign_gov(x, OrgGov {.org_id = id, .version = (UInt(64))1, .founder = x.c.log_id, .nonce = nonce, .name = name, .owners = [x.c.log_id], .admins = [],
@@ -131,21 +160,92 @@ Result(Int, Str) found(Str dir, Str name) {
 // `org join DIR ORG-ID FOUNDER`: the founder's log id binds the org id
 // (SPEC 29.1), so a server cannot hand the device another organization.
 @requires(filesystem, network, device, declassify, clock, provision, environment)
-pub Int org_join(Str dir, Str id, Str founder) { return done(join(dir, id, founder)); }
+pub Int org_join(Str dir, Str id, Str founder, Str code) { return done(join(dir, id, founder, code)); }
 
 @requires(filesystem, network, device, declassify, clock, provision, environment)
-Result(Int, Str) join(Str dir, Str id, Str founder) {
+Result(Int, Str) join(Str dir, Str id, Str founder, Str code) {
+    if (str_len(code) > 0 && !share_id_ok(code)) { return Err("an invite code is 32 hex digits"); }
     if (!share_id_ok(id) || !log_hex_ok(founder)) { return Err("an organization id (32 hex digits) and its founder's log id (64)"); }
-    Ctx x = unlocked(dir)?;
+    Ctx x0 = unlocked(dir)?;
     Option(OrgRef) old = org_ref(dir);
     if (match old { Some(r) => !bytes_eq(r.id, cose_hex_decode(id)), None => false }) { return Err("this device is already in another organization"); }
+    Ctx x = signed_in_ctx(dir, x0)?;
     Str before = filesystem.read_all(dir + "/org");
     if (!filesystem.write_all(dir + "/org", id + " " + founder)) { return Err("cannot write the organization to the device"); }
+    OrgRef ref = OrgRef {.id = cose_hex_decode(id), .founder = cose_hex_decode(founder)};
+    Result(OrgGov, Str) rg = gov_chain(dir, x.c, x.vh, ref);
+    return match rg {
+        Err(m) => forget_org(dir, before, m),
+        Ok(g) => answered(dir, x, g, code)
+    };
+}
+
+// The governance verified: the invite answered, when there is a code; a
+// member already, or waiting for an administrator's device to add them
+// (org sync), until when the relay does not show them the membership.
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+Result(Int, Str) answered(Str dir, Ctx x, OrgGov g, Str code) {
+    Int sent = if (str_len(code) == 0) { 0 } else { send_accept(x, g.org_id, code)? };
     Result(OrgState, Str) rs = org_at(dir, x.c, x.vh);
     return match rs {
-        Err(m) => forget_org(dir, before, m),
-        Ok(st) => joined(dir, x, st)
+        Ok(st) => joined(dir, x, st),
+        Err(m) => pending(g, m)
     };
+}
+
+Result(Int, Str) pending(OrgGov g, Str m) {
+    eprintln("not a member yet: " + m);
+    println(hex_encode(g.org_id) + " " + hex_encode(utf8(g.name)) + " pending");
+    return Ok(0);
+}
+
+// An invite code's key (SPEC 29.3).
+pub List(Int) code_key(Str code) { return sha256_bytes(utf8("symbolon v1 invite key").concat(cose_hex_decode(code))); }
+
+@requires(network, device, declassify, clock, environment)
+Result(Int, Str) send_accept(Ctx x, List(Int) org, Str code) {
+    List(Int) pub_key = ec_public_key(P256, code_key(code));
+    List(Int) iid = invite_id_of(pub_key);
+    List(Int) csig = ecdsag_sign_raw(P256, Sha256, secret_bytes(code_key(code)), code_message(org, x.c.log_id));
+    OrgAccept a0 = OrgAccept {.org_id = org, .id = iid, .log_id = x.c.log_id, .code_sig = csig, .log_sequence = x.vh.head.sequence, .signer = x.c.party, .sig = []};
+    List(Int) sig = dk_sign(x.c, x.u.real, x.u.st, accept_tbs(a0))?;
+    if (!blob_put(x.ep, accept_blob(org, iid), cbor_or_empty(to_cbor(accept_signed(a0, sig))))) { return Err("the server refused the answer to the invite (used already?)"); }
+    return Ok(0);
+}
+
+// `org invite DIR EXT-ID NAME [GROUP,...]`: an invite for one person of the
+// company directory, good for 14 days; prints "CODE ID". The person's
+// device answers it with `org join ... CODE`; an administrator's `org
+// sync` then adds them with this directory id and these groups.
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+pub Int org_invite(Str dir, Str ext, Str label, Str groups_arg) { return done(invite(dir, ext, label, groups_arg)); }
+
+pub Int invite_secs() { return 1209600; }
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+Result(Int, Str) invite(Str dir, Str ext, Str label, Str groups_arg) {
+    if (!label_ok(label) || str_len(ext) == 0 || str_len(ext) > 256) { return Err("a directory id of 1-256 characters and a name of 1-64"); }
+    OrgCtx o = org_unlocked(dir)?;
+    Int ok = admin_only(o)?;
+    Str made = make_invite(dir, o, ext, label, if (str_len(groups_arg) == 0) { [] } else { group_ids(o.st.org.groups, str_split(groups_arg, ","), 0, ListBuf())? })?;
+    println(made);
+    return Ok(0);
+}
+
+// A new invite stored at the relay; "CODE ID".
+@requires(filesystem, network, device, declassify, clock, environment)
+pub Result(Str, Str) make_invite(Str dir, OrgCtx o, Str ext, Str label, List(List(Int)) gs) {
+    Str code = hex_encode(random_bytes(16));
+    List(Int) pub_key = ec_public_key(P256, code_key(code));
+    List(Int) iid = invite_id_of(pub_key);
+    Int now = witness_now(o.x.vh.head.policy.witnesses, o.x.c.ca, random_bytes(32));
+    if (now == 0) { return Err("the witnesses did not answer for the time"); }
+    OrgInvite v0 = OrgInvite {.org_id = o.st.org.org_id, .id = iid, .public_key = pub_key, .ext_id = ext, .label = label, .groups = gs, .expires = now + invite_secs(),
+                              .log_sequence = o.x.vh.head.sequence, .signer_log = o.x.c.log_id, .signer = o.x.c.party, .sig = []};
+    List(Int) sig = dk_sign(o.x.c, o.x.u.real, o.x.u.st, invite_tbs(v0))?;
+    Int put = put_blob(o.x, invite_blob(v0.org_id, iid), cbor_or_empty(to_cbor(invite_signed(v0, sig))), "invite")?;
+    _ = audit(dir, o.x, v0.org_id, "member", hex_encode(iid), "invite " + ext);
+    return Ok(code + " " + hex_encode(iid));
 }
 
 @requires(filesystem)
@@ -164,7 +264,7 @@ Result(Int, Str) joined(Str dir, Ctx x, OrgState st) {
 
 // Reading needs the verified log, not the PIN.
 @requires(filesystem, network, clock(readonly), declassify)
-Result(OrgCtx, Str) org_view(Str dir) {
+pub Result(OrgCtx, Str) org_view(Str dir) {
     DeviceConfig c = set_up(dir)?;
     Result(VerifiedHead, SymbolonError) rv = verified_log(relay_ep(c), c.log_id);
     VerifiedHead vh = match rv { Err(e) => Err(err_text(e)), Ok(h) => Ok(h) }?;
@@ -172,12 +272,12 @@ Result(OrgCtx, Str) org_view(Str dir) {
     List(Secret(UInt(8))) none = [];
     Unlocked u = Unlocked {.kind = 0, .real = RealProfile {.share = none, .cc = none, .vault_key = none, .dek = none, .duress_hpke_pub = []},
                            .duress = DuressFull {.share = none, .subkey = none, .vault_key = none, .hpke_priv = none, .tweaks = []}, .st = none};
-    return Ok(OrgCtx {.x = Ctx {.c = c, .u = u, .vh = vh, .pin = ""}, .st = st});
+    return Ok(OrgCtx {.x = Ctx {.c = c, .u = u, .vh = vh, .pin = "", .ep = relay_at(dir, c)}, .st = st});
 }
 
-Str role_of(OrgGov g, List(Int) l) { return if (is_owner(g, l)) { "owner" } else { if (is_admin(g, l)) { "admin" } else { "member" } }; }
+pub Str role_of(OrgGov g, List(Int) l) { return if (is_owner(g, l)) { "owner" } else { if (is_admin(g, l)) { "admin" } else { "member" } }; }
 
-Str yes(Bool b) { return if (b) { "yes" } else { "no" }; }
+pub Str yes(Bool b) { return if (b) { "yes" } else { "no" }; }
 
 @requires(filesystem, network, clock(readonly), declassify)
 pub Int org_show(Str dir) { return done(show(dir)); }
@@ -193,8 +293,26 @@ Result(Int, Str) show(Str dir) {
     println("role " + (if (member) { role_of(g, o.x.c.log_id) } else { "pending" }));
     println(f"policy min_pin_len={p.min_pin_len} allow_biometric={yes(p.allow_biometric)} allow_duress={yes(p.allow_duress)} allow_offline_copy={yes(p.allow_offline_copy)} max_offline_days={p.max_offline_days} allow_personal_export={yes(p.allow_personal_export)}");
     println(if (g.recovery.on) { f"recovery on {g.recovery.threshold}/{g.recovery.admins.len()} delay {g.recovery.delay_sec}" } else { "recovery off" });
-    return Ok(0);
+    return Ok(notices(o, blob_list(o.x.ep, "recreq-" + hex_encode(g.org_id) + "-"), 0));
 }
+
+// The person is told (SPEC 29.8): "recovery-request CID REQUESTER OPENS-AT"
+// for each request to open one of their work folders.
+@requires(network, clock(readonly), declassify)
+Int notices(OrgCtx o, List(Str) names, Int i) {
+    if (i >= names.len()) { return 0; }
+    Option(OrgRecoveryRequest) oq = recreq_of(blob_get(o.x.ep, names[i]) else { [] });
+    _ = match oq {
+        None => 0,
+        Some(q) => match escrow_of(blob_get(o.x.ep, escrow_blob(q.org_id, hex_encode(q.coll_id))) else { [] }) {
+            None => 0,
+            Some(e) => if (bytes_eq(e.owner, o.x.c.log_id)) { notice(q, o.st.gov.recovery.delay_sec) } else { 0 }
+        }
+    };
+    return notices(o, names, i + 1);
+}
+
+Int notice(OrgRecoveryRequest q, Int delay) { println("recovery-request " + hex_encode(q.coll_id) + " " + hex_encode(q.requester) + f" {q.time + delay}"); return 0; }
 
 @requires(filesystem, network, clock(readonly), declassify)
 pub Int org_members(Str dir) { return done(members(dir)); }
@@ -434,10 +552,232 @@ pub Int org_sync(Str dir) { return done(sync(dir)); }
 
 @requires(filesystem, network, device, declassify, clock, provision, environment)
 Result(Int, Str) sync(Str dir) {
-    OrgCtx o = org_unlocked(dir)?;
-    Int ok = admin_only(o)?;
-    List(Str) wraps = blob_list(relay_ep(o.x.c), "wrap-");
-    return Ok(sync_all(dir, o, wraps, ids_of(blob_list(relay_ep(o.x.c), "gfolder-"), 0, ListBuf()), 0));
+    OrgCtx o0 = org_unlocked(dir)?;
+    Int ok = admin_only(o0)?;
+    OrgCtx o1 = admit(dir, o0)?;
+    OrgCtx o = directory_sync(dir, o1)?;
+    List(Str) wraps = blob_list(o.x.ep, "wrap-");
+    return Ok(sync_all(dir, o, wraps, ids_of(blob_list(o.x.ep, "gfolder-"), 0, ListBuf()), 0));
+}
+
+// ─── Answered invites (SPEC 29.3) ───────────────────────────────
+
+type Admit = { OrgMember m; List(List(Int)) gids; Str inv; Str acc; };
+
+// Everyone who answered a valid invite, added in one new membership
+// record with the invite's directory id, name and groups; "joined LOG
+// EXT-HEX" for each. The invite and the answer are then cleared.
+@requires(filesystem, network, device, declassify, clock, environment)
+Result(OrgCtx, Str) admit(Str dir, OrgCtx o) {
+    List(Str) names = blob_list(o.x.ep, "accept-" + hex_encode(o.st.org.org_id) + "-");
+    if (names.len() == 0) { return Ok(o); }
+    Int now = witness_now(o.x.vh.head.policy.witnesses, o.x.c.ca, random_bytes(32));
+    List(Admit) ads = admits(o, names, now, 0, [], ListBuf());
+    if (ads.len() == 0) { return Ok(o); }
+    Int stored = store_org(dir, o.x, o.st, o.st.gov.version, o.st.org.members.concat(admit_members(ads, 0, ListBuf())), with_admits(o.st.org.groups, ads, 0, ListBuf()),
+                           "member", f"{ads.len()} joined by invite")?;
+    _ = clear_admits(o.x, ads, 0);
+    OrgState st = org_at(dir, o.x.c, o.x.vh)?;
+    return Ok(OrgCtx {.x = o.x, .st = st});
+}
+
+@requires(network, clock(readonly), declassify)
+List(Admit) admits(OrgCtx o, List(Str) names, Int now, Int i, List(List(Int)) seen, ListBuf(Admit) acc) {
+    if (i >= names.len()) { return acc.finish(); }
+    Option(Admit) oa = admit_one(o, names[i], now);
+    return match oa {
+        None => admits(o, names, now, i + 1, seen, acc),
+        Some(a) => if (has_log(seen, a.m.log_id) || member_index(o.st.org.members, a.m.log_id, 0) >= 0) { admits(o, names, now, i + 1, seen, acc) }
+                   else { admits(o, names, now, i + 1, seen.concat([a.m.log_id]), acc.push(a)) }
+    };
+}
+
+Option(T) ok_of(Result(T, Str) r) { return match r { Ok(v) => Some(v), Err(_) => None }; }
+
+// An answer that verifies: for this organization, to an unexpired invite
+// an owner or administrator signed, the code's key over the person's log
+// id, and a device of that log over the answer.
+@requires(network, clock(readonly), declassify)
+Option(Admit) admit_one(OrgCtx o, Str name, Int now) {
+    OrgAccept a = accept_of(blob_get(o.x.ep, name) else { [] })?;
+    if (name != accept_blob(o.st.org.org_id, a.id) || !bytes_eq(a.org_id, o.st.org.org_id)) { return None; }
+    OrgInvite v = invite_of(blob_get(o.x.ep, invite_blob(a.org_id, a.id)) else { [] })?;
+    if (!bytes_eq(v.org_id, a.org_id) || !bytes_eq(v.id, a.id) || !bytes_eq(invite_id_of(v.public_key), v.id) || v.expires < now || !is_admin(o.st.gov, v.signer_log)) { return None; }
+    if (!ecdsa_verify_raw(P256, Sha256, v.public_key, code_message(a.org_id, a.log_id), a.code_sig)) { return None; }
+    VerifiedHead hv = ok_of(head_of(o.x.c, o.x.vh, v.signer_log))?;
+    if (!signed_by(hv, v.log_sequence, v.signer, invite_tbs(v), v.sig)) { return None; }
+    VerifiedHead ha = ok_of(head_of(o.x.c, o.x.vh, a.log_id))?;
+    if (!signed_by(ha, a.log_sequence, a.signer, accept_tbs(a), a.sig)) { return None; }
+    return Some(Admit {.m = OrgMember {.log_id = a.log_id, .label = v.label, .ext_id = v.ext_id}, .gids = v.groups, .inv = invite_blob(a.org_id, a.id), .acc = name});
+}
+
+List(OrgMember) admit_members(List(Admit) ads, Int i, ListBuf(OrgMember) acc) {
+    if (i >= ads.len()) { return acc.finish(); }
+    println("joined " + hex_encode(ads[i].m.log_id) + " " + hex_encode(utf8(ads[i].m.ext_id)));
+    return admit_members(ads, i + 1, acc.push(ads[i].m));
+}
+
+List(OrgGroup) with_admits(List(OrgGroup) gs, List(Admit) ads, Int i, ListBuf(OrgGroup) acc) {
+    if (i >= gs.len()) { return acc.finish(); }
+    OrgGroup g = gs[i];
+    return with_admits(gs, ads, i + 1, acc.push(OrgGroup {.group_id = g.group_id, .name = g.name, .members = g.members.concat(admits_in(ads, g.group_id, 0, ListBuf()))}));
+}
+
+List(List(Int)) admits_in(List(Admit) ads, List(Int) gid, Int i, ListBuf(List(Int)) acc) {
+    if (i >= ads.len()) { return acc.finish(); }
+    return admits_in(ads, gid, i + 1, if (has_log(ads[i].gids, gid)) { acc.push(ads[i].m.log_id) } else { acc });
+}
+
+@requires(network, clock(readonly), declassify)
+Bool clear_admits(Ctx x, List(Admit) ads, Int i) {
+    if (i >= ads.len()) { return true; }
+    _ = blob_put(x.ep, ads[i].inv, []);
+    _ = blob_put(x.ep, ads[i].acc, []);
+    return clear_admits(x, ads, i + 1);
+}
+
+// ─── The company directory (SPEC 29.7) ──────────────────────────
+// What the relay's SCIM service holds, applied by this device's
+// signature: members with a directory id the directory no longer has (or
+// turned off) are taken out, the directory's groups are set by name, and
+// the directory's people who are not members get an invite, once.
+// Members added by hand (no directory id) and owners are left alone; an
+// administrator must lose the role first. Prints "removed LOG EXT-HEX",
+// "kept LOG EXT-HEX administrator", "group NAME-HEX N", "invite
+// USERNAME-HEX CODE ID".
+
+@requires(filesystem, network, device, declassify, clock, environment)
+Result(OrgCtx, Str) directory_sync(Str dir, OrgCtx o) {
+    HttpOut r = http_call_ep(o.x.ep, "GET", "/directory/" + hex_encode(o.st.org.org_id), []);
+    if (r.status == 404) { return Ok(o); }
+    if (r.status != 200) { return Err(f"the relay did not give the directory ({r.status})"); }
+    List(Str) lines = str_split(http_text(r.body, 0, r.body.len()), "\n");
+    List(DirUser) us = dir_users(lines, 0, ListBuf());
+    List(DirGroup) dgs = dir_groups(lines, 0, ListBuf());
+    List(OrgMember) kept = still_listed(o.st, us, 0, ListBuf());
+    List(OrgGroup) gs0 = drop_gone(o.st.org.groups, kept, 0, ListBuf());
+    List(OrgGroup) gs = set_groups(gs0, dgs, us, kept, 0);
+    Bool changed = kept.len() != o.st.org.members.len() || !same_groups(o.st.org.groups, gs, 0);
+    OrgCtx o2 = if (changed) { stored_again(dir, o, kept, gs)? } else { o };
+    List(Str) pending = invited(o2, blob_list(o2.x.ep, "invite-" + hex_encode(o2.st.org.org_id) + "-"), 0, ListBuf());
+    Int made = invite_new(dir, o2, us, dgs, pending, 0)?;
+    return Ok(o2);
+}
+
+@requires(filesystem, network, device, declassify, clock, environment)
+Result(OrgCtx, Str) stored_again(Str dir, OrgCtx o, List(OrgMember) ms, List(OrgGroup) gs) {
+    Int stored = store_org(dir, o.x, o.st, o.st.gov.version, ms, gs, "member", "directory")?;
+    OrgState st = org_at(dir, o.x.c, o.x.vh)?;
+    return Ok(OrgCtx {.x = o.x, .st = st});
+}
+
+Str unhx(Str s) { List(Int) b = if (s == "-") { [] } else { cose_hex_decode(s) }; return http_text(b, 0, b.len()); }
+
+List(DirUser) dir_users(List(Str) lines, Int i, ListBuf(DirUser) acc) {
+    if (i >= lines.len()) { return acc.finish(); }
+    List(Str) p = str_split(lines[i], " ");
+    Bool ok = p.len() == 4 && p[0] == "U";
+    return dir_users(lines, i + 1, if (ok) { acc.push(DirUser {.id = "", .user_name = unhx(p[1]), .external_id = unhx(p[2]), .display = unhx(p[3]), .active = true}) } else { acc });
+}
+
+List(DirGroup) dir_groups(List(Str) lines, Int i, ListBuf(DirGroup) acc) {
+    if (i >= lines.len()) { return acc.finish(); }
+    List(Str) p = str_split(lines[i], " ");
+    Bool ok = p.len() == 3 && p[0] == "G" && p[1] != "-";
+    return dir_groups(lines, i + 1, if (ok) { acc.push(DirGroup {.id = "", .display = unhx(p[1]), .members = if (p[2] == "-") { [] } else { unhx_all(str_split(p[2], ","), 0, ListBuf()) }}) } else { acc });
+}
+
+List(Str) unhx_all(List(Str) xs, Int i, ListBuf(Str) acc) { return if (i >= xs.len()) { acc.finish() } else { unhx_all(xs, i + 1, acc.push(unhx(xs[i]))) }; }
+
+Bool listed_user(List(DirUser) us, Str ext, Int i) {
+    if (i >= us.len()) { return false; }
+    return names_user(ext, us[i]) || listed_user(us, ext, i + 1);
+}
+
+List(OrgMember) still_listed(OrgState st, List(DirUser) us, Int i, ListBuf(OrgMember) acc) {
+    if (i >= st.org.members.len()) { return acc.finish(); }
+    OrgMember m = st.org.members[i];
+    Bool keep = str_len(m.ext_id) == 0 || is_owner(st.gov, m.log_id) || listed_user(us, m.ext_id, 0);
+    Bool admin = !keep && is_admin(st.gov, m.log_id);
+    if (!keep) { println((if (admin) { "kept " } else { "removed " }) + hex_encode(m.log_id) + " " + hex_encode(utf8(m.ext_id)) + (if (admin) { " administrator" } else { "" })); }
+    return still_listed(st, us, i + 1, if (keep || admin) { acc.push(m) } else { acc });
+}
+
+List(OrgGroup) drop_gone(List(OrgGroup) gs, List(OrgMember) ms, Int i, ListBuf(OrgGroup) acc) {
+    if (i >= gs.len()) { return acc.finish(); }
+    return drop_gone(gs, ms, i + 1, acc.push(OrgGroup {.group_id = gs[i].group_id, .name = gs[i].name, .members = in_members(gs[i].members, ms, 0, ListBuf())}));
+}
+
+List(List(Int)) in_members(List(List(Int)) ls, List(OrgMember) ms, Int i, ListBuf(List(Int)) acc) {
+    if (i >= ls.len()) { return acc.finish(); }
+    return in_members(ls, ms, i + 1, if (member_index(ms, ls[i], 0) >= 0) { acc.push(ls[i]) } else { acc });
+}
+
+// Each directory group as the organization's group of that name (a new
+// one when there is none), its members the members the directory puts in it.
+List(OrgGroup) set_groups(List(OrgGroup) gs, List(DirGroup) dgs, List(DirUser) us, List(OrgMember) ms, Int i) {
+    if (i >= dgs.len()) { return gs; }
+    List(List(Int)) want = members_named(ms, dgs[i].members, us, 0, ListBuf());
+    Int at = group_named(gs, dgs[i].display, 0);
+    List(OrgGroup) next = if (at >= 0) { replace_group(gs, OrgGroup {.group_id = gs[at].group_id, .name = gs[at].name, .members = want}, 0, ListBuf()) }
+                          else { gs.concat([OrgGroup {.group_id = sha256_bytes(utf8("symbolon v1 directory group").concat(utf8(dgs[i].display)))[0..16], .name = dgs[i].display, .members = want}]) };
+    if (at < 0 || !same_logs(gs[at].members, want)) { println("group " + hex_encode(utf8(dgs[i].display)) + f" {want.len()}"); }
+    return set_groups(next, dgs, us, ms, i + 1);
+}
+
+Int group_named(List(OrgGroup) gs, Str name, Int i) {
+    if (i >= gs.len()) { return -1; }
+    if (gs[i].name == name) { return i; }
+    return group_named(gs, name, i + 1);
+}
+
+
+// The members whose directory id names one of these user names.
+List(List(Int)) members_named(List(OrgMember) ms, List(Str) names, List(DirUser) us, Int i, ListBuf(List(Int)) acc) {
+    if (i >= ms.len()) { return acc.finish(); }
+    Bool inside = str_len(ms[i].ext_id) > 0 && named_in(ms[i].ext_id, names, us, 0);
+    return members_named(ms, names, us, i + 1, if (inside) { acc.push(ms[i].log_id) } else { acc });
+}
+
+Bool named_in(Str ext, List(Str) names, List(DirUser) us, Int i) {
+    if (i >= us.len()) { return false; }
+    return (has_str(names, us[i].user_name, 0) && names_user(ext, us[i])) || named_in(ext, names, us, i + 1);
+}
+
+Bool same_logs(List(List(Int)) a, List(List(Int)) b) { return a.len() == b.len() && all_in(a, b, 0); }
+Bool all_in(List(List(Int)) a, List(List(Int)) b, Int i) { return i >= a.len() || (has_log(b, a[i]) && all_in(a, b, i + 1)); }
+
+Bool same_groups(List(OrgGroup) a, List(OrgGroup) b, Int i) {
+    if (a.len() != b.len()) { return false; }
+    if (i >= a.len()) { return true; }
+    return bytes_eq(a[i].group_id, b[i].group_id) && same_logs(a[i].members, b[i].members) && same_groups(a, b, i + 1);
+}
+
+// The directory ids of the invites still at the relay.
+@requires(network, clock(readonly), declassify)
+List(Str) invited(OrgCtx o, List(Str) names, Int i, ListBuf(Str) acc) {
+    if (i >= names.len()) { return acc.finish(); }
+    Option(OrgInvite) v = invite_of(blob_get(o.x.ep, names[i]) else { [] });
+    return invited(o, names, i + 1, match v { Some(x) => acc.push(str_to_lower(x.ext_id)), None => acc });
+}
+
+@requires(filesystem, network, device, declassify, clock, environment)
+Result(Int, Str) invite_new(Str dir, OrgCtx o, List(DirUser) us, List(DirGroup) dgs, List(Str) pending, Int i) {
+    if (i >= us.len()) { return Ok(0); }
+    DirUser u = us[i];
+    Bool member = members_named(o.st.org.members, [u.user_name], [u], 0, ListBuf()).len() > 0;
+    if (member || has_str(pending, str_to_lower(u.user_name), 0)) { return invite_new(dir, o, us, dgs, pending, i + 1); }
+    Str made = make_invite(dir, o, u.user_name, if (label_ok(u.display)) { u.display } else { str_slice(u.user_name, 0, min_int(64, str_len(u.user_name))) }, groups_for(o.st.org.groups, dgs, u.user_name, 0, ListBuf()))?;
+    println("invite " + hex_encode(utf8(u.user_name)) + " " + made);
+    return invite_new(dir, o, us, dgs, pending, i + 1);
+}
+
+Int min_int(Int a, Int b) { return if (a < b) { a } else { b }; }
+
+List(List(Int)) groups_for(List(OrgGroup) gs, List(DirGroup) dgs, Str user, Int i, ListBuf(List(Int)) acc) {
+    if (i >= dgs.len()) { return acc.finish(); }
+    Int at = group_named(gs, dgs[i].display, 0);
+    return groups_for(gs, dgs, user, i + 1, if (at >= 0 && has_str(dgs[i].members, user, 0)) { acc.push(gs[at].group_id) } else { acc });
 }
 
 List(Str) ids_of(List(Str) names, Int i, ListBuf(Str) acc) {
@@ -464,11 +804,11 @@ Result(Str, Str) sync_one(Str dir, OrgCtx o, List(Str) wraps, Str cid) {
         _ = fill_wraps(o.x, ld, people, 0, 0);
         return Ok("ok");
     }
-    GroupFolder f = need(gfolder_of(blob_get(relay_ep(o.x.c), gfolder_blob(cid)) else { [] }), "the group folder does not decode")?;
+    GroupFolder f = need(gfolder_of(blob_get(o.x.ep, gfolder_blob(cid)) else { [] }), "the group folder does not decode")?;
     Opened op = opened_with(dir, o.x, cid, true)?;
     List(Secret(UInt(8))) key = random_secret(32);
     List(Item) items = reseal(ld.key, key, op.p.vid, op.st.items, 0, ListBuf())?;
-    Opened next = Opened {.c = op.c, .u = op.u, .vh = op.vh, .st = op.st, .pin = op.pin, .p = Place {.share = cid, .vk = key, .vid = op.p.vid}};
+    Opened next = Opened {.c = op.c, .u = op.u, .vh = op.vh, .st = op.st, .pin = op.pin, .p = Place {.share = cid, .vk = key, .vid = op.p.vid}, .ep = op.ep};
     if (publish_items(dir, next, items) != 0) { return Err("the server refused the items sealed again"); }
     UInt(64) v = ld.r.version + (UInt(64))1;
     GroupFolder nf = sign_gfolder(o.x, ld.r.coll_id, v, f.org_id, f.groups, key, ld.name, false)?;
@@ -490,8 +830,218 @@ List(List(Int)) holders_gone(Ctx x, List(Str) wraps, Str cid, UInt(64) version, 
     Str n = wraps[i];
     Bool mine = str_len(n) == 5 + 64 + 1 + 32 && str_slice(n, 70, 102) == cid;
     List(Int) l = if (mine) { cose_hex_decode(str_slice(n, 5, 69)) } else { [] };
-    Bool holds = mine && !has_log(people, l) && match wraps_of(blob_get(relay_ep(x.c), n) else { [] }) { None => false, Some(ws) => ws.roster_version == version && ws.wraps.len() > 0 };
+    Bool holds = mine && !has_log(people, l) && match wraps_of(blob_get(x.ep, n) else { [] }) { None => false, Some(ws) => ws.roster_version == version && ws.wraps.len() > 0 };
     return holders_gone(x, wraps, cid, version, people, i + 1, if (holds) { acc.push(l) } else { acc });
+}
+
+// ─── Opt-in recovery of work folders (SPEC 29.8) ────────────────
+// An owner turns recovery on: a new HPKE P-256 key whose private key is
+// split among recovery administrators (any `threshold` of them recover
+// it) and then forgotten; each share is wrapped to its administrator's
+// devices. A member escrows a work folder they own (never their own
+// vault): its key sealed to the recovery key. A recovery administrator
+// asks to open one; after the delay (witness time), `threshold` of them
+// approve, each re-wrapping their share to the requester's devices; the
+// requester rebuilds the recovery key and opens that folder. The folder's
+// owner sees the request in `org show`, and every step is audited.
+
+pub List(Int) rec_share_id(List(Int) org, UInt(64) since, Int i) { return sha256_bytes(utf8("symbolon v1 recovery share").concat(org).concat(utf8(f"{since} {i}")))[0..16]; }
+pub List(Int) rec_part_id(List(Int) cid, List(Int) admin, Int time) { return sha256_bytes(utf8("symbolon v1 recovery part").concat(cid).concat(admin).concat(utf8(f"{time}")))[0..16]; }
+
+List(Int) be_bytes(UInt(256) v, Int n, List(Int) acc) {
+    if (n == 0) { return acc; }
+    UInt(256) base = 256;
+    Int d = (Int)(v % base);
+    return be_bytes(v / base, n - 1, [d].concat(acc));
+}
+
+UInt(256) u256_of(List(Int) b, Int i, UInt(256) acc) {
+    if (i >= b.len()) { return acc; }
+    UInt(256) base = 256;
+    UInt(256) d = (UInt(256))b[i];
+    return u256_of(b, i + 1, acc * base + d);
+}
+
+// A scalar below the P-256 order: 31 random bytes.
+List(Int) small_secret() { return [0].concat(random_bytes(31)); }
+
+List(UInt(256)) coeffs(Int k, ListBuf(UInt(256)) acc) {
+    if (k <= 0) { return acc.finish(); }
+    return coeffs(k - 1, acc.push(u256_of(small_secret(), 0, (UInt(256))0)));
+}
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+pub Int org_recovery(Str dir, Str on, Str k, Str delay, Str admins_arg) { return done(recovery(dir, on, k, delay, admins_arg)); }
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+Result(Int, Str) recovery(Str dir, Str on, Str k_arg, Str delay_arg, Str admins_arg) {
+    OrgCtx o = org_unlocked(dir)?;
+    if (!is_owner(o.st.gov, o.x.c.log_id)) { return Err("only an owner turns recovery on or off"); }
+    if (on == "off") { return store_gov_r(dir, o.x, o.st, o.st.gov.owners, o.st.gov.admins, o.st.gov.policy, no_recovery(), "recovery", "off"); }
+    List(List(Int)) admins = logs_arg(str_split(admins_arg, ","), 0, ListBuf());
+    Int k = str_parse_int(k_arg);
+    Int delay = str_parse_int(delay_arg);
+    if (admins.len() == 0 || admins.len() > 255 || k < 1 || k > admins.len() || delay < 0) { return Err("recovery on K DELAY-SECONDS ADMIN-LOG,...: 1 <= K <= administrators <= 255"); }
+    if (!all_admins(o.st, admins, 0)) { return Err("each recovery administrator must be an owner or administrator in the organization"); }
+    List(Int) r = small_secret();
+    HpkeKeyPair kp = hpke_derive_keypair(16, r);
+    if (!kp.ok) { return Err("cannot make the recovery key"); }
+    List(UInt(256)) shares = sh_split([u256_of(r, 0, (UInt(256))0)].concat(coeffs(k - 1, ListBuf())), admins.len());
+    UInt(64) since = o.st.gov.version + (UInt(64))1;
+    Str m = wrap_shares(o.x, o.st.org.org_id, since, shares, admins, 0);
+    if (str_len(m) > 0) { return Err(m); }
+    OrgRecovery rec = OrgRecovery {.on = true, .public_key = kp.pk, .threshold = k, .admins = admins, .delay_sec = delay, .since = since, .owner = o.x.c.log_id};
+    return store_gov_r(dir, o.x, o.st, o.st.gov.owners, o.st.gov.admins, o.st.gov.policy, rec, "recovery", f"on {k}/{admins.len()} delay {delay}");
+}
+
+List(List(Int)) logs_arg(List(Str) xs, Int i, ListBuf(List(Int)) acc) {
+    if (i >= xs.len()) { return acc.finish(); }
+    return logs_arg(xs, i + 1, if (log_hex_ok(xs[i])) { acc.push(cose_hex_decode(xs[i])) } else { acc });
+}
+
+Bool all_admins(OrgState st, List(List(Int)) ls, Int i) {
+    if (i >= ls.len()) { return true; }
+    return is_admin(st.gov, ls[i]) && member_index(st.org.members, ls[i], 0) >= 0 && all_admins(st, ls, i + 1);
+}
+
+@requires(network, clock(readonly), declassify)
+Str wrap_shares(Ctx x, List(Int) org, UInt(64) since, List(UInt(256)) shares, List(List(Int)) admins, Int i) {
+    if (i >= admins.len()) { return ""; }
+    Str m = put_wraps(x, rec_share_id(org, since, i), since, secret_bytes(be_bytes(shares[i], 32, [])), [admins[i]], 0);
+    return if (str_len(m) > 0) { m } else { wrap_shares(x, org, since, shares, admins, i + 1) };
+}
+
+// `org escrow DIR CID`: a work folder this person owns, its key sealed to
+// the recovery key. Run again after the folder's key changes.
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+pub Int org_escrow(Str dir, Str cid) { return done(escrow(dir, cid)); }
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+Result(Int, Str) escrow(Str dir, Str cid) {
+    OrgCtx o = org_unlocked(dir)?;
+    OrgRecovery rec = o.st.gov.recovery;
+    if (!rec.on) { return Err("the organization has not turned recovery on"); }
+    Loaded ld = load_folder(dir, o.x, cid)?;
+    if (is_group_roster(ld.r) || !bytes_eq(ld.r.owner, o.x.c.log_id)) { return Err("only a shared folder you own is escrowed (group folders need none)"); }
+    HpkeMessageG(Secret(UInt(8))) m = hpkeg_seal_to(share_suite(), rec.public_key, escrow_info(o.st.org.org_id, ld.r.coll_id, ld.r.version), [], ld.key);
+    if (!m.ok) { return Err("cannot seal the key"); }
+    OrgEscrow e0 = OrgEscrow {.org_id = o.st.org.org_id, .coll_id = ld.r.coll_id, .owner = o.x.c.log_id, .roster_version = ld.r.version, .enc = m.enc, .ct = reveal(m.ct),
+                              .log_sequence = o.x.vh.head.sequence, .signer = o.x.c.party, .sig = []};
+    List(Int) sig = dk_sign(o.x.c, o.x.u.real, o.x.u.st, escrow_tbs(e0))?;
+    Int put = put_blob(o.x, escrow_blob(e0.org_id, cid), cbor_or_empty(to_cbor(escrow_signed(e0, sig))), "escrow")?;
+    _ = audit(dir, o.x, e0.org_id, "recovery", cid, f"escrowed at version {ld.r.version}");
+    println(f"escrowed {cid} {ld.r.version}");
+    return Ok(0);
+}
+
+// `org recover request|approve|open DIR CID`.
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+pub Int org_recover(Str dir, Str step, Str cid) {
+    if (!share_id_ok(cid)) { return done(Err("a folder id is 32 hex digits")); }
+    if (step == "request") { return done(rec_request(dir, cid)); }
+    if (step == "approve") { return done(rec_approve(dir, cid)); }
+    if (step == "open") { return done(rec_open(dir, cid)); }
+    return done(Err("org recover request|approve|open DIR CID"));
+}
+
+Result(Int, Str) rec_admin_only(OrgCtx o) {
+    OrgRecovery rec = o.st.gov.recovery;
+    if (!rec.on) { return Err("the organization has not turned recovery on"); }
+    return if (log_at(rec.admins, o.x.c.log_id, 0) >= 0) { Ok(log_at(rec.admins, o.x.c.log_id, 0)) } else { Err("only a recovery administrator does that") };
+}
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+Result(Int, Str) rec_request(Str dir, Str cid) {
+    OrgCtx o = org_unlocked(dir)?;
+    Int me = rec_admin_only(o)?;
+    OrgEscrow e = need(escrow_of(blob_get(o.x.ep, escrow_blob(o.st.org.org_id, cid)) else { [] }), "the folder has no escrow")?;
+    Int now = witness_now(o.x.vh.head.policy.witnesses, o.x.c.ca, random_bytes(32));
+    if (now == 0) { return Err("the witnesses did not answer for the time"); }
+    OrgRecoveryRequest q0 = OrgRecoveryRequest {.org_id = o.st.org.org_id, .coll_id = e.coll_id, .requester = o.x.c.log_id, .time = now,
+                                                .log_sequence = o.x.vh.head.sequence, .signer = o.x.c.party, .sig = []};
+    List(Int) sig = dk_sign(o.x.c, o.x.u.real, o.x.u.st, recreq_tbs(q0))?;
+    Int put = put_blob(o.x, recreq_blob(q0.org_id, cid), cbor_or_empty(to_cbor(recreq_signed(q0, sig))), "recovery request")?;
+    _ = audit(dir, o.x, q0.org_id, "recovery", cid, "requested by " + hex_encode(o.x.c.log_id));
+    println("requested " + cid + f" {now + o.st.gov.recovery.delay_sec}");
+    return Ok(0);
+}
+
+// The request at the relay, signed by a recovery administrator's device.
+@requires(network, clock(readonly), declassify)
+Result(OrgRecoveryRequest, Str) verified_request(OrgCtx o, Str cid) {
+    OrgRecoveryRequest q = need(recreq_of(blob_get(o.x.ep, recreq_blob(o.st.org.org_id, cid)) else { [] }), "no one asked to open this folder")?;
+    if (!bytes_eq(q.org_id, o.st.org.org_id) || hex_encode(q.coll_id) != cid || log_at(o.st.gov.recovery.admins, q.requester, 0) < 0) { return Err("the request is not a recovery administrator's"); }
+    VerifiedHead h = head_of(o.x.c, o.x.vh, q.requester)?;
+    if (!signed_by(h, q.log_sequence, q.signer, recreq_tbs(q), q.sig)) { return Err("the request's signature does not verify"); }
+    return Ok(q);
+}
+
+// A wrapped secret for this device: id `id`, version `v`, wrapped by `from`.
+@requires(network, clock(readonly), declassify)
+Result(List(Secret(UInt(8))), Str) unwrapped(Ctx x, List(Int) id, UInt(64) v, List(Int) from) {
+    WrapSet ws = need(wraps_of(blob_get(x.ep, wrap_blob(x.c.log_id, hex_encode(id))) else { [] }), "no wrapped share for you")?;
+    if (ws.roster_version != v || !bytes_eq(ws.coll_id, id) || !bytes_eq(ws.member, x.c.log_id)) { return Err("the wrapped share is for something else"); }
+    ShareWrap w = need(wrap_to(ws.wraps, x.c.party, 0), "no wrapped share for this device")?;
+    return unwrap(x, Roster {.coll_id = id, .version = v, .owner = from, .owner_label = "", .members = [], .name_ct = [], .deleted = false,
+                             .log_sequence = (UInt(64))0, .signer = [], .sig = []}, w);
+}
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+Result(Int, Str) rec_approve(Str dir, Str cid) {
+    OrgCtx o = org_unlocked(dir)?;
+    Int me = rec_admin_only(o)?;
+    OrgRecovery rec = o.st.gov.recovery;
+    OrgRecoveryRequest q = verified_request(o, cid)?;
+    Int now = witness_now(o.x.vh.head.policy.witnesses, o.x.c.ca, random_bytes(32));
+    if (now < q.time + rec.delay_sec) { return Err(f"the request opens at {q.time + rec.delay_sec} (witness time now {now})"); }
+    List(Secret(UInt(8))) share = unwrapped(o.x, rec_share_id(o.st.org.org_id, rec.since, me), rec.since, rec.owner)?;
+    Str m = put_wraps(o.x, rec_part_id(q.coll_id, o.x.c.log_id, q.time), (UInt(64))q.time, share, [q.requester], 0);
+    if (str_len(m) > 0) { return Err(m); }
+    _ = audit(dir, o.x, o.st.org.org_id, "recovery", cid, "approved for " + hex_encode(q.requester));
+    println("approved " + cid);
+    return Ok(0);
+}
+
+type Share = { Int id; UInt(256) v; };
+
+@requires(network, clock(readonly), declassify)
+List(Share) parts(OrgCtx o, OrgRecoveryRequest q, Int i, ListBuf(Share) acc) {
+    List(List(Int)) admins = o.st.gov.recovery.admins;
+    if (i >= admins.len()) { return acc.finish(); }
+    Result(List(Secret(UInt(8))), Str) r = unwrapped(o.x, rec_part_id(q.coll_id, admins[i], q.time), (UInt(64))q.time, admins[i]);
+    return parts(o, q, i + 1, match r { Ok(b) => acc.push(Share {.id = i + 1, .v = u256_of(reveal(b), 0, (UInt(256))0)}), Err(_) => acc });
+}
+
+List(Int) share_ids(List(Share) xs, Int i, ListBuf(Int) acc) { return if (i >= xs.len()) { acc.finish() } else { share_ids(xs, i + 1, acc.push(xs[i].id)) }; }
+List(UInt(256)) share_vals(List(Share) xs, Int i, ListBuf(UInt(256)) acc) { return if (i >= xs.len()) { acc.finish() } else { share_vals(xs, i + 1, acc.push(xs[i].v)) }; }
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+Result(Int, Str) rec_open(Str dir, Str cid) {
+    OrgCtx o = org_unlocked(dir)?;
+    Int me = rec_admin_only(o)?;
+    OrgRecovery rec = o.st.gov.recovery;
+    OrgRecoveryRequest q = verified_request(o, cid)?;
+    if (!bytes_eq(q.requester, o.x.c.log_id)) { return Err("the request is someone else's"); }
+    List(Share) got = parts(o, q, 0, ListBuf());
+    if (got.len() < rec.threshold) { return Err(f"{got.len()} of {rec.threshold} recovery administrators approved so far"); }
+    List(Share) use = got[0..rec.threshold];
+    List(Int) r = be_bytes(sh_reconstruct(share_ids(use, 0, ListBuf()), share_vals(use, 0, ListBuf())), 32, []);
+    HpkeKeyPair kp = hpke_derive_keypair(16, r);
+    if (!kp.ok || !bytes_eq(kp.pk, rec.public_key)) { return Err("the shares do not rebuild the recovery key"); }
+    OrgEscrow e = need(escrow_of(blob_get(o.x.ep, escrow_blob(o.st.org.org_id, cid)) else { [] }), "the folder has no escrow")?;
+    VerifiedHead eh = head_of(o.x.c, o.x.vh, e.owner)?;
+    if (!signed_by(eh, e.log_sequence, e.signer, escrow_tbs(e), e.sig) || hex_encode(e.coll_id) != cid) { return Err("the escrow's signature does not verify"); }
+    Roster ro = roster_at(dir, o.x, cid)?;
+    if (!bytes_eq(ro.owner, e.owner)) { return Err("the escrow is not the folder owner's"); }
+    if (ro.version != e.roster_version) { return Err(f"the escrow is for version {e.roster_version}, the folder is at {ro.version}: its owner escrows it again"); }
+    HpkeCtxG(Secret(UInt(8))) hc = hpkeg_setup_receiver(share_suite(), e.enc, secret_bytes(kp.sk), escrow_info(e.org_id, e.coll_id, e.roster_version));
+    if (!hc.ok) { return Err("the escrow does not open"); }
+    HpkeOpenedG(Secret(UInt(8))) op = hpkeg_open(hc, [], e.ct);
+    if (!op.ok || op.pt.len() != 32) { return Err("the escrow does not open"); }
+    VaultState st = fetch_coll(dir, o.x, ro, cid, false)?;
+    _ = audit(dir, o.x, o.st.org.org_id, "recovery", cid, "opened by " + hex_encode(o.x.c.log_id));
+    println("opened " + cid + f" {st.items.len()}");
+    return Ok(list_items(View {.vk = op.pt, .vid = coll_vid(ro.coll_id), .st = st, .offline = false}, 0, 0));
 }
 
 // ─── Audit ──────────────────────────────────────────────────────
@@ -499,26 +1049,7 @@ List(List(Int)) holders_gone(Ctx x, List(Str) wraps, Str cid, UInt(64) version, 
 // number, dir/audit.prev the SHA-256 of the last event's CBOR.
 
 @requires(filesystem, network, device, declassify, clock, environment)
-pub Bool audit(Str dir, Ctx x, List(Int) org_id, Str action, Str object, Str detail) {
-    UInt(64) seq = (UInt(64))(kept_version(dir + "/audit.seq") + 1);
-    List(Int) prev = get_file(dir + "/audit.prev");
-    AuditEvent e0 = AuditEvent {.org_id = org_id, .log_id = x.c.log_id, .party = x.c.party, .seq = seq, .prev = prev,
-                                .time = witness_now(x.vh.head.policy.witnesses, x.c.ca, random_bytes(32)), .action = action, .object = object, .detail = detail, .sig = []};
-    Result(List(Int), Str) rs = dk_sign(x.c, x.u.real, x.u.st, event_tbs(e0));
-    return match rs {
-        Err(_) => false,
-        Ok(sig) => stored_event(dir, x, event_signed(e0, sig))
-    };
-}
-
-@requires(filesystem, network, clock(readonly), declassify)
-Bool stored_event(Str dir, Ctx x, AuditEvent e) {
-    List(Int) b = cbor_or_empty(to_cbor(e));
-    if (!blob_put(relay_ep(x.c), audit_blob(e.org_id, e.log_id, e.seq), b)) { return false; }
-    return filesystem.write_all(dir + "/audit.seq", f"{e.seq}") && filesystem.write_bytes(dir + "/audit.prev", sha256_bytes(b));
-}
-
-Str audit_blob(List(Int) org_id, List(Int) log_id, UInt(64) seq) { return "audit-" + hex_encode(org_id) + "-" + hex_encode(log_id) + "-" + f"{seq:zero, width 12}"; }
+pub Bool audit(Str dir, Ctx x, List(Int) org_id, Str action, Str object, Str detail) { return audit_event(dir, x.c, x.u, x.vh, x.ep, org_id, action, object, detail); }
 
 // `org audit DIR`: every event at the server for the organization, in
 // order per device: "TIME LOG SEQ ACTION OBJECT DETAIL-HEX ok", or
@@ -529,14 +1060,14 @@ pub Int org_audit(Str dir) { return done(audit_list(dir)); }
 @requires(filesystem, network, clock(readonly), declassify)
 Result(Int, Str) audit_list(Str dir) {
     OrgCtx o = org_view(dir)?;
-    List(Str) names = blob_list(relay_ep(o.x.c), "audit-" + hex_encode(o.st.org.org_id) + "-");
+    List(Str) names = blob_list(o.x.ep, "audit-" + hex_encode(o.st.org.org_id) + "-");
     return Ok(print_events(o, names, 0, [], (UInt(64))0, []));
 }
 
 @requires(network, clock(readonly), declassify)
 Int print_events(OrgCtx o, List(Str) names, Int i, List(Int) log, UInt(64) last, List(Int) prev) {
     if (i >= names.len()) { return 0; }
-    Option(AuditEvent) oe = event_of(blob_get(relay_ep(o.x.c), names[i]) else { [] });
+    Option(AuditEvent) oe = event_of(blob_get(o.x.ep, names[i]) else { [] });
     return match oe {
         None => print_events(o, names, i + 1, log, last, prev),
         Some(e) => next_event(o, names, i, e, bytes_eq(e.log_id, log), last, prev)
@@ -545,14 +1076,14 @@ Int print_events(OrgCtx o, List(Str) names, Int i, List(Int) log, UInt(64) last,
 
 @requires(network, clock(readonly), declassify)
 Int next_event(OrgCtx o, List(Str) names, Int i, AuditEvent e, Bool same, UInt(64) last, List(Int) prev) {
-    List(Int) b = blob_get(relay_ep(o.x.c), names[i]) else { [] };
+    List(Int) b = blob_get(o.x.ep, names[i]) else { [] };
     Str why = event_problem(o, names[i], e, if (same) { last } else { (UInt(64))0 }, if (same) { prev } else { [] });
     println(f"{e.time} " + hex_encode(e.log_id) + f" {e.seq} " + e.action + " " + e.object + " " + hex_or_dash(e.detail) + (if (str_len(why) == 0) { " ok" } else { " broken " + hex_encode(utf8(why)) }));
     return print_events(o, names, i + 1, e.log_id, e.seq, sha256_bytes(b));
 }
 
 @requires(network, clock(readonly), declassify)
-Str event_problem(OrgCtx o, Str name, AuditEvent e, UInt(64) last, List(Int) prev) {
+pub Str event_problem(OrgCtx o, Str name, AuditEvent e, UInt(64) last, List(Int) prev) {
     if (name != audit_blob(e.org_id, e.log_id, e.seq) || !bytes_eq(e.org_id, o.st.org.org_id)) { return "stored under another name"; }
     if (e.seq != last + (UInt(64))1) { return f"after {last} comes {e.seq}: events are missing"; }
     if (!bytes_eq(e.prev, prev)) { return "does not follow the event before"; }
@@ -562,3 +1093,105 @@ Str event_problem(OrgCtx o, Str name, AuditEvent e, UInt(64) last, List(Int) pre
         Ok(h) => if (match device_party(h.head.quorum.parties, e.party, 0) { None => false, Some(d) => ecdsa_verify_raw(P256, Sha256, d.auth_key, event_tbs(e), e.sig) }) { "" } else { "signature does not verify" }
     };
 }
+
+// ─── Export to a SIEM (SPEC 29.6) ───────────────────────────────
+// `org export DIR [--https URL [--token T] [--ca FILE]] [--syslog HOST:PORT [--ca FILE]]`:
+// every audit event, verified here first, as one JSON object per line:
+// {"time","org","log","seq","action","object","detail","verified","problem"}.
+// Without a destination the lines go to standard output; --https POSTs
+// them (application/x-ndjson, "Authorization: Bearer T"); --syslog sends
+// each as an RFC 5424 message over TLS (RFC 5425, octet counting) when
+// --ca is given, else over TCP (RFC 6587).
+
+@requires(filesystem, network, clock(readonly), declassify)
+pub Int org_export(Str dir, Str https, Str token, Str syslog, Str ca_file) { return done(export(dir, https, token, syslog, ca_file)); }
+
+@requires(filesystem, network, clock(readonly), declassify)
+Result(Int, Str) export(Str dir, Str https, Str token, Str syslog, Str ca_file) {
+    OrgCtx o = org_view(dir)?;
+    List(Str) names = blob_list(o.x.ep, "audit-" + hex_encode(o.st.org.org_id) + "-");
+    List(Str) lines = event_lines(o, names, 0, [], (UInt(64))0, [], ListBuf());
+    Str ca = if (str_len(ca_file) == 0) { "" } else { filesystem.read_all(ca_file) };
+    if (str_len(https) > 0) { return post_lines(https, token, ca, lines); }
+    if (str_len(syslog) > 0) { return syslog_lines(syslog, ca, hex_encode(o.st.org.org_id), lines); }
+    println(str_join(lines, "\n"));
+    return Ok(0);
+}
+
+@requires(network, clock(readonly), declassify)
+List(Str) event_lines(OrgCtx o, List(Str) names, Int i, List(Int) log, UInt(64) last, List(Int) prev, ListBuf(Str) acc) {
+    if (i >= names.len()) { return acc.finish(); }
+    List(Int) b = blob_get(o.x.ep, names[i]) else { [] };
+    Option(AuditEvent) oe = event_of(b);
+    return match oe {
+        None => event_lines(o, names, i + 1, log, last, prev, acc),
+        Some(e) => event_lines(o, names, i + 1, e.log_id, e.seq, sha256_bytes(b), acc.push(event_json(e, event_problem(o, names[i], e, if (bytes_eq(e.log_id, log)) { last } else { (UInt(64))0 }, if (bytes_eq(e.log_id, log)) { prev } else { [] }))))
+    };
+}
+
+Str event_json(AuditEvent e, Str why) {
+    return f"{{\"time\":{e.time},\"org\":" + json_quote(hex_encode(e.org_id)) + ",\"log\":" + json_quote(hex_encode(e.log_id)) + f",\"seq\":{e.seq},\"action\":" + json_quote(e.action)
+         + ",\"object\":" + json_quote(e.object) + ",\"detail\":" + json_quote(e.detail) + ",\"verified\":" + (if (str_len(why) == 0) { "true" } else { "false" })
+         + ",\"problem\":" + json_quote(why) + "}";
+}
+
+// scheme, host, port, path of an http(s) URL.
+List(Str) url_parts(Str u) {
+    Bool tls = str_starts_with(u, "https://");
+    Str rest = str_slice(u, if (tls) { 8 } else { 7 }, str_len(u));
+    Int slash = str_index_of(rest, "/", 0);
+    Str hp = if (slash < 0) { rest } else { str_slice(rest, 0, slash) };
+    Int colon = str_index_of(hp, ":", 0);
+    return [if (tls) { "https" } else { "http" }, if (colon < 0) { hp } else { str_slice(hp, 0, colon) },
+            if (colon < 0) { if (tls) { "443" } else { "80" } } else { str_slice(hp, colon + 1, str_len(hp)) }, if (slash < 0) { "/" } else { str_slice(rest, slash, str_len(rest)) }];
+}
+
+@requires(network, clock(readonly), declassify)
+Result(Int, Str) post_lines(Str url, Str token, Str ca, List(Str) lines) {
+    List(Str) u = url_parts(url);
+    Str heads = "Content-Type: application/x-ndjson\r\n" + (if (str_len(token) > 0) { "Authorization: Bearer " + token + "\r\n" } else { "" });
+    List(Int) body = utf8(str_join(lines, "\n") + "\n");
+    HttpOut r = if (u[0] == "https") { https_post(url, ca, heads, body) } else { http_call_head(u[1], str_parse_int(u[2]), "POST", u[3], heads, body) };
+    if (r.status < 200 || r.status > 299) { return Err(f"the SIEM answered {r.status}"); }
+    println(f"exported {lines.len()} events");
+    return Ok(0);
+}
+
+@requires(network, clock(readonly), declassify)
+HttpOut https_post(Str url, Str ca, Str heads, List(Int) body) {
+    HttpsGet g = tls_https_request(url, "", trust_store_add_pem(trust_store_empty(), ca), ["http/1.1"], 30000, "POST", heads, body);
+    return HttpOut {.status = g.status, .body = g.bytes};
+}
+
+// <110>1 TIME - symbolon - audit - MSG  (facility 13 log audit, severity info)
+Str syslog_frame(Str org, Str line) {
+    Str m = "<110>1 - - symbolon - audit [symbolon@32473 org=\"" + org + "\"] " + line;
+    return f"{str_len(m)} " + m;
+}
+
+@requires(network, clock(readonly), declassify)
+Result(Int, Str) syslog_lines(Str hp, Str ca, Str org, List(Str) lines) {
+    List(Str) p = str_split(hp, ":");
+    if (p.len() != 2) { return Err("--syslog HOST:PORT"); }
+    List(Int) data = utf8(str_join(frames(org, lines, 0, ListBuf()), ""));
+    if (str_len(ca) == 0) {
+        Int fd = resid_tcp_connect(p[0], str_parse_int(p[1]));
+        if (fd < 0) { return Err("cannot reach the syslog server"); }
+        Bool sent = resid_tcp_send_bin(fd, data);
+        _ = resid_tcp_close(fd);
+        return if (sent) { exported(lines.len()) } else { Err("cannot send to the syslog server") };
+    }
+    TlsDial d = tls_client_connect(p[0], str_parse_int(p[1]), tls_client_cfg(p[0], trust_store_add_pem(trust_store_empty(), ca), []));
+    if (d.err != "") { return Err("syslog over TLS: " + d.err); }
+    WireOut(TlsClient) w = wire_send(d.conn, data);
+    _ = wire_close(w.conn);
+    return if (w.ok) { exported(lines.len()) } else { Err("cannot send to the syslog server") };
+}
+
+Result(Int, Str) exported(Int n) { println(f"exported {n} events"); return Ok(0); }
+
+List(Str) frames(Str org, List(Str) lines, Int i, ListBuf(Str) acc) {
+    if (i >= lines.len()) { return acc.finish(); }
+    return frames(org, lines, i + 1, acc.push(syslog_frame(org, lines[i])));
+}
+

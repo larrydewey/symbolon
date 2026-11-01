@@ -34,6 +34,16 @@ class MainActivity : FlutterFragmentActivity() {
             when (call.method) {
                 "paths" -> result.success(platformPaths(this))
                 "keystore" -> result.success(KeystoreServer.info(this))
+                // What the organization's device management set (res/xml/app_restrictions.xml).
+                "managedConfig" -> {
+                    val b = (getSystemService(android.content.Context.RESTRICTIONS_SERVICE) as android.content.RestrictionsManager).applicationRestrictions
+                    result.success(mapOf(
+                        "org_id" to (b.getString("org_id") ?: ""),
+                        "org_founder" to (b.getString("org_founder") ?: ""),
+                        "invite_code" to (b.getString("invite_code") ?: ""),
+                        "disable_duress" to b.getBoolean("disable_duress", false),
+                    ))
+                }
                 // Android 14+: whether passkey providers can be chosen, and
                 // the system page where the user turns Symbolon on.
                 "providerSupported" -> result.success(Build.VERSION.SDK_INT >= 34)

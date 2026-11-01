@@ -218,10 +218,14 @@ Int find_crlf2(List(Int) b, Int i) {
 // One request on a fresh connection to host:port (loopback or a pinned
 // address), Connection: close; the status and the body.
 @requires(network)
-pub HttpOut http_call_bytes(Str host, Int port, Str method, Str path, List(Int) body) {
+pub HttpOut http_call_bytes(Str host, Int port, Str method, Str path, List(Int) body) { return http_call_head(host, port, method, path, "", body); }
+
+// As http_call_bytes, with `extra` header lines (each ending in CRLF).
+@requires(network)
+pub HttpOut http_call_head(Str host, Int port, Str method, Str path, Str extra, List(Int) body) {
     Int fd = resid_tcp_connect(host, port);
     if (fd < 0) { return HttpOut {.status = 0, .body = []}; }
-    Str head = method + " " + path + " HTTP/1.1\r\nHost: " + host + "\r\nConnection: close\r\nContent-Length: " + f"{body.len()}" + "\r\n\r\n";
+    Str head = method + " " + path + " HTTP/1.1\r\nHost: " + host + "\r\n" + extra + "Connection: close\r\nContent-Length: " + f"{body.len()}" + "\r\n\r\n";
     _ = resid_tcp_send_bin(fd, ascii(head).concat(body));
     _ = resid_tcp_deadline(fd, 30000);
     List(Int) raw = recv_all(fd, 0, ListBuf());
@@ -254,14 +258,17 @@ ListBuf(Int) push_all(ListBuf(Int) acc, List(Int) xs, Int i) {
 // envelopes, signed log events and witness signatures); TLS hides the
 // traffic's metadata from the network and keeps a path attacker from
 // posing as the relay or a witness.
-pub type Endpoint = { Str host; Int port; Str ca; };
+// `token`: a session from the relay's sign-in (SPEC 29.4), sent as a
+// bearer token; "" sends none.
+pub type Endpoint = { Str host; Int port; Str ca; Str token; };
 
 // One request to `e`: HTTPS under e.ca when it is set, else plain HTTP.
 @requires(network, clock(readonly), declassify)
 pub HttpOut http_call_ep(Endpoint e, Str method, Str path, List(Int) body) {
-    if (str_len(e.ca) == 0) { return http_call_bytes(e.host, e.port, method, path, body); }
+    Str auth = if (str_len(e.token) == 0) { "" } else { "Authorization: Bearer " + e.token + "\r\n" };
+    if (str_len(e.ca) == 0) { return http_call_head(e.host, e.port, method, path, auth, body); }
     TrustStore store = trust_store_add_pem(trust_store_empty(), e.ca);
-    HttpsGet g = tls_https_request("https://" + e.host + ":" + f"{e.port}" + path, "", store, ["http/1.1"], 30000, method, "", body);
+    HttpsGet g = tls_https_request("https://" + e.host + ":" + f"{e.port}" + path, "", store, ["http/1.1"], 30000, method, auth, body);
     return HttpOut {.status = g.status, .body = g.bytes};
 }
 
@@ -299,10 +306,18 @@ pub Option(List(Int)) blob_get(Endpoint e, Str name) {
 
 // The names of the relay's blobs that start with `prefix`.
 @requires(network, clock(readonly), declassify)
-pub List(Str) blob_list(Endpoint e, Str prefix) {
-    HttpOut o = http_call_ep(e, "GET", "/list/" + prefix, []);
-    if (o.status != 200 || o.body.len() == 0) { return []; }
-    return str_split(text_of_body(o.body, 0, StrBuf()), "\n");
+pub List(Str) blob_list(Endpoint e, Str prefix) { return list_from(e, prefix, "", []); }
+
+// Page after page: a relay that pages (SPEC 29.4) answers from after the
+// last name it gave; a plain one gives at most max_listed() once.
+@requires(network, clock(readonly), declassify)
+List(Str) list_from(Endpoint e, Str prefix, Str after, List(Str) acc) {
+    HttpOut o = http_call_ep(e, "GET", "/list/" + prefix + (if (str_len(after) == 0) { "" } else { "?after=" + after }), []);
+    if (o.status != 200 || o.body.len() == 0) { return acc; }
+    List(Str) page = str_split(text_of_body(o.body, 0, StrBuf()), "\n");
+    List(Str) all = acc.concat(page);
+    Bool more = page.len() >= max_listed() && page[page.len() - 1] != after && all.len() < 1048576;
+    return if (more) { list_from(e, prefix, page[page.len() - 1], all) } else { all };
 }
 
 Str text_of_body(List(Int) b, Int i, StrBuf acc) {

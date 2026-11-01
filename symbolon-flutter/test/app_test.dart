@@ -410,4 +410,44 @@ void main() {
     expect(find.textContaining('Changes need a connection'), findsOneWidget);
     await lock(t);
   });
+
+  testWidgets('organization: join with an invite code, see a recovery request, invite someone', (t) async {
+    await start(t);
+    await t.tap(find.text('More').last);
+    await t.pumpAndSettle();
+    await t.tap(find.byKey(const Key('open-org')));
+    await t.pump(const Duration(milliseconds: 300));
+    await settle(t);
+    expect(find.byKey(const Key('org-join')), findsOneWidget);
+    await t.enterText(find.byKey(const Key('org-id')), '0123456789abcdef0123456789abcdef');
+    await t.enterText(find.byKey(const Key('org-founder')), 'a' * 64);
+    await t.enterText(find.byKey(const Key('org-code')), 'fedcba9876543210fedcba9876543210');
+    await t.tap(find.byKey(const Key('org-join')));
+    await t.pump();
+    await settle(t);
+    await pin(t, '2468');
+    await settle(t);
+    expect(agent.argsLog.readAsStringSync(), contains('device org join ${settings.deviceDir} 0123456789abcdef0123456789abcdef ${'a' * 64} fedcba9876543210fedcba9876543210'));
+    expect(find.text('Acme'), findsOneWidget);
+    expect(find.text('You are an owner'), findsOneWidget);
+    expect(find.byKey(const Key('org-request-00112233445566778899aabbccddeeff')), findsOneWidget);
+    expect(find.byKey(const Key('org-member-Bob')), findsOneWidget);
+    expect(find.text('bob@acme.example · member'), findsOneWidget);
+    await t.ensureVisible(find.byKey(const Key('org-invite')));
+    await t.tap(find.byKey(const Key('org-invite')));
+    await t.pumpAndSettle();
+    await t.enterText(find.byKey(const Key('org-invite-ext')), 'erin@acme.example');
+    await t.enterText(find.byKey(const Key('org-invite-name')), 'Erin');
+    await t.tap(find.byKey(const Key('org-invite-ok')));
+    await t.pump();
+    await settle(t);
+    expect(find.byKey(const Key('org-invite-code')), findsOneWidget);
+    expect(find.text('fedcba9876543210fedcba9876543210'), findsOneWidget);
+    expect(agent.argsLog.readAsStringSync(), contains('device org invite ${settings.deviceDir} erin@acme.example Erin'));
+    await t.tap(find.text('Done'));
+    await t.pumpAndSettle();
+    await t.pageBack();
+    await t.pumpAndSettle();
+    await lock(t);
+  });
 }

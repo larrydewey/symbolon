@@ -102,57 +102,63 @@ Result(Parsed(OrgPolicy, F), SerialError) derive_org_policy_done(F s, Option(Int
 }
 Decode(OrgPolicy, F) = derive_org_policy_decode;
 
-// ── OrgRecovery (line 29)
+// ── OrgRecovery (line 32)
 /// The serialized field names of `OrgRecovery`, in declaration order.
-pub List(Str) derive_org_recovery_names() { return ["on", "public_key", "threshold", "admins", "delay_sec"]; }
+pub List(Str) derive_org_recovery_names() { return ["on", "public_key", "threshold", "admins", "delay_sec", "since", "owner"]; }
 /// Encodes a `OrgRecovery` through the encoder `s`.
 @needs(Encoder(F))
 pub Result(F, SerialError) derive_org_recovery_encode(OrgRecovery v, F s) {
-    Int n = 5;
+    Int n = 7;
     F s0 = write_struct_begin(s, "OrgRecovery", n)?;
     F s1 = write_named(s0, "on", v.on)?;
     F s2 = write_named(s1, "public_key", v.public_key)?;
     F s3 = write_named(s2, "threshold", v.threshold)?;
     F s4 = write_named(s3, "admins", v.admins)?;
     F s5 = write_named(s4, "delay_sec", v.delay_sec)?;
-    return write_struct_end(s5);
+    F s6 = write_named(s5, "since", v.since)?;
+    F s7 = write_named(s6, "owner", v.owner)?;
+    return write_struct_end(s7);
 }
 Encode(OrgRecovery, F) = derive_org_recovery_encode;
 /// Decodes a `OrgRecovery` from the decoder `s`, with the input left over.
 @needs(Decoder(F))
 pub Result(Parsed(OrgRecovery, F), SerialError) derive_org_recovery_decode(F s) {
     F s0 = read_struct_begin(s, "OrgRecovery", derive_org_recovery_names())?;
-    return derive_org_recovery_fields(s0, None, None, None, None, None);
+    return derive_org_recovery_fields(s0, None, None, None, None, None, None, None);
 }
 @needs(Decoder(F))
-Result(Parsed(OrgRecovery, F), SerialError) derive_org_recovery_fields(F s, Option(Bool) f_on, Option(List(Int)) f_public_key, Option(Int) f_threshold, Option(List(List(Int))) f_admins, Option(Int) f_delay_sec) {
+Result(Parsed(OrgRecovery, F), SerialError) derive_org_recovery_fields(F s, Option(Bool) f_on, Option(List(Int)) f_public_key, Option(Int) f_threshold, Option(List(List(Int))) f_admins, Option(Int) f_delay_sec, Option(UInt(64)) f_since, Option(List(Int)) f_owner) {
     Parsed(FieldKey, F) k = read_field(s, derive_org_recovery_names())?;
     FieldKey key = k.value;
     return match key {
-        KnownField(i) => derive_org_recovery_field(k.rest, i, f_on, f_public_key, f_threshold, f_admins, f_delay_sec),
-        UnknownField(name) => derive_org_recovery_fields(skip_unknown(k.rest, name, derive_org_recovery_names(), false)?, f_on, f_public_key, f_threshold, f_admins, f_delay_sec),
-        EndOfFields => derive_org_recovery_done(k.rest, f_on, f_public_key, f_threshold, f_admins, f_delay_sec)
+        KnownField(i) => derive_org_recovery_field(k.rest, i, f_on, f_public_key, f_threshold, f_admins, f_delay_sec, f_since, f_owner),
+        UnknownField(name) => derive_org_recovery_fields(skip_unknown(k.rest, name, derive_org_recovery_names(), false)?, f_on, f_public_key, f_threshold, f_admins, f_delay_sec, f_since, f_owner),
+        EndOfFields => derive_org_recovery_done(k.rest, f_on, f_public_key, f_threshold, f_admins, f_delay_sec, f_since, f_owner)
     };
 }
 @needs(Decoder(F))
-Result(Parsed(OrgRecovery, F), SerialError) derive_org_recovery_field(F s, Int i, Option(Bool) f_on, Option(List(Int)) f_public_key, Option(Int) f_threshold, Option(List(List(Int))) f_admins, Option(Int) f_delay_sec) {
-    if (i == 0) { Parsed(Option(Bool), F) p = read_slot(s, f_on, "on")?; return derive_org_recovery_fields(p.rest, p.value, f_public_key, f_threshold, f_admins, f_delay_sec); }
-    if (i == 1) { Parsed(Option(List(Int)), F) p = read_slot(s, f_public_key, "public_key")?; return derive_org_recovery_fields(p.rest, f_on, p.value, f_threshold, f_admins, f_delay_sec); }
-    if (i == 2) { Parsed(Option(Int), F) p = read_slot(s, f_threshold, "threshold")?; return derive_org_recovery_fields(p.rest, f_on, f_public_key, p.value, f_admins, f_delay_sec); }
-    if (i == 3) { Parsed(Option(List(List(Int))), F) p = read_slot(s, f_admins, "admins")?; return derive_org_recovery_fields(p.rest, f_on, f_public_key, f_threshold, p.value, f_delay_sec); }
-    Parsed(Option(Int), F) p = read_slot(s, f_delay_sec, "delay_sec")?; return derive_org_recovery_fields(p.rest, f_on, f_public_key, f_threshold, f_admins, p.value);
+Result(Parsed(OrgRecovery, F), SerialError) derive_org_recovery_field(F s, Int i, Option(Bool) f_on, Option(List(Int)) f_public_key, Option(Int) f_threshold, Option(List(List(Int))) f_admins, Option(Int) f_delay_sec, Option(UInt(64)) f_since, Option(List(Int)) f_owner) {
+    if (i == 0) { Parsed(Option(Bool), F) p = read_slot(s, f_on, "on")?; return derive_org_recovery_fields(p.rest, p.value, f_public_key, f_threshold, f_admins, f_delay_sec, f_since, f_owner); }
+    if (i == 1) { Parsed(Option(List(Int)), F) p = read_slot(s, f_public_key, "public_key")?; return derive_org_recovery_fields(p.rest, f_on, p.value, f_threshold, f_admins, f_delay_sec, f_since, f_owner); }
+    if (i == 2) { Parsed(Option(Int), F) p = read_slot(s, f_threshold, "threshold")?; return derive_org_recovery_fields(p.rest, f_on, f_public_key, p.value, f_admins, f_delay_sec, f_since, f_owner); }
+    if (i == 3) { Parsed(Option(List(List(Int))), F) p = read_slot(s, f_admins, "admins")?; return derive_org_recovery_fields(p.rest, f_on, f_public_key, f_threshold, p.value, f_delay_sec, f_since, f_owner); }
+    if (i == 4) { Parsed(Option(Int), F) p = read_slot(s, f_delay_sec, "delay_sec")?; return derive_org_recovery_fields(p.rest, f_on, f_public_key, f_threshold, f_admins, p.value, f_since, f_owner); }
+    if (i == 5) { Parsed(Option(UInt(64)), F) p = read_slot(s, f_since, "since")?; return derive_org_recovery_fields(p.rest, f_on, f_public_key, f_threshold, f_admins, f_delay_sec, p.value, f_owner); }
+    Parsed(Option(List(Int)), F) p = read_slot(s, f_owner, "owner")?; return derive_org_recovery_fields(p.rest, f_on, f_public_key, f_threshold, f_admins, f_delay_sec, f_since, p.value);
 }
-Result(Parsed(OrgRecovery, F), SerialError) derive_org_recovery_done(F s, Option(Bool) f_on, Option(List(Int)) f_public_key, Option(Int) f_threshold, Option(List(List(Int))) f_admins, Option(Int) f_delay_sec) {
+Result(Parsed(OrgRecovery, F), SerialError) derive_org_recovery_done(F s, Option(Bool) f_on, Option(List(Int)) f_public_key, Option(Int) f_threshold, Option(List(List(Int))) f_admins, Option(Int) f_delay_sec, Option(UInt(64)) f_since, Option(List(Int)) f_owner) {
     Bool d_on = require(f_on, "on")?;
     List(Int) d_public_key = require(f_public_key, "public_key")?;
     Int d_threshold = require(f_threshold, "threshold")?;
     List(List(Int)) d_admins = require(f_admins, "admins")?;
     Int d_delay_sec = require(f_delay_sec, "delay_sec")?;
-    return parsed(OrgRecovery {.on = d_on, .public_key = d_public_key, .threshold = d_threshold, .admins = d_admins, .delay_sec = d_delay_sec}, s);
+    UInt(64) d_since = require(f_since, "since")?;
+    List(Int) d_owner = require(f_owner, "owner")?;
+    return parsed(OrgRecovery {.on = d_on, .public_key = d_public_key, .threshold = d_threshold, .admins = d_admins, .delay_sec = d_delay_sec, .since = d_since, .owner = d_owner}, s);
 }
 Decode(OrgRecovery, F) = derive_org_recovery_decode;
 
-// ── OrgGov (line 34)
+// ── OrgGov (line 37)
 /// The serialized field names of `OrgGov`, in declaration order.
 pub List(Str) derive_org_gov_names() { return ["org_id", "version", "founder", "nonce", "name", "owners", "admins", "policy", "recovery", "log_sequence", "signer_log", "signer", "sig"]; }
 /// Encodes a `OrgGov` through the encoder `s`.
@@ -226,7 +232,7 @@ Result(Parsed(OrgGov, F), SerialError) derive_org_gov_done(F s, Option(List(Int)
 }
 Decode(OrgGov, F) = derive_org_gov_decode;
 
-// ── OrgMember (line 51)
+// ── OrgMember (line 54)
 /// The serialized field names of `OrgMember`, in declaration order.
 pub List(Str) derive_org_member_names() { return ["log_id", "label", "ext_id"]; }
 /// Encodes a `OrgMember` through the encoder `s`.
@@ -270,7 +276,7 @@ Result(Parsed(OrgMember, F), SerialError) derive_org_member_done(F s, Option(Lis
 }
 Decode(OrgMember, F) = derive_org_member_decode;
 
-// ── OrgGroup (line 54)
+// ── OrgGroup (line 57)
 /// The serialized field names of `OrgGroup`, in declaration order.
 pub List(Str) derive_org_group_names() { return ["group_id", "name", "members"]; }
 /// Encodes a `OrgGroup` through the encoder `s`.
@@ -314,7 +320,7 @@ Result(Parsed(OrgGroup, F), SerialError) derive_org_group_done(F s, Option(List(
 }
 Decode(OrgGroup, F) = derive_org_group_decode;
 
-// ── Org (line 58)
+// ── Org (line 61)
 /// The serialized field names of `Org`, in declaration order.
 pub List(Str) derive_org_names() { return ["org_id", "version", "gov_version", "members", "groups", "log_sequence", "signer_log", "signer", "sig"]; }
 /// Encodes a `Org` through the encoder `s`.
@@ -376,7 +382,7 @@ Result(Parsed(Org, F), SerialError) derive_org_done(F s, Option(List(Int)) f_org
 }
 Decode(Org, F) = derive_org_decode;
 
-// ── GroupFolder (line 72)
+// ── GroupFolder (line 75)
 /// The serialized field names of `GroupFolder`, in declaration order.
 pub List(Str) derive_group_folder_names() { return ["coll_id", "version", "org_id", "groups", "name_ct", "deleted", "log_sequence", "signer_log", "signer", "sig"]; }
 /// Encodes a `GroupFolder` through the encoder `s`.
@@ -441,7 +447,7 @@ Result(Parsed(GroupFolder, F), SerialError) derive_group_folder_done(F s, Option
 }
 Decode(GroupFolder, F) = derive_group_folder_decode;
 
-// ── AuditEvent (line 87)
+// ── AuditEvent (line 90)
 /// The serialized field names of `AuditEvent`, in declaration order.
 pub List(Str) derive_audit_event_names() { return ["org_id", "log_id", "party", "seq", "prev", "time", "action", "object", "detail", "sig"]; }
 /// Encodes a `AuditEvent` through the encoder `s`.
@@ -505,3 +511,245 @@ Result(Parsed(AuditEvent, F), SerialError) derive_audit_event_done(F s, Option(L
     return parsed(AuditEvent {.org_id = d_org_id, .log_id = d_log_id, .party = d_party, .seq = d_seq, .prev = d_prev, .time = d_time, .action = d_action, .object = d_object, .detail = d_detail, .sig = d_sig}, s);
 }
 Decode(AuditEvent, F) = derive_audit_event_decode;
+
+// ── OrgInvite (line 109)
+/// The serialized field names of `OrgInvite`, in declaration order.
+pub List(Str) derive_org_invite_names() { return ["org_id", "id", "public_key", "ext_id", "label", "groups", "expires", "log_sequence", "signer_log", "signer", "sig"]; }
+/// Encodes a `OrgInvite` through the encoder `s`.
+@needs(Encoder(F))
+pub Result(F, SerialError) derive_org_invite_encode(OrgInvite v, F s) {
+    Int n = 11;
+    F s0 = write_struct_begin(s, "OrgInvite", n)?;
+    F s1 = write_named(s0, "org_id", v.org_id)?;
+    F s2 = write_named(s1, "id", v.id)?;
+    F s3 = write_named(s2, "public_key", v.public_key)?;
+    F s4 = write_named(s3, "ext_id", v.ext_id)?;
+    F s5 = write_named(s4, "label", v.label)?;
+    F s6 = write_named(s5, "groups", v.groups)?;
+    F s7 = write_named(s6, "expires", v.expires)?;
+    F s8 = write_named(s7, "log_sequence", v.log_sequence)?;
+    F s9 = write_named(s8, "signer_log", v.signer_log)?;
+    F s10 = write_named(s9, "signer", v.signer)?;
+    F s11 = write_named(s10, "sig", v.sig)?;
+    return write_struct_end(s11);
+}
+Encode(OrgInvite, F) = derive_org_invite_encode;
+/// Decodes a `OrgInvite` from the decoder `s`, with the input left over.
+@needs(Decoder(F))
+pub Result(Parsed(OrgInvite, F), SerialError) derive_org_invite_decode(F s) {
+    F s0 = read_struct_begin(s, "OrgInvite", derive_org_invite_names())?;
+    return derive_org_invite_fields(s0, None, None, None, None, None, None, None, None, None, None, None);
+}
+@needs(Decoder(F))
+Result(Parsed(OrgInvite, F), SerialError) derive_org_invite_fields(F s, Option(List(Int)) f_org_id, Option(List(Int)) f_id, Option(List(Int)) f_public_key, Option(Str) f_ext_id, Option(Str) f_label, Option(List(List(Int))) f_groups, Option(Int) f_expires, Option(UInt(64)) f_log_sequence, Option(List(Int)) f_signer_log, Option(List(Int)) f_signer, Option(List(Int)) f_sig) {
+    Parsed(FieldKey, F) k = read_field(s, derive_org_invite_names())?;
+    FieldKey key = k.value;
+    return match key {
+        KnownField(i) => derive_org_invite_field(k.rest, i, f_org_id, f_id, f_public_key, f_ext_id, f_label, f_groups, f_expires, f_log_sequence, f_signer_log, f_signer, f_sig),
+        UnknownField(name) => derive_org_invite_fields(skip_unknown(k.rest, name, derive_org_invite_names(), false)?, f_org_id, f_id, f_public_key, f_ext_id, f_label, f_groups, f_expires, f_log_sequence, f_signer_log, f_signer, f_sig),
+        EndOfFields => derive_org_invite_done(k.rest, f_org_id, f_id, f_public_key, f_ext_id, f_label, f_groups, f_expires, f_log_sequence, f_signer_log, f_signer, f_sig)
+    };
+}
+@needs(Decoder(F))
+Result(Parsed(OrgInvite, F), SerialError) derive_org_invite_field(F s, Int i, Option(List(Int)) f_org_id, Option(List(Int)) f_id, Option(List(Int)) f_public_key, Option(Str) f_ext_id, Option(Str) f_label, Option(List(List(Int))) f_groups, Option(Int) f_expires, Option(UInt(64)) f_log_sequence, Option(List(Int)) f_signer_log, Option(List(Int)) f_signer, Option(List(Int)) f_sig) {
+    if (i == 0) { Parsed(Option(List(Int)), F) p = read_slot(s, f_org_id, "org_id")?; return derive_org_invite_fields(p.rest, p.value, f_id, f_public_key, f_ext_id, f_label, f_groups, f_expires, f_log_sequence, f_signer_log, f_signer, f_sig); }
+    if (i == 1) { Parsed(Option(List(Int)), F) p = read_slot(s, f_id, "id")?; return derive_org_invite_fields(p.rest, f_org_id, p.value, f_public_key, f_ext_id, f_label, f_groups, f_expires, f_log_sequence, f_signer_log, f_signer, f_sig); }
+    if (i == 2) { Parsed(Option(List(Int)), F) p = read_slot(s, f_public_key, "public_key")?; return derive_org_invite_fields(p.rest, f_org_id, f_id, p.value, f_ext_id, f_label, f_groups, f_expires, f_log_sequence, f_signer_log, f_signer, f_sig); }
+    if (i == 3) { Parsed(Option(Str), F) p = read_slot(s, f_ext_id, "ext_id")?; return derive_org_invite_fields(p.rest, f_org_id, f_id, f_public_key, p.value, f_label, f_groups, f_expires, f_log_sequence, f_signer_log, f_signer, f_sig); }
+    if (i == 4) { Parsed(Option(Str), F) p = read_slot(s, f_label, "label")?; return derive_org_invite_fields(p.rest, f_org_id, f_id, f_public_key, f_ext_id, p.value, f_groups, f_expires, f_log_sequence, f_signer_log, f_signer, f_sig); }
+    if (i == 5) { Parsed(Option(List(List(Int))), F) p = read_slot(s, f_groups, "groups")?; return derive_org_invite_fields(p.rest, f_org_id, f_id, f_public_key, f_ext_id, f_label, p.value, f_expires, f_log_sequence, f_signer_log, f_signer, f_sig); }
+    if (i == 6) { Parsed(Option(Int), F) p = read_slot(s, f_expires, "expires")?; return derive_org_invite_fields(p.rest, f_org_id, f_id, f_public_key, f_ext_id, f_label, f_groups, p.value, f_log_sequence, f_signer_log, f_signer, f_sig); }
+    if (i == 7) { Parsed(Option(UInt(64)), F) p = read_slot(s, f_log_sequence, "log_sequence")?; return derive_org_invite_fields(p.rest, f_org_id, f_id, f_public_key, f_ext_id, f_label, f_groups, f_expires, p.value, f_signer_log, f_signer, f_sig); }
+    if (i == 8) { Parsed(Option(List(Int)), F) p = read_slot(s, f_signer_log, "signer_log")?; return derive_org_invite_fields(p.rest, f_org_id, f_id, f_public_key, f_ext_id, f_label, f_groups, f_expires, f_log_sequence, p.value, f_signer, f_sig); }
+    if (i == 9) { Parsed(Option(List(Int)), F) p = read_slot(s, f_signer, "signer")?; return derive_org_invite_fields(p.rest, f_org_id, f_id, f_public_key, f_ext_id, f_label, f_groups, f_expires, f_log_sequence, f_signer_log, p.value, f_sig); }
+    Parsed(Option(List(Int)), F) p = read_slot(s, f_sig, "sig")?; return derive_org_invite_fields(p.rest, f_org_id, f_id, f_public_key, f_ext_id, f_label, f_groups, f_expires, f_log_sequence, f_signer_log, f_signer, p.value);
+}
+Result(Parsed(OrgInvite, F), SerialError) derive_org_invite_done(F s, Option(List(Int)) f_org_id, Option(List(Int)) f_id, Option(List(Int)) f_public_key, Option(Str) f_ext_id, Option(Str) f_label, Option(List(List(Int))) f_groups, Option(Int) f_expires, Option(UInt(64)) f_log_sequence, Option(List(Int)) f_signer_log, Option(List(Int)) f_signer, Option(List(Int)) f_sig) {
+    List(Int) d_org_id = require(f_org_id, "org_id")?;
+    List(Int) d_id = require(f_id, "id")?;
+    List(Int) d_public_key = require(f_public_key, "public_key")?;
+    Str d_ext_id = require(f_ext_id, "ext_id")?;
+    Str d_label = require(f_label, "label")?;
+    List(List(Int)) d_groups = require(f_groups, "groups")?;
+    Int d_expires = require(f_expires, "expires")?;
+    UInt(64) d_log_sequence = require(f_log_sequence, "log_sequence")?;
+    List(Int) d_signer_log = require(f_signer_log, "signer_log")?;
+    List(Int) d_signer = require(f_signer, "signer")?;
+    List(Int) d_sig = require(f_sig, "sig")?;
+    return parsed(OrgInvite {.org_id = d_org_id, .id = d_id, .public_key = d_public_key, .ext_id = d_ext_id, .label = d_label, .groups = d_groups, .expires = d_expires, .log_sequence = d_log_sequence, .signer_log = d_signer_log, .signer = d_signer, .sig = d_sig}, s);
+}
+Decode(OrgInvite, F) = derive_org_invite_decode;
+
+// ── OrgAccept (line 126)
+/// The serialized field names of `OrgAccept`, in declaration order.
+pub List(Str) derive_org_accept_names() { return ["org_id", "id", "log_id", "code_sig", "log_sequence", "signer", "sig"]; }
+/// Encodes a `OrgAccept` through the encoder `s`.
+@needs(Encoder(F))
+pub Result(F, SerialError) derive_org_accept_encode(OrgAccept v, F s) {
+    Int n = 7;
+    F s0 = write_struct_begin(s, "OrgAccept", n)?;
+    F s1 = write_named(s0, "org_id", v.org_id)?;
+    F s2 = write_named(s1, "id", v.id)?;
+    F s3 = write_named(s2, "log_id", v.log_id)?;
+    F s4 = write_named(s3, "code_sig", v.code_sig)?;
+    F s5 = write_named(s4, "log_sequence", v.log_sequence)?;
+    F s6 = write_named(s5, "signer", v.signer)?;
+    F s7 = write_named(s6, "sig", v.sig)?;
+    return write_struct_end(s7);
+}
+Encode(OrgAccept, F) = derive_org_accept_encode;
+/// Decodes a `OrgAccept` from the decoder `s`, with the input left over.
+@needs(Decoder(F))
+pub Result(Parsed(OrgAccept, F), SerialError) derive_org_accept_decode(F s) {
+    F s0 = read_struct_begin(s, "OrgAccept", derive_org_accept_names())?;
+    return derive_org_accept_fields(s0, None, None, None, None, None, None, None);
+}
+@needs(Decoder(F))
+Result(Parsed(OrgAccept, F), SerialError) derive_org_accept_fields(F s, Option(List(Int)) f_org_id, Option(List(Int)) f_id, Option(List(Int)) f_log_id, Option(List(Int)) f_code_sig, Option(UInt(64)) f_log_sequence, Option(List(Int)) f_signer, Option(List(Int)) f_sig) {
+    Parsed(FieldKey, F) k = read_field(s, derive_org_accept_names())?;
+    FieldKey key = k.value;
+    return match key {
+        KnownField(i) => derive_org_accept_field(k.rest, i, f_org_id, f_id, f_log_id, f_code_sig, f_log_sequence, f_signer, f_sig),
+        UnknownField(name) => derive_org_accept_fields(skip_unknown(k.rest, name, derive_org_accept_names(), false)?, f_org_id, f_id, f_log_id, f_code_sig, f_log_sequence, f_signer, f_sig),
+        EndOfFields => derive_org_accept_done(k.rest, f_org_id, f_id, f_log_id, f_code_sig, f_log_sequence, f_signer, f_sig)
+    };
+}
+@needs(Decoder(F))
+Result(Parsed(OrgAccept, F), SerialError) derive_org_accept_field(F s, Int i, Option(List(Int)) f_org_id, Option(List(Int)) f_id, Option(List(Int)) f_log_id, Option(List(Int)) f_code_sig, Option(UInt(64)) f_log_sequence, Option(List(Int)) f_signer, Option(List(Int)) f_sig) {
+    if (i == 0) { Parsed(Option(List(Int)), F) p = read_slot(s, f_org_id, "org_id")?; return derive_org_accept_fields(p.rest, p.value, f_id, f_log_id, f_code_sig, f_log_sequence, f_signer, f_sig); }
+    if (i == 1) { Parsed(Option(List(Int)), F) p = read_slot(s, f_id, "id")?; return derive_org_accept_fields(p.rest, f_org_id, p.value, f_log_id, f_code_sig, f_log_sequence, f_signer, f_sig); }
+    if (i == 2) { Parsed(Option(List(Int)), F) p = read_slot(s, f_log_id, "log_id")?; return derive_org_accept_fields(p.rest, f_org_id, f_id, p.value, f_code_sig, f_log_sequence, f_signer, f_sig); }
+    if (i == 3) { Parsed(Option(List(Int)), F) p = read_slot(s, f_code_sig, "code_sig")?; return derive_org_accept_fields(p.rest, f_org_id, f_id, f_log_id, p.value, f_log_sequence, f_signer, f_sig); }
+    if (i == 4) { Parsed(Option(UInt(64)), F) p = read_slot(s, f_log_sequence, "log_sequence")?; return derive_org_accept_fields(p.rest, f_org_id, f_id, f_log_id, f_code_sig, p.value, f_signer, f_sig); }
+    if (i == 5) { Parsed(Option(List(Int)), F) p = read_slot(s, f_signer, "signer")?; return derive_org_accept_fields(p.rest, f_org_id, f_id, f_log_id, f_code_sig, f_log_sequence, p.value, f_sig); }
+    Parsed(Option(List(Int)), F) p = read_slot(s, f_sig, "sig")?; return derive_org_accept_fields(p.rest, f_org_id, f_id, f_log_id, f_code_sig, f_log_sequence, f_signer, p.value);
+}
+Result(Parsed(OrgAccept, F), SerialError) derive_org_accept_done(F s, Option(List(Int)) f_org_id, Option(List(Int)) f_id, Option(List(Int)) f_log_id, Option(List(Int)) f_code_sig, Option(UInt(64)) f_log_sequence, Option(List(Int)) f_signer, Option(List(Int)) f_sig) {
+    List(Int) d_org_id = require(f_org_id, "org_id")?;
+    List(Int) d_id = require(f_id, "id")?;
+    List(Int) d_log_id = require(f_log_id, "log_id")?;
+    List(Int) d_code_sig = require(f_code_sig, "code_sig")?;
+    UInt(64) d_log_sequence = require(f_log_sequence, "log_sequence")?;
+    List(Int) d_signer = require(f_signer, "signer")?;
+    List(Int) d_sig = require(f_sig, "sig")?;
+    return parsed(OrgAccept {.org_id = d_org_id, .id = d_id, .log_id = d_log_id, .code_sig = d_code_sig, .log_sequence = d_log_sequence, .signer = d_signer, .sig = d_sig}, s);
+}
+Decode(OrgAccept, F) = derive_org_accept_decode;
+
+// ── OrgEscrow (line 139)
+/// The serialized field names of `OrgEscrow`, in declaration order.
+pub List(Str) derive_org_escrow_names() { return ["org_id", "coll_id", "owner", "roster_version", "enc", "ct", "log_sequence", "signer", "sig"]; }
+/// Encodes a `OrgEscrow` through the encoder `s`.
+@needs(Encoder(F))
+pub Result(F, SerialError) derive_org_escrow_encode(OrgEscrow v, F s) {
+    Int n = 9;
+    F s0 = write_struct_begin(s, "OrgEscrow", n)?;
+    F s1 = write_named(s0, "org_id", v.org_id)?;
+    F s2 = write_named(s1, "coll_id", v.coll_id)?;
+    F s3 = write_named(s2, "owner", v.owner)?;
+    F s4 = write_named(s3, "roster_version", v.roster_version)?;
+    F s5 = write_named(s4, "enc", v.enc)?;
+    F s6 = write_named(s5, "ct", v.ct)?;
+    F s7 = write_named(s6, "log_sequence", v.log_sequence)?;
+    F s8 = write_named(s7, "signer", v.signer)?;
+    F s9 = write_named(s8, "sig", v.sig)?;
+    return write_struct_end(s9);
+}
+Encode(OrgEscrow, F) = derive_org_escrow_encode;
+/// Decodes a `OrgEscrow` from the decoder `s`, with the input left over.
+@needs(Decoder(F))
+pub Result(Parsed(OrgEscrow, F), SerialError) derive_org_escrow_decode(F s) {
+    F s0 = read_struct_begin(s, "OrgEscrow", derive_org_escrow_names())?;
+    return derive_org_escrow_fields(s0, None, None, None, None, None, None, None, None, None);
+}
+@needs(Decoder(F))
+Result(Parsed(OrgEscrow, F), SerialError) derive_org_escrow_fields(F s, Option(List(Int)) f_org_id, Option(List(Int)) f_coll_id, Option(List(Int)) f_owner, Option(UInt(64)) f_roster_version, Option(List(Int)) f_enc, Option(List(Int)) f_ct, Option(UInt(64)) f_log_sequence, Option(List(Int)) f_signer, Option(List(Int)) f_sig) {
+    Parsed(FieldKey, F) k = read_field(s, derive_org_escrow_names())?;
+    FieldKey key = k.value;
+    return match key {
+        KnownField(i) => derive_org_escrow_field(k.rest, i, f_org_id, f_coll_id, f_owner, f_roster_version, f_enc, f_ct, f_log_sequence, f_signer, f_sig),
+        UnknownField(name) => derive_org_escrow_fields(skip_unknown(k.rest, name, derive_org_escrow_names(), false)?, f_org_id, f_coll_id, f_owner, f_roster_version, f_enc, f_ct, f_log_sequence, f_signer, f_sig),
+        EndOfFields => derive_org_escrow_done(k.rest, f_org_id, f_coll_id, f_owner, f_roster_version, f_enc, f_ct, f_log_sequence, f_signer, f_sig)
+    };
+}
+@needs(Decoder(F))
+Result(Parsed(OrgEscrow, F), SerialError) derive_org_escrow_field(F s, Int i, Option(List(Int)) f_org_id, Option(List(Int)) f_coll_id, Option(List(Int)) f_owner, Option(UInt(64)) f_roster_version, Option(List(Int)) f_enc, Option(List(Int)) f_ct, Option(UInt(64)) f_log_sequence, Option(List(Int)) f_signer, Option(List(Int)) f_sig) {
+    if (i == 0) { Parsed(Option(List(Int)), F) p = read_slot(s, f_org_id, "org_id")?; return derive_org_escrow_fields(p.rest, p.value, f_coll_id, f_owner, f_roster_version, f_enc, f_ct, f_log_sequence, f_signer, f_sig); }
+    if (i == 1) { Parsed(Option(List(Int)), F) p = read_slot(s, f_coll_id, "coll_id")?; return derive_org_escrow_fields(p.rest, f_org_id, p.value, f_owner, f_roster_version, f_enc, f_ct, f_log_sequence, f_signer, f_sig); }
+    if (i == 2) { Parsed(Option(List(Int)), F) p = read_slot(s, f_owner, "owner")?; return derive_org_escrow_fields(p.rest, f_org_id, f_coll_id, p.value, f_roster_version, f_enc, f_ct, f_log_sequence, f_signer, f_sig); }
+    if (i == 3) { Parsed(Option(UInt(64)), F) p = read_slot(s, f_roster_version, "roster_version")?; return derive_org_escrow_fields(p.rest, f_org_id, f_coll_id, f_owner, p.value, f_enc, f_ct, f_log_sequence, f_signer, f_sig); }
+    if (i == 4) { Parsed(Option(List(Int)), F) p = read_slot(s, f_enc, "enc")?; return derive_org_escrow_fields(p.rest, f_org_id, f_coll_id, f_owner, f_roster_version, p.value, f_ct, f_log_sequence, f_signer, f_sig); }
+    if (i == 5) { Parsed(Option(List(Int)), F) p = read_slot(s, f_ct, "ct")?; return derive_org_escrow_fields(p.rest, f_org_id, f_coll_id, f_owner, f_roster_version, f_enc, p.value, f_log_sequence, f_signer, f_sig); }
+    if (i == 6) { Parsed(Option(UInt(64)), F) p = read_slot(s, f_log_sequence, "log_sequence")?; return derive_org_escrow_fields(p.rest, f_org_id, f_coll_id, f_owner, f_roster_version, f_enc, f_ct, p.value, f_signer, f_sig); }
+    if (i == 7) { Parsed(Option(List(Int)), F) p = read_slot(s, f_signer, "signer")?; return derive_org_escrow_fields(p.rest, f_org_id, f_coll_id, f_owner, f_roster_version, f_enc, f_ct, f_log_sequence, p.value, f_sig); }
+    Parsed(Option(List(Int)), F) p = read_slot(s, f_sig, "sig")?; return derive_org_escrow_fields(p.rest, f_org_id, f_coll_id, f_owner, f_roster_version, f_enc, f_ct, f_log_sequence, f_signer, p.value);
+}
+Result(Parsed(OrgEscrow, F), SerialError) derive_org_escrow_done(F s, Option(List(Int)) f_org_id, Option(List(Int)) f_coll_id, Option(List(Int)) f_owner, Option(UInt(64)) f_roster_version, Option(List(Int)) f_enc, Option(List(Int)) f_ct, Option(UInt(64)) f_log_sequence, Option(List(Int)) f_signer, Option(List(Int)) f_sig) {
+    List(Int) d_org_id = require(f_org_id, "org_id")?;
+    List(Int) d_coll_id = require(f_coll_id, "coll_id")?;
+    List(Int) d_owner = require(f_owner, "owner")?;
+    UInt(64) d_roster_version = require(f_roster_version, "roster_version")?;
+    List(Int) d_enc = require(f_enc, "enc")?;
+    List(Int) d_ct = require(f_ct, "ct")?;
+    UInt(64) d_log_sequence = require(f_log_sequence, "log_sequence")?;
+    List(Int) d_signer = require(f_signer, "signer")?;
+    List(Int) d_sig = require(f_sig, "sig")?;
+    return parsed(OrgEscrow {.org_id = d_org_id, .coll_id = d_coll_id, .owner = d_owner, .roster_version = d_roster_version, .enc = d_enc, .ct = d_ct, .log_sequence = d_log_sequence, .signer = d_signer, .sig = d_sig}, s);
+}
+Decode(OrgEscrow, F) = derive_org_escrow_decode;
+
+// ── OrgRecoveryRequest (line 154)
+/// The serialized field names of `OrgRecoveryRequest`, in declaration order.
+pub List(Str) derive_org_recovery_request_names() { return ["org_id", "coll_id", "requester", "time", "log_sequence", "signer", "sig"]; }
+/// Encodes a `OrgRecoveryRequest` through the encoder `s`.
+@needs(Encoder(F))
+pub Result(F, SerialError) derive_org_recovery_request_encode(OrgRecoveryRequest v, F s) {
+    Int n = 7;
+    F s0 = write_struct_begin(s, "OrgRecoveryRequest", n)?;
+    F s1 = write_named(s0, "org_id", v.org_id)?;
+    F s2 = write_named(s1, "coll_id", v.coll_id)?;
+    F s3 = write_named(s2, "requester", v.requester)?;
+    F s4 = write_named(s3, "time", v.time)?;
+    F s5 = write_named(s4, "log_sequence", v.log_sequence)?;
+    F s6 = write_named(s5, "signer", v.signer)?;
+    F s7 = write_named(s6, "sig", v.sig)?;
+    return write_struct_end(s7);
+}
+Encode(OrgRecoveryRequest, F) = derive_org_recovery_request_encode;
+/// Decodes a `OrgRecoveryRequest` from the decoder `s`, with the input left over.
+@needs(Decoder(F))
+pub Result(Parsed(OrgRecoveryRequest, F), SerialError) derive_org_recovery_request_decode(F s) {
+    F s0 = read_struct_begin(s, "OrgRecoveryRequest", derive_org_recovery_request_names())?;
+    return derive_org_recovery_request_fields(s0, None, None, None, None, None, None, None);
+}
+@needs(Decoder(F))
+Result(Parsed(OrgRecoveryRequest, F), SerialError) derive_org_recovery_request_fields(F s, Option(List(Int)) f_org_id, Option(List(Int)) f_coll_id, Option(List(Int)) f_requester, Option(Int) f_time, Option(UInt(64)) f_log_sequence, Option(List(Int)) f_signer, Option(List(Int)) f_sig) {
+    Parsed(FieldKey, F) k = read_field(s, derive_org_recovery_request_names())?;
+    FieldKey key = k.value;
+    return match key {
+        KnownField(i) => derive_org_recovery_request_field(k.rest, i, f_org_id, f_coll_id, f_requester, f_time, f_log_sequence, f_signer, f_sig),
+        UnknownField(name) => derive_org_recovery_request_fields(skip_unknown(k.rest, name, derive_org_recovery_request_names(), false)?, f_org_id, f_coll_id, f_requester, f_time, f_log_sequence, f_signer, f_sig),
+        EndOfFields => derive_org_recovery_request_done(k.rest, f_org_id, f_coll_id, f_requester, f_time, f_log_sequence, f_signer, f_sig)
+    };
+}
+@needs(Decoder(F))
+Result(Parsed(OrgRecoveryRequest, F), SerialError) derive_org_recovery_request_field(F s, Int i, Option(List(Int)) f_org_id, Option(List(Int)) f_coll_id, Option(List(Int)) f_requester, Option(Int) f_time, Option(UInt(64)) f_log_sequence, Option(List(Int)) f_signer, Option(List(Int)) f_sig) {
+    if (i == 0) { Parsed(Option(List(Int)), F) p = read_slot(s, f_org_id, "org_id")?; return derive_org_recovery_request_fields(p.rest, p.value, f_coll_id, f_requester, f_time, f_log_sequence, f_signer, f_sig); }
+    if (i == 1) { Parsed(Option(List(Int)), F) p = read_slot(s, f_coll_id, "coll_id")?; return derive_org_recovery_request_fields(p.rest, f_org_id, p.value, f_requester, f_time, f_log_sequence, f_signer, f_sig); }
+    if (i == 2) { Parsed(Option(List(Int)), F) p = read_slot(s, f_requester, "requester")?; return derive_org_recovery_request_fields(p.rest, f_org_id, f_coll_id, p.value, f_time, f_log_sequence, f_signer, f_sig); }
+    if (i == 3) { Parsed(Option(Int), F) p = read_slot(s, f_time, "time")?; return derive_org_recovery_request_fields(p.rest, f_org_id, f_coll_id, f_requester, p.value, f_log_sequence, f_signer, f_sig); }
+    if (i == 4) { Parsed(Option(UInt(64)), F) p = read_slot(s, f_log_sequence, "log_sequence")?; return derive_org_recovery_request_fields(p.rest, f_org_id, f_coll_id, f_requester, f_time, p.value, f_signer, f_sig); }
+    if (i == 5) { Parsed(Option(List(Int)), F) p = read_slot(s, f_signer, "signer")?; return derive_org_recovery_request_fields(p.rest, f_org_id, f_coll_id, f_requester, f_time, f_log_sequence, p.value, f_sig); }
+    Parsed(Option(List(Int)), F) p = read_slot(s, f_sig, "sig")?; return derive_org_recovery_request_fields(p.rest, f_org_id, f_coll_id, f_requester, f_time, f_log_sequence, f_signer, p.value);
+}
+Result(Parsed(OrgRecoveryRequest, F), SerialError) derive_org_recovery_request_done(F s, Option(List(Int)) f_org_id, Option(List(Int)) f_coll_id, Option(List(Int)) f_requester, Option(Int) f_time, Option(UInt(64)) f_log_sequence, Option(List(Int)) f_signer, Option(List(Int)) f_sig) {
+    List(Int) d_org_id = require(f_org_id, "org_id")?;
+    List(Int) d_coll_id = require(f_coll_id, "coll_id")?;
+    List(Int) d_requester = require(f_requester, "requester")?;
+    Int d_time = require(f_time, "time")?;
+    UInt(64) d_log_sequence = require(f_log_sequence, "log_sequence")?;
+    List(Int) d_signer = require(f_signer, "signer")?;
+    List(Int) d_sig = require(f_sig, "sig")?;
+    return parsed(OrgRecoveryRequest {.org_id = d_org_id, .coll_id = d_coll_id, .requester = d_requester, .time = d_time, .log_sequence = d_log_sequence, .signer = d_signer, .sig = d_sig}, s);
+}
+Decode(OrgRecoveryRequest, F) = derive_org_recovery_request_decode;

@@ -26,7 +26,10 @@ pub type OrgPolicy = {
 
 // Opt-in recovery of work folders (SPEC 29.8); off unless the owners turn it on.
 //@ serial
-pub type OrgRecovery = { Bool on; List(Int) public_key; Int threshold; List(List(Int)) admins; Int delay_sec; };
+// `public_key`: HPKE P-256, its private key split among `admins` (Shamir,
+// `threshold` of them), the shares wrapped to them by `owner` at
+// governance version `since` (SPEC 29.8).
+pub type OrgRecovery = { Bool on; List(Int) public_key; Int threshold; List(List(Int)) admins; Int delay_sec; UInt(64) since; List(Int) owner; };
 
 // "orggov-<id>-<version>": version 1 is signed by the founder; each later
 // one by an owner of the version before.
@@ -94,5 +97,66 @@ pub type AuditEvent = {
     Str action;
     Str object;
     Str detail;
+    List(Int) sig;
+};
+
+// "invite-<org>-<id>": an administrator's invitation for one person from
+// the company directory. The invite code is a key: `public_key` is its
+// P-256 public key, `id` the first 16 bytes of SHA-256("symbolon v1
+// invite" || public_key), so neither the server nor anyone without the
+// code can answer it.
+//@ serial
+pub type OrgInvite = {
+    List(Int) org_id;
+    List(Int) id;
+    List(Int) public_key;
+    Str ext_id;
+    Str label;
+    List(List(Int)) groups;
+    Int expires;                         // seconds since the epoch, by witness time
+    UInt(64) log_sequence;
+    List(Int) signer_log;                // an owner or administrator
+    List(Int) signer;
+    List(Int) sig;
+};
+
+// "accept-<org>-<id>": a device answering an invite: the code's key signs
+// the person's log id, and a device of that log signs the whole.
+//@ serial
+pub type OrgAccept = {
+    List(Int) org_id;
+    List(Int) id;
+    List(Int) log_id;
+    List(Int) code_sig;                  // by the invite's key over "symbolon v1 accept" || org_id || log_id
+    UInt(64) log_sequence;
+    List(Int) signer;
+    List(Int) sig;
+};
+
+// "escrow-<org>-<cid>": a work folder's key sealed to the organization's
+// recovery key by the folder's owner (SPEC 29.8).
+//@ serial
+pub type OrgEscrow = {
+    List(Int) org_id;
+    List(Int) coll_id;
+    List(Int) owner;                     // the folder's owner, who signs
+    UInt(64) roster_version;             // the key is the folder's at this version
+    List(Int) enc;
+    List(Int) ct;
+    UInt(64) log_sequence;
+    List(Int) signer;
+    List(Int) sig;
+};
+
+// "recreq-<org>-<cid>": a recovery administrator asks to open a work
+// folder; the others approve no earlier than `time` + the delay.
+//@ serial
+pub type OrgRecoveryRequest = {
+    List(Int) org_id;
+    List(Int) coll_id;
+    List(Int) requester;
+    Int time;                            // witness time of the request
+    UInt(64) log_sequence;
+    List(Int) signer;
     List(Int) sig;
 };

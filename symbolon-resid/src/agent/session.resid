@@ -264,7 +264,7 @@ List(Int) nexts_of(List(Cursor) cs, Int i, ListBuf(Int) acc) {
 // 1 when one does.
 @requires(network, declassify, clock)
 pub Int wait_mail(Str host, Int port, Str ca, List(Int) parties, List(Int) nexts, Int until) {
-    if (any_mail(Endpoint {.host = host, .port = port, .ca = ca}, parties, nexts, 0)) { return 1; }
+    if (any_mail(Endpoint {.host = host, .port = port, .ca = ca, .token = ""}, parties, nexts, 0)) { return 1; }
     if (clock_now_seconds() > until) { return 0; }
     _ = clock_sleep_ms(100);
     return wait_mail(host, port, ca, parties, nexts, until);

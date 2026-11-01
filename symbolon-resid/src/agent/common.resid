@@ -144,14 +144,18 @@ pub Result(VerifiedHead, SymbolonError) verified_log(Endpoint relay, List(Int) l
 // when it is set: a cosigner on a Symbolon Home box, which may not reach
 // the box at the address its devices use.
 @requires(network, clock(readonly), declassify)
-pub Result(VerifiedHead, SymbolonError) verified_log_at(Endpoint relay, List(Int) l, Str here) {
-    List(SignedEvent) es = fetch_log(relay, l, 0, []);
+pub Result(VerifiedHead, SymbolonError) verified_log_at(Endpoint relay, List(Int) l, Str here) { return verified_events(l, fetch_log(relay, l, 0, []), relay.ca, here); }
+
+// The events of log `l`, however they were fetched, verified now; `ca`
+// as Endpoint.ca for the witnesses.
+@requires(network, clock(readonly), declassify)
+pub Result(VerifiedHead, SymbolonError) verified_events(List(Int) l, List(SignedEvent) es, Str ca, Str here) {
     if (es.len() == 0) { return Err(ErrInvalidLog("no log at the relay")); }
     Int t = last_time(es, policy_of_e0(es));
     Result(VerifiedHead, SymbolonError) v0 = il_verify(l, es, t, lambda(p) { false });
     return match v0 {
         Err(e) => Err(e),
-        Ok(vh) => il_verify(l, es, at_least(witness_now(witnesses_at(vh.head.policy.witnesses, here), relay.ca, random_bytes(32)), t), lambda(p) { false })
+        Ok(vh) => il_verify(l, es, at_least(witness_now(witnesses_at(vh.head.policy.witnesses, here), ca, random_bytes(32)), t), lambda(p) { false })
     };
 }
 
@@ -191,5 +195,5 @@ pub Option(Endpoint) endpoint_of_url(Str u, Str ca) {
     Str hp = if (str_len(u) > 8 && str_slice(u, 0, 8) == "https://") { str_slice(u, 8, str_len(u)) } else {
         if (str_len(u) > 7 && str_slice(u, 0, 7) == "http://") { str_slice(u, 7, str_len(u)) } else { u } };
     List(Str) parts = str_split(hp, ":");
-    return if (parts.len() == 2) { Some(Endpoint {.host = parts[0], .port = str_parse_int(parts[1]), .ca = ca}) } else { None };
+    return if (parts.len() == 2) { Some(Endpoint {.host = parts[0], .port = str_parse_int(parts[1]), .ca = ca, .token = ""}) } else { None };
 }

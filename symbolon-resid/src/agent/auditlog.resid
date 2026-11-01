@@ -1,0 +1,62 @@
+// The organization's audit log (SPEC 29.6), as each device writes it:
+// "audit-<org>-<log>-<seq>", signed by the device, chained per device
+// (dir/audit.seq holds the last sequence number, dir/audit.prev the
+// SHA-256 of the last event's CBOR). Here so that vault changes in group
+// folders are audited where they are made (vaultcli), not only the `org`
+// commands.
+
+import "../types.resid";
+import "../core/log.resid";
+import "../net/services.resid";
+import "state.resid";
+import "common.resid";
+import "device.resid";
+import "serials.resid";
+import "orgtypes.resid";
+import "crypto.resid";
+import "cose.resid";
+
+List(Int) cbor_of(Result(List(Int), SerialError) r) { return match r { Ok(b) => b, Err(_) => [] }; }
+
+pub AuditEvent event_signed(AuditEvent e, List(Int) sig) {
+    return AuditEvent {.org_id = e.org_id, .log_id = e.log_id, .party = e.party, .seq = e.seq, .prev = e.prev, .time = e.time,
+                       .action = e.action, .object = e.object, .detail = e.detail, .sig = sig};
+}
+
+pub List(Int) event_tbs(AuditEvent e) { return utf8("symbolon v1 audit").concat(cbor_of(to_cbor(event_signed(e, [])))); }
+
+pub Str audit_blob(List(Int) org_id, List(Int) log_id, UInt(64) seq) { return "audit-" + hex_encode(org_id) + "-" + hex_encode(log_id) + "-" + f"{seq:zero, width 12}"; }
+
+// The org id from dir/org ("ORG-ID FOUNDER"), or empty.
+@requires(filesystem)
+pub List(Int) org_id_here(Str dir) {
+    List(Str) p = str_split(str_trim(filesystem.read_all(dir + "/org")), " ");
+    return if (p.len() == 2 && str_len(p[0]) == 32) { cose_hex_decode(p[0]) } else { [] };
+}
+
+@requires(filesystem)
+Int last_seq(Str path) {
+    Str s = str_trim(filesystem.read_all(path));
+    return if (str_len(s) == 0) { 0 } else { str_parse_int(s) };
+}
+
+// One signed, chained event; false when it could not be signed or stored.
+@requires(filesystem, network, device, declassify, clock, environment)
+pub Bool audit_event(Str dir, DeviceConfig c, Unlocked u, VerifiedHead vh, Endpoint ep, List(Int) org_id, Str action, Str object, Str detail) {
+    if (org_id.len() == 0 || u.kind != 1) { return false; }
+    UInt(64) seq = (UInt(64))(last_seq(dir + "/audit.seq") + 1);
+    AuditEvent e0 = AuditEvent {.org_id = org_id, .log_id = c.log_id, .party = c.party, .seq = seq, .prev = get_file(dir + "/audit.prev"),
+                                .time = witness_now(vh.head.policy.witnesses, c.ca, random_bytes(32)), .action = action, .object = object, .detail = detail, .sig = []};
+    Result(List(Int), Str) rs = dk_sign(c, u.real, u.st, event_tbs(e0));
+    return match rs {
+        Err(_) => false,
+        Ok(sig) => stored_event(dir, ep, event_signed(e0, sig))
+    };
+}
+
+@requires(filesystem, network, clock(readonly), declassify)
+Bool stored_event(Str dir, Endpoint ep, AuditEvent e) {
+    List(Int) b = cbor_of(to_cbor(e));
+    if (!blob_put(ep, audit_blob(e.org_id, e.log_id, e.seq), b)) { return false; }
+    return filesystem.write_all(dir + "/audit.seq", f"{e.seq}") && filesystem.write_bytes(dir + "/audit.prev", sha256_bytes(b));
+}

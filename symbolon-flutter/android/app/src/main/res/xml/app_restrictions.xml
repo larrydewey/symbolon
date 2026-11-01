@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Managed configuration an organization's device management sets for
+     Symbolon (SPEC 29.9). It carries no keys. -->
+<restrictions xmlns:android="http://schemas.android.com/apk/res/android">
+    <restriction android:key="org_id" android:title="@string/r_org_id" android:restrictionType="string"
+        android:description="@string/r_org_id_desc" android:defaultValue="" />
+    <restriction android:key="org_founder" android:title="@string/r_founder" android:restrictionType="string"
+        android:description="@string/r_founder_desc" android:defaultValue="" />
+    <restriction android:key="invite_code" android:title="@string/r_code" android:restrictionType="string"
+        android:description="@string/r_code_desc" android:defaultValue="" />
+    <restriction android:key="disable_duress" android:title="@string/r_duress" android:restrictionType="bool"
+        android:description="@string/r_duress_desc" android:defaultValue="false" />
+</restrictions>

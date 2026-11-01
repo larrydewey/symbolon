@@ -13,6 +13,7 @@ import "../net/services.resid";
 import "state.resid";
 import "common.resid";
 import "device.resid";
+import "auditlog.resid";
 import "serials.resid";
 import "crypto.resid";
 import "word.resid";
@@ -75,7 +76,8 @@ pub Result(VaultState, Str) fetch_vault(Str dir, DeviceConfig c, VerifiedHead vh
     };
 }
 
-pub type Opened = { DeviceConfig c; Unlocked u; VerifiedHead vh; VaultState st; Str pin; Place p; };
+// `ep`: the relay with this device's session (orgcore relay_at).
+pub type Opened = { DeviceConfig c; Unlocked u; VerifiedHead vh; VaultState st; Str pin; Place p; Endpoint ep; };
 
 @requires(filesystem, network, device, declassify, clock, provision, environment)
 pub Result(Opened, Str) open_vault(Str dir) {
@@ -88,7 +90,7 @@ pub Result(Opened, Str) open_vault(Str dir) {
     Result(VerifiedHead, SymbolonError) rv = verified_log(relay_ep(c), c.log_id);
     return match rv {
         Err(e) => Err(err_text(e)),
-        Ok(vh) => match fetch_vault(dir, c, vh) { Err(m) => Err(m), Ok(st) => Ok(Opened {.c = c, .u = u, .vh = vh, .st = st, .pin = pin, .p = own_place(c, u)}) }
+        Ok(vh) => match fetch_vault(dir, c, vh) { Err(m) => Err(m), Ok(st) => Ok(Opened {.c = c, .u = u, .vh = vh, .st = st, .pin = pin, .p = own_place(c, u), .ep = relay_ep(c)}) }
     };
 }
 
@@ -143,15 +145,19 @@ pub Int publish_items(Str dir, Opened o, List(Item) items) {
     };
 }
 
-@requires(filesystem, network, clock(readonly), declassify)
+@requires(filesystem, network, device, declassify, clock, environment)
 Int store_vault(Str dir, Opened o, VaultState st) {
     // Accepting our own state first: what other devices will check.
     Result(VaultState, SymbolonError) self_check = vault_accept(st, o.p.vid, o.vh.head, st.head.version);
     if (match self_check { Ok(_) => false, Err(_) => true }) { return dfail("the new vault state does not verify"); }
-    if (!blob_put(relay_ep(o.c), place_blob(o.c, o.p.share), cbor_of_vault(st))) { return dfail("the relay refused the vault"); }
+    if (!blob_put(o.ep, place_blob(o.c, o.p.share), cbor_of_vault(st))) { return dfail("the relay refused the vault"); }
     _ = filesystem.write_all(place_local(dir, o.p.share) + ".version", f"{st.head.version}");
     _ = keep_place_copy(place_local(dir, o.p.share), o.p.vk, st);
     println(f"vault version {st.head.version}, {st.items.len()} items");
+    // A change to a shared folder of an organization member is audited
+    // (SPEC 29.6): which folder, its version and item count, never item
+    // names (they are sealed).
+    _ = if (str_len(o.p.share) > 0) { audit_event(dir, o.c, o.u, o.vh, o.ep, org_id_here(dir), "item", o.p.share, f"version {st.head.version}, {st.items.len()} items") } else { false };
     return 0;
 }
 
@@ -322,6 +328,6 @@ pub Int vault_reanchor(Str dir, DeviceConfig c, Unlocked u, VerifiedHead vh, Quo
     Result(VaultState, SymbolonError) ok = vault_accept(st, vault_id_of(c.log_id), before, 0);
     return match ok {
         Err(e) => dfail("the vault does not verify under the quorum before the recovery: " + err_text(e)),
-        Ok(v) => publish_items(dir, Opened {.c = c, .u = u, .vh = vh, .st = v, .pin = pin, .p = own_place(c, u)}, v.items)
+        Ok(v) => publish_items(dir, Opened {.c = c, .u = u, .vh = vh, .st = v, .pin = pin, .p = own_place(c, u), .ep = relay_ep(c)}, v.items)
     };
 }

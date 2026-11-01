@@ -155,8 +155,158 @@ run 120 "$BIN" device org audit "$A" > "$W/audit2.log" 2>&1 || fail "audit: $(ca
 grep -q broken "$W/audit2.log" || fail "a tampered event was not shown: $(cat "$W/audit2.log")"
 echo "audit: every device's events verify in order; a tampered one shows as broken"
 
+# The relay's access control (SPEC 29.4).
+RELAY="https://127.0.0.1:$((BASE + 1))"
+code() { curl -s -o /dev/null -w '%{http_code}' --cacert "$W/box/tls/ca.pem" "$@"; }
+tok() { cut -d' ' -f1 "$1/relay.token"; }
+[ "$(code "$RELAY/blob/org-$ORG")" = 401 ] || fail "the membership record was served to nobody"
+[ "$(code -H "Authorization: Bearer $(tok "$B")" "$RELAY/blob/org-$ORG")" = 200 ] || fail "a member could not read the membership record"
+[ "$(code -H "Authorization: Bearer $(tok "$C")" "$RELAY/blob/audit-$ORG-$ALOG-000000000001")" = 403 ] || fail "a member read the audit log"
+[ "$(code -H "Authorization: Bearer $(tok "$C")" -X PUT --data junk "$RELAY/blob/coll-$FID")" = 403 ] || fail "someone out of the group wrote to its folder"
+[ "$(code -H "Authorization: Bearer $(tok "$C")" "$RELAY/blob/wrap-$CLOG-$FID")" = 403 ] || fail "someone out of the group read its folder"
+NEXTGOV=$(( $(ls "$BLOB" | grep -c "^orggov-$ORG-") + 1 ))
+[ "$(code -H "Authorization: Bearer $(tok "$B")" -X PUT --data-binary @"$BLOB/orggov-$ORG-1" "$RELAY/blob/orggov-$ORG-$NEXTGOV")" = 403 ] || fail "the relay stored a governance record out of order"
+[ "$(code -H "Authorization: Bearer $(tok "$B")" -X PUT --data-binary @"$BLOB/org-$ORG" "$RELAY/blob/org-$ORG")" = 403 ] || fail "the relay stored an old membership record again"
+[ "$(code -X PUT --data junk "$RELAY/blob/audit-$ORG-$BLOG-000000000099")" = 401 ] || fail "the relay stored an audit event from nobody"
+curl -s --cacert "$W/box/tls/ca.pem" "$RELAY/list/org" | grep -q . && fail "the relay listed an organization's records to nobody"
+echo "relay: only members read the membership, only administrators the audit log; people out of a group neither read nor write its folder; records out of order are refused"
+
 pin device org remove "$A" "$BLOG" > "$W/rmadmin.log" 2>&1 && fail "an administrator was removed without losing the role"
 pin device org remove "$A" "$CLOG" > /dev/null 2>&1 || fail "remove carol"
 run 120 "$BIN" device org members "$A" | grep -q "$CLOG" && fail "carol is still a member"
 echo "remove: carol leaves the organization; an administrator must lose the role first"
+
+# Invites (SPEC 29.3): carol comes back through the company directory.
+read -r ICODE IID < <(pin device org invite "$A" carol@acme.example Carol "$GID") || fail "invite"
+[[ "$ICODE" =~ ^[0-9a-f]{32}$ ]] || fail "invite: $ICODE"
+pin device org join "$C" "$ORG" "$FOUNDER" 0123456789abcdef0123456789abcdef > "$W/badcode.log" 2>&1 || fail "carol answers with a wrong code: $(cat "$W/badcode.log")"
+pin device org sync "$A" > "$W/isync0.log" 2>&1 || fail "sync after a wrong code: $(cat "$W/isync0.log")"
+grep -q "^joined" "$W/isync0.log" && fail "a wrong code let carol in"
+pin device org join "$C" "$ORG" "$FOUNDER" "$ICODE" > "$W/ijoin.log" 2>&1 || fail "carol answers the invite: $(cat "$W/ijoin.log")"
+grep -qx "$ORG $(hx Acme) pending" "$W/ijoin.log" || fail "carol answers the invite: $(cat "$W/ijoin.log")"
+pin device org join "$B" "$ORG" "$FOUNDER" "$ICODE" > "$W/ijoin2.log" 2>&1
+pin device org sync "$A" > "$W/isync.log" 2>&1 || fail "sync with an answered invite: $(cat "$W/isync.log")"
+grep -qx "joined $CLOG $(hx carol@acme.example)" "$W/isync.log" || fail "sync with an answered invite: $(cat "$W/isync.log")"
+run 120 "$BIN" device org members "$A" | grep -qx "$CLOG $(hx Carol) $(hx carol@acme.example) member $GID" || fail "carol after the invite: $(run 120 "$BIN" device org members "$A")"
+pin device vault show "$C" Deploy --share "$FID" > "$W/cback.log" 2>&1 || fail "carol reads again: $(cat "$W/cback.log")"
+grep -qx "text $(hx 'deploy key')" "$W/cback.log" || fail "carol reads again: $(cat "$W/cback.log")"
+pin device org join "$C" "$ORG" "$FOUNDER" "$ICODE" > /dev/null 2>&1
+[ "$(ls "$BLOB" | grep -c "^invite-$ORG-")" -ge 1 ] && [ ! -s "$BLOB/invite-$ORG-$IID" ] || fail "the used invite was not cleared"
+echo "invites: a wrong code does nothing; the right one brings carol back with her directory id and group, once"
+
+# The company directory over SCIM (SPEC 29.7).
+STOK=$(run 60 "$BIN" relay scim-token "$W/box/relay" "$ORG") || fail "scim-token"
+scim() { curl -sS --cacert "$W/box/tls/ca.pem" -H "Authorization: Bearer $STOK" -H 'Content-Type: application/scim+json' "$@"; }
+[ "$(code -H "Authorization: Bearer 000000000000000000000000000000000000000000000000" "$RELAY/scim/v2/Users")" = 401 ] || fail "SCIM without the token"
+user() { scim -X POST --data "{\"schemas\":[\"urn:ietf:params:scim:schemas:core:2.0:User\"],\"userName\":\"$1\",\"name\":{\"givenName\":\"$2\",\"familyName\":\"X\"},\"active\":true}" "$RELAY/scim/v2/Users" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])'; }
+UB=$(user bob-ext Bob) && UC=$(user carol@acme.example Carol) && UE=$(user erin@acme.example Erin) || fail "SCIM users"
+[ "$(code -H "Authorization: Bearer $STOK" -X POST --data '{"userName":"BOB-EXT"}' "$RELAY/scim/v2/Users")" = 409 ] || fail "SCIM took a userName twice"
+scim "$RELAY/scim/v2/Users?filter=userName%20eq%20%22erin%40acme.example%22" | grep -q '"totalResults":1' || fail "SCIM filter"
+scim -X POST --data "{\"displayName\":\"Engineering\",\"members\":[{\"value\":\"$UC\"}]}" "$RELAY/scim/v2/Groups" > "$W/sg.json" || fail "SCIM group"
+SG=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["id"])' "$W/sg.json")
+scim -X PATCH --data "{\"Operations\":[{\"op\":\"add\",\"path\":\"members\",\"value\":[{\"value\":\"$UE\"}]}]}" "$RELAY/scim/v2/Groups/$SG" | grep -q "$UE" || fail "SCIM group patch"
+pin device org sync "$A" > "$W/dsync.log" 2>&1 || fail "directory sync: $(cat "$W/dsync.log")"
+grep -q "^invite $(hx erin@acme.example) [0-9a-f]\{32\} [0-9a-f]\{32\}$" "$W/dsync.log" || fail "directory sync did not invite erin: $(cat "$W/dsync.log")"
+grep -q "^removed" "$W/dsync.log" && fail "directory sync removed someone listed: $(cat "$W/dsync.log")"
+pin device org sync "$A" > "$W/dsync2.log" 2>&1 || fail "directory sync again"
+grep -q "^invite" "$W/dsync2.log" && fail "erin was invited twice: $(cat "$W/dsync2.log")"
+scim -X PATCH --data '{"schemas":["urn:ietf:params:scim:api:messages:2.0:PatchOp"],"Operations":[{"op":"Replace","path":"active","value":"False"}]}' "$RELAY/scim/v2/Users/$UC" | grep -q '"active":false' || fail "SCIM deactivate"
+[ "$(code -H "Authorization: Bearer $(tok "$C")" "$RELAY/blob/org-$ORG")" = 401 ] || fail "carol's session still worked after the directory turned her off"
+run 120 "$BIN" device org show "$C" > /dev/null 2>&1 && fail "carol still reads the organization"
+pin device org sync "$A" > "$W/dsync3.log" 2>&1 || fail "directory sync after deactivation: $(cat "$W/dsync3.log")"
+grep -qx "removed $CLOG $(hx carol@acme.example)" "$W/dsync3.log" && grep -qx "$FID rekeyed 1" "$W/dsync3.log" || fail "directory sync after deactivation: $(cat "$W/dsync3.log")"
+run 120 "$BIN" device org members "$A" | grep -q "$CLOG" && fail "carol is still a member after the directory turned her off"
+echo "directory: SCIM users and groups; sync invites the new person once; turning carol off ends her sessions at once, and the next sync removes her and re-keys"
+# Opt-in recovery of work folders (SPEC 29.8).
+pin device org recovery on "$A" 2 3600 "$ALOG,$BLOG" > "$W/recon.log" 2>&1 || fail "recovery on: $(cat "$W/recon.log")"
+run 120 "$BIN" device org show "$B" | grep -qx "recovery on 2/2 delay 3600" || fail "recovery on: $(run 120 "$BIN" device org show "$B")"
+WID=$(pin device share new "$B" Work) || fail "bob's work folder"
+printf '2468\ntext %s\n' "$(hx 'q3 plan')" | run 300 "$BIN" device vault set "$B" Plan note --share "$WID" > /dev/null 2>&1 || fail "bob writes his work folder"
+pin device org escrow "$B" "$WID" | grep -qx "escrowed $WID 1" || fail "escrow"
+pin device org recover request "$A" "$WID" > "$W/req.log" 2>&1 || fail "request: $(cat "$W/req.log")"
+run 120 "$BIN" device org show "$B" | grep -q "^recovery-request $WID $ALOG " || fail "bob was not told of the request"
+pin device org recover approve "$B" "$WID" > "$W/early.log" 2>&1 && fail "approved before the delay"
+grep -q "opens at" "$W/early.log" || fail "early approval: $(cat "$W/early.log")"
+pin device org recovery on "$A" 2 0 "$ALOG,$BLOG" > /dev/null 2>&1 || fail "recovery on, no delay"
+pin device org recover request "$A" "$WID" > /dev/null 2>&1 || fail "request again"
+pin device org recover open "$A" "$WID" > "$W/open0.log" 2>&1 && fail "opened without approvals"
+pin device org recover approve "$A" "$WID" > /dev/null 2>&1 || fail "alice approves"
+pin device org recover open "$A" "$WID" > "$W/open1.log" 2>&1 && fail "opened with one approval of two"
+grep -q "1 of 2" "$W/open1.log" || fail "one approval: $(cat "$W/open1.log")"
+pin device org recover approve "$B" "$WID" > /dev/null 2>&1 || fail "bob approves"
+pin device org recover open "$A" "$WID" > "$W/open2.log" 2>&1 && fail "opened an escrow made under the old recovery key"
+pin device org escrow "$B" "$WID" > /dev/null 2>&1 || fail "escrow again"
+pin device org recover open "$A" "$WID" > "$W/open3.log" 2>&1 || fail "open: $(cat "$W/open3.log")"
+grep -qx "opened $WID 1" "$W/open3.log" && grep -q "Plan" "$W/open3.log" || fail "open: $(cat "$W/open3.log")"
+run 120 "$BIN" device org audit "$A" > "$W/raudit.log" 2>&1; grep -q " recovery $WID " "$W/raudit.log" || fail "recovery not audited"
+echo "recovery: an owner turns it on 2 of 2; bob escrows his work folder; he is told of alice's request; nothing opens before the delay or with one approval; two approvals open it"
+# Export to a SIEM, item-level events, and how long a copy may be read offline.
+run 120 "$BIN" device org export "$A" > "$W/export.jsonl" 2> "$W/export.err" || fail "export: $(cat "$W/export.err")"
+python3 - "$W/export.jsonl" <<'PY' || fail "export: $(head -3 "$W/export.jsonl")"
+import json, sys
+ev = [json.loads(l) for l in open(sys.argv[1]) if l.strip()]
+assert len(ev) >= 10, len(ev)
+assert any(e["action"] == "item" for e in ev), "no item events"
+assert any(e["action"] == "recovery" for e in ev), "no recovery events"
+assert any(not e["verified"] for e in ev) and sum(e["verified"] for e in ev) >= 10, "verification"
+PY
+SP=$((BASE + 7))
+python3 - "$SP" "$W/siem.body" "$W/siem.auth" <<'PY' &
+import http.server, sys
+class H(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        b = self.rfile.read(int(self.headers['Content-Length']))
+        open(sys.argv[2], 'wb').write(b); open(sys.argv[3], 'w').write(self.headers.get('Authorization', ''))
+        self.send_response(200); self.send_header('Content-Length', '0'); self.end_headers()
+    def log_message(self, *a): pass
+http.server.HTTPServer(('127.0.0.1', int(sys.argv[1])), H).handle_request()
+PY
+sleep 1
+run 120 "$BIN" device org export "$A" --https "http://127.0.0.1:$SP/ingest" --token hec-123 > /dev/null 2>&1 || fail "export over HTTP(S)"
+[ "$(wc -l < "$W/siem.body")" = "$(grep -c . "$W/export.jsonl")" ] && [ "$(cat "$W/siem.auth")" = "Bearer hec-123" ] || fail "the SIEM got: $(head -c 300 "$W/siem.body")"
+SY=$((BASE + 8))
+python3 - "$SY" "$W/box/tls/server.pem" "$W/box/tls/server.key" "$W/syslog.bin" <<'PY' &
+import socket, ssl, sys
+ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER); ctx.load_cert_chain(sys.argv[2], sys.argv[3])
+s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind(('127.0.0.1', int(sys.argv[1]))); s.listen(1)
+c, _ = s.accept(); t = ctx.wrap_socket(c, server_side=True); data = b''
+while True:
+    try: chunk = t.recv(65536)
+    except Exception: break
+    if not chunk: break
+    data += chunk
+open(sys.argv[4], 'wb').write(data)
+PY
+sleep 1
+run 120 "$BIN" device org export "$A" --syslog "127.0.0.1:$SY" --ca "$W/box/tls/ca.pem" > "$W/sysexp.log" 2>&1 || fail "export over syslog/TLS: $(cat "$W/sysexp.log")"
+sleep 1
+python3 - "$W/syslog.bin" "$(grep -c . "$W/export.jsonl")" <<'PY' || fail "syslog frames"
+import sys
+b = open(sys.argv[1], 'rb').read(); n = 0
+while b:
+    sp = b.index(b' '); ln = int(b[:sp]); msg = b[sp + 1:sp + 1 + ln]; b = b[sp + 1 + ln:]
+    assert msg.startswith(b'<110>1 '), msg[:20]; n += 1
+assert n == int(sys.argv[2]), (n, sys.argv[2])
+PY
+echo "export: verified events as JSON lines, to an HTTP collector and to syslog over TLS; vault changes and recovery steps are among them"
+
+pin device org policy "$A" allow_offline_copy yes > /dev/null 2>&1 && pin device org policy "$A" max_offline_days 1 > /dev/null 2>&1 || fail "policy max_offline_days"
+pin device vault show "$B" Deploy --share "$FID" > /dev/null 2>&1 || fail "bob reads online"
+cp "$BLOB/coll-$FID" "$W/coll.saved"
+python3 -c 'import sys; p=sys.argv[1]; b=bytearray(open(p,"rb").read()); b[len(b)//2]^=1; open(p,"wb").write(b)' "$BLOB/coll-$FID"
+pin device vault show "$B" Deploy --share "$FID" > "$W/off1.log" 2>&1 || fail "bob's local copy within the limit: $(cat "$W/off1.log")"
+echo 0 > "$B/share-$FID.seen"
+pin device vault show "$B" Deploy --share "$FID" > "$W/off2.log" 2>&1 && fail "bob read a copy older than the policy allows"
+grep -q "offline for 1 days" "$W/off2.log" || fail "offline limit: $(cat "$W/off2.log")"
+cp "$W/coll.saved" "$BLOB/coll-$FID"
+echo "policy: a local copy reads offline within max_offline_days, not after"
+CP=$((BASE + 9))
+( setsid "$BIN" device org console "$A" "$CP" > "$W/console.log" 2>&1 & )
+for _ in $(seq 50); do grep -q "^console at" "$W/console.log" && break; sleep 0.2; done
+CURL=$(sed -n 's/^console at //p' "$W/console.log")
+[ "$(code "http://127.0.0.1:$CP/")" = 403 ] || fail "the console answered without its token"
+curl -sS "$CURL" > "$W/console.html" || fail "console"
+grep -q "Acme" "$W/console.html" && grep -q "class=ok>verified" "$W/console.html" && grep -q "class=bad>" "$W/console.html" && grep -q "erin\|bob-ext" "$W/console.html" || fail "console page: $(head -c 400 "$W/console.html")"
+pkill -f -- "org console $A" 2>/dev/null
+echo "console: a read-only page on 127.0.0.1 behind a token: people, policy, and the audit log with each event verified"
 echo "PASS org_e2e"

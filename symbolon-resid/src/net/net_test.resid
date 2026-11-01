@@ -18,10 +18,10 @@ import "crypto.resid";
 List(Int) rep(Int b, Int n) { return if (n == 0) { [] } else { [b].concat(rep(b, n - 1)) }; }
 
 @requires(environment)
-Endpoint relay_at() { return Endpoint {.host = "127.0.0.1", .port = str_parse_int(environment.get("SYM_RELAY_PORT")), .ca = ""}; }
+Endpoint relay_at() { return Endpoint {.host = "127.0.0.1", .port = str_parse_int(environment.get("SYM_RELAY_PORT")), .ca = "", .token = ""}; }
 
 @requires(environment)
-Endpoint witness_at() { return Endpoint {.host = "127.0.0.1", .port = str_parse_int(environment.get("SYM_WITNESS_PORT")), .ca = ""}; }
+Endpoint witness_at() { return Endpoint {.host = "127.0.0.1", .port = str_parse_int(environment.get("SYM_WITNESS_PORT")), .ca = "", .token = ""}; }
 
 @requires(network, environment, declassify, clock(readonly))
 test "relay: mailboxes in order, append-only log, blobs; names are checked" {

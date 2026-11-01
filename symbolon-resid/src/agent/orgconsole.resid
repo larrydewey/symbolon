@@ -1,0 +1,102 @@
+// The administrator console (SPEC 29.10), apart from orgcli so that its
+// HTTP server's names do not meet the relay client's.
+
+import "../types.resid";
+import "../core/log.resid";
+import "../net/services.resid" as svc;
+import "state.resid";
+import "common.resid";
+import "orgtypes.resid";
+import "orgcore.resid";
+import "auditlog.resid";
+import "sharecli.resid";
+import "orgcli.resid";
+import "crypto.resid";
+import "httpserv.resid";
+
+// ─── The administrator console (SPEC 29.10) ─────────────────────
+// `org console DIR PORT`: a page on this machine (127.0.0.1 only, behind
+// a random token in its address) showing the organization as this device
+// verifies it: governance, policy, recovery, people, groups, recovery
+// requests and the audit log, each event verified. It changes nothing:
+// changes are signed on an owner's or administrator's own device (the
+// app, or the `org` commands, which the page shows).
+
+@requires(filesystem, network, clock(readonly), declassify)
+pub Int org_console(Str dir, Int port) {
+    Str token = hex_encode(random_bytes(16));
+    Int lfd = http_listen_at("127.0.0.1", port);
+    if (lfd < 0) { eprintln(f"console: cannot listen on {port}"); return 1; }
+    println(f"console at http://127.0.0.1:{http_bound_port(lfd)}/?t=" + token);
+    return console_loop(dir, token, lfd);
+}
+
+@requires(filesystem, network, clock(readonly), declassify)
+Int console_loop(Str dir, Str token, Int lfd) {
+    Int n = http_accept_loop(lfd, lambda(q) { console_page(dir, token, q) }, http_limits(), 100);
+    return if (n > 0) { console_loop(dir, token, lfd) } else { 1 };
+}
+
+Str esc(Str s) { return str_replace(str_replace(str_replace(str_replace(s, "&", "&amp;"), "<", "&lt;"), ">", "&gt;"), "\"", "&quot;"); }
+
+@requires(filesystem, network, clock(readonly), declassify)
+HttpReply console_page(Str dir, Str token, HttpRequest r) {
+    if (r.method != "GET" || r.path != "/" || http_query_param(r.query, "t") != token) { return http_reply_status(403); }
+    Result(OrgCtx, Str) ro = org_view(dir);
+    Str body = match ro {
+        Err(m) => "<p class=bad>" + esc(m) + "</p>",
+        Ok(o) => console_body(o)
+    };
+    HttpReply rep = http_reply_text(200, "text/html; charset=utf-8", "<!doctype html><html><head><meta charset=utf-8><meta name=viewport content=\"width=device-width\"><title>Symbolon organization</title>"
+        + "<style>body{font:15px system-ui;margin:2em auto;max-width:60em;padding:0 1em;color:#222}table{border-collapse:collapse;width:100%}td,th{border-bottom:1px solid #ddd;padding:.3em;text-align:left;vertical-align:top}"
+        + "code{font-size:12px}.bad{color:#b00}.ok{color:#070}h2{margin-top:1.6em}</style></head><body>" + body + "</body></html>");
+    return http_with_header(http_with_header(rep, "Cache-Control", "no-store"), "Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'");
+}
+
+@requires(network, clock(readonly), declassify)
+Str console_body(OrgCtx o) {
+    OrgGov g = o.st.gov;
+    OrgPolicy p = g.policy;
+    List(Str) names = svc.blob_list(o.x.ep, "audit-" + hex_encode(o.st.org.org_id) + "-");
+    List(Str) events = event_rows(o, names, 0, [], (UInt(64))0, [], ListBuf());
+    List(Str) reqs = svc.blob_list(o.x.ep, "recreq-" + hex_encode(g.org_id) + "-");
+    return "<h1>" + esc(g.name) + "</h1><p>Organization <code>" + hex_encode(g.org_id) + f"</code> · membership version {o.st.org.version} · governance version {g.version}"
+         + " · this device is " + role_of(g, o.x.c.log_id) + "</p>"
+         + "<h2>Policy</h2><table>" + f"<tr><td>Minimum PIN length</td><td>{p.min_pin_len}</td></tr><tr><td>Biometric unlock</td><td>{yes(p.allow_biometric)}</td></tr>"
+         + f"<tr><td>Duress PIN for group folders</td><td>{yes(p.allow_duress)}</td></tr><tr><td>Offline copies of group folders</td><td>{yes(p.allow_offline_copy)}</td></tr>"
+         + "<tr><td>Days a copy reads offline</td><td>" + (if (p.max_offline_days == 0) { "no limit" } else { f"{p.max_offline_days}" }) + "</td></tr></table>"
+         + "<h2>Recovery</h2><p>" + (if (g.recovery.on) { f"On: {g.recovery.threshold} of {g.recovery.admins.len()} recovery administrators, after {g.recovery.delay_sec} seconds." } else { "Off: no one but each person opens their folders." })
+         + f" Open requests: {reqs.len()}.</p>"
+         + f"<h2>People ({o.st.org.members.len()})</h2><table><tr><th>Name</th><th>Directory id</th><th>Role</th><th>Log</th></tr>" + str_join(member_rows(o.st, 0, ListBuf()), "") + "</table>"
+         + f"<h2>Groups ({o.st.org.groups.len()})</h2><table><tr><th>Name</th><th>People</th><th>Id</th></tr>" + str_join(group_rows(o.st.org.groups, 0, ListBuf()), "") + "</table>"
+         + f"<h2>Audit log ({events.len()})</h2><table><tr><th>Time</th><th>Device log</th><th>Seq</th><th>Action</th><th>Object</th><th>Detail</th><th></th></tr>" + str_join(events, "") + "</table>"
+         + "<h2>Making changes</h2><p>Changes are signed on an owner's or administrator's own device: the Symbolon app (Organization), or "
+         + "<code>symbolon device org invite|add|remove|role|policy|group|folder|sync|recovery ...</code>.</p>";
+}
+
+List(Str) member_rows(OrgState st, Int i, ListBuf(Str) acc) {
+    if (i >= st.org.members.len()) { return acc.finish(); }
+    OrgMember m = st.org.members[i];
+    return member_rows(st, i + 1, acc.push("<tr><td>" + esc(m.label) + "</td><td>" + esc(m.ext_id) + "</td><td>" + role_of(st.gov, m.log_id) + "</td><td><code>" + str_slice(hex_encode(m.log_id), 0, 16) + "</code></td></tr>"));
+}
+
+List(Str) group_rows(List(OrgGroup) gs, Int i, ListBuf(Str) acc) {
+    if (i >= gs.len()) { return acc.finish(); }
+    return group_rows(gs, i + 1, acc.push("<tr><td>" + esc(gs[i].name) + f"</td><td>{gs[i].members.len()}</td><td><code>" + hex_encode(gs[i].group_id) + "</code></td></tr>"));
+}
+
+@requires(network, clock(readonly), declassify)
+List(Str) event_rows(OrgCtx o, List(Str) names, Int i, List(Int) log, UInt(64) last, List(Int) prev, ListBuf(Str) acc) {
+    if (i >= names.len()) { return acc.finish(); }
+    List(Int) b = svc.blob_get(o.x.ep, names[i]) else { [] };
+    Option(AuditEvent) oe = event_of(b);
+    return match oe {
+        None => event_rows(o, names, i + 1, log, last, prev, acc),
+        Some(e) => event_rows(o, names, i + 1, e.log_id, e.seq, sha256_bytes(b), acc.push(event_row(e, event_problem(o, names[i], e, if (bytes_eq(e.log_id, log)) { last } else { (UInt(64))0 }, if (bytes_eq(e.log_id, log)) { prev } else { [] }))))
+    };
+}
+
+Str event_row(AuditEvent e, Str why) {
+    return f"<tr><td>{e.time}</td><td><code>" + str_slice(hex_encode(e.log_id), 0, 16) + f"</code></td><td>{e.seq}</td><td>" + esc(e.action) + "</td><td><code>" + esc(e.object) + "</code></td><td>" + esc(e.detail) + "</td><td>"
+         + (if (str_len(why) == 0) { "<span class=ok>verified</span>" } else { "<span class=bad>" + esc(why) + "</span>" }) + "</td></tr>";
+}

@@ -17,6 +17,7 @@ import "serials.resid";
 import "orgtypes.resid";
 import "sharetypes.resid";
 import "vaultcli.resid";
+import "auditlog.resid";
 import "crypto.resid";
 import "ecdsa.resid";
 import "cbor.resid";
@@ -93,6 +94,59 @@ pub Option(AuditEvent) event_of(List(Int) b) {
     return match r { Ok(x) => Some(x), Err(_) => None };
 }
 
+pub Option(OrgInvite) invite_of(List(Int) b) {
+    if (b.len() == 0 || b.len() > 65536 || !cbor_well_formed(b, 6)) { return None; }
+    Result(OrgInvite, SerialError) r = from_cbor(b);
+    return match r { Ok(x) => Some(x), Err(_) => None };
+}
+
+pub Option(OrgAccept) accept_of(List(Int) b) {
+    if (b.len() == 0 || b.len() > 65536 || !cbor_well_formed(b, 6)) { return None; }
+    Result(OrgAccept, SerialError) r = from_cbor(b);
+    return match r { Ok(x) => Some(x), Err(_) => None };
+}
+
+pub Option(OrgEscrow) escrow_of(List(Int) b) {
+    if (b.len() == 0 || b.len() > 65536 || !cbor_well_formed(b, 6)) { return None; }
+    Result(OrgEscrow, SerialError) r = from_cbor(b);
+    return match r { Ok(x) => Some(x), Err(_) => None };
+}
+
+pub Option(OrgRecoveryRequest) recreq_of(List(Int) b) {
+    if (b.len() == 0 || b.len() > 65536 || !cbor_well_formed(b, 6)) { return None; }
+    Result(OrgRecoveryRequest, SerialError) r = from_cbor(b);
+    return match r { Ok(x) => Some(x), Err(_) => None };
+}
+
+pub OrgEscrow escrow_signed(OrgEscrow e, List(Int) sig) {
+    return OrgEscrow {.org_id = e.org_id, .coll_id = e.coll_id, .owner = e.owner, .roster_version = e.roster_version, .enc = e.enc, .ct = e.ct,
+                      .log_sequence = e.log_sequence, .signer = e.signer, .sig = sig};
+}
+
+pub OrgRecoveryRequest recreq_signed(OrgRecoveryRequest q, List(Int) sig) {
+    return OrgRecoveryRequest {.org_id = q.org_id, .coll_id = q.coll_id, .requester = q.requester, .time = q.time, .log_sequence = q.log_sequence, .signer = q.signer, .sig = sig};
+}
+
+pub List(Int) escrow_tbs(OrgEscrow e) { return utf8("symbolon v1 escrow").concat(cbor_bytes(to_cbor(escrow_signed(e, [])))); }
+pub List(Int) recreq_tbs(OrgRecoveryRequest q) { return utf8("symbolon v1 recovery request").concat(cbor_bytes(to_cbor(recreq_signed(q, [])))); }
+
+// What the escrowed key is sealed under (HPKE info).
+pub List(Int) escrow_info(List(Int) org, List(Int) cid, UInt(64) version) {
+    return utf8("symbolon v1 escrow").concat(org).concat(cid).concat(utf8(f"{version}"));
+}
+
+pub Str escrow_blob(List(Int) org, Str cid) { return "escrow-" + hex_encode(org) + "-" + cid; }
+pub Str recreq_blob(List(Int) org, Str cid) { return "recreq-" + hex_encode(org) + "-" + cid; }
+
+pub OrgInvite invite_signed(OrgInvite v, List(Int) sig) {
+    return OrgInvite {.org_id = v.org_id, .id = v.id, .public_key = v.public_key, .ext_id = v.ext_id, .label = v.label, .groups = v.groups, .expires = v.expires,
+                      .log_sequence = v.log_sequence, .signer_log = v.signer_log, .signer = v.signer, .sig = sig};
+}
+
+pub OrgAccept accept_signed(OrgAccept a, List(Int) sig) {
+    return OrgAccept {.org_id = a.org_id, .id = a.id, .log_id = a.log_id, .code_sig = a.code_sig, .log_sequence = a.log_sequence, .signer = a.signer, .sig = sig};
+}
+
 pub OrgGov gov_signed(OrgGov g, List(Int) sig) {
     return OrgGov {.org_id = g.org_id, .version = g.version, .founder = g.founder, .nonce = g.nonce, .name = g.name, .owners = g.owners, .admins = g.admins,
                    .policy = g.policy, .recovery = g.recovery, .log_sequence = g.log_sequence, .signer_log = g.signer_log, .signer = g.signer, .sig = sig};
@@ -108,22 +162,35 @@ pub GroupFolder gfolder_signed(GroupFolder f, List(Int) sig) {
                         .log_sequence = f.log_sequence, .signer_log = f.signer_log, .signer = f.signer, .sig = sig};
 }
 
-pub AuditEvent event_signed(AuditEvent e, List(Int) sig) {
-    return AuditEvent {.org_id = e.org_id, .log_id = e.log_id, .party = e.party, .seq = e.seq, .prev = e.prev, .time = e.time,
-                       .action = e.action, .object = e.object, .detail = e.detail, .sig = sig};
-}
 
 // What a device signs: a label, then the record's CBOR without the signature.
 pub List(Int) gov_tbs(OrgGov g) { return utf8("symbolon v1 org gov").concat(cbor_bytes(to_cbor(gov_signed(g, [])))); }
 pub List(Int) org_tbs(Org o) { return utf8("symbolon v1 org").concat(cbor_bytes(to_cbor(org_signed(o, [])))); }
 pub List(Int) gfolder_tbs(GroupFolder f) { return utf8("symbolon v1 group folder").concat(cbor_bytes(to_cbor(gfolder_signed(f, [])))); }
-pub List(Int) event_tbs(AuditEvent e) { return utf8("symbolon v1 audit").concat(cbor_bytes(to_cbor(event_signed(e, [])))); }
+
+pub List(Int) invite_tbs(OrgInvite v) { return utf8("symbolon v1 invite").concat(cbor_bytes(to_cbor(invite_signed(v, [])))); }
+pub List(Int) accept_tbs(OrgAccept a) { return utf8("symbolon v1 accept record").concat(cbor_bytes(to_cbor(accept_signed(a, [])))); }
+
+// What an invite code's key signs: the person who answered it.
+pub List(Int) code_message(List(Int) org_id, List(Int) log_id) { return utf8("symbolon v1 accept").concat(org_id).concat(log_id); }
+pub List(Int) invite_id_of(List(Int) public_key) { return sha256_bytes(utf8("symbolon v1 invite").concat(public_key))[0..16]; }
 
 pub List(Int) org_id_of(List(Int) founder, List(Int) nonce) { return sha256_bytes(utf8("symbolon v1 org").concat(founder).concat(nonce))[0..16]; }
 
 pub Str gov_blob(List(Int) id, UInt(64) v) { return "orggov-" + hex_encode(id) + "-" + f"{v}"; }
 pub Str org_blob(List(Int) id) { return "org-" + hex_encode(id); }
 pub Str gfolder_blob(Str cid) { return "gfolder-" + cid; }
+pub Str invite_blob(List(Int) org, List(Int) id) { return "invite-" + hex_encode(org) + "-" + hex_encode(id); }
+pub Str accept_blob(List(Int) org, List(Int) id) { return "accept-" + hex_encode(org) + "-" + hex_encode(id); }
+
+// The relay as this device reaches it: with its session from the relay's
+// sign-in (dir/relay.token, "TOKEN UNTIL"), which the relay asks for
+// before it serves an organization's records (SPEC 29.4).
+@requires(filesystem)
+pub Endpoint relay_at(Str dir, DeviceConfig c) {
+    List(Str) p = str_split(str_trim(filesystem.read_all(dir + "/relay.token")), " ");
+    return Endpoint {.host = c.relay_host, .port = c.relay_port, .ca = c.ca, .token = if (p.len() >= 1 && str_len(p[0]) == 64) { p[0] } else { "" }};
+}
 
 // ─── This device's organization ─────────────────────────────────
 // dir/org holds "ORG-ID FOUNDER" in hex, from the enrolment.
@@ -164,19 +231,19 @@ pub Int group_index(List(OrgGroup) gs, List(Int) id, Int i) {
 // checked against the one before.
 @requires(filesystem, network, clock(readonly), declassify)
 pub Result(OrgGov, Str) gov_chain(Str dir, DeviceConfig c, VerifiedHead mine, OrgRef o) {
-    Int n = blob_list(relay_ep(c), "orggov-" + hex_encode(o.id) + "-").len();
+    Int n = blob_list(relay_at(dir, c), "orggov-" + hex_encode(o.id) + "-").len();
     Int seen = kept_version(dir + "/org.gov");
     if (n == 0) { return Err("the server has no record of the organization"); }
     if (n < seen) { return Err(f"the organization's governance went back to version {n} (this device saw {seen})"); }
-    OrgGov g = chain_from(c, mine, o, (UInt(64))1, (UInt(64))n, None)?;
+    OrgGov g = chain_from(relay_at(dir, c), c, mine, o, (UInt(64))1, (UInt(64))n, None)?;
     _ = filesystem.write_all(dir + "/org.gov", f"{g.version}");
     return Ok(g);
 }
 
 @requires(network, clock(readonly), declassify)
-Result(OrgGov, Str) chain_from(DeviceConfig c, VerifiedHead mine, OrgRef o, UInt(64) v, UInt(64) n, Option(OrgGov) prev) {
+Result(OrgGov, Str) chain_from(Endpoint e, DeviceConfig c, VerifiedHead mine, OrgRef o, UInt(64) v, UInt(64) n, Option(OrgGov) prev) {
     if (v > n) { return need(prev, "the server has no record of the organization"); }
-    OrgGov g = need(gov_of(blob_get(relay_ep(c), gov_blob(o.id, v)) else { [] }), f"the organization's governance version {v} is missing or does not decode")?;
+    OrgGov g = need(gov_of(blob_get(e, gov_blob(o.id, v)) else { [] }), f"the organization's governance version {v} is missing or does not decode")?;
     if (!bytes_eq(g.org_id, o.id) || g.version != v || !bytes_eq(g.founder, o.founder) || !bytes_eq(org_id_of(g.founder, g.nonce), o.id)) {
         return Err(f"the organization's governance version {v} is for another organization");
     }
@@ -185,7 +252,7 @@ Result(OrgGov, Str) chain_from(DeviceConfig c, VerifiedHead mine, OrgRef o, UInt
     if (!may) { return Err(f"the organization's governance version {v} is not signed by an owner of the version before"); }
     VerifiedHead h = head_of(c, mine, g.signer_log)?;
     if (!signed_by(h, g.log_sequence, g.signer, gov_tbs(g), g.sig)) { return Err(f"the signature on the organization's governance version {v} does not verify"); }
-    return chain_from(c, mine, o, v + (UInt(64))1, n, Some(g));
+    return chain_from(e, c, mine, o, v + (UInt(64))1, n, Some(g));
 }
 
 // The organization as the server holds it, verified.
@@ -193,7 +260,7 @@ Result(OrgGov, Str) chain_from(DeviceConfig c, VerifiedHead mine, OrgRef o, UInt
 pub Result(OrgState, Str) org_at(Str dir, DeviceConfig c, VerifiedHead mine) {
     OrgRef o = need(org_ref(dir), "this device is in no organization (org join)")?;
     OrgGov g = gov_chain(dir, c, mine, o)?;
-    Org r = need(org_of(blob_get(relay_ep(c), org_blob(o.id)) else { [] }), "the organization's membership record is missing or does not decode")?;
+    Org r = need(org_of(blob_get(relay_at(dir, c), org_blob(o.id)) else { [] }), "the organization's membership record is missing or does not decode")?;
     if (!bytes_eq(r.org_id, o.id)) { return Err("the membership record is for another organization"); }
     if (r.gov_version != g.version) { return Err("the membership record is behind the organization's governance: an owner or administrator signs it again (org sync)"); }
     if (!is_admin(g, r.signer_log)) { return Err("the membership record is not signed by an owner or administrator"); }
@@ -202,12 +269,18 @@ pub Result(OrgState, Str) org_at(Str dir, DeviceConfig c, VerifiedHead mine) {
     Int seen = kept_version(dir + "/org.version");
     if ((Int)r.version < seen) { return Err(f"the membership record went back to version {r.version} (this device saw {seen})"); }
     _ = filesystem.write_all(dir + "/org.version", f"{r.version}");
-    _ = filesystem.write_all(dir + "/org.policy", (if (g.policy.allow_offline_copy) { "offline " } else { "no-offline " }) + (if (g.policy.allow_duress) { "duress" } else { "no-duress" }));
+    _ = filesystem.write_all(dir + "/org.policy", (if (g.policy.allow_offline_copy) { "offline " } else { "no-offline " }) + (if (g.policy.allow_duress) { "duress" } else { "no-duress" }) + f" max_offline_days={g.policy.max_offline_days}");
     return Ok(OrgState {.gov = g, .org = r});
 }
 
 // What the last verified policy forbids this device for group folders:
 // "offline" or "duress".
+@requires(filesystem)
+pub Int org_max_offline(Str dir) {
+    List(Str) p = str_split(str_trim(filesystem.read_all(dir + "/org.policy")), "max_offline_days=");
+    return if (p.len() == 2) { str_parse_int(p[1]) } else { 0 };
+}
+
 @requires(filesystem)
 pub Bool org_forbids(Str dir, Str what) { return str_contains(filesystem.read_all(dir + "/org.policy"), "no-" + what); }
 

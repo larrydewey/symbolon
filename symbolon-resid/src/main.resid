@@ -1,7 +1,10 @@
 // symbolon: the Linux command-line agent and its services.
 //
-//   symbolon relay serve DIR PORT [--tls CERT KEY] [--bind ADDR]   the sync service (SPEC 20.1)
+//   symbolon relay serve DIR PORT [--tls CERT KEY] [--bind ADDR] [--ca FILE] [--store SPEC] [--store-ca FILE]
+//       the sync service (SPEC 20.1, 29.4, 29.9); --store: a directory (DIR by default),
+//       postgres://USER:PASSWORD@HOST:PORT/DB, s3://KEY:SECRET@HOST:PORT/BUCKET?region=R, or @FILE holding one
 //   symbolon witness keygen KEYFILE            a witness's signing key; prints its public key
+//   symbolon relay scim-token DIR ORG-ID          a bearer token for ORG-ID's SCIM directory (SPEC 29.7)
 //   symbolon witness serve DIR PORT KEYFILE [OFFSET] [--tls CERT KEY] [--bind ADDR]
 //                                              a witness (SPEC 20.3); OFFSET seconds added to its
 //                                              clock (tests: time passing)
@@ -67,6 +70,7 @@
 // for anything else (SPEC 20.2: envelopes are end to end, objects signed).
 
 import "net/services.resid";
+import "net/store.resid";
 import "agent/state.resid";
 import "agent/device.resid";
 import "agent/cosignerd.resid";
@@ -78,6 +82,9 @@ import "agent/vaultitems.resid";
 import "agent/importers.resid";
 import "agent/sharecli.resid";
 import "agent/orgcli.resid";
+import "agent/orgconsole.resid";
+import "agent/relaysrv.resid";
+import "agent/scim.resid";
 import "agent/webauthn.resid";
 import "agent/home.resid";
 import "httpserv.resid";
@@ -131,25 +138,55 @@ Int supervise_children(Str cmd) {
     return supervise_children(cmd);
 }
 
-@requires(network, filesystem, declassify, provision, process)
-Int relay_serve(Str dir, Int port, Str bind, Str cert, Str key, Str self) {
+// --store SPEC (net/store.resid): a directory, postgres://... or s3://...;
+// "@FILE" reads it from FILE, so a password is not on a command line.
+// --store-ca FILE: the trust anchor for an S3 store over HTTPS.
+@requires(filesystem)
+Option(StoreCfg) store_of(Str dir, Str spec, Str store_ca) {
+    Str sp = if (str_starts_with(spec, "@")) { str_trim(filesystem.read_all(str_slice(spec, 1, str_len(spec)))) } else { spec };
+    return store_cfg(sp, dir, if (str_len(store_ca) == 0) { "" } else { filesystem.read_all(store_ca) });
+}
+
+Str opt(Str flag, Str v) { return if (str_len(v) == 0) { "" } else { " " + flag + " " + v }; }
+
+@requires(network, filesystem, declassify, provision, process, clock(readonly))
+Int relay_serve(Str dir, Int port, Str bind, Str cert, Str key, Str ca, Str spec, Str store_ca, Str self) {
     Tls t = tls_from(cert, key);
     if (!t.ok) { eprintln("relay: the TLS certificate or key does not load, or they do not match"); return 1; }
     _ = filesystem.create_dir(dir);
+    Option(StoreCfg) sc = store_of(dir, spec, store_ca);
+    if (match sc { None => true, Some(_) => false }) { eprintln("relay: --store is a directory, postgres://USER:PASSWORD@HOST:PORT/DB or s3://KEY:SECRET@HOST:PORT/BUCKET"); return 2; }
+    Str why = store_prepare(sc else { Fs(dir) });
+    if (str_len(why) > 0) { eprintln("relay: the store is not ready: " + why); return 1; }
     Int lfd = http_listen_at(bind, port);
     if (lfd < 0) { eprintln(f"relay: cannot listen on {port}"); return 1; }
     println(f"relay listening on {bind}:{http_bound_port(lfd)}" + if (t.on) { " (TLS)" } else { "" });
-    return supervise_children(self + " relay child " + dir + f" {lfd}" + tls_args(cert, key));
+    return supervise_children(self + " relay child " + dir + f" {lfd}" + tls_args(cert, key) + opt("--ca", ca) + opt("--store", spec) + opt("--store-ca", store_ca));
 }
 
-// `symbolon relay child DIR FD [--tls CERT KEY]` (run by `relay serve`).
-@requires(network, filesystem, declassify, provision)
-Int relay_child(Str dir, Int lfd, Str cert, Str key) {
+// `symbolon relay child DIR FD [--tls CERT KEY] [--ca FILE] [--store SPEC] [--store-ca FILE]`
+// (run by `relay serve`). --ca: the trust anchor for the witnesses the
+// relay asks the time of when it verifies a device signing in (SPEC 29.4).
+@requires(network, filesystem, declassify, provision, clock(readonly))
+Int relay_child(Str dir, Int lfd, Str cert, Str key, Str ca, Str spec, Str store_ca) {
     Tls t = tls_from(cert, key);
     if (!t.ok) { return 2; }
-    Int n = if (t.on) { tls_accept_loop(lfd, t.cfg, lambda(q) { relay_handle(dir, q) }, http_limits(), batch_conns()) }
-            else { http_accept_loop(lfd, lambda(q) { relay_handle(dir, q) }, http_limits(), batch_conns()) };
+    Option(StoreCfg) sc = store_of(dir, spec, store_ca);
+    if (match sc { None => true, Some(_) => false }) { return 2; }
+    RelayCfg g = RelayCfg {.store = sc else { Fs(dir) }, .ca = if (str_len(ca) == 0) { "" } else { filesystem.read_all(ca) }};
+    Int n = if (t.on) { tls_accept_loop(lfd, t.cfg, lambda(q) { relay_serve_handle(g, q) }, http_limits(), batch_conns()) }
+            else { http_accept_loop(lfd, lambda(q) { relay_serve_handle(g, q) }, http_limits(), batch_conns()) };
     return if (n > 0) { 0 } else { 3 };
+}
+
+@requires(network, filesystem, declassify, clock(readonly))
+Int relay_scim_token(Str dir, Str org, Str spec, Str store_ca) {
+    Option(StoreCfg) sc = store_of(dir, spec, store_ca);
+    if (match sc { None => true, Some(_) => false }) { eprintln("relay: bad --store"); return 2; }
+    Store st = store_open(sc else { Fs(dir) });
+    Int rc = if (store_ok(st)) { scim_token(st, org) } else { 1 };
+    _ = store_close(st);
+    return rc;
 }
 
 @requires(filesystem)
@@ -245,7 +282,8 @@ Int org_command(Int n) {
     Str c = args.get(3);
     Str d = args.get(4);
     if (c == "new" && n == 6) { return org_new(d, args.get(5)); }
-    if (c == "join" && n == 7) { return org_join(d, args.get(5), args.get(6)); }
+    if (c == "join" && (n == 7 || n == 8)) { return org_join(d, args.get(5), args.get(6), if (n == 8) { args.get(7) } else { "" }); }
+    if (c == "invite" && (n == 7 || n == 8)) { return org_invite(d, args.get(5), args.get(6), if (n == 8) { args.get(7) } else { "" }); }
     if (c == "show" && n == 5) { return org_show(d); }
     if (c == "members" && n == 5) { return org_members(d); }
     if (c == "groups" && n == 5) { return org_groups(d); }
@@ -254,7 +292,14 @@ Int org_command(Int n) {
     if (c == "role" && n == 7) { return org_role(d, args.get(5), args.get(6)); }
     if (c == "policy" && n == 7) { return org_policy(d, args.get(5), args.get(6)); }
     if (c == "sync" && n == 5) { return org_sync(d); }
+    // `org recovery on DIR K DELAY ADMINS`, `org recovery off DIR`, `org escrow DIR CID`, `org recover request|approve|open DIR CID`
+    if (c == "recovery" && d == "on" && n == 9) { return org_recovery(args.get(5), "on", args.get(6), args.get(7), args.get(8)); }
+    if (c == "recovery" && d == "off" && n == 6) { return org_recovery(args.get(5), "off", "", "", ""); }
+    if (c == "escrow" && n == 6) { return org_escrow(d, args.get(5)); }
+    if (c == "recover" && n == 7) { return org_recover(args.get(5), d, args.get(6)); }
     if (c == "audit" && n == 5) { return org_audit(d); }
+    if (c == "console" && n == 6) { return org_console(d, str_parse_int(args.get(5))); }
+    if (c == "export" && positional(3) == 5) { return org_export(d, flag_arg("--https", 1, 5), flag_arg("--token", 1, 5), flag_arg("--syslog", 1, 5), flag_arg("--ca", 1, 5)); }
     // `org group new DIR NAME`, `org group add|remove DIR GROUP LOG`, `org folder new DIR NAME GROUPS`
     if (c == "group" && d == "new" && n == 7) { return org_group_new(args.get(5), args.get(6)); }
     if (c == "group" && (d == "add" || d == "remove") && n == 8) { return org_group_set(args.get(5), args.get(6), args.get(7), d == "add"); }
@@ -324,8 +369,9 @@ Int main() {
     if (a1 == "device" && a2 == "veto" && n == 4) { return device_veto(args.get(3)); }
     if (a1 == "device" && a2 == "recover-release" && n == 4) { return device_recover_release(args.get(3)); }
     if (a1 == "device" && a2 == "recover-finish" && (n == 5 || n == 6)) { return device_recover_finish(args.get(3), args.get(4), if (n == 6) { args.get(5) } else { "" }); }
-    if (a1 == "relay" && a2 == "serve" && positional(3) == 5) { return relay_serve(args.get(3), str_parse_int(args.get(4)), bind_or(flag_arg("--bind", 1, 5)), flag_arg("--tls", 1, 5), flag_arg("--tls", 2, 5), args.get(0)); }
-    if (a1 == "relay" && a2 == "child" && positional(3) == 5) { return relay_child(args.get(3), str_parse_int(args.get(4)), flag_arg("--tls", 1, 5), flag_arg("--tls", 2, 5)); }
+    if (a1 == "relay" && a2 == "serve" && positional(3) == 5) { return relay_serve(args.get(3), str_parse_int(args.get(4)), bind_or(flag_arg("--bind", 1, 5)), flag_arg("--tls", 1, 5), flag_arg("--tls", 2, 5), flag_arg("--ca", 1, 5), flag_arg("--store", 1, 5), flag_arg("--store-ca", 1, 5), args.get(0)); }
+    if (a1 == "relay" && a2 == "scim-token" && positional(3) == 5) { return relay_scim_token(args.get(3), args.get(4), flag_arg("--store", 1, 5), flag_arg("--store-ca", 1, 5)); }
+    if (a1 == "relay" && a2 == "child" && positional(3) == 5) { return relay_child(args.get(3), str_parse_int(args.get(4)), flag_arg("--tls", 1, 5), flag_arg("--tls", 2, 5), flag_arg("--ca", 1, 5), flag_arg("--store", 1, 5), flag_arg("--store-ca", 1, 5)); }
     if (a1 == "witness" && a2 == "keygen" && args.count() == 4) { return witness_keygen(args.get(3)); }
     Int np = positional(3);
     if (a1 == "witness" && a2 == "serve" && (np == 6 || np == 7)) {

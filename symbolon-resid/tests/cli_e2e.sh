@@ -48,7 +48,7 @@ if [ -n "${TLS:-}" ]; then
 fi
 
 RP=$(port)
-runs 3600 "$BIN" relay serve "$W/relay" "$RP" "${SERVE_TLS[@]}" > "$W/relay.log" 2>&1 & PIDS+=($!)
+runs 3600 "$BIN" relay serve "$W/relay" "$RP" "${SERVE_TLS[@]}" ${RELAY_STORE:+--store "$RELAY_STORE"} > "$W/relay.log" 2>&1 & PIDS+=($!)
 WS=()
 for i in 1 2 3; do
   P=$(port)
@@ -154,29 +154,35 @@ grep -q 'not for this relying party' "$W/otherrp.log" || fail "other RP: $(cat "
 # The vault (SPEC 18): put, get, overwrite, list; tampering and rollback at
 # the relay are refused.
 LOG=$(awk '/^log / {print $2}' "$W/init.log")
-VB="$W/relay/blob/vault-$LOG"
+# The vault as the relay stores it, through the relay itself (so this
+# works whatever the relay's store, RELAY_STORE).
+RURL="$([ -n "${TLS:-}" ] && echo https || echo http)://127.0.0.1:$RP/blob/vault-$LOG"
+getb() { curl -sS ${TLS:+--cacert "$W/ca.pem"} -o "$1" "$RURL"; }
+putb() { curl -sS ${TLS:+--cacert "$W/ca.pem"} -X PUT --data-binary @"$1" "$RURL" > /dev/null; }
 printf '2468\nhunter2\n' | run 300 "$BIN" device vault put "$W/dev" mail > "$W/v1.log" 2>&1 || fail "vault put"
-cp "$VB" "$W/vault.v1"
+getb "$W/vault.v1"
 printf '2468\nc0rrect-horse\n' | run 300 "$BIN" device vault put "$W/dev" mail > "$W/v2.log" 2>&1 || fail "vault overwrite"
 printf '2468\ns3cret\n' | run 300 "$BIN" device vault put "$W/dev" bank > "$W/v3.log" 2>&1 || fail "vault put 2"
 grep -q 'vault version 3, 2 items' "$W/v3.log" || fail "vault versions: $(cat "$W/v3.log")"
 [ "$(printf '2468\n' | run 300 "$BIN" device vault get "$W/dev" mail 2>&1)" = "c0rrect-horse" ] || fail "vault get"
 [ "$(printf '2468\n' | run 300 "$BIN" device vault list "$W/dev" 2>&1 | sort | tr '\n' ' ')" = "bank mail " ] || fail "vault list"
 [ "$(printf '2468\n' | run 300 "$BIN" device vault list "$W/dev" --kinds 2>&1 | sort | tr '\n' ' ')" = "secret bank secret mail " ] || fail "vault list --kinds"
-cp "$VB" "$W/vault.good"
-python3 - "$VB" <<'PY'
+getb "$W/vault.good"
+cp "$W/vault.good" "$W/vault.bad"
+python3 - "$W/vault.bad" <<'PY'
 import sys
 b = bytearray(open(sys.argv[1], 'rb').read()); b[len(b) // 2] ^= 1; open(sys.argv[1], 'wb').write(b)
 PY
+putb "$W/vault.bad"
 # A state that does not verify is never accepted: reading falls back to
 # this device's copy and says why; changing refuses.
 printf '2468\n' | run 300 "$BIN" device vault get "$W/dev" mail > "$W/vt.log" 2> "$W/vt.err" || fail "the local copy after tampering: $(cat "$W/vt.err")"
 [ "$(cat "$W/vt.log")" = "c0rrect-horse" ] && grep -q 'local copy:' "$W/vt.err" || fail "a tampered vault was read: $(cat "$W/vt.log" "$W/vt.err")"
 printf '2468\nx\n' | run 300 "$BIN" device vault put "$W/dev" other > "$W/vtp.log" 2>&1 && fail "a change was made over a tampered vault"
-cp "$W/vault.v1" "$VB"
+putb "$W/vault.v1"
 printf '2468\n' | run 300 "$BIN" device vault get "$W/dev" mail > "$W/vr.log" 2>&1 || fail "the local copy after rollback"
 grep -q 'local copy: .*backwards' "$W/vr.log" && grep -q '^c0rrect-horse$' "$W/vr.log" || fail "rollback: $(cat "$W/vr.log")"
-cp "$W/vault.good" "$VB"
+putb "$W/vault.good"
 echo "vault: put/get/list, tampering and rollback refused (reads use the device's verified copy)"
 # Typed items (SPEC 18.2): set, list --long, show, delete; bad input refused.
 hx() { printf '%s' "$1" | od -An -tx1 | tr -d ' \n'; }

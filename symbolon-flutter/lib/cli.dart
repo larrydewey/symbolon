@@ -148,6 +148,34 @@ class SymbolonCli {
   Future<CliResult> vaultDelete(String dir, String name, String pin, {String share = ''}) =>
       run(['device', 'vault', 'delete', dir, name, ..._in(share)], input: [pin], timeout: const Duration(minutes: 5));
 
+  // ─── Organizations (SPEC 29) ────────────────────────────────────────
+
+  /// "org ID NAME-HEX", "version V gov G", "role R", "policy ...",
+  /// "recovery on K/N delay S" or "recovery off", then "recovery-request
+  /// CID REQUESTER OPENS-AT" per request to open one of this person's
+  /// work folders (no PIN).
+  Future<CliResult> orgShow(String dir) => run(['device', 'org', 'show', dir], timeout: const Duration(minutes: 5));
+
+  /// "LOG NAME-HEX EXT-HEX|- owner|admin|member GROUP-IDS|-" per member (no PIN).
+  Future<CliResult> orgMembers(String dir) => run(['device', 'org', 'members', dir], timeout: const Duration(minutes: 5));
+
+  /// "GROUP-ID NAME-HEX PEOPLE" per group (no PIN).
+  Future<CliResult> orgGroups(String dir) => run(['device', 'org', 'groups', dir], timeout: const Duration(minutes: 5));
+
+  /// Prints "ORG-ID NAME-HEX member|pending"; [code] answers an invite.
+  Future<CliResult> orgJoin(String dir, String org, String founder, String code, String pin) =>
+      run(['device', 'org', 'join', dir, org, founder, if (code.isNotEmpty) code], input: [pin], timeout: const Duration(minutes: 5));
+
+  /// Prints "CODE ID" for one person of the company directory.
+  Future<CliResult> orgInvite(String dir, String ext, String name, String pin, {String groups = ''}) =>
+      run(['device', 'org', 'invite', dir, ext, name, if (groups.isNotEmpty) groups], input: [pin], timeout: const Duration(minutes: 5));
+
+  /// Adds those who answered invites, applies the company directory, re-keys group folders people left.
+  Future<CliResult> orgSync(String dir, String pin) => run(['device', 'org', 'sync', dir], input: [pin], timeout: const Duration(minutes: 30));
+
+  /// Escrows a work folder this person owns to the organization's recovery key.
+  Future<CliResult> orgEscrow(String dir, String id, String pin) => run(['device', 'org', 'escrow', dir, id], input: [pin], timeout: const Duration(minutes: 5));
+
   // ─── Shared folders ─────────────────────────────────────────────────
 
   /// "ID NAME-HEX owner|member PEOPLE [duress]" per folder; "ID - waiting

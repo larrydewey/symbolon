@@ -1,0 +1,236 @@
+// A PostgreSQL client (frontend/backend protocol 3.0) for the relay's
+// storage (SPEC 29.9): one connection per request, SCRAM-SHA-256
+// authentication (RFC 5802, RFC 7677) or trust, and the extended query
+// protocol with binary parameters and results, so object bytes are never
+// quoted into SQL.
+//
+// The connection is plain TCP: run the database on the relay's private
+// network (or behind a TLS tunnel); every object is end-to-end protected,
+// and the database password never crosses the wire (SCRAM).
+
+import "crypto.resid";
+
+pub type PgCfg = { Str host; Int port; Str user; Str password; Str db; };
+
+// An open, authenticated connection; fd < 0 when it failed (`err` says why).
+pub type PgConn = { Int fd; Str err; };
+
+// A statement's rows (each column's bytes; None for NULL) and its
+// command tag ("INSERT 0 1", "SELECT 3", ...).
+pub type PgResult = { List(List(Option(List(Int)))) rows; Str tag; Str err; };
+
+// postgres://USER:PASSWORD@HOST:PORT/DB
+pub Option(PgCfg) pg_url(Str u) {
+    if (!str_starts_with(u, "postgres://")) { return None; }
+    Str rest = str_slice(u, 11, str_len(u));
+    Int at = str_last_index_of(rest, "@");
+    if (at < 0) { return None; }
+    Str cred = str_slice(rest, 0, at);
+    Str hp_db = str_slice(rest, at + 1, str_len(rest));
+    Int colon = str_index_of(cred, ":", 0);
+    Int slash = str_index_of(hp_db, "/", 0);
+    if (colon < 0 || slash < 0) { return None; }
+    Str hp = str_slice(hp_db, 0, slash);
+    Int pc = str_index_of(hp, ":", 0);
+    return Some(PgCfg {.host = if (pc < 0) { hp } else { str_slice(hp, 0, pc) }, .port = if (pc < 0) { 5432 } else { str_parse_int(str_slice(hp, pc + 1, str_len(hp))) },
+                       .user = str_slice(cred, 0, colon), .password = str_slice(cred, colon + 1, str_len(cred)), .db = str_slice(hp_db, slash + 1, str_len(hp_db))});
+}
+
+Int str_last_index_of(Str s, Str c) { return last_at(s, c, str_len(s) - 1); }
+Int last_at(Str s, Str c, Int i) {
+    if (i < 0) { return -1; }
+    if (str_slice(s, i, i + 1) == c) { return i; }
+    return last_at(s, c, i - 1);
+}
+
+// ─── Bytes ──────────────────────────────────────────────────────
+
+List(Int) be32(Int n) { return [(n >> 24) & 255, (n >> 16) & 255, (n >> 8) & 255, n & 255]; }
+List(Int) be16(Int n) { return [(n >> 8) & 255, n & 255]; }
+Int rd32(List(Int) b, Int i) {
+    Int v = (b[i] << 24) | (b[i + 1] << 16) | (b[i + 2] << 8) | b[i + 3];
+    return if (v >= 2147483648) { v - 4294967296 } else { v };
+}
+Int rd16(List(Int) b, Int i) { return (b[i] << 8) | b[i + 1]; }
+
+List(Int) asc(Str s) { return str_to_bytes(s); }
+List(Int) cstr(Str s) { return asc(s).concat([0]); }
+
+// A message: type byte, length (itself included), body.
+List(Int) msg(Int t, List(Int) body) { return [t].concat(be32(body.len() + 4)).concat(body); }
+
+Str text_of(List(Int) b, Int i, Int end, StrBuf acc) {
+    if (i >= end) { return acc.finish(); }
+    return text_of(b, i + 1, end, acc.push(str_from_code(b[i])));
+}
+
+// ─── Reading messages ───────────────────────────────────────────
+
+type Msg = { Int t; List(Int) body; };
+type Rx = { List(Msg) ms; List(Int) rest; Bool ok; };
+
+// Messages from `buf` and the socket until one of type `until` arrives
+// (included), or the connection fails.
+@requires(network)
+Rx read_until(Int fd, List(Int) buf, Int until, ListBuf(Msg) acc, Int n) {
+    if (buf.len() >= 5) {
+        Int len = rd32(buf, 1);
+        if (len < 4 || len > 268435456) { return Rx {.ms = acc.finish(), .rest = [], .ok = false}; }
+        if (buf.len() >= 1 + len) {
+            Msg m = Msg {.t = buf[0], .body = buf[5..1 + len]};
+            List(Int) rest = buf[1 + len..buf.len()];
+            if (m.t == until) { return Rx {.ms = acc.push(m).finish(), .rest = rest, .ok = true}; }
+            return read_until(fd, rest, until, acc.push(m), n + 1);
+        }
+    }
+    List(Int) more = resid_tcp_recv_some(fd, 65536);
+    if (more.len() == 0) { return Rx {.ms = acc.finish(), .rest = [], .ok = false}; }
+    return read_until(fd, buf.concat(more), until, acc, n);
+}
+
+// The 'M' (message) field of an ErrorResponse.
+Str error_text(List(Int) b, Int i) {
+    if (i >= b.len() || b[i] == 0) { return "the database refused"; }
+    Int end = zero_at(b, i + 1);
+    if (b[i] == 77) { return text_of(b, i + 1, end, StrBuf()); }
+    return error_text(b, end + 1);
+}
+
+Int zero_at(List(Int) b, Int i) { return if (i >= b.len() || b[i] == 0) { i } else { zero_at(b, i + 1) }; }
+
+Option(Msg) first_of(List(Msg) ms, Int t, Int i) {
+    if (i >= ms.len()) { return None; }
+    if (ms[i].t == t) { return Some(ms[i]); }
+    return first_of(ms, t, i + 1);
+}
+
+// ─── SCRAM-SHA-256 ──────────────────────────────────────────────
+
+List(Int) xor_bytes(List(Int) a, List(Int) b, Int i, ListBuf(Int) acc) {
+    if (i >= a.len()) { return acc.finish(); }
+    return xor_bytes(a, b, i + 1, acc.push((a[i] ^ b[i]) & 255));
+}
+
+// `key=value` from a SCRAM attribute list.
+Str attr(Str s, Str k) { return attr_in(str_split(s, ","), k + "=", 0); }
+Str attr_in(List(Str) xs, Str k, Int i) {
+    if (i >= xs.len()) { return ""; }
+    if (str_starts_with(xs[i], k)) { return str_slice(xs[i], str_len(k), str_len(xs[i])); }
+    return attr_in(xs, k, i + 1);
+}
+
+pub type Scram = { Str client_final; List(Int) server_sig; };
+
+// The client's final message and the server signature it expects, from
+// the client-first-bare and server-first messages (RFC 5802 section 3).
+pub Scram scram_final(Str password, Str client_first_bare, Str server_first) {
+    Str nonce = attr(server_first, "r");
+    List(Int) salt = base64_decode(attr(server_first, "s"));
+    Int iters = str_parse_int(attr(server_first, "i"));
+    List(Int) salted = pbkdf2_hmac_sha256(asc(password), salt, if (iters < 1) { 1 } else { iters }, 1);
+    List(Int) client_key = hmac_sha256_bytes(salted, asc("Client Key"));
+    List(Int) stored_key = sha256_bytes(client_key);
+    Str without_proof = "c=biws,r=" + nonce;
+    List(Int) auth = asc(client_first_bare + "," + server_first + "," + without_proof);
+    List(Int) proof = xor_bytes(client_key, hmac_sha256_bytes(stored_key, auth), 0, ListBuf());
+    List(Int) server_key = hmac_sha256_bytes(salted, asc("Server Key"));
+    return Scram {.client_final = without_proof + ",p=" + base64_encode(proof), .server_sig = hmac_sha256_bytes(server_key, auth)};
+}
+
+// ─── Connecting ─────────────────────────────────────────────────
+
+@requires(network)
+PgConn failed(Int fd, Str why) {
+    _ = if (fd >= 0) { resid_tcp_close(fd) } else { true };
+    return PgConn {.fd = -1, .err = why};
+}
+
+@requires(network, declassify)
+pub PgConn pg_connect(PgCfg c) {
+    Int fd = resid_tcp_connect(c.host, c.port);
+    if (fd < 0) { return PgConn {.fd = -1, .err = "cannot reach the database"}; }
+    _ = resid_tcp_deadline(fd, 30000);
+    List(Int) params = cstr("user").concat(cstr(c.user)).concat(cstr("database")).concat(cstr(c.db)).concat([0]);
+    List(Int) startup = be32(params.len() + 8).concat(be32(196608)).concat(params);
+    _ = resid_tcp_send_bin(fd, startup);
+    Rx r = read_until(fd, [], 82, ListBuf(), 0);
+    if (!r.ok) { return failed(fd, auth_error(r.ms, "the database closed the connection")); }
+    Msg a = r.ms[r.ms.len() - 1];
+    Int code = rd32(a.body, 0);
+    if (code == 0) { return ready(fd, r.rest); }
+    if (code != 10) { return failed(fd, f"the database asks for authentication {code}; use scram-sha-256"); }
+    Str cnonce = base64_encode(random_bytes(18));
+    Str first_bare = "n=,r=" + cnonce;
+    Str first = "n,," + first_bare;
+    _ = resid_tcp_send_bin(fd, msg(112, cstr("SCRAM-SHA-256").concat(be32(str_len(first))).concat(asc(first))));
+    Rx r2 = read_until(fd, r.rest, 82, ListBuf(), 0);
+    if (!r2.ok) { return failed(fd, auth_error(r2.ms, "the database ended SCRAM")); }
+    Msg m2 = r2.ms[r2.ms.len() - 1];
+    if (rd32(m2.body, 0) != 11) { return failed(fd, "the database did not continue SCRAM"); }
+    Str server_first = text_of(m2.body, 4, m2.body.len(), StrBuf());
+    if (!str_starts_with(attr(server_first, "r"), cnonce)) { return failed(fd, "the database's SCRAM nonce is not ours"); }
+    Scram s = scram_final(c.password, first_bare, server_first);
+    _ = resid_tcp_send_bin(fd, msg(112, asc(s.client_final)));
+    Rx r3 = read_until(fd, r2.rest, 82, ListBuf(), 0);
+    if (!r3.ok) { return failed(fd, auth_error(r3.ms, "the database refused the password")); }
+    Msg m3 = r3.ms[r3.ms.len() - 1];
+    Str server_final = text_of(m3.body, 4, m3.body.len(), StrBuf());
+    if (rd32(m3.body, 0) != 12 || !bytes_eq(base64_decode(attr(server_final, "v")), s.server_sig)) { return failed(fd, "the database did not prove it knows the password"); }
+    Rx r4 = read_until(fd, r3.rest, 82, ListBuf(), 0);
+    if (!r4.ok || rd32(r4.ms[r4.ms.len() - 1].body, 0) != 0) { return failed(fd, auth_error(r4.ms, "the database refused the password")); }
+    return ready(fd, r4.rest);
+}
+
+Str auth_error(List(Msg) ms, Str dflt) { return match first_of(ms, 69, 0) { Some(e) => error_text(e.body, 0), None => dflt }; }
+
+@requires(network)
+PgConn ready(Int fd, List(Int) rest) {
+    Rx r = read_until(fd, rest, 90, ListBuf(), 0);
+    return if (r.ok) { PgConn {.fd = fd, .err = ""} } else { failed(fd, auth_error(r.ms, "the database did not become ready")) };
+}
+
+@requires(network)
+pub Int pg_close(PgConn c) {
+    if (c.fd < 0) { return 0; }
+    _ = resid_tcp_send_bin(c.fd, msg(88, []));
+    _ = resid_tcp_close(c.fd);
+    return 0;
+}
+
+// ─── Statements ─────────────────────────────────────────────────
+
+List(Int) param_bytes(List(List(Int)) ps, Int i, List(Int) acc) {
+    if (i >= ps.len()) { return acc; }
+    return param_bytes(ps, i + 1, acc.concat(be32(ps[i].len())).concat(ps[i]));
+}
+
+// `sql` with parameters $1.. (each sent as binary: text columns take
+// their UTF-8, bytea its bytes), results in binary.
+@requires(network)
+pub PgResult pg_exec(PgConn c, Str sql, List(List(Int)) ps) {
+    if (c.fd < 0) { return PgResult {.rows = [], .tag = "", .err = c.err}; }
+    List(Int) parse = msg(80, cstr("").concat(cstr(sql)).concat(be16(0)));
+    List(Int) bind = msg(66, cstr("").concat(cstr("")).concat(be16(1)).concat(be16(1)).concat(be16(ps.len())).concat(param_bytes(ps, 0, [])).concat(be16(1)).concat(be16(1)));
+    List(Int) exec = msg(69, cstr("").concat(be32(0)));
+    _ = resid_tcp_send_bin(c.fd, parse.concat(bind).concat(exec).concat(msg(83, [])));
+    Rx r = read_until(c.fd, [], 90, ListBuf(), 0);
+    if (!r.ok) { return PgResult {.rows = [], .tag = "", .err = "the database closed the connection"}; }
+    return match first_of(r.ms, 69, 0) {
+        Some(e) => PgResult {.rows = [], .tag = "", .err = error_text(e.body, 0)},
+        None => PgResult {.rows = rows_of(r.ms, 0, ListBuf()), .tag = tag_of(r.ms), .err = ""}
+    };
+}
+
+Str tag_of(List(Msg) ms) { return match first_of(ms, 67, 0) { Some(m) => text_of(m.body, 0, zero_at(m.body, 0), StrBuf()), None => "" }; }
+
+List(List(Option(List(Int)))) rows_of(List(Msg) ms, Int i, ListBuf(List(Option(List(Int)))) acc) {
+    if (i >= ms.len()) { return acc.finish(); }
+    return rows_of(ms, i + 1, if (ms[i].t == 68) { acc.push(cols_of(ms[i].body, rd16(ms[i].body, 0), 2, ListBuf())) } else { acc });
+}
+
+List(Option(List(Int))) cols_of(List(Int) b, Int n, Int at, ListBuf(Option(List(Int))) acc) {
+    if (n <= 0 || at + 4 > b.len()) { return acc.finish(); }
+    Int len = rd32(b, at);
+    if (len < 0) { return cols_of(b, n - 1, at + 4, acc.push(None)); }
+    return cols_of(b, n - 1, at + 4 + len, acc.push(Some(b[at + 4..at + 4 + len])));
+}

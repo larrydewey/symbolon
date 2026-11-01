@@ -7,6 +7,7 @@ import '../widgets.dart';
 import 'devices_page.dart';
 import 'hardware_page.dart';
 import 'import_page.dart';
+import 'org_page.dart';
 import 'recovery_page.dart';
 import 'settings_page.dart';
 import 'sharing_page.dart';
@@ -38,6 +39,14 @@ class MorePage extends StatelessWidget {
             subtitle: const Text('Folders shared with your household'),
             trailing: const Icon(Icons.chevron_right),
             onTap: () => open(SharingPage(app: app)),
+          ),
+          ListTile(
+            key: const Key('open-org'),
+            leading: const Icon(Icons.business_outlined),
+            title: const Text('Organization'),
+            subtitle: const Text('Your company: people, invites, recovery'),
+            trailing: const Icon(Icons.chevron_right),
+            onTap: () => open(OrgPage(app: app)),
           ),
           ListTile(
             key: const Key('open-import'),

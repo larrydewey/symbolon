@@ -2073,30 +2073,70 @@ them, not in personal vaults.
 ### 29.3 Enrolment and who is who
 
 Comparing fingerprints (Section 19.3) does not scale to a company, so an
-organization binds people to its directory instead. The server issues an
-invite for a directory user (from SCIM, 29.7, or an administrator); the
-link reaches the person through the directory (their work e-mail or the
-company's device management) and pairs as in Symbolon Home, carrying the
-org id. The server records which log paired with which `ext_id`, and an
-admin device adds the member to the org record with that `ext_id`.
-Residual risk, stated: the binding of a log to a person rests on the
-directory and the server, as an enterprise identity provider's does; the
-app still shows fingerprints, and an organization may require the
-comparison for administrators.
+organization binds people to its directory instead, with invites. An
+owner or administrator (or `org sync` for a new directory user, 29.7)
+makes an invite `invite-<org>-<id>` for one directory id (`ext_id`), a
+name and groups, good for 14 days by witness time, signed by their
+device. The invite code is 16 random bytes; it is a key: the record holds
+the P-256 public key of `SHA-256("symbolon v1 invite key" || code)` and
+`id` is the first 16 bytes of `SHA-256("symbolon v1 invite" ||
+public_key)`. The code reaches the person through the company (work
+e-mail, device management, the console). Their device runs `org join ORG
+FOUNDER CODE`: it verifies the governance chain (29.1), signs with the
+code's key `"symbolon v1 accept" || org_id || log_id`, and stores the
+answer `accept-<org>-<id>`, also signed by one of its devices. Neither the
+server nor anyone who sees the answer learns the code. An administrator's
+next `org sync` checks the invite (signed by an owner or administrator
+of the current governance, unexpired), the code's signature and the
+device's, adds the person with the invite's `ext_id`, name and groups in
+one new membership record, and clears the invite and the answer. A code
+answers once (the server keeps the first answer, 29.4); an answer to no
+invite is ignored. Residual risk, stated: whoever holds the code first
+becomes that directory person, as with any enrolment link; the binding
+rests on how the company delivers codes. The app still shows
+fingerprints, and an organization may require the comparison for
+administrators.
 
 ### 29.4 Access at the server
 
-An organization's server authenticates every request: the device signs
-`"symbolon v1 request" || method || path || SHA-256(body) || time` with
-its DK and sends party, log id, time and signature in a header; the
-server checks the device against the log it verifies, a time within five
-minutes, and that the log is a member in the current org record. It
-serves `org-`, `gfolder-`, `coll-`, `wrap-`, `leave-` and audit objects
-only to members (a group folder's to its people), so removing someone in
-the directory cuts their access at once, before an admin device re-keys.
+An organization's server (the relay) signs devices in and controls access
+to the organization's objects. Sign-in: the device fetches a challenge
+(32 random bytes, good once for five minutes), signs `"symbolon v1 relay
+auth" || challenge` with its DK and posts the challenge, its log id,
+party id and signature. The relay verifies the log itself, from the
+events it stores and at the time its witnesses sign (8.3), finds the
+device in the quorum and checks the signature; it answers a bearer token
+for seven days, kept by its SHA-256 with the log, party and the device's
+key. A device in an organization signs in again when its PIN unlocks it
+and its session is a day old; under the duress PIN it keeps the session
+it has (signing in would need the real profile).
+
+The relay then serves:
+
+- `orggov-` to any device signed in (joining needs it before membership);
+- `org-<id>` and `gfolder-` to members of the organization;
+- `audit-`, `invite-` and `accept-` to owners and administrators;
+- a group folder's `coll-`, `roster-`, `wrap-` and `leave-` objects, to
+  read and to write, only to the folder's people, so someone taken out of
+  a group can no longer write with the old key before the next re-key;
+- listings (`/list/`) without the names the caller may not read, a page
+  at a time (`?after=`), so listings are no longer capped at 4096 names.
+
+It verifies records before storing them: a governance version is written
+once, in order, version 1 by the founder binding the org id and each
+later one by an owner of the version before; a membership record under
+the latest governance, by an owner or administrator, newer than the one
+stored; a group folder by an owner or administrator, newer than the one
+stored; an audit event once, by its own device, from a member; an answer
+to an invite once, by the device it names. Each record's signer must be
+the device that signed in, so the relay checks signatures with the key
+it verified at sign-in. A log the directory turned off (29.7) is refused
+at sign-in and its sessions stop at once.
+
 Access control is a second line only: every object is still verified on
 the device, and the server can still withhold or serve stale objects
-(down to what each device last saw).
+(down to what each device last saw). A household's relay works as before:
+objects that are not an organization's keep the plain relay's rules.
 
 ### 29.5 Policy
 
@@ -2109,11 +2149,14 @@ policy = { min_pin_len, allow_biometric, allow_duress, allow_offline_copy,
            password_rules }
 ```
 
-A device refuses to set a PIN shorter than `min_pin_len`, does not keep
-offline copies of group folders when `allow_offline_copy` is false (and
-forgets them), reads them offline no longer than `max_offline_days` after
-it last verified the record, and offers no duress choice for group
-folders when `allow_duress` is false. `require_attestation` names the
+A device warns when its PIN is shorter than `min_pin_len` (a PIN cannot
+be changed yet), does not keep offline copies of group folders when
+`allow_offline_copy` is false (and forgets them), reads a shared folder
+from its own copy no longer than `max_offline_days` after it last reached
+the relay for that folder (`share-<id>.seen`), and offers no duress
+choice for group folders when `allow_duress` is false. Android device
+management can also hide the duress setting (managed configuration
+`disable_duress`, 29.9). `require_attestation` names the
 platform attestation kinds (Section 21) a member device must present at
 enrolment. Policy never reaches a person's own vault or passkeys beyond
 the PIN length.
@@ -2128,79 +2171,136 @@ event = { org_id, log-id, party, seq, prev (SHA-256 of the previous event),
           time (witness time), action, object, detail }
 ```
 
-`action` is one of `open`, `read`, `write`, `delete`, `move`, `share`,
-`member`, `group`, `policy`, `recover`; `object` is a folder id and item
-id, never a name; `detail` holds no secret. A gap in a device's chain, or
-two events with one `seq`, shows that the server dropped or forked events.
-The server exports events as JSON lines, one per event with its signature,
-over HTTPS to a security monitoring system (SIEM) or syslog over TLS
-(RFC 5425). Administrators who hold a folder's key can map item ids to
-names; the server cannot.
+`action` is one of `member`, `group`, `policy`, `share`, `item`,
+`recovery`; `object` is an org, group or folder id, never a name; `detail`
+holds no secret. Every change a member's device makes to a shared folder
+is an `item` event with the folder's version and item count (item names
+stay sealed). A gap in a device's chain, or two events with one `seq`,
+shows that the server dropped or forked events; `org audit` and the
+console mark such an event as broken.
+
+`org export` sends the events, each verified on the exporting device
+first, to a security monitoring system (SIEM) as JSON lines (`time, org,
+log, seq, action, object, detail, verified, problem`): to standard
+output, POSTed over HTTPS (`application/x-ndjson`, a bearer token, as
+Splunk HEC and similar collectors take), or as RFC 5424 messages over
+syslog with TLS (RFC 5425, octet counting) or TCP (RFC 6587). An
+organization can run it on a schedule from an administrator's device.
 
 ### 29.7 Directory synchronization (SCIM)
 
-The server implements SCIM 2.0 (RFC 7643, RFC 7644) Users and Groups for
+The relay implements SCIM 2.0 (RFC 7643, RFC 7644) Users and Groups for
 the company's identity provider (Okta, Microsoft Entra ID, Google
-Workspace and others), with a bearer token the owners set. The server
-cannot sign the org record, so SCIM changes act in two ways:
+Workspace and others): create, read, filter (`userName`, `externalId`,
+`displayName` eq), replace, patch (including Entra's string booleans and
+`members[value eq "..."]` paths) and delete, with a bearer token the
+server's operator makes (`relay scim-token DIR ORG`). A member's `ext_id`
+names a directory user when it equals the user's `userName` (ignoring
+case) or `externalId`. The server cannot sign the org record, so SCIM
+changes act in two ways:
 
-- at once, on access (29.4): a deactivated or deleted user loses access
-  to every organization object, and a user removed from a group loses that
-  group's folders;
-- in the signed record, when an admin device next runs `org sync`: it
-  reads the pending changes, adds and removes members and group
-  memberships, signs the new org record and re-keys the group folders
-  people left. An organization may run `org sync` on a schedule on a
-  dedicated admin device (an automation administrator): an identity of
-  its own, listed as an admin, whose devices hold the group folders' keys
-  like any admin's. Owners decide whether to have one; it should not run
-  on the server.
+- at once, at the server (29.4): a user made inactive or deleted has every
+  member log they name suspended: sign-in is refused and their sessions
+  stop, so they read and write nothing of the organization's;
+- in the signed record, when an owner's or administrator's device next
+  runs `org sync`: it reads the directory (`GET /directory/<org>`, active
+  users and groups), takes out members whose `ext_id` the directory no
+  longer lists (members added by hand, without an `ext_id`, and owners
+  stay; an administrator stays until an owner takes the role), sets the
+  organization's group of each directory group's name to the members it
+  lists (making the group when there is none), signs one new membership
+  record, invites each directory user who is neither a member nor
+  invited (29.3), and re-keys the group folders people left. An
+  organization may run `org sync` on a schedule on a dedicated admin
+  device (an automation administrator): an identity of its own, listed
+  as an admin, whose devices hold the group folders' keys like any
+  admin's. Owners decide whether to have one; it should not run on the
+  server.
 
 ### 29.8 Recovery (opt-in)
 
 By default no one can open a person's vault but that person (G9 holds).
-An organization's owners may turn on recovery for **work items** only:
+An organization's owners may turn on recovery for **work folders** only
+(`org recovery on K DELAY ADMIN,...`):
 
-- The owners make an organization recovery key and split it k-of-n
-  (Shamir) among named administrators, each share sealed by HPKE to that
-  administrator's devices; the org record's `recovery` holds the public
-  key, k, the administrators and `delay_sec` (at least 72 hours).
-- With recovery on, each member device keeps the person's work items in a
-  **work folder**: a collection whose people are the person alone, with
-  its key also sealed to the organization recovery key. Items in the
-  person's own vault are never in it, and the app marks the work folder
-  as recoverable by the organization.
-- To recover, k administrators sign a recovery request naming the person
-  and the reason; the server publishes it, the person's devices tell the
-  person at once (and every member device shows that a recovery is
-  pending), and administrator devices combine shares only after
-  `delay_sec` of witness time, as an audit event of each.
+- The owner's device makes a recovery secret (a scalar below the P-256
+  order), derives an HPKE P-256 key pair from it, splits the secret
+  k-of-n with Shamir over the P-256 scalar field among the named recovery
+  administrators (each an owner or administrator and a member), wraps
+  each share to that administrator's devices as a folder key is wrapped
+  (HPKE mode_auth, 19.1), and forgets the secret. The new governance
+  version's `recovery` holds the public key, k, the administrators in
+  share order, `delay_sec`, the governance version the shares were made
+  at and the owner who wrapped them. Turning it on again makes a new key;
+  escrows under the old one no longer open.
+- A member escrows a shared folder they own (`org escrow CID`): its key
+  sealed by HPKE base mode to the recovery public key, bound to the org,
+  the folder and its roster version, signed by their device
+  (`escrow-<org>-<cid>`). The person's own vault is never escrowed; group
+  folders need none (owners and administrators hold their keys). After the
+  folder's key changes the person escrows it again; an escrow of an older
+  version does not open.
+- A recovery administrator asks to open a folder (`org recover request`):
+  a signed request with the witness time (`recreq-<org>-<cid>`). The
+  folder's owner sees it at once in `org show` ("recovery-request CID
+  REQUESTER OPENS-AT"), and it is audited. No earlier than the request's
+  time plus `delay_sec` by witness time, each approving administrator's
+  device opens its own share and wraps it to the requester's devices
+  (`org recover approve`). With k shares the requester's device rebuilds
+  the secret, checks it gives the recorded public key, opens the escrow
+  and reads the folder (`org recover open`); each step is an audit event.
 
+Owners choose `delay_sec`; 72 hours (259200) is the recommended minimum,
+so a person has time to see a request and the company to react.
 Residual risk, stated: k administrators acting together can read a
-person's work folder after the delay; turning recovery on is visible to
-every member in the signed policy.
+person's escrowed work folders after the delay; turning recovery on is
+visible to every member in the signed governance; the delay is enforced
+by the approving administrators' devices (witness time), not by the
+server.
 
 ### 29.9 Running at scale
 
-The relay is stateless over a storage backend: files (Symbolon Home),
-PostgreSQL (one table of named objects, logs inserted only if absent) or
-an S3-compatible object store (logs written with `If-None-Match: *`), so
-several relay processes run behind a load balancer. Witnesses run apart
+The relay keeps everything in a store (`relay serve ... --store SPEC`):
+a directory (the default; Symbolon Home), PostgreSQL
+(`postgres://USER:PASSWORD@HOST:PORT/DB`) or an S3-compatible object
+store (`s3://KEY-ID:SECRET@HOST:PORT/BUCKET?region=R`, HTTPS under
+`--store-ca`); `@FILE` reads the specification from a file so a password
+is not on a command line. Sessions, sign-in challenges, suspensions and
+the SCIM directory live in the store too, so the relay holds nothing of
+its own and several relay processes run behind a load balancer.
+
+- PostgreSQL: one table `symbolon_objects (k text COLLATE "C" PRIMARY KEY,
+  v bytea)`, made when a relay starts; a connection per request,
+  authenticated with SCRAM-SHA-256 (the password never crosses the wire),
+  the extended query protocol with binary parameters. Objects written
+  once (log events, mailbox messages, audit events) use `INSERT ... ON
+  CONFLICT DO NOTHING`, so one writer wins across relays. The connection
+  is plain TCP: run the database on the relay's private network.
+- S3: path-style requests signed with Signature Version 4; objects
+  written once use `If-None-Match: *` (412 for the loser); listings use
+  ListObjectsV2 with `start-after` and continuation tokens.
+
+A mailbox index is the first free one from the number stored, written
+once, so two relays never give out the same index. Witnesses run apart
 from the relay, ideally in different places and operated by different
 people (Section 13.4). The server is configured by the organization's
 device management: Android managed configurations and iOS managed app
-configuration carry the server address, the org id and an enrolment
-token, and lock settings policy fixes. Device management carries no keys.
+configuration carry the server address, the org id and an invite code,
+and lock settings policy fixes. Device management carries no keys.
 
 ### 29.10 The administrator console
 
-The server serves a console over HTTPS for owners and administrators:
-people, groups, group folders, pending directory changes, policy and the
-audit log. An administrator signs in with a Symbolon passkey registered
-at the console. Reading needs no more; a change to a signed record is
-prepared by the console and signed on the administrator's own device
-(the app shows the change and asks for the PIN), because the server holds
-no administrator key.
+`org console DIR PORT` serves a page on the administrator's own machine
+(127.0.0.1 only, behind a random token in its address, no caching, a
+content security policy that allows no scripts): the governance, policy,
+recovery setting and open requests, people, groups and the audit log,
+everything verified by that device as `org show` and `org audit` verify
+it, with each event marked verified or broken. The console is read-only
+and holds no key of its own. Changes to signed records are signed on an
+owner's or administrator's own device, in the app (Organization: invite,
+sync) or with the `org` commands, because the server holds no
+administrator key. A console served by the relay, with passkey sign-in
+and changes the app confirms, is future work.
 
 ---
 

@@ -1,0 +1,450 @@
+// SCIM 2.0 (RFC 7643, 7644) on the relay: how Okta, Microsoft Entra ID or
+// Google Workspace tell an organization who works there (SPEC 29.7).
+//
+// The directory cannot sign anything a device trusts, so it decides only
+// what a server can: a person it turns off (active false, or deleted)
+// loses the relay at once, every session of their log refused (the relay
+// matches the person to members by directory id: a member's ext_id is the
+// user's userName or externalId). Everything else waits for an owner's or
+// administrator's device: `org sync` reads the directory (GET
+// /directory/<org>), takes out the people it turned off and re-keys their
+// folders, invites the new ones, and sets the groups it names.
+//
+//   relay scim-token DIR ORG-ID [--store URL]   prints a bearer token for ORG-ID's directory
+//
+//   /scim/v2/ServiceProviderConfig, /ResourceTypes, /Schemas
+//   /scim/v2/Users       GET (filter userName|externalId eq "..."), POST
+//   /scim/v2/Users/<id>  GET, PUT, PATCH, DELETE
+//   /scim/v2/Groups      GET (filter displayName eq "..."), POST
+//   /scim/v2/Groups/<id> GET, PUT, PATCH, DELETE
+//
+// Stored as scim/token-<SHA-256 of the token> (the org id), scim/<org>/on,
+// scim/<org>/u-<id> and scim/<org>/g-<id> (one user or group each, as JSON).
+
+import "../browser/json.resid";
+import "orgtypes.resid";
+import "orgcore.resid";
+import "crypto.resid";
+import "httpserv.resid";
+import "../net/store.resid";
+
+pub type DirUser = { Str id; Str user_name; Str external_id; Str display; Bool active; };
+pub type DirGroup = { Str id; Str display; List(Str) members; };
+
+// ─── Tokens ─────────────────────────────────────────────────────
+
+@requires(filesystem, network, clock(readonly), declassify)
+pub Int scim_token(Store root, Str org) {
+    if (str_len(org) != 32 || !all_hex(org, 0)) { eprintln("scim-token: an organization id, 32 hex digits"); return 2; }
+    Str t = hex_encode(random_bytes(24));
+    _ = st_text(root, "scim/" + org + "/on", "1");
+    if (!st_text(root, "scim/token-" + hex_encode(sha256_bytes(utf8(t))), org)) { eprintln("scim-token: cannot store the token"); return 1; }
+    println(t);
+    return 0;
+}
+
+Bool all_hex(Str s, Int i) {
+    if (i >= str_len(s)) { return true; }
+    Int c = str_char_at(s, i);
+    return ((c >= 48 && c <= 57) || (c >= 97 && c <= 102)) && all_hex(s, i + 1);
+}
+
+// The organization a SCIM request's bearer token is for, or "".
+@requires(filesystem, network, clock(readonly), declassify)
+Str scim_org(Store root, HttpRequest r) {
+    Str h = http_header(r, "authorization");
+    if (str_len(h) != 55 || str_slice(h, 0, 7) != "Bearer ") { return ""; }
+    Str t = str_slice(h, 7, 55);
+    if (!all_hex(t, 0)) { return ""; }
+    Str f = "scim/token-" + hex_encode(sha256_bytes(utf8(t)));
+    Str org = str_trim(st_read_text(root, f));
+    return if (str_len(org) == 32 && all_hex(org, 0)) { org } else { "" };
+}
+
+// ─── Stored users and groups ────────────────────────────────────
+
+Str q(Str s) { return json_quote(s); }
+
+Str user_json(DirUser u) {
+    return "{\"id\":" + q(u.id) + ",\"userName\":" + q(u.user_name) + ",\"externalId\":" + q(u.external_id) + ",\"displayName\":" + q(u.display)
+         + ",\"active\":" + (if (u.active) { "true" } else { "false" }) + "}";
+}
+
+Str group_json(DirGroup g) { return "{\"id\":" + q(g.id) + ",\"displayName\":" + q(g.display) + ",\"members\":[" + quoted(g.members, 0, StrBuf()) + "]}"; }
+
+Str quoted(List(Str) xs, Int i, StrBuf acc) {
+    if (i >= xs.len()) { return acc.finish(); }
+    return quoted(xs, i + 1, acc.push(if (i > 0) { "," } else { "" }).push(q(xs[i])));
+}
+
+Option(DirUser) user_of(List(Int) b) {
+    Jv v = json_parse(b)?;
+    Str id = jstr(jget(v, "id"));
+    if (str_len(id) == 0) { return None; }
+    return Some(DirUser {.id = id, .user_name = jstr(jget(v, "userName")), .external_id = jstr(jget(v, "externalId")), .display = jstr(jget(v, "displayName")), .active = jbool(jget(v, "active"))});
+}
+
+Option(DirGroup) group_of(List(Int) b) {
+    Jv v = json_parse(b)?;
+    Str id = jstr(jget(v, "id"));
+    if (str_len(id) == 0) { return None; }
+    return Some(DirGroup {.id = id, .display = jstr(jget(v, "displayName")), .members = strs_of(jget(v, "members"))});
+}
+
+List(Str) strs_of(Option(Jv) v) { return strs_at(arr_of(v), 0, ListBuf()); }
+
+List(Jv) arr_of(Option(Jv) v) { return match v { Some(x) => match x { JArr(xs) => xs, _ => [] }, None => [] }; }
+
+List(Str) strs_at(List(Jv) xs, Int i, ListBuf(Str) acc) {
+    if (i >= xs.len()) { return acc.finish(); }
+    Jv x0 = xs[i];
+    Str s = match x0 { JStr(x) => x, _ => jstr(jget(x0, "value")) };
+    return strs_at(xs, i + 1, if (str_len(s) > 0) { acc.push(s) } else { acc });
+}
+
+Str odir(Str org) { return "scim/" + org; }
+
+// Whether the organization has a directory (a token was made for it).
+@requires(filesystem, network, clock(readonly), declassify)
+pub Bool scim_on(Store root, Str org) { return st_read_text(root, "scim/" + org + "/on") == "1"; }
+
+@requires(filesystem, network, clock(readonly), declassify)
+Option(DirUser) load_user(Store root, Str org, Str id) {
+    if (!id_ok(id)) { return None; }
+    return user_of(st_bytes(root, odir(org) + "/u-" + id));
+}
+
+@requires(filesystem, network, clock(readonly), declassify)
+Option(DirGroup) load_group(Store root, Str org, Str id) {
+    if (!id_ok(id)) { return None; }
+    return group_of(st_bytes(root, odir(org) + "/g-" + id));
+}
+
+Bool id_ok(Str id) { return str_len(id) == 32 && all_hex(id, 0); }
+
+@requires(filesystem, network, clock(readonly), declassify)
+Bool save_user(Store root, Str org, DirUser u) { return st_text(root, odir(org) + "/u-" + u.id, user_json(u)); }
+
+@requires(filesystem, network, clock(readonly), declassify)
+Bool save_group(Store root, Str org, DirGroup g) { return st_text(root, odir(org) + "/g-" + g.id, group_json(g)); }
+
+// Deleted is an empty file (the store cannot remove one).
+@requires(filesystem, network, clock(readonly), declassify)
+pub List(DirUser) all_users(Store root, Str org) { return users_in(root, org, st_list(root, odir(org) + "/u-", "", 1048576), 0, ListBuf()); }
+
+@requires(filesystem, network, clock(readonly), declassify)
+List(DirUser) users_in(Store root, Str org, List(Str) names, Int i, ListBuf(DirUser) acc) {
+    if (i >= names.len()) { return acc.finish(); }
+    Option(DirUser) u = load_user(root, org, str_slice(names[i], str_len(odir(org)) + 3, str_len(names[i])));
+    return users_in(root, org, names, i + 1, match u { Some(x) => acc.push(x), None => acc });
+}
+
+@requires(filesystem, network, clock(readonly), declassify)
+pub List(DirGroup) all_groups(Store root, Str org) { return groups_in(root, org, st_list(root, odir(org) + "/g-", "", 1048576), 0, ListBuf()); }
+
+@requires(filesystem, network, clock(readonly), declassify)
+List(DirGroup) groups_in(Store root, Str org, List(Str) names, Int i, ListBuf(DirGroup) acc) {
+    if (i >= names.len()) { return acc.finish(); }
+    Option(DirGroup) g = load_group(root, org, str_slice(names[i], str_len(odir(org)) + 3, str_len(names[i])));
+    return groups_in(root, org, names, i + 1, match g { Some(x) => acc.push(x), None => acc });
+}
+
+// ─── The relay's side: turning people off ───────────────────────
+
+// Whether a member's directory id names this user.
+pub Bool names_user(Str ext, DirUser u) {
+    return str_len(ext) > 0 && (str_to_lower(ext) == str_to_lower(u.user_name) || (str_len(u.external_id) > 0 && ext == u.external_id));
+}
+
+// Suspends (or lets back) every member the user names.
+@requires(filesystem, network, clock(readonly), declassify)
+Bool set_suspended(Store root, Str org, DirUser u, Bool off) {
+    return match relay_org_members(root, org) { None => true, Some(ms) => suspend_each(root, ms, u, off, 0) };
+}
+
+@requires(filesystem, network, clock(readonly), declassify)
+Bool suspend_each(Store root, List(OrgMember) ms, DirUser u, Bool off, Int i) {
+    if (i >= ms.len()) { return true; }
+    _ = if (names_user(ms[i].ext_id, u)) { st_text(root, "suspended/" + hex_encode(ms[i].log_id), if (off) { "directory: " + u.user_name } else { "" }) } else { true };
+    return suspend_each(root, ms, u, off, i + 1);
+}
+
+@requires(filesystem, network, clock(readonly), declassify)
+Option(List(OrgMember)) relay_org_members(Store root, Str org) {
+    Org o = org_of(st_bytes(root, "blob/org-" + org))?;
+    return Some(o.members);
+}
+
+// What an administrator's device reads (GET /directory/<org>): one line
+// per active user, "U USERNAME-HEX EXTERNALID-HEX DISPLAY-HEX", then per
+// group "G NAME-HEX USERNAME-HEX,...", with "-" for an empty field.
+@requires(filesystem, network, clock(readonly), declassify)
+pub Str directory_text(Store root, Str org) {
+    List(DirUser) us = all_users(root, org);
+    List(DirGroup) gs = all_groups(root, org);
+    return str_join(user_lines(us, 0, ListBuf()).concat(group_lines(gs, us, 0, ListBuf())), "\n");
+}
+
+Str hx(Str s) { return if (str_len(s) == 0) { "-" } else { hex_encode(utf8(s)) }; }
+
+List(Str) user_lines(List(DirUser) us, Int i, ListBuf(Str) acc) {
+    if (i >= us.len()) { return acc.finish(); }
+    return user_lines(us, i + 1, if (us[i].active) { acc.push("U " + hx(us[i].user_name) + " " + hx(us[i].external_id) + " " + hx(us[i].display)) } else { acc });
+}
+
+List(Str) group_lines(List(DirGroup) gs, List(DirUser) us, Int i, ListBuf(Str) acc) {
+    if (i >= gs.len()) { return acc.finish(); }
+    return group_lines(gs, us, i + 1, acc.push("G " + hx(gs[i].display) + " " + member_names(gs[i].members, us, 0, StrBuf(), true)));
+}
+
+Str member_names(List(Str) ids, List(DirUser) us, Int i, StrBuf acc, Bool first) {
+    if (i >= ids.len()) { Str s = acc.finish(); return if (str_len(s) == 0) { "-" } else { s }; }
+    Option(DirUser) u = user_by_id(us, ids[i], 0);
+    return match u {
+        Some(x) => if (x.active) { member_names(ids, us, i + 1, acc.push(if (first) { "" } else { "," }).push(hx(x.user_name)), false) } else { member_names(ids, us, i + 1, acc, first) },
+        None => member_names(ids, us, i + 1, acc, first)
+    };
+}
+
+Option(DirUser) user_by_id(List(DirUser) us, Str id, Int i) {
+    if (i >= us.len()) { return None; }
+    if (us[i].id == id) { return Some(us[i]); }
+    return user_by_id(us, id, i + 1);
+}
+
+// ─── Requests ───────────────────────────────────────────────────
+
+Bool is_obj(Jv v) { return match v { JObj(_) => true, _ => false }; }
+
+Str scim_type() { return "application/scim+json"; }
+
+HttpReply sreply(Int status, Str body) { return http_reply_text(status, scim_type(), body); }
+
+HttpReply serror(Int status, Str detail) {
+    return sreply(status, "{\"schemas\":[\"urn:ietf:params:scim:api:messages:2.0:Error\"],\"status\":\"" + f"{status}" + "\",\"detail\":" + q(detail) + "}");
+}
+
+Str user_resource(DirUser u) {
+    return "{\"schemas\":[\"urn:ietf:params:scim:schemas:core:2.0:User\"],\"id\":" + q(u.id) + ",\"userName\":" + q(u.user_name)
+         + (if (str_len(u.external_id) > 0) { ",\"externalId\":" + q(u.external_id) } else { "" })
+         + ",\"displayName\":" + q(u.display) + ",\"active\":" + (if (u.active) { "true" } else { "false" })
+         + ",\"meta\":{\"resourceType\":\"User\",\"location\":\"/scim/v2/Users/" + u.id + "\"}}";
+}
+
+Str group_resource(DirGroup g) {
+    return "{\"schemas\":[\"urn:ietf:params:scim:schemas:core:2.0:Group\"],\"id\":" + q(g.id) + ",\"displayName\":" + q(g.display)
+         + ",\"members\":[" + member_objs(g.members, 0, StrBuf()) + "],\"meta\":{\"resourceType\":\"Group\",\"location\":\"/scim/v2/Groups/" + g.id + "\"}}";
+}
+
+Str member_objs(List(Str) xs, Int i, StrBuf acc) {
+    if (i >= xs.len()) { return acc.finish(); }
+    return member_objs(xs, i + 1, acc.push(if (i > 0) { "," } else { "" }).push("{\"value\":" + q(xs[i]) + "}"));
+}
+
+Str list_response(List(Str) rs) {
+    return "{\"schemas\":[\"urn:ietf:params:scim:api:messages:2.0:ListResponse\"]," + f"\"totalResults\":{rs.len()},\"startIndex\":1,\"itemsPerPage\":{rs.len()}"
+         + ",\"Resources\":[" + str_join(rs, ",") + "]}";
+}
+
+// `attr eq "value"` from a filter; ["", ""] when it is not one.
+List(Str) eq_filter(Str f) {
+    List(Str) p = str_split(str_trim(f), " ");
+    if (p.len() < 3 || str_to_lower(p[1]) != "eq") { return ["", ""]; }
+    Int at = str_index_of(f, "\"", 0);
+    Int end = str_index_of(f, "\"", at + 1);
+    if (at < 0 || end < 0) { return ["", ""]; }
+    return [str_to_lower(p[0]), str_slice(f, at + 1, end)];
+}
+
+@requires(filesystem, network, clock(readonly), declassify)
+pub HttpReply scim_handle(Store root, HttpRequest r) {
+    Str org = scim_org(root, r);
+    if (str_len(org) == 0) { return serror(401, "a bearer token from `relay scim-token`"); }
+    List(Str) p = str_split(r.path, "/");
+    // ["", "scim", "v2", RESOURCE, ID?]
+    if (p.len() < 4 || p[2] != "v2") { return serror(404, "no such resource"); }
+    Str kind = p[3];
+    Str id = if (p.len() >= 5) { p[4] } else { "" };
+    if (kind == "ServiceProviderConfig") { return sreply(200, provider_config()); }
+    if (kind == "ResourceTypes") { return sreply(200, list_response([res_type("User"), res_type("Group")])); }
+    if (kind == "Schemas") { return sreply(200, list_response([])); }
+    if (kind == "Users") { return users_req(root, org, r, id); }
+    if (kind == "Groups") { return groups_req(root, org, r, id); }
+    return serror(404, "no such resource");
+}
+
+Str provider_config() {
+    return "{\"schemas\":[\"urn:ietf:params:scim:schemas:core:2.0:ServiceProviderConfig\"],\"patch\":{\"supported\":true},\"bulk\":{\"supported\":false,\"maxOperations\":0,\"maxPayloadSize\":0},"
+         + "\"filter\":{\"supported\":true,\"maxResults\":10000},\"changePassword\":{\"supported\":false},\"sort\":{\"supported\":false},\"etag\":{\"supported\":false},"
+         + "\"authenticationSchemes\":[{\"type\":\"oauthbearertoken\",\"name\":\"Bearer token\",\"description\":\"From relay scim-token\"}]}";
+}
+
+Str res_type(Str n) {
+    return "{\"schemas\":[\"urn:ietf:params:scim:schemas:core:2.0:ResourceType\"],\"id\":" + q(n) + ",\"name\":" + q(n) + ",\"endpoint\":\"/" + n + "s\",\"schema\":\"urn:ietf:params:scim:schemas:core:2.0:" + n + "\"}";
+}
+
+// A JSON boolean, or the strings "true"/"false" (Entra sends those).
+Bool truth(Option(Jv) v, Bool dflt) {
+    return match v { Some(x) => match x { JBool(b) => b, JStr(t) => str_to_lower(t) == "true", _ => dflt }, None => dflt };
+}
+
+Str display_of(Jv v) {
+    Str d = jstr(jget(v, "displayName"));
+    if (str_len(d) > 0) { return d; }
+    Str f = jstr(jpath(v, ["name", "formatted"], 0));
+    if (str_len(f) > 0) { return f; }
+    return str_trim(jstr(jpath(v, ["name", "givenName"], 0)) + " " + jstr(jpath(v, ["name", "familyName"], 0)));
+}
+
+@requires(filesystem, network, clock(readonly), declassify)
+Bool name_taken(List(DirUser) us, Str name, Str except, Int i) {
+    if (i >= us.len()) { return false; }
+    return (str_to_lower(us[i].user_name) == str_to_lower(name) && us[i].id != except) || name_taken(us, name, except, i + 1);
+}
+
+@requires(filesystem, network, clock(readonly), declassify)
+HttpReply users_req(Store root, Str org, HttpRequest r, Str id) {
+    if (str_len(id) == 0 && r.method == "GET") {
+        List(Str) f = eq_filter(http_query_param(r.query, "filter"));
+        return sreply(200, list_response(user_resources(all_users(root, org), f[0], f[1], 0, ListBuf())));
+    }
+    if (str_len(id) == 0 && r.method == "POST") {
+        Jv v = json_parse(r.body) else { JNull };
+        if (!is_obj(v)) { return serror(400, "the body is not a JSON object"); }
+        Str name = jstr(jget(v, "userName"));
+        if (str_len(name) == 0 || str_len(name) > 256) { return serror(400, "userName is required"); }
+        if (name_taken(all_users(root, org), name, "", 0)) { return serror(409, "userName is taken"); }
+        DirUser u = DirUser {.id = hex_encode(random_bytes(16)), .user_name = name, .external_id = jstr(jget(v, "externalId")), .display = display_of(v), .active = truth(jget(v, "active"), true)};
+        if (!save_user(root, org, u)) { return serror(500, "cannot store the user"); }
+        _ = set_suspended(root, org, u, !u.active);
+        return sreply(201, user_resource(u));
+    }
+    Option(DirUser) ou = load_user(root, org, id);
+    if (match ou { None => true, Some(_) => false }) { return serror(404, "no such user"); }
+    DirUser u0 = ou else { DirUser {.id = "", .user_name = "", .external_id = "", .display = "", .active = false} };
+    if (r.method == "GET") { return sreply(200, user_resource(u0)); }
+    if (r.method == "DELETE") {
+        _ = set_suspended(root, org, u0, true);
+        return if (st_text(root, odir(org) + "/u-" + id, "")) { http_reply_status(204) } else { serror(500, "cannot delete the user") };
+    }
+    Jv v = json_parse(r.body) else { JNull };
+        if (!is_obj(v)) { return serror(400, "the body is not a JSON object"); }
+    DirUser u = if (r.method == "PUT") { put_user(u0, v) } else { patch_user(u0, ops_of(v), 0) };
+    if (r.method != "PUT" && r.method != "PATCH") { return serror(405, "not allowed"); }
+    if (str_len(u.user_name) == 0 || name_taken(all_users(root, org), u.user_name, u.id, 0)) { return serror(409, "userName is taken or empty"); }
+    if (!save_user(root, org, u)) { return serror(500, "cannot store the user"); }
+    _ = set_suspended(root, org, u, !u.active);
+    return sreply(200, user_resource(u));
+}
+
+List(Str) user_resources(List(DirUser) us, Str attr, Str val, Int i, ListBuf(Str) acc) {
+    if (i >= us.len()) { return acc.finish(); }
+    Bool ok = str_len(attr) == 0 || (attr == "username" && str_to_lower(us[i].user_name) == str_to_lower(val)) || (attr == "externalid" && us[i].external_id == val);
+    return user_resources(us, attr, val, i + 1, if (ok) { acc.push(user_resource(us[i])) } else { acc });
+}
+
+DirUser put_user(DirUser u, Jv v) {
+    Str name = jstr(jget(v, "userName"));
+    return DirUser {.id = u.id, .user_name = if (str_len(name) > 0) { name } else { u.user_name }, .external_id = jstr(jget(v, "externalId")), .display = display_of(v), .active = truth(jget(v, "active"), true)};
+}
+
+List(Jv) ops_of(Jv v) { return arr_of(jget(v, "Operations")); }
+
+// PATCH operations on a user: replace/add of active, userName,
+// externalId, displayName, by path or as a value object.
+DirUser patch_user(DirUser u, List(Jv) ops, Int i) {
+    if (i >= ops.len()) { return u; }
+    Jv op = ops[i];
+    Str path = str_to_lower(jstr(jget(op, "path")));
+    Option(Jv) val = jget(op, "value");
+    DirUser next = if (str_len(path) == 0) { match val { Some(obj) => user_fields(u, obj), None => u } } else { user_path(u, path, val) };
+    return patch_user(next, ops, i + 1);
+}
+
+DirUser user_fields(DirUser u, Jv obj) {
+    Str name = jstr(jget(obj, "userName"));
+    Str ext = jstr(jget(obj, "externalId"));
+    Str disp = jstr(jget(obj, "displayName"));
+    return DirUser {.id = u.id, .user_name = if (str_len(name) > 0) { name } else { u.user_name }, .external_id = if (str_len(ext) > 0) { ext } else { u.external_id },
+                    .display = if (str_len(disp) > 0) { disp } else { u.display }, .active = truth(jget(obj, "active"), u.active)};
+}
+
+DirUser user_path(DirUser u, Str path, Option(Jv) val) {
+    Str s = jstr(val);
+    if (path == "active") { return DirUser {.id = u.id, .user_name = u.user_name, .external_id = u.external_id, .display = u.display, .active = truth(val, u.active)}; }
+    if (path == "username" && str_len(s) > 0) { return DirUser {.id = u.id, .user_name = s, .external_id = u.external_id, .display = u.display, .active = u.active}; }
+    if (path == "externalid") { return DirUser {.id = u.id, .user_name = u.user_name, .external_id = s, .display = u.display, .active = u.active}; }
+    if (path == "displayname") { return DirUser {.id = u.id, .user_name = u.user_name, .external_id = u.external_id, .display = s, .active = u.active}; }
+    return u;
+}
+
+@requires(filesystem, network, clock(readonly), declassify)
+HttpReply groups_req(Store root, Str org, HttpRequest r, Str id) {
+    if (str_len(id) == 0 && r.method == "GET") {
+        List(Str) f = eq_filter(http_query_param(r.query, "filter"));
+        return sreply(200, list_response(group_resources(all_groups(root, org), f[0], f[1], 0, ListBuf())));
+    }
+    if (str_len(id) == 0 && r.method == "POST") {
+        Jv v = json_parse(r.body) else { JNull };
+        if (!is_obj(v)) { return serror(400, "the body is not a JSON object"); }
+        Str name = jstr(jget(v, "displayName"));
+        if (str_len(name) == 0 || str_len(name) > 64) { return serror(400, "displayName of 1-64 characters is required"); }
+        DirGroup g = DirGroup {.id = hex_encode(random_bytes(16)), .display = name, .members = strs_of(jget(v, "members"))};
+        return if (save_group(root, org, g)) { sreply(201, group_resource(g)) } else { serror(500, "cannot store the group") };
+    }
+    Option(DirGroup) og = load_group(root, org, id);
+    if (match og { None => true, Some(_) => false }) { return serror(404, "no such group"); }
+    DirGroup g0 = og else { DirGroup {.id = "", .display = "", .members = []} };
+    if (r.method == "GET") { return sreply(200, group_resource(g0)); }
+    if (r.method == "DELETE") { return if (st_text(root, odir(org) + "/g-" + id, "")) { http_reply_status(204) } else { serror(500, "cannot delete the group") }; }
+    if (r.method != "PUT" && r.method != "PATCH") { return serror(405, "not allowed"); }
+    Jv v = json_parse(r.body) else { JNull };
+        if (!is_obj(v)) { return serror(400, "the body is not a JSON object"); }
+    DirGroup g = if (r.method == "PUT") { DirGroup {.id = g0.id, .display = if (str_len(jstr(jget(v, "displayName"))) > 0) { jstr(jget(v, "displayName")) } else { g0.display }, .members = strs_of(jget(v, "members"))} }
+                 else { patch_group(g0, ops_of(v), 0) };
+    return if (save_group(root, org, g)) { sreply(200, group_resource(g)) } else { serror(500, "cannot store the group") };
+}
+
+List(Str) group_resources(List(DirGroup) gs, Str attr, Str val, Int i, ListBuf(Str) acc) {
+    if (i >= gs.len()) { return acc.finish(); }
+    Bool ok = str_len(attr) == 0 || (attr == "displayname" && gs[i].display == val);
+    return group_resources(gs, attr, val, i + 1, if (ok) { acc.push(group_resource(gs[i])) } else { acc });
+}
+
+// PATCH operations on a group: add/remove/replace members (by value list
+// or `members[value eq "ID"]`), replace displayName.
+DirGroup patch_group(DirGroup g, List(Jv) ops, Int i) {
+    if (i >= ops.len()) { return g; }
+    Jv op = ops[i];
+    Str kind = str_to_lower(jstr(jget(op, "op")));
+    Str path = jstr(jget(op, "path"));
+    Str lpath = str_to_lower(path);
+    Option(Jv) val = jget(op, "value");
+    List(Str) vals = strs_of(val);
+    List(Str) f = eq_filter(if (str_contains(path, "[")) { str_slice(path, str_index_of(path, "[", 0) + 1, str_len(path)) } else { "" });
+    List(Str) named = if (str_len(f[1]) > 0) { [f[1]] } else { vals };
+    DirGroup next = if (str_starts_with(lpath, "members") && kind == "add") { with_members(g, add_all(g.members, vals, 0)) } else {
+        if (str_starts_with(lpath, "members") && kind == "remove") { with_members(g, remove_all(g.members, named, 0, ListBuf())) } else {
+        if (lpath == "members" && kind == "replace") { with_members(g, vals) } else {
+        if (lpath == "displayname") { DirGroup {.id = g.id, .display = if (str_len(jstr(val)) > 0) { jstr(val) } else { g.display }, .members = g.members} } else {
+        if (str_len(lpath) == 0 && kind == "replace") { match val { Some(obj) => DirGroup {.id = g.id, .display = if (str_len(jstr(jget(obj, "displayName"))) > 0) { jstr(jget(obj, "displayName")) } else { g.display },
+                                                                            .members = match jget(obj, "members") { Some(m) => strs_of(Some(m)), None => g.members }}, None => g } } else { g } } } } };
+    return patch_group(next, ops, i + 1);
+}
+
+DirGroup with_members(DirGroup g, List(Str) ms) { return DirGroup {.id = g.id, .display = g.display, .members = ms}; }
+
+List(Str) add_all(List(Str) xs, List(Str) more, Int i) {
+    if (i >= more.len()) { return xs; }
+    return add_all(if (has_str(xs, more[i], 0)) { xs } else { xs.concat([more[i]]) }, more, i + 1);
+}
+
+List(Str) remove_all(List(Str) xs, List(Str) gone, Int i, ListBuf(Str) acc) {
+    if (i >= xs.len()) { return acc.finish(); }
+    return remove_all(xs, gone, i + 1, if (has_str(gone, xs[i], 0)) { acc } else { acc.push(xs[i]) });
+}
+
+pub Bool has_str(List(Str) xs, Str s, Int i) {
+    if (i >= xs.len()) { return false; }
+    return xs[i] == s || has_str(xs, s, i + 1);
+}

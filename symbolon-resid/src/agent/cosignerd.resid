@@ -32,7 +32,7 @@ import "clock.resid";
 
 pub type Cosigner = { Str dir; CosignerConfig cfg; List(Secret(UInt(8))) root; };
 
-Endpoint relay_of(CosignerConfig c) { return Endpoint {.host = c.relay_host, .port = c.relay_port, .ca = c.ca}; }
+Endpoint relay_of(CosignerConfig c) { return Endpoint {.host = c.relay_host, .port = c.relay_port, .ca = c.ca, .token = ""}; }
 
 @requires(declassify)
 List(Secret(UInt(8))) cos_dk(List(Secret(UInt(8))) root) { return software_key(root, "symbolon v1 cosigner dk"); }

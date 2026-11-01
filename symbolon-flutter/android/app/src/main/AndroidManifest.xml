@@ -53,6 +53,8 @@
                 android:name="android.credentials.provider"
                 android:resource="@xml/credential_provider" />
         </service>
+        <!-- Managed configuration from an organization's device management (SPEC 29.9). -->
+        <meta-data android:name="android.content.APP_RESTRICTIONS" android:resource="@xml/app_restrictions" />
         <!-- Don't delete the meta-data below.
              This is used by the Flutter tool to generate GeneratedPluginRegistrant.java -->
         <meta-data

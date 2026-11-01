@@ -1,0 +1,154 @@
+// An S3-compatible object store client for the relay's storage (SPEC
+// 29.9): GET, PUT (with If-None-Match: * for objects written once),
+// ListObjectsV2, path-style, signed with AWS Signature Version 4.
+
+import "crypto.resid";
+import "clock.resid";
+import "tlsclient.resid";
+import "services.resid";
+
+// `ca`: the PEM trust anchor for HTTPS; "" speaks plain HTTP (a store on
+// the relay's private network, or tests).
+pub type S3Cfg = { Str host; Int port; Str ca; Str bucket; Str region; Str key_id; Str secret; };
+
+// s3://KEY-ID:SECRET@HOST:PORT/BUCKET?region=REGION
+pub Option(S3Cfg) s3_url(Str u, Str ca) {
+    if (!str_starts_with(u, "s3://")) { return None; }
+    Str rest = str_slice(u, 5, str_len(u));
+    Int at = str_index_of(rest, "@", 0);
+    Int q = str_index_of(rest, "?", 0);
+    Str main = if (q < 0) { rest } else { str_slice(rest, 0, q) };
+    Str region0 = if (q < 0) { "" } else { qparam(str_slice(rest, q + 1, str_len(rest)), "region") };
+    if (at < 0) { return None; }
+    Str cred = str_slice(main, 0, at);
+    Str hpb = str_slice(main, at + 1, str_len(main));
+    Int colon = str_index_of(cred, ":", 0);
+    Int slash = str_index_of(hpb, "/", 0);
+    if (colon < 0 || slash < 0) { return None; }
+    Str hp = str_slice(hpb, 0, slash);
+    Int pc = str_index_of(hp, ":", 0);
+    return Some(S3Cfg {.host = if (pc < 0) { hp } else { str_slice(hp, 0, pc) }, .port = if (pc < 0) { if (str_len(ca) > 0) { 443 } else { 80 } } else { str_parse_int(str_slice(hp, pc + 1, str_len(hp))) },
+                       .ca = ca, .bucket = str_slice(hpb, slash + 1, str_len(hpb)), .region = if (str_len(region0) == 0) { "us-east-1" } else { region0 },
+                       .key_id = str_slice(cred, 0, colon), .secret = str_slice(cred, colon + 1, str_len(cred))});
+}
+
+Str qparam(Str q, Str k) { return qp_in(str_split(q, "&"), k + "=", 0); }
+Str qp_in(List(Str) xs, Str k, Int i) {
+    if (i >= xs.len()) { return ""; }
+    if (str_starts_with(xs[i], k)) { return str_slice(xs[i], str_len(k), str_len(xs[i])); }
+    return qp_in(xs, k, i + 1);
+}
+
+// ─── Time ───────────────────────────────────────────────────────
+
+// Days since 1970-01-01 to a civil date (Howard Hinnant's algorithm).
+pub List(Int) civil(Int days) {
+    Int z = days + 719468;
+    Int era = (if (z >= 0) { z } else { z - 146096 }) / 146097;
+    Int doe = z - era * 146097;
+    Int yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    Int doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    Int mp = (5 * doy + 2) / 153;
+    Int d = doy - (153 * mp + 2) / 5 + 1;
+    Int m = if (mp < 10) { mp + 3 } else { mp - 9 };
+    return [yoe + era * 400 + (if (m <= 2) { 1 } else { 0 }), m, d];
+}
+
+// YYYYMMDDTHHMMSSZ
+pub Str amz_date(Int t) {
+    List(Int) c = civil(t / 86400);
+    Int s = t % 86400;
+    return f"{c[0]:zero, width 4}{c[1]:zero, width 2}{c[2]:zero, width 2}T{s / 3600:zero, width 2}{(s % 3600) / 60:zero, width 2}{s % 60:zero, width 2}Z";
+}
+
+// ─── Signature Version 4 ────────────────────────────────────────
+
+List(Int) asc(Str s) { return str_to_bytes(s); }
+
+// RFC 3986 unreserved kept; everything else %XX (and "/" too unless `path`).
+pub Str uri_encode(Str s, Bool path) { return enc_at(asc(s), 0, path, StrBuf()); }
+
+Str enc_at(List(Int) b, Int i, Bool path, StrBuf acc) {
+    if (i >= b.len()) { return acc.finish(); }
+    Int c = b[i];
+    Bool keep = (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c == 45 || c == 46 || c == 95 || c == 126 || (path && c == 47);
+    return enc_at(b, i + 1, path, if (keep) { acc.push_char(c) } else { acc.push("%" + str_to_upper(hex_encode([c]))) });
+}
+
+pub List(Int) signing_key(Str secret, Str date, Str region) {
+    return hmac_sha256_bytes(hmac_sha256_bytes(hmac_sha256_bytes(hmac_sha256_bytes(asc("AWS4" + secret), asc(date)), asc(region)), asc("s3")), asc("aws4_request"));
+}
+
+// The Authorization header's value for a request with these canonical
+// parts (headers host, x-amz-content-sha256, x-amz-date signed).
+pub Str sigv4(S3Cfg c, Str method, Str path, Str query, Str host, Str payload_hash, Str when) {
+    Str date = str_slice(when, 0, 8);
+    Str canonical = method + "\n" + path + "\n" + query + "\nhost:" + host + "\nx-amz-content-sha256:" + payload_hash + "\nx-amz-date:" + when
+                  + "\n\nhost;x-amz-content-sha256;x-amz-date\n" + payload_hash;
+    Str scope = date + "/" + c.region + "/s3/aws4_request";
+    Str to_sign = "AWS4-HMAC-SHA256\n" + when + "\n" + scope + "\n" + hex_encode(sha256_bytes(asc(canonical)));
+    return "AWS4-HMAC-SHA256 Credential=" + c.key_id + "/" + scope + ", SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature="
+         + hex_encode(hmac_sha256_bytes(signing_key(c.secret, date, c.region), asc(to_sign)));
+}
+
+// One signed request; `query` already canonical (sorted, encoded).
+@requires(network, clock(readonly), declassify)
+pub HttpOut s3_call(S3Cfg c, Str method, Str key, Str query, Str extra, List(Int) body) {
+    Str path = "/" + uri_encode(c.bucket, false) + "/" + uri_encode(key, true);
+    // The Host header each transport sends: http_call_head the bare host,
+    // the TLS client host:port.
+    Str host = if (str_len(c.ca) == 0) { c.host } else { c.host + ":" + f"{c.port}" };
+    Str ph = hex_encode(sha256_bytes(body));
+    Str when = amz_date(clock_now_seconds());
+    Str heads = "Authorization: " + sigv4(c, method, path, query, host, ph, when) + "\r\nx-amz-content-sha256: " + ph + "\r\nx-amz-date: " + when + "\r\n" + extra;
+    Str target = path + (if (str_len(query) == 0) { "" } else { "?" + query });
+    if (str_len(c.ca) == 0) { return http_call_head(c.host, c.port, method, target, heads, body); }
+    HttpsGet g = tls_https_request("https://" + host + target, "", trust_store_add_pem(trust_store_empty(), c.ca), ["http/1.1"], 30000, method, heads, body);
+    return HttpOut {.status = g.status, .body = g.bytes};
+}
+
+@requires(network, clock(readonly), declassify)
+pub Option(List(Int)) s3_get(S3Cfg c, Str key) {
+    HttpOut o = s3_call(c, "GET", key, "", "", []);
+    return if (o.status == 200) { Some(o.body) } else { None };
+}
+
+@requires(network, clock(readonly), declassify)
+pub Bool s3_put(S3Cfg c, Str key, List(Int) b) { return s3_call(c, "PUT", key, "", "", b).status == 200; }
+
+// 1 stored, 0 there already (412), -1 failed.
+@requires(network, clock(readonly), declassify)
+pub Int s3_put_new(S3Cfg c, Str key, List(Int) b) {
+    Int st = s3_call(c, "PUT", key, "", "If-None-Match: *\r\n", b).status;
+    return if (st == 200) { 1 } else { if (st == 412 || st == 409) { 0 } else { -1 } };
+}
+
+// The keys under `prefix` after `after`, in order, every page.
+@requires(network, clock(readonly), declassify)
+pub List(Str) s3_list(S3Cfg c, Str prefix, Str after, Int max) { return list_pages(c, prefix, after, "", max, []); }
+
+@requires(network, clock(readonly), declassify)
+List(Str) list_pages(S3Cfg c, Str prefix, Str after, Str token, Int max, List(Str) acc) {
+    Str q = (if (str_len(token) > 0) { "continuation-token=" + uri_encode(token, false) + "&" } else { "" }) + "list-type=2&prefix=" + uri_encode(prefix, false)
+          + (if (str_len(after) > 0 && str_len(token) == 0) { "&start-after=" + uri_encode(after, false) } else { "" });
+    HttpOut o = s3_call(c, "GET", "", q, "", []);
+    if (o.status != 200) { return acc; }
+    Str x = http_text(o.body, 0, o.body.len());
+    List(Str) keys = acc.concat(tags(x, "Key", 0, ListBuf()));
+    Str next = tag(x, "NextContinuationToken");
+    return if (str_len(next) > 0 && tag(x, "IsTruncated") == "true" && keys.len() < max) { list_pages(c, prefix, after, next, max, keys) } else { keys };
+}
+
+// The text of each <name>...</name> in `x` (XML entities &amp; &lt; &gt; undone).
+List(Str) tags(Str x, Str name, Int from, ListBuf(Str) acc) {
+    Int a = str_index_of(x, "<" + name + ">", from);
+    if (a < 0) { return acc.finish(); }
+    Int s = a + str_len(name) + 2;
+    Int e = str_index_of(x, "</" + name + ">", s);
+    if (e < 0) { return acc.finish(); }
+    return tags(x, name, e, acc.push(unxml(str_slice(x, s, e))));
+}
+
+Str tag(Str x, Str name) { List(Str) t = tags(x, name, 0, ListBuf()); return if (t.len() > 0) { t[0] } else { "" }; }
+
+Str unxml(Str s) { return str_replace(str_replace(str_replace(s, "&lt;", "<"), "&gt;", ">"), "&amp;", "&"); }

@@ -43,7 +43,7 @@ Int dk_handle() { return 0x81000111; }
 Int unlock_a_handle() { return 0x81000112; }
 Int unlock_b_handle() { return 0x81000113; }
 
-pub Endpoint relay_ep(DeviceConfig c) { return Endpoint {.host = c.relay_host, .port = c.relay_port, .ca = c.ca}; }
+pub Endpoint relay_ep(DeviceConfig c) { return Endpoint {.host = c.relay_host, .port = c.relay_port, .ca = c.ca, .token = ""}; }
 
 pub Int dfail(Str m) { eprintln("device: " + m); return 1; }
 
@@ -356,7 +356,7 @@ List(WitnessCosignature) cosigs(List(WitnessEp) ws, Str ca, List(Int) l, Int i, 
 @requires(network, clock(readonly), declassify)
 pub List(WitnessCosignature) cosigs_for(List(WitnessEp) ws, Str ca, List(Int) l, UInt(64) seq, List(Int) d, Int i, List(WitnessCosignature) acc) {
     if (i >= ws.len()) { return acc; }
-    Option(WitnessCosignature) c = cosign_from(Endpoint {.host = ws[i].host, .port = ws[i].port, .ca = ca}, ws[i].key, l, seq, d);
+    Option(WitnessCosignature) c = cosign_from(Endpoint {.host = ws[i].host, .port = ws[i].port, .ca = ca, .token = ""}, ws[i].key, l, seq, d);
     return cosigs_for(ws, ca, l, seq, d, i + 1, match c { Some(x) => acc.concat([x]), None => acc });
 }
 

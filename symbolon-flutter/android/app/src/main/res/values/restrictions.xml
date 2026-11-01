@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="r_org_id">Organization id</string>
+    <string name="r_org_id_desc">The organization\'s id (32 hex digits)</string>
+    <string name="r_founder">Organization founder</string>
+    <string name="r_founder_desc">The founder\'s log id (64 hex digits); it binds the organization\'s id</string>
+    <string name="r_code">Invite code</string>
+    <string name="r_code_desc">An invite code for this person (32 hex digits), from org invite</string>
+    <string name="r_duress">No duress PIN</string>
+    <string name="r_duress_desc">Hide the duress PIN setting, as the organization\'s policy forbids it</string>
+</resources>

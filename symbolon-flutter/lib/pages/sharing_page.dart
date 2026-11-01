@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import '../app.dart';
+import '../managed.dart';
 import '../vault_types.dart' show unhex;
 import '../widgets.dart';
 import 'vault_page.dart';
@@ -288,9 +289,12 @@ class _PeoplePageState extends State<PeoplePage> {
     if (r != null && r.ok && mounted) setState(() => duress = on);
   }
 
+  bool noDuress = false;   // the organization's device management hides the duress choice
+
   @override
   void initState() {
     super.initState();
+    ManagedConfig.read().then((m) { if (mounted) setState(() => noDuress = m.noDuress); });
     WidgetsBinding.instance.addPostFrameCallback((_) => load());
   }
 
@@ -422,7 +426,7 @@ class _PeoplePageState extends State<PeoplePage> {
           ] else
             Text('Only the owner adds or removes people.', style: t.bodySmall),
           const SizedBox(height: 16),
-          SwitchListTile(
+          if (!noDuress) SwitchListTile(
             key: const Key('share-duress'),
             contentPadding: EdgeInsets.zero,
             value: duress,

@@ -21,5 +21,6 @@ echo "tests/tpm_e2e.sh: $(tests/tpm_e2e.sh 2>&1 | grep -E "PASS|FAIL|SKIP" | hea
 echo "tests/home_e2e.sh: $(tests/home_e2e.sh 2>&1 | grep -E "PASS|FAIL" | head -1)"
 echo "tests/share_e2e.sh: $(tests/share_e2e.sh 2>&1 | grep -E "PASS|FAIL" | head -1)"
 echo "tests/org_e2e.sh: $(tests/org_e2e.sh 2>&1 | grep -E "PASS|FAIL" | head -1)"
+echo "tests/store_e2e.sh: $(tests/store_e2e.sh 2>&1 | grep -E "PASS|FAIL" | head -1)"
 echo "tests/rotate_e2e.sh: $(tests/rotate_e2e.sh 2>&1 | grep -E "PASS|FAIL|SKIP" | head -1)"
 exit $fail
