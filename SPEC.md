@@ -1,6 +1,6 @@
 # Symbolon: A Credential Agent for Continuity of Control
 
-**Draft 2 -- 2026-10-12 (red-team revision, see Appendix A). Confidential (see NOTICE.md).**
+**Draft 2 -- 2026-10-12 (red-team revision, see Appendix A).**
 
 ## Abstract
 

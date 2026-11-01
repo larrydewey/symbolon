@@ -4,7 +4,7 @@ A *symbolon* was a token broken in two: each party kept one half, and
 the halves fitting together proved who was who, with nothing secret said
 aloud. That is the idea here.
 
-Symbolon is the design of a **credential agent** built around continuity
+Symbolon is a **credential agent** built around continuity
 of control. It speaks ordinary passkeys to every site, but behind each
 passkey is a threshold key: any quorum of the person's devices, recovery
 kit and an optional blind cosigner signs together, and no single device,
@@ -16,19 +16,24 @@ bound sessions, minimal and verifier-constrained disclosure of attributes,
 and a legacy password vault designed against the malicious-server attacks
 published in 2025-2026.
 
-The reference implementation is planned in
-[Resid](https://github.com/larrydewey/Resid), whose secret types,
-capability checks, attestation verifier and TPM access carry much of the
-design's enforcement.
+The implementation is in [Resid](https://github.com/larrydewey/Resid),
+whose secret types, capability checks, attestation verifier and TPM
+access carry much of the design's enforcement.
 
 ## Status
 
-Draft design. No code yet. **Confidential: see [NOTICE.md](NOTICE.md)
-before sharing anything in this repository.**
+v0.1.0: the agent, relay, witnesses and cosigner, Symbolon Home (a
+self-hosted box for a household) and organizations for companies, with an
+Android and Linux app. See the
+[releases](https://github.com/larrydewey/symbolon/releases).
 
-## Documents
+## Layout
 
-- [SPEC.md](SPEC.md) -- the formal specification (draft 2, with its red-team audit in Appendix A).
-- [PRIOR-ART.md](PRIOR-ART.md) -- what already exists, component by
-  component, with sources, and an honest account of what may be new.
-- [NOTICE.md](NOTICE.md) -- confidentiality and intellectual-property notes.
+- [SPEC.md](SPEC.md) -- the specification, with its red-team audit in Appendix A.
+- [symbolon-resid](symbolon-resid) -- the agent and servers, in Resid.
+- [symbolon-flutter](symbolon-flutter) -- the app (Android, Linux).
+- [symbolon-home](symbolon-home) -- Symbolon Home's container build.
+
+## License
+
+MIT; see [LICENSE](LICENSE).
