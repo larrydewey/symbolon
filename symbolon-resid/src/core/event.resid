@@ -1,0 +1,121 @@
+// Identity-log event payloads as bytes (SPEC Sections 7, 8.1).
+//
+// Deterministic CBOR (RFC 8949 Section 4.2.1): definite lengths, shortest
+// heads, map keys in ascending order of their encodings. Public keys are
+// held as SEC1 uncompressed points (65 bytes) and written as COSE_Key EC2
+// P-256 maps {1: 2, -1: 1, -2: x, -3: y}. The signed bytes of an event are
+// this payload encoding (src/core/log.resid verifies signatures over it).
+
+import "../types.resid";
+import "cose.resid";
+
+List(Int) cb_null(List(Int) acc) { return cbe_head(7, 22, acc); }
+List(Int) cb_bool(Bool b, List(Int) acc) { return cbe_head(7, if (b) { 21 } else { 20 }, acc); }
+
+// COSE_Key for a SEC1 uncompressed P-256 point, or None for any other length.
+pub Option(List(Int)) cose_key(List(Int) pt, List(Int) acc) {
+    if (pt.len() != 65 || pt[0] != 4) { return None; }
+    List(Int) a = cbe_uint(2, cbe_uint(1, cbe_map(4, acc)));
+    List(Int) b = cbe_uint(1, cbe_int(-1, a));
+    List(Int) c = cbe_bytes(pt[1..33], cbe_int(-2, b));
+    return Some(cbe_bytes(pt[33..65], cbe_int(-3, c)));
+}
+
+Option(List(Int)) attestation_ref(AttestationRef a, List(Int) acc) {
+    return match a {
+        NoAttestation => Some(cb_null(acc)),
+        Attested(d) => Some(cbe_bytes(d.digest, cbe_uint(2, cbe_text(d.format, cbe_uint(1, cbe_map(2, acc))))))
+    };
+}
+
+pub Option(List(Int)) party_cbor(Party p, List(Int) acc) {
+    List(Int) a = cbe_uint(p.kind, cbe_uint(2, cbe_bytes(p.id, cbe_uint(1, cbe_map(6, acc)))));
+    List(Int) b = cose_key(p.auth_key, cbe_uint(3, a))?;
+    List(Int) c = cose_key(p.hpke_key, cbe_uint(4, b))?;
+    List(Int) d = cbe_text(p.label, cbe_uint(5, c));
+    return attestation_ref(p.attestation, cbe_uint(6, d));
+}
+
+Option(List(Int)) parties_cbor(List(Party) ps, Int i, List(Int) acc) {
+    if (i >= ps.len()) { return Some(acc); }
+    return parties_cbor(ps, i + 1, party_cbor(ps[i], acc)?);
+}
+
+pub Option(List(Int)) quorum_cbor(Quorum q, List(Int) acc) {
+    List(Int) a = parties_cbor(q.parties, 0, cbe_array(q.parties.len(), cbe_uint(1, cbe_map(5, acc))))?;
+    List(Int) b = cbe_uint(q.t, cbe_uint(2, a));
+    List(Int) c = cose_key(q.root_pubkey, cbe_uint(3, b))?;
+    return Some(cbe_bytes(q.transcript_digest, cbe_uint(5, cbe_uint((Int)q.epoch, cbe_uint(4, c)))));
+}
+
+List(Int) bytes_list(List(List(Int)) xs, Int i, List(Int) acc) {
+    if (i >= xs.len()) { return acc; }
+    return bytes_list(xs, i + 1, cbe_bytes(xs[i], acc));
+}
+
+Option(List(Int)) witnesses_cbor(List(WitnessRef) ws, Int i, List(Int) acc) {
+    if (i >= ws.len()) { return Some(acc); }
+    List(Int) a = cbe_text(ws[i].url, cbe_uint(1, cbe_map(2, acc)));
+    return witnesses_cbor(ws, i + 1, cose_key(ws[i].key, cbe_uint(2, a))?);
+}
+
+List(Int) cosigner_policy_cbor(CosignerPolicy c, List(Int) acc) {
+    return match c {
+        NoCosignerPolicy => cb_null(acc),
+        // Field 2 is reserved (draft 1); it is written false.
+        CosignerLimit(n) => cb_bool(false, cbe_uint(2, cbe_uint((Int)n, cbe_uint(1, cbe_map(2, acc)))))
+    };
+}
+
+pub Option(List(Int)) policy_cbor(Policy p, List(Int) acc) {
+    List(Int) a = cbe_uint(p.device_sigs_for_authority, cbe_uint(1, cbe_map(7, acc)));
+    List(Int) b = cbe_uint((Int)p.recovery_delay_sec, cbe_uint(2, a));
+    List(Int) c = bytes_list(p.guardians, 0, cbe_array(p.guardians.len(), cbe_uint(3, b)));
+    List(Int) d = cbe_uint(p.guardian_threshold, cbe_uint(4, c));
+    List(Int) e = witnesses_cbor(p.witnesses, 0, cbe_array(p.witnesses.len(), cbe_uint(5, d)))?;
+    List(Int) f = cbe_uint((Int)p.duress_window_sec, cbe_uint(6, e));
+    return Some(cosigner_policy_cbor(p.cosigner_policy, cbe_uint(7, f)));
+}
+
+// The guardian approvals are COSE_Sign1 encodings, written in place as CBOR
+// items.
+List(Int) raw_items(List(List(Int)) xs, Int i, List(Int) acc) {
+    if (i >= xs.len()) { return acc; }
+    return raw_items(xs, i + 1, acc.concat(xs[i]));
+}
+
+pub Option(List(Int)) recover_body_cbor(RecoverBodyInner r, List(Int) acc) {
+    List(Int) a = parties_cbor(r.new_parties, 0, cbe_array(r.new_parties.len(), cbe_uint(r.path, cbe_array(4, acc))))?;
+    Option(List(Int)) rk = r.revealed_recovery_key;
+    List(Int) b = match rk { None => Some(cb_null(a)), Some(k) => cose_key(k, a) }?;
+    return Some(raw_items(r.guardian_approvals, 0, cbe_array(r.guardian_approvals.len(), b)));
+}
+
+pub Option(List(Int)) body_cbor(EventBody b, List(Int) acc) {
+    return match b {
+        InceptionBody(q, p) => policy_cbor(p, quorum_cbor(q, cbe_uint(0, cbe_array(3, acc)))?),
+        ProposePartyBody(p, t) => Some(cbe_bytes(t, party_cbor(p, cbe_uint(1, cbe_array(3, acc)))?)),
+        RemovePartyBody(id) => Some(cbe_bytes(id, cbe_uint(2, cbe_array(2, acc)))),
+        ReshareBody(q) => quorum_cbor(q, cbe_uint(3, cbe_array(2, acc))),
+        SetPolicyBody(p) => policy_cbor(p, cbe_uint(4, cbe_array(2, acc))),
+        RotateRecoveryBody => Some(cbe_uint(5, cbe_array(1, acc))),
+        RecoverBody(r) => recover_body_cbor(r, cbe_uint(6, cbe_array(2, acc))),
+        VetoBody(seq) => Some(cbe_uint((Int)seq, cbe_uint(7, cbe_array(2, acc)))),
+        MigrateBody(s) => Some(cbe_uint(s, cbe_uint(10, cbe_array(2, acc))))
+    };
+}
+
+List(Int) opt_bytes(Option(List(Int)) o, List(Int) acc) {
+    return match o { None => cb_null(acc), Some(b) => cbe_bytes(b, acc) };
+}
+
+// The event payload, the bytes every party signs and the log hashes.
+pub Option(List(Int)) payload_cbor(EventPayload p) {
+    List(Int) a = opt_bytes(p.log_id, cbe_uint(1, cbe_map(7, [])));
+    List(Int) b = cbe_uint((Int)p.sequence, cbe_uint(2, a));
+    List(Int) c = opt_bytes(p.predecessor_digest, cbe_uint(3, b));
+    List(Int) d = cbe_uint(p.suite, cbe_uint(4, c));
+    List(Int) e = body_cbor(p.body, cbe_uint(5, d))?;
+    List(Int) f = bytes_list(p.next_recovery_key_digests, 0, cbe_array(p.next_recovery_key_digests.len(), cbe_uint(6, e)));
+    return Some(cbe_uint((Int)p.advisory_time, cbe_uint(7, f)));
+}

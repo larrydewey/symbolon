@@ -1,0 +1,282 @@
+// Symbolon local unlock and duress (SPEC Sections 9, 14).
+//
+// A device holds two sealed blobs and one update slot, always, whether or
+// not a duress PIN exists (SPEC 9.2):
+//
+//   blob_i = iv (12) || AES-256-GCM(unlock_key_i, iv, profile (4096), aad)
+//   slot   = enc (65) || HPKE ciphertext of a duress profile (4096 + 16)
+//
+// The real PIN's unlock key opens the real profile; the duress PIN's, the
+// duress profile; a device without a duress PIN has a random second blob.
+// Unlocking tries both blobs with the derived key, always both, so the
+// unseal work does not depend on which one opens. The real profile keeps the
+// duress profile current by writing the slot to the duress HPKE public key,
+// which it can do without being able to read the duress profile; without a
+// duress PIN it writes random bytes of the same size on the same schedule.
+//
+// The duress profile holds the device's share, the duress DK sub-key, the
+// duress vault key and the subset's tweaks -- never the chain code (A-06).
+// Containment itself is the cosigner's (src/cosigner/cosigner.resid).
+
+import "../types.resid";
+import "../vault/vault.resid";
+import "argon2g.resid";
+import "sha256g.resid";
+import "word.resid";
+import "hpkeg.resid";
+import "hpke.resid";
+import "crypto.resid";
+
+pub Int profile_len() { return 4096; }
+pub Int max_subset() { return 32; }
+pub Int blob_len() { return 12 + profile_len() + 16; }
+pub Int slot_len() { return 65 + profile_len() + 16; }
+
+// SPEC 6.1 names Argon2id m = 256 MiB, t = 3, p = 1. Until the Resid
+// Argon2id's compression function is fast enough (it works on byte lists:
+// 64 MiB, t = 3 takes about 50 s), new devices use OWASP's minimum, m = 19 MiB,
+// t = 2 (about 9 s and 0.6 GB a stretch). Each device records its own
+// parameters in its configuration, so raising these later leaves existing
+// devices working.
+pub Int argon_m_kib() { return 19456; }
+pub Int argon_t() { return 2; }
+
+// ============================================================================
+// Unlock (SPEC 9.1)
+// ============================================================================
+
+// pin_stretch = Argon2id(pin, salt_local, m, t, p = 1), 32 bytes. `m_kib`
+// and `t` are the SPEC's values in use (argon_m_kib, argon_t); tests pass
+// smaller ones.
+@requires(declassify)
+pub List(Secret(UInt(8))) pin_stretch(List(Secret(UInt(8))) pin, List(Int) salt_local, Int m_kib, Int t) {
+    List(Secret(UInt(8))) none = [];
+    return argon2id(pin, salt_local, none, [], 1, m_kib, t, 32);
+}
+
+// unlock_key = HKDF(hw_secret, salt_local, "symbolon v1 unlock", 32). On the
+// unprotected-device profile hw_secret is pin_stretch itself.
+pub List(Secret(UInt(8))) unlock_key(List(Secret(UInt(8))) hw_secret, List(Int) salt_local) {
+    return hkdf256g_expand(hkdf256g_extract(secret_bytes(salt_local), hw_secret), secret_bytes(utf8("symbolon v1 unlock")), 32);
+}
+
+// ============================================================================
+// Profiles
+// ============================================================================
+
+pub type RealProfile = {
+    List(Secret(UInt(8))) share;          // 32
+    List(Secret(UInt(8))) cc;             // 32
+    List(Secret(UInt(8))) vault_key;      // 32
+    List(Secret(UInt(8))) dek;            // 32
+    List(Int) duress_hpke_pub;            // 65, or [] without a duress PIN
+};
+
+pub type SubsetTweak = { List(Int) cid; List(Secret(UInt(8))) tau; };   // 32 + 32
+
+pub type DuressFull = {
+    List(Secret(UInt(8))) share;
+    List(Secret(UInt(8))) subkey;         // duress DK sub-key (P-256 scalar)
+    List(Secret(UInt(8))) vault_key;      // the duress subset's vault key
+    List(Secret(UInt(8))) hpke_priv;      // reads the update slot
+    List(SubsetTweak) tweaks;
+};
+
+// Layout, 4096 bytes: kind (1: real, 2: duress) || fields || zero padding.
+//   real:   share 32 | cc 32 | vault 32 | dek 32 | has-duress 1 | duress pub 65
+//   duress: share 32 | subkey 32 | vault 32 | hpke 32 | count 1 | count x (cid 32 | tau 32)
+
+List(Secret(UInt(8))) zeros(Int n, ListBuf(Secret(UInt(8))) acc) {
+    if (n <= 0) { return acc.finish(); }
+    return zeros(n - 1, acc.push(classify((UInt(8)) 0)));
+}
+
+ListBuf(Secret(UInt(8))) put(ListBuf(Secret(UInt(8))) acc, List(Secret(UInt(8))) xs, Int i) {
+    if (i >= xs.len()) { return acc; }
+    return put(acc.push(xs[i]), xs, i + 1);
+}
+
+ListBuf(Secret(UInt(8))) put_pub(ListBuf(Secret(UInt(8))) acc, List(Int) xs, Int i) {
+    if (i >= xs.len()) { return acc; }
+    return put_pub(acc.push(classify(wrapping_u8(xs[i]))), xs, i + 1);
+}
+
+List(Secret(UInt(8))) pad_to(ListBuf(Secret(UInt(8))) acc, Int have) {
+    List(Secret(UInt(8))) body = acc.finish();
+    return body.concat(zeros(profile_len() - have, ListBuf()));
+}
+
+pub Option(List(Secret(UInt(8)))) encode_real(RealProfile p) {
+    if (p.share.len() != 32 || p.cc.len() != 32 || p.vault_key.len() != 32 || p.dek.len() != 32) { return None; }
+    Bool has = p.duress_hpke_pub.len() == 65;
+    if (!has && p.duress_hpke_pub.len() != 0) { return None; }
+    ListBuf(Secret(UInt(8))) a = put(put(put(put(put_pub(ListBuf(), [1], 0), p.share, 0), p.cc, 0), p.vault_key, 0), p.dek, 0);
+    ListBuf(Secret(UInt(8))) b = put_pub(put_pub(a, [if (has) { 1 } else { 0 }], 0), if (has) { p.duress_hpke_pub } else { rep0(65) }, 0);
+    return Some(pad_to(b, 1 + 128 + 1 + 65));
+}
+
+List(Int) rep0(Int n) { return if (n <= 0) { [] } else { [0].concat(rep0(n - 1)) }; }
+
+ListBuf(Secret(UInt(8))) put_tweaks(ListBuf(Secret(UInt(8))) acc, List(SubsetTweak) ts, Int i) {
+    if (i >= ts.len()) { return acc; }
+    return put_tweaks(put(put_pub(acc, ts[i].cid, 0), ts[i].tau, 0), ts, i + 1);
+}
+
+Bool tweaks_ok(List(SubsetTweak) ts, Int i) {
+    if (i >= ts.len()) { return true; }
+    if (ts[i].cid.len() != 32 || ts[i].tau.len() != 32) { return false; }
+    return tweaks_ok(ts, i + 1);
+}
+
+pub Option(List(Secret(UInt(8)))) encode_duress(DuressFull d) {
+    if (d.share.len() != 32 || d.subkey.len() != 32 || d.vault_key.len() != 32 || d.hpke_priv.len() != 32) { return None; }
+    if (d.tweaks.len() > max_subset() || !tweaks_ok(d.tweaks, 0)) { return None; }
+    ListBuf(Secret(UInt(8))) a = put(put(put(put(put_pub(ListBuf(), [2], 0), d.share, 0), d.subkey, 0), d.vault_key, 0), d.hpke_priv, 0);
+    ListBuf(Secret(UInt(8))) b = put_tweaks(put_pub(a, [d.tweaks.len()], 0), d.tweaks, 0);
+    return Some(pad_to(b, 1 + 128 + 1 + 64 * d.tweaks.len()));
+}
+
+// What unlocking gives: kind 1 real, 2 duress, 0 neither (the other record
+// is empty). A sum type cannot carry secrets, so both records are present.
+// `st` is the stretched PIN that opened it (the device key's TPM authValue),
+// kept so that one operation stretches the PIN once (empty when unknown).
+pub type Unlocked = { Int kind; RealProfile real; DuressFull duress; List(Secret(UInt(8))) st; };
+
+pub Unlocked with_stretched(Unlocked u, List(Secret(UInt(8))) st) { return Unlocked {.kind = u.kind, .real = u.real, .duress = u.duress, .st = st}; }
+
+RealProfile real_none() { return RealProfile {.share = [], .cc = [], .vault_key = [], .dek = [], .duress_hpke_pub = []}; }
+DuressFull duress_none() { return DuressFull {.share = [], .subkey = [], .vault_key = [], .hpke_priv = [], .tweaks = []}; }
+Unlocked locked() { return Unlocked {.kind = 0, .real = real_none(), .duress = duress_none(), .st = []}; }
+
+List(Int) pub_bytes(List(UInt(8)) bs, Int i, ListBuf(Int) acc) {
+    if (i >= bs.len()) { return acc.finish(); }
+    return pub_bytes(bs, i + 1, acc.push((Int)bs[i]));
+}
+
+// The holder of the unlock key learns which profile it opened, and the
+// public parts of it (whether a duress profile exists, its HPKE key, the
+// subset's credential IDs, their count): declassified for that holder only.
+@requires(declassify)
+Int byte_at(List(Secret(UInt(8))) p, Int i) { return (Int)declassify(p[i], "unlocked profile structure"); }
+
+@requires(declassify)
+List(Int) bytes_at(List(Secret(UInt(8))) p, Int from, Int n) {
+    return pub_bytes(declassify(secret_join(p[from..from + n]), "unlocked profile structure"), 0, ListBuf());
+}
+
+@requires(declassify)
+List(SubsetTweak) read_tweaks(List(Secret(UInt(8))) p, Int at, Int n, ListBuf(SubsetTweak) acc) {
+    if (n <= 0) { return acc.finish(); }
+    return read_tweaks(p, at + 64, n - 1, acc.push(SubsetTweak {.cid = bytes_at(p, at, 32), .tau = p[at + 32..at + 64]}));
+}
+
+@requires(declassify, provision)
+pub Unlocked decode_profile(List(Secret(UInt(8))) p) {
+    if (p.len() != profile_len()) { return locked(); }
+    Int kind = byte_at(p, 0);
+    if (kind == 1) {
+        Bool has = byte_at(p, 129) == 1;
+        return Unlocked {.kind = 1, .duress = duress_none(), .st = [], .real = RealProfile {
+            .share = provisioned_key(p[1..33], "a key from the device's sealed profile, drawn by random_secret at setup"), .cc = provisioned_key(p[33..65], "a key from the device's sealed profile, drawn by random_secret at setup"),
+            .vault_key = provisioned_key(p[65..97], "a key from the device's sealed profile, drawn by random_secret at setup"), .dek = provisioned_key(p[97..129], "a key from the device's sealed profile, drawn by random_secret at setup"),
+            .duress_hpke_pub = if (has) { bytes_at(p, 130, 65) } else { [] }}};
+    }
+    if (kind == 2) {
+        Int n = byte_at(p, 129);
+        if (n > max_subset()) { return locked(); }
+        return Unlocked {.kind = 2, .real = real_none(), .st = [], .duress = DuressFull {
+            .share = provisioned_key(p[1..33], "a key from the device's sealed profile, drawn by random_secret at setup"), .subkey = provisioned_key(p[33..65], "a key from the device's sealed profile, drawn by random_secret at setup"),
+            .vault_key = provisioned_key(p[65..97], "a key from the device's sealed profile, drawn by random_secret at setup"), .hpke_priv = provisioned_key(p[97..129], "a key from the device's sealed profile, drawn by random_secret at setup"),
+            .tweaks = read_tweaks(p, 130, n, ListBuf())}};
+    }
+    return locked();
+}
+
+// ============================================================================
+// Blobs (SPEC 9.2)
+// ============================================================================
+
+List(Int) blob_aad() { return utf8("symbolon v1 profile blob"); }
+
+@requires(declassify)
+pub List(Int) seal_blob(List(Secret(UInt(8))) key, List(Int) iv, List(Secret(UInt(8))) profile) {
+    List(Secret(UInt(8))) ct = aes_gcmg_seal(key, iv, profile, blob_aad());
+    return iv.concat(pub_bytes(declassify(secret_join(ct), "AEAD output is public"), 0, ListBuf()));
+}
+
+// A device without a duress PIN stores random bytes of a blob's length.
+pub List(Int) decoy_blob(List(Int) random) { return random; }
+
+@requires(declassify)
+Option(List(Secret(UInt(8)))) open_one(List(Secret(UInt(8))) key, List(Int) blob) {
+    if (blob.len() != blob_len()) { return None; }
+    return aes_gcmg_decrypt(key, blob[0..12], blob[12..blob.len()], blob_aad());
+}
+
+// Tries both blobs, always both, and decodes the one that opens.
+@requires(declassify, provision)
+pub Unlocked unlock(List(Secret(UInt(8))) key, List(Int) blob_a, List(Int) blob_b) {
+    Option(List(Secret(UInt(8)))) a = open_one(key, blob_a);
+    Option(List(Secret(UInt(8)))) b = open_one(key, blob_b);
+    return match a {
+        Some(p) => decode_profile(p),
+        None => match b { Some(p) => decode_profile(p), None => locked() }
+    };
+}
+
+// ============================================================================
+// The update slot (SPEC 9.2, A-21)
+// ============================================================================
+
+pub HpkeSuite slot_suite() { return hpke_suite(16, 1, 2); }
+
+List(Int) slot_info(UInt(32) epoch) { return utf8("symbolon v1 duress update").concat(u64be((UInt(64))epoch)); }
+
+// The real profile writes the current duress profile to the slot.
+@requires(declassify)
+pub Option(List(Int)) seal_slot(List(Int) duress_hpke_pub, UInt(32) epoch, DuressFull d, List(Secret(UInt(8))) ikm_e) {
+    List(Secret(UInt(8))) pt = encode_duress(d)?;
+    List(Secret(UInt(8))) none = [];
+    HpkeSenderG(Secret(UInt(8))) s = hpkeg_setup_sender_full(slot_suite(), duress_hpke_pub, slot_info(epoch), none, [], none, ikm_e);
+    if (!s.ctx.ok) { return None; }
+    HpkeSealedG(Secret(UInt(8))) sealed = hpkeg_seal(s.ctx, [], pt);
+    if (sealed.ct.len() == 0) { return None; }
+    return Some(s.enc.concat(pub_bytes(declassify(secret_join(sealed.ct), "HPKE output is public"), 0, ListBuf())));
+}
+
+// Without a duress PIN, the same write with random content.
+pub List(Int) decoy_slot(List(Int) random) { return random; }
+
+// The duress profile reads the slot; None when it holds nothing for it (a
+// decoy, or an update for another epoch).
+@requires(declassify, provision)
+pub Option(DuressFull) open_slot(List(Secret(UInt(8))) hpke_priv, UInt(32) epoch, List(Int) slot) {
+    if (slot.len() != slot_len()) { return None; }
+    Option(List(Secret(UInt(8)))) pt = hpkeg_open_with(slot_suite(), slot[0..65], hpke_priv, slot_info(epoch), [], slot[65..slot.len()]);
+    return match pt {
+        None => None,
+        Some(p) => duress_of(decode_profile(p))
+    };
+}
+
+Option(DuressFull) duress_of(Unlocked u) { return if (u.kind == 2) { Some(u.duress) } else { None }; }
+
+// The duress profile's tweak for a credential ID, if the credential is in
+// the subset. Outside the subset there is no tweak to find: the duress
+// profile has no chain code to derive one (A-06).
+pub Option(List(Secret(UInt(8)))) subset_tweak(DuressFull d, List(Int) cid, Int i) {
+    if (i >= d.tweaks.len()) { return None; }
+    if (bytes_eq_pub(d.tweaks[i].cid, cid)) { return Some(d.tweaks[i].tau); }
+    return subset_tweak(d, cid, i + 1);
+}
+
+Bool bytes_eq_pub(List(Int) a, List(Int) b) {
+    if (a.len() != b.len()) { return false; }
+    return beq(a, b, 0);
+}
+
+Bool beq(List(Int) a, List(Int) b, Int i) {
+    if (i >= a.len()) { return true; }
+    if (a[i] != b[i]) { return false; }
+    return beq(a, b, i + 1);
+}

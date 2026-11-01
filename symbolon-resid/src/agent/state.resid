@@ -1,0 +1,41 @@
+// What a device and a cosigner keep on disk, besides the sealed profile
+// blobs (src/duress/) and the encrypted CGGMP configuration.
+
+import "../types.resid";
+import "../core/log.resid";
+import "../net/proto.resid";
+
+//@ serial
+pub type WitnessEp = { Str host; Int port; List(Int) key; };
+
+// A device's public configuration (config.cbor).
+//@ serial
+pub type DeviceConfig = {
+    Str relay_host; Int relay_port;
+    Str ca;                              // PEM trust anchor for TLS to the relay and witnesses; "" plain HTTP
+    List(WitnessEp) witnesses;
+    Bool unprotected;                    // SPEC 9.1 unprotected-device profile: no TPM
+    Int argon_m_kib; Int argon_t;
+    List(Int) salt;
+    Int tpm_dk; Int tpm_unlock_a; Int tpm_unlock_b;   // persistent handles (TPM mode)
+    List(Int) party; List(Int) dk_pub; List(Int) hpke_pub;
+    List(Int) log_id;
+    Int mbox_next;
+    List(PartyKeys) peers;               // every party of the quorum, this device included
+};
+
+// One log event as the relay and the devices store it.
+//@ serial
+pub type StoredEvent = { List(Int) encoded; List(EventSig) sigs; List(WitnessCosignature) cosigs; };
+
+// A cosigner's public configuration (cosigner.cbor).
+//@ serial
+pub type CosignerConfig = {
+    Str relay_host; Int relay_port;
+    Str ca;                              // as DeviceConfig.ca
+    List(Int) party; List(Int) dk_pub; List(Int) hpke_pub;
+    List(Int) log_id;                    // empty until inception
+    Int mbox_next;
+    List(PartyKeys) peers;
+    Bool accept_inception;               // the operator allowed one inception
+};

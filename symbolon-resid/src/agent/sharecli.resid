@@ -1,0 +1,1007 @@
+// Shared collections from the command line (SPEC 19): `symbolon device
+// share ...`, and the shared side of `device vault ... --share ID`.
+//
+// A collection is a vault of its own: items sealed under the collection
+// key, at the relay as "coll-<id>" under a head signed by a device of any
+// member. Who is in it is the roster ("roster-<id>"), signed by a device
+// of the owner's log; the key reaches each member device as an HPKE
+// mode_auth wrap ("wrap-<member log>-<id>") from a device of a member.
+// Every key comes from a verified log, never from the relay's word: a
+// member's devices from the member's verified log head, a wrap's sender
+// from the sender's. The relay (on Symbolon Home, the box) could still
+// put a log of its own under a person's name, so people compare
+// fingerprints of each other's log ids out of band (`share me`).
+// Removing a member rotates the key and re-seals every item; a member
+// may leave, and the owner's device then removes them. A device keeps its
+// own sealed copy of each folder's key and items, to read offline and,
+// for the folders the person chose, under the duress PIN.
+
+import "../types.resid";
+import "../core/log.resid";
+import "../vault/vault.resid";
+import "../net/services.resid";
+import "state.resid";
+import "common.resid";
+import "device.resid";
+import "serials.resid";
+import "sharetypes.resid";
+import "vaultcli.resid";
+import "crypto.resid";
+import "ecdsa.resid";
+import "hpkeg.resid";
+import "hpke.resid";
+import "cose.resid";
+import "cbor.resid";
+import "word.resid";
+
+pub List(Int) coll_vid(List(Int) id) { return sha256_bytes(utf8("symbolon v1 collection").concat(id)); }
+
+Str roster_blob(Str cid) { return "roster-" + cid; }
+Str wrap_blob(List(Int) member, Str cid) { return "wrap-" + hex_encode(member) + "-" + cid; }
+Str card_blob(List(Int) l) { return "card-" + hex_encode(l); }
+
+// A collection id: 16 bytes as 32 lower-case hex digits.
+pub Bool share_id_ok(Str s) { return str_len(s) == 32 && lower_hex(s, 0); }
+
+Bool lower_hex(Str s, Int i) {
+    if (i >= str_len(s)) { return true; }
+    Int c = str_char_at(s, i);
+    return ((c >= 48 && c <= 57) || (c >= 97 && c <= 102)) && lower_hex(s, i + 1);
+}
+
+// A log id: 32 bytes as 64 lower-case hex digits.
+Bool log_hex_ok(Str s) { return str_len(s) == 64 && lower_hex(s, 0); }
+
+// What people read to each other to check that a log id is the one they
+// mean: six groups of five digits from a hash of it.
+pub Str fingerprint(List(Int) log_id) { return fp_groups(sha256_bytes(utf8("symbolon v1 fingerprint").concat(log_id)), 0, StrBuf()); }
+
+Str fp_groups(List(Int) h, Int g, StrBuf acc) {
+    if (g >= 6) { return acc.finish(); }
+    Int v = ((h[3 * g] << 16) | (h[3 * g + 1] << 8) | h[3 * g + 2]) % 100000;
+    return fp_groups(h, g + 1, acc.push(if (g > 0) { "-" } else { "" }).push(f"{v:zero, width 5}"));
+}
+
+// An Option as a Result, for `?`.
+Result(T, Str) need(Option(T) o, Str m) { return match o { Some(v) => Ok(v), None => Err(m) }; }
+
+// A command's exit code; its error on standard error.
+Int done(Result(Int, Str) r) { return match r { Ok(v) => v, Err(m) => dfail(m) }; }
+
+// ─── Records ────────────────────────────────────────────────────
+
+Int max_record() { return 1048576; }
+
+Option(Roster) roster_of(List(Int) b) {
+    if (b.len() == 0 || b.len() > max_record() || !cbor_well_formed(b, 8)) { return None; }
+    Result(Roster, SerialError) r = from_cbor(b);
+    return match r { Ok(x) => Some(x), Err(_) => None };
+}
+
+Option(WrapSet) wraps_of(List(Int) b) {
+    if (b.len() == 0 || b.len() > max_record() || !cbor_well_formed(b, 8)) { return None; }
+    Result(WrapSet, SerialError) r = from_cbor(b);
+    return match r { Ok(x) => Some(x), Err(_) => None };
+}
+
+Option(Card) card_of(List(Int) b) {
+    if (b.len() == 0 || b.len() > 4096 || !cbor_well_formed(b, 4)) { return None; }
+    Result(Card, SerialError) r = from_cbor(b);
+    return match r { Ok(x) => Some(x), Err(_) => None };
+}
+
+List(Int) cbor_or_empty(Result(List(Int), SerialError) r) { return match r { Ok(b) => b, Err(_) => [] }; }
+
+Roster roster_signed(Roster r, List(Int) sig) {
+    return Roster {.coll_id = r.coll_id, .version = r.version, .owner = r.owner, .owner_label = r.owner_label, .members = r.members, .name_ct = r.name_ct,
+                   .deleted = r.deleted, .log_sequence = r.log_sequence, .signer = r.signer, .sig = sig};
+}
+
+// What a device signs: a label, then the record's CBOR without the signature.
+List(Int) roster_tbs(Roster r) { return utf8("symbolon v1 roster").concat(cbor_or_empty(to_cbor(roster_signed(r, [])))); }
+
+List(Int) card_tbs(Card k) {
+    Card bare = Card {.log_id = k.log_id, .name = k.name, .log_sequence = k.log_sequence, .signer = k.signer, .sig = []};
+    return utf8("symbolon v1 card").concat(cbor_or_empty(to_cbor(bare)));
+}
+
+List(Int) share_info(List(Int) vid, List(Int) member, UInt(64) version) { return utf8("symbolon v1 share").concat(vid).concat(member).concat(u64be(version)); }
+
+HpkeSuite share_suite() { return hpke_suite(16, 1, 2); }
+
+// ─── Logs and devices ───────────────────────────────────────────
+
+// A log's verified head: this device's own as it has it, another's
+// verified now (events signed by its quorum, witnessed under its policy).
+@requires(network, clock(readonly), declassify)
+Result(VerifiedHead, Str) head_of(DeviceConfig c, VerifiedHead mine, List(Int) l) {
+    if (bytes_eq(l, c.log_id)) { return Ok(mine); }
+    Result(VerifiedHead, SymbolonError) r = verified_log(relay_ep(c), l);
+    return match r { Ok(h) => Ok(h), Err(e) => Err("the log " + str_slice(hex_encode(l), 0, 12) + " does not verify: " + err_text(e)) };
+}
+
+Option(Party) device_party(List(Party) ps, List(Int) id, Int i) {
+    if (i >= ps.len()) { return None; }
+    if (ps[i].kind == party_kind_device() && bytes_eq(ps[i].id, id)) { return Some(ps[i]); }
+    return device_party(ps, id, i + 1);
+}
+
+// The devices of a quorum: not the cosigner (it runs on the box), not the
+// kit or a guardian.
+List(Party) devices_of(List(Party) ps, Int i, ListBuf(Party) acc) {
+    if (i >= ps.len()) { return acc.finish(); }
+    return devices_of(ps, i + 1, if (ps[i].kind == party_kind_device()) { acc.push(ps[i]) } else { acc });
+}
+
+Bool member_in(Roster r, List(Int) l) { return bytes_eq(r.owner, l) || member_at(r.members, l, 0) >= 0; }
+
+Int member_at(List(Member) ms, List(Int) l, Int i) {
+    if (i >= ms.len()) { return -1; }
+    if (bytes_eq(ms[i].log_id, l)) { return i; }
+    return member_at(ms, l, i + 1);
+}
+
+// The owner first, then the members.
+List(List(Int)) people_of(Roster r) { return [r.owner].concat(logs_of(r.members, 0, ListBuf())); }
+
+List(List(Int)) logs_of(List(Member) ms, Int i, ListBuf(List(Int)) acc) {
+    if (i >= ms.len()) { return acc.finish(); }
+    return logs_of(ms, i + 1, acc.push(ms[i].log_id));
+}
+
+// ─── Opening ────────────────────────────────────────────────────
+
+// This device, unlocked, with its own verified log. Under the duress PIN
+// u.kind is 2: the folders chosen for it can be read, nothing changed.
+pub type Ctx = { DeviceConfig c; Unlocked u; VerifiedHead vh; Str pin; };
+
+// The device unlocked by its PIN or its duress PIN, before the network.
+type Dev = { DeviceConfig c; Unlocked u; Str pin; };
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+Result(Dev, Str) unlocked_dev(Str dir) {
+    DeviceConfig c = set_up(dir)?;
+    Str pin = read_pin();
+    Unlocked u = unlock_dir(dir, c, pin);
+    if (u.kind != 1 && u.kind != 2) { return Err("wrong PIN"); }
+    return Ok(Dev {.c = c, .u = u, .pin = pin});
+}
+
+@requires(network, clock(readonly), declassify)
+Result(Ctx, Str) online(Dev d) {
+    Result(VerifiedHead, SymbolonError) rv = verified_log(relay_ep(d.c), d.c.log_id);
+    return match rv { Err(e) => Err(err_text(e)), Ok(vh) => Ok(Ctx {.c = d.c, .u = d.u, .vh = vh, .pin = d.pin}) };
+}
+
+// For a change. Under the duress PIN a change fails as one the relay does
+// not take would (SPEC 14.3: refusals look like faults).
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+Result(Ctx, Str) unlocked(Str dir) {
+    Dev d = unlocked_dev(dir)?;
+    if (d.u.kind != 1) { return Err("the relay refused the change; try again later"); }
+    return online(d);
+}
+
+// Errors that say the folder is gone for this person: the device forgets
+// its copy, and reading does not fall back to it.
+Bool gone(Str m) { return str_contains(m, "deleted this shared folder") || str_contains(m, "not in this shared folder") || str_contains(m, "you left this shared folder"); }
+
+// A roster that verifies: signed by a device of the owner's verified
+// quorum, citing a sequence of it already verified, and no older than any
+// this device saw.
+@requires(filesystem, network, clock(readonly), declassify)
+Result(Roster, Str) roster_at(Str dir, Ctx x, Str cid) {
+    Option(List(Int)) b = blob_get(relay_ep(x.c), roster_blob(cid));
+    List(Int) rb = need(b, "no such shared folder")?;
+    Roster r = need(roster_of(rb), "the shared folder's roster does not decode")?;
+    if (!bytes_eq(r.coll_id, cose_hex_decode(cid))) { return Err("the roster is for another folder"); }
+    VerifiedHead oh = head_of(x.c, x.vh, r.owner)?;
+    if (r.log_sequence > oh.head.sequence) { return Err("the roster cites a log sequence not yet verified"); }
+    Party d = need(device_party(oh.head.quorum.parties, r.signer, 0), "the roster's signer is not a device of the owner")?;
+    if (!ecdsa_verify_raw(P256, Sha256, d.auth_key, roster_tbs(r), r.sig)) { return Err("the roster's signature does not verify"); }
+    Int seen = kept_version(place_local(dir, cid) + ".roster");
+    if ((Int)r.version < seen) { return Err(f"the roster went back to version {r.version} (this device saw {seen})"); }
+    _ = filesystem.write_all(place_local(dir, cid) + ".roster", f"{r.version}");
+    return Ok(r);
+}
+
+// A roster, the collection key and its name.
+pub type Loaded = { Roster r; List(Secret(UInt(8))) key; Str name; };
+
+// The device keeps the key while the folder loads, and forgets it once
+// the folder is gone for this person.
+@requires(filesystem, network, clock(readonly), declassify)
+Result(Loaded, Str) load_share(Str dir, Ctx x, Str cid) {
+    if (!share_id_ok(cid)) { return Err("a shared folder's id is 32 hex digits"); }
+    Roster r = roster_at(dir, x, cid)?;
+    Result(Loaded, Str) rl = loaded(dir, x, r, cid);
+    _ = match rl { Err(m) => if (gone(m)) { forget(dir, cid) } else { true }, Ok(ld) => keep_key(dir, x, ld) };
+    return rl;
+}
+
+@requires(filesystem, network, clock(readonly), declassify)
+Result(Loaded, Str) loaded(Str dir, Ctx x, Roster r, Str cid) {
+    if (r.deleted) { return Err("the owner deleted this shared folder"); }
+    if (!member_in(r, x.c.log_id)) { return Err("you are not in this shared folder"); }
+    if (left(x, r, x.c.log_id)) { return Err("you left this shared folder"); }
+    Result(List(Secret(UInt(8))), Str) rk = if (x.u.kind == 2) { duress_key(dir, x, r) } else { wrapped_key(x, r, cid) };
+    List(Secret(UInt(8))) key = rk?;
+    Result(List(Secret(UInt(8))), SymbolonError) rn = field_open(key, coll_vid(r.coll_id), r.coll_id, r.version, "share", "name", r.name_ct);
+    return match rn {
+        Err(_) => Err("the folder's name does not open under its key"),
+        Ok(n) => Ok(Loaded {.r = r, .key = key, .name = text_of(reveal(n))})
+    };
+}
+
+// Under the duress PIN: the key this device sealed to its duress profile,
+// for the folders the person chose for it.
+@requires(filesystem, declassify)
+Result(List(Secret(UInt(8))), Str) duress_key(Str dir, Ctx x, Roster r) {
+    KeyRec k = need(kept_key(dir, x.u, r.coll_id), "no such shared folder")?;
+    return Ok(k.key);
+}
+
+@requires(network, clock(readonly), declassify)
+Result(List(Secret(UInt(8))), Str) wrapped_key(Ctx x, Roster r, Str cid) {
+    Option(List(Int)) wb = blob_get(relay_ep(x.c), wrap_blob(x.c.log_id, cid));
+    Option(WrapSet) ows = wraps_of(wb else { [] });
+    WrapSet ws = need(ows, "no key for you yet")?;
+    if (ws.roster_version != r.version || !bytes_eq(ws.member, x.c.log_id) || !bytes_eq(ws.coll_id, r.coll_id)) {
+        return Err("no key for this device at the folder's current version yet: a member's device adds it when it next opens the folder");
+    }
+    ShareWrap w = need(wrap_to(ws.wraps, x.c.party, 0), "no key for this device yet: a member's device adds it when it next opens the folder")?;
+    return unwrap(x, r, w);
+}
+
+// ─── This device's copy of a folder's key ───────────────────────
+// share-<id>.key holds the folder's key and what the list shows, sealed
+// under a key from the vault key, for reading offline. share-<id>.dkey
+// holds the same sealed to the duress profile's HPKE key when the person
+// chose the folder for the duress PIN on this device, and otherwise random
+// bytes of the same length: every folder has both files, so they tell no
+// one whether there is a duress profile or what is in its subset.
+
+type KeyRec = { List(Secret(UInt(8))) key; Bool duress; Bool owner; Int people; Str name; };
+
+Int rec_len() { return 32 + 5 + 256; }
+Int key_len() { return 12 + rec_len() + 16; }
+Int dkey_len() { return 65 + rec_len() + 16; }
+
+List(Int) rec_label(List(Int) id) { return utf8("symbolon v1 share record").concat(id); }
+
+List(Int) zeros(Int n, ListBuf(Int) acc) { return if (n <= 0) { acc.finish() } else { zeros(n - 1, acc.push(0)) }; }
+
+List(Secret(UInt(8))) rec_bytes(KeyRec k) {
+    List(Int) n0 = utf8(k.name);
+    List(Int) n = if (n0.len() > 256) { n0[0..256] } else { n0 };
+    List(Int) meta = [(if (k.duress) { 1 } else { 0 }) + (if (k.owner) { 2 } else { 0 }), (k.people >> 8) & 255, k.people & 255, n.len() >> 8, n.len() & 255];
+    return k.key.concat(secret_bytes(meta.concat(n).concat(zeros(256 - n.len(), ListBuf()))));
+}
+
+@requires(declassify)
+Option(KeyRec) rec_of(List(Secret(UInt(8))) pt) {
+    if (pt.len() != rec_len()) { return None; }
+    List(Int) m = reveal(pt[32..rec_len()]);
+    Int nl = (m[3] << 8) | m[4];
+    if (nl > 256) { return None; }
+    return Some(KeyRec {.key = pt[0..32], .duress = (m[0] & 1) == 1, .owner = (m[0] & 2) == 2, .people = (m[1] << 8) | m[2], .name = text_of(m[5..5 + nl])});
+}
+
+List(Secret(UInt(8))) rec_key(Unlocked u) { return hk(u.real.vault_key, "symbolon v1 share record", 32); }
+
+// The record for folder `id`: from .key under the PIN, from .dkey under
+// the duress PIN.
+@requires(filesystem, declassify)
+Option(KeyRec) kept_key(Str dir, Unlocked u, List(Int) id) {
+    Str local = place_local(dir, hex_encode(id));
+    List(Int) b = get_file(local + (if (u.kind == 2) { ".dkey" } else { ".key" }));
+    Option(List(Secret(UInt(8)))) pt = if (u.kind == 2) {
+        if (b.len() != dkey_len()) { None } else { hpkeg_open_with(share_suite(), b[0..65], u.duress.hpke_priv, rec_label(id), [], b[65..b.len()]) }
+    } else {
+        if (b.len() != key_len()) { None } else { aes_gcmg_decrypt(rec_key(u), b[0..12], b[12..b.len()], rec_label(id)) }
+    };
+    return match pt { None => None, Some(p) => rec_of(p) };
+}
+
+@requires(declassify)
+List(Int) dkey_bytes(Unlocked u, List(Int) id, KeyRec k) {
+    if (!k.duress || u.real.duress_hpke_pub.len() == 0) { return random_bytes(dkey_len()); }
+    HpkeMessageG(Secret(UInt(8))) m = hpkeg_seal_to(share_suite(), u.real.duress_hpke_pub, rec_label(id), [], rec_bytes(k));
+    return if (m.ok) { m.enc.concat(reveal(m.ct)) } else { random_bytes(dkey_len()) };
+}
+
+@requires(filesystem, declassify)
+Bool write_key(Str dir, Unlocked u, List(Int) id, KeyRec k) {
+    Str local = place_local(dir, hex_encode(id));
+    List(Int) iv = random_bytes(12);
+    List(Int) sealed = iv.concat(reveal(aes_gcmg_seal(rec_key(u), iv, rec_bytes(k), rec_label(id))));
+    return filesystem.write_bytes(local + ".key", sealed) && filesystem.write_bytes(local + ".dkey", dkey_bytes(u, id, k));
+}
+
+// Under the PIN, after a folder loads: the record again when the key, the
+// name, the role or the number of people changed; the duress choice stays.
+@requires(filesystem, declassify)
+Bool keep_key(Str dir, Ctx x, Loaded ld) {
+    if (x.u.kind != 1) { return true; }
+    Option(KeyRec) old = kept_key(dir, x.u, ld.r.coll_id);
+    KeyRec k = KeyRec {.key = ld.key, .duress = match old { Some(o) => o.duress, None => false }, .owner = bytes_eq(ld.r.owner, x.c.log_id),
+                       .people = 1 + ld.r.members.len(), .name = ld.name};
+    Bool same = match old { None => false, Some(o) => bytes_eq(reveal(o.key), reveal(k.key)) && o.owner == k.owner && o.people == k.people && o.name == k.name };
+    return same || write_key(dir, x.u, ld.r.coll_id, k);
+}
+
+@requires(filesystem)
+Bool forget(Str dir, Str cid) {
+    Str local = place_local(dir, cid);
+    return filesystem.write_bytes(local + ".key", []) && filesystem.write_bytes(local + ".dkey", []) && filesystem.write_bytes(local + ".cache", []) && filesystem.write_bytes(local + ".tag", []);
+}
+
+// ─── Leaving ────────────────────────────────────────────────────
+
+Str leave_blob(Str cid, List(Int) l) { return "leave-" + cid + "-" + hex_encode(l); }
+
+Option(Leave) leave_of(List(Int) b) {
+    if (b.len() == 0 || b.len() > 4096 || !cbor_well_formed(b, 4)) { return None; }
+    Result(Leave, SerialError) r = from_cbor(b);
+    return match r { Ok(x) => Some(x), Err(_) => None };
+}
+
+Leave leave_signed(Leave v, List(Int) sig) {
+    return Leave {.coll_id = v.coll_id, .log_id = v.log_id, .roster_version = v.roster_version, .log_sequence = v.log_sequence, .signer = v.signer, .sig = sig};
+}
+
+List(Int) leave_tbs(Leave v) { return utf8("symbolon v1 leave").concat(cbor_or_empty(to_cbor(leave_signed(v, [])))); }
+
+// Whether `l` left the folder: a record for it signed by a device of l's
+// verified log, at a roster version no newer than the current one.
+@requires(network, clock(readonly), declassify)
+Bool left(Ctx x, Roster r, List(Int) l) {
+    Option(List(Int)) b = blob_get(relay_ep(x.c), leave_blob(hex_encode(r.coll_id), l));
+    Option(Leave) ol = leave_of(b else { [] });
+    return match ol { None => false, Some(v) => leave_ok(x, r, l, v) };
+}
+
+@requires(network, clock(readonly), declassify)
+Bool leave_ok(Ctx x, Roster r, List(Int) l, Leave v) {
+    if (!bytes_eq(v.coll_id, r.coll_id) || !bytes_eq(v.log_id, l) || v.roster_version > r.version) { return false; }
+    Result(VerifiedHead, Str) rh = head_of(x.c, x.vh, l);
+    return match rh {
+        Err(_) => false,
+        Ok(h) => v.log_sequence <= h.head.sequence && match device_party(h.head.quorum.parties, v.signer, 0) {
+            None => false,
+            Some(d) => ecdsa_verify_raw(P256, Sha256, d.auth_key, leave_tbs(v), v.sig)
+        }
+    };
+}
+
+// The members who left.
+@requires(network, clock(readonly), declassify)
+List(List(Int)) leavers(Ctx x, Roster r, Int i, ListBuf(List(Int)) acc) {
+    if (i >= r.members.len()) { return acc.finish(); }
+    List(Int) l = r.members[i].log_id;
+    return leavers(x, r, i + 1, if (left(x, r, l)) { acc.push(l) } else { acc });
+}
+
+Option(ShareWrap) wrap_to(List(ShareWrap) ws, List(Int) party, Int i) {
+    if (i >= ws.len()) { return None; }
+    if (bytes_eq(ws[i].to, party)) { return Some(ws[i]); }
+    return wrap_to(ws, party, i + 1);
+}
+
+// Opens a wrap for this device. Its sender must be a device in the
+// verified log of someone in the roster.
+@requires(network, clock(readonly), declassify)
+Result(List(Secret(UInt(8))), Str) unwrap(Ctx x, Roster r, ShareWrap w) {
+    if (!member_in(r, w.from_log)) { return Err("the key was wrapped by someone not in the folder"); }
+    VerifiedHead fh = head_of(x.c, x.vh, w.from_log)?;
+    Party s = need(device_party(fh.head.quorum.parties, w.from_party, 0), "the key was wrapped by a device that is not in its owner's log")?;
+    List(Secret(UInt(8))) none = [];
+    HpkeCtxG(Secret(UInt(8))) hc = hpkeg_setup_receiver_full(share_suite(), w.enc, device_hpke(x.u.real.dek).sk, share_info(coll_vid(r.coll_id), x.c.log_id, r.version), none, [], s.hpke_key);
+    if (!hc.ok) { return Err("the key's wrap does not open"); }
+    HpkeOpenedG(Secret(UInt(8))) o = hpkeg_open(hc, [], w.ct);
+    if (!o.ok || o.pt.len() != 32) { return Err("the key's wrap does not open"); }
+    return Ok(o.pt);
+}
+
+// The collection's items: accepted only under a head signed by a device
+// of someone in the roster, never older than this device accepted.
+@requires(filesystem, network, clock(readonly), declassify)
+Result(VaultState, Str) fetch_coll(Str dir, Ctx x, Roster r, Str cid) {
+    List(Int) vid = coll_vid(r.coll_id);
+    Int seen = kept_version(place_local(dir, cid) + ".version");
+    Option(List(Int)) b = blob_get(relay_ep(x.c), place_blob(x.c, cid));
+    if (match b { None => true, Some(_) => false }) {
+        return if (seen == 0) { Ok(empty_state(vid, r.owner)) } else { Err(f"the relay has no items for the folder, but this device accepted version {seen}") };
+    }
+    VaultState st = need(state_of(b else { [] }), "the folder's items do not decode")?;
+    if (!member_in(r, st.head.log_id)) { return Err("the folder's items were signed by someone not in it"); }
+    VerifiedHead sh = head_of(x.c, x.vh, st.head.log_id)?;
+    Result(VaultState, SymbolonError) ra = vault_accept(st, vid, sh.head, (UInt(64))seen);
+    return match ra {
+        Err(e) => Err(err_text(e)),
+        Ok(v) => accepted(place_local(dir, cid), v)
+    };
+}
+
+@requires(filesystem)
+Result(VaultState, Str) accepted(Str local, VaultState v) {
+    _ = filesystem.write_all(local + ".version", f"{v.head.version}");
+    return Ok(v);
+}
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+pub Result(Opened, Str) share_open(Str dir, Str cid) {
+    Ctx x = unlocked(dir)?;
+    return opened_in(dir, x, cid);
+}
+
+@requires(filesystem, network, declassify, clock)
+Result(Opened, Str) opened_in(Str dir, Ctx x, Str cid) {
+    Loaded ld = load_share(dir, x, cid)?;
+    VaultState st = fetch_coll(dir, x, ld.r, cid)?;
+    _ = keep_place_copy(place_local(dir, cid), ld.key, st);
+    return Ok(Opened {.c = x.c, .u = x.u, .vh = x.vh, .st = st, .pin = x.pin, .p = Place {.share = cid, .vk = ld.key, .vid = coll_vid(ld.r.coll_id)}});
+}
+
+// The place `share` names: the own vault for "", else that collection.
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+pub Result(Opened, Str) open_place(Str dir, Str share) { return if (str_len(share) == 0) { open_vault(dir) } else { share_open(dir, share) }; }
+
+// The same with this device already unlocked.
+@requires(filesystem, network, declassify, clock)
+Result(Opened, Str) place_in(Str dir, Ctx x, Str share) {
+    if (str_len(share) > 0) { return opened_in(dir, x, share); }
+    VaultState st = fetch_vault(dir, x.c, x.vh)?;
+    return Ok(Opened {.c = x.c, .u = x.u, .vh = x.vh, .st = st, .pin = x.pin, .p = own_place(x.c, x.u)});
+}
+
+// The place again after this device changed it, with the key it has now
+// (a member's removal may have changed it meanwhile).
+@requires(filesystem, network, declassify, clock)
+pub Result(Opened, Str) reopened(Str dir, Opened o) { return place_in(dir, Ctx {.c = o.c, .u = o.u, .vh = o.vh, .pin = o.pin}, o.p.share); }
+
+// For reading, also under the duress PIN (the folders chosen for it).
+// Like the own vault (SPEC 18.8), a folder falls back to this device's
+// copy when the relay or the log cannot be had or does not verify, unless
+// the folder is gone for this person.
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+pub Result(View, Str) view_place(Str dir, Str share) {
+    if (str_len(share) == 0) { return open_view(dir); }
+    if (!share_id_ok(share)) { return Err("a shared folder's id is 32 hex digits"); }
+    Dev d = unlocked_dev(dir)?;
+    Result(Ctx, Str) rx = online(d);
+    Result(Opened, Str) ro = match rx { Err(m) => Err(m), Ok(x) => opened_in(dir, x, share) };
+    return match ro {
+        Ok(o) => Ok(View {.vk = o.p.vk, .vid = o.p.vid, .st = o.st, .offline = false}),
+        Err(m) => if (gone(m)) { Err(m) } else { kept_view(dir, d, share, m) }
+    };
+}
+
+@requires(filesystem, declassify)
+Result(View, Str) kept_view(Str dir, Dev d, Str cid, Str why) {
+    List(Int) id = cose_hex_decode(cid);
+    KeyRec k = need(kept_key(dir, d.u, id), why)?;
+    VaultState st = need(kept_place_copy(place_local(dir, cid), k.key), why)?;
+    return offline_view(why, View {.vk = k.key, .vid = coll_vid(id), .st = st, .offline = true});
+}
+
+// `symbolon device vault list DIR [--kinds | --long] [--share ID]`.
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+pub Int vault_list_at(Str dir, Int form, Str share) {
+    Result(View, Str) rv = view_place(dir, share);
+    return match rv { Err(m) => dfail(m), Ok(v) => list_items(v, form, 0) };
+}
+
+// ─── Writing rosters and wraps ──────────────────────────────────
+
+@requires(declassify)
+List(Int) sealed_name(List(Secret(UInt(8))) key, List(Int) id, UInt(64) version, Str name) {
+    return field_seal(key, coll_vid(id), id, version, "share", "name", secret_bytes(utf8(name)));
+}
+
+@requires(filesystem, network, device, declassify, clock, environment)
+Result(Roster, Str) signed_roster(Ctx x, List(Int) id, UInt(64) version, Str owner_label, List(Member) ms, List(Secret(UInt(8))) key, Str name, Bool deleted) {
+    Roster r0 = Roster {.coll_id = id, .version = version, .owner = x.c.log_id, .owner_label = owner_label, .members = ms, .name_ct = sealed_name(key, id, version, name),
+                        .deleted = deleted, .log_sequence = x.vh.head.sequence, .signer = x.c.party, .sig = []};
+    Result(List(Int), Str) rs = dk_sign(x.c, x.u.real, x.u.st, roster_tbs(r0));
+    return match rs { Err(m) => Err(m), Ok(sig) => Ok(roster_signed(r0, sig)) };
+}
+
+@requires(declassify)
+Option(ShareWrap) wrap_for(Ctx x, List(Int) vid, List(Int) member, UInt(64) version, List(Secret(UInt(8))) key, Party to) {
+    List(Secret(UInt(8))) none = [];
+    List(Secret(UInt(8))) fresh = [];
+    HpkeSenderG(Secret(UInt(8))) s = hpkeg_setup_sender_full(share_suite(), to.hpke_key, share_info(vid, member, version), none, [], device_hpke(x.u.real.dek).sk, fresh);
+    if (!s.ctx.ok) { return None; }
+    HpkeSealedG(Secret(UInt(8))) sealed = hpkeg_seal(s.ctx, [], key);
+    if (sealed.ct.len() == 0) { return None; }
+    return Some(ShareWrap {.to = to.id, .from_log = x.c.log_id, .from_party = x.c.party, .enc = s.enc, .ct = reveal(sealed.ct)});
+}
+
+// The key wrapped to every device in `member`'s verified log.
+@requires(network, clock(readonly), declassify)
+Result(WrapSet, Str) wraps_for(Ctx x, List(Int) id, UInt(64) version, List(Secret(UInt(8))) key, List(Int) member) {
+    VerifiedHead mh = head_of(x.c, x.vh, member)?;
+    List(Party) ds = devices_of(mh.head.quorum.parties, 0, ListBuf());
+    List(ShareWrap) ws = need(wrap_all(x, coll_vid(id), member, version, key, ds, 0, ListBuf()), "cannot wrap the key to a device of " + str_slice(hex_encode(member), 0, 12))?;
+    return Ok(WrapSet {.coll_id = id, .roster_version = version, .member = member, .wraps = ws});
+}
+
+@requires(declassify)
+Option(List(ShareWrap)) wrap_all(Ctx x, List(Int) vid, List(Int) member, UInt(64) version, List(Secret(UInt(8))) key, List(Party) ds, Int i, ListBuf(ShareWrap) acc) {
+    if (i >= ds.len()) { return Some(acc.finish()); }
+    Option(ShareWrap) w = wrap_for(x, vid, member, version, key, ds[i]);
+    return match w {
+        None => fail_wraps(acc),
+        Some(v) => wrap_all(x, vid, member, version, key, ds, i + 1, acc.push(v))
+    };
+}
+
+Option(List(ShareWrap)) fail_wraps(ListBuf(ShareWrap) acc) { acc.discard(); return None; }
+
+// Wraps for each of `people`, written to the relay.
+@requires(network, clock(readonly), declassify)
+Str put_wraps(Ctx x, List(Int) id, UInt(64) version, List(Secret(UInt(8))) key, List(List(Int)) people, Int i) {
+    if (i >= people.len()) { return ""; }
+    Result(WrapSet, Str) rw = wraps_for(x, id, version, key, people[i]);
+    Str m = match rw {
+        Err(e) => e,
+        Ok(ws) => if (blob_put(relay_ep(x.c), wrap_blob(people[i], hex_encode(id)), cbor_or_empty(to_cbor(ws)))) { "" } else { "the relay refused a key wrap" }
+    };
+    return if (str_len(m) > 0) { m } else { put_wraps(x, id, version, key, people, i + 1) };
+}
+
+// Empty wraps at `version` for people no longer in the folder: their
+// listing shows it gone.
+@requires(network, clock(readonly), declassify)
+Bool clear_wraps(Ctx x, List(Int) id, UInt(64) version, List(List(Int)) people, Int i) {
+    if (i >= people.len()) { return true; }
+    WrapSet ws = WrapSet {.coll_id = id, .roster_version = version, .member = people[i], .wraps = []};
+    return blob_put(relay_ep(x.c), wrap_blob(people[i], hex_encode(id)), cbor_or_empty(to_cbor(ws))) && clear_wraps(x, id, version, people, i + 1);
+}
+
+// A device a member added later (an enrolment, a recovery) has no wrap
+// yet: any member's device that can open the folder adds the missing
+// ones, wrapping the key it holds to the devices of that person's
+// verified log.
+@requires(network, clock(readonly), declassify)
+Int fill_wraps(Ctx x, Loaded ld, List(List(Int)) people, Int i, Int added) {
+    if (i >= people.len()) { return added; }
+    Bool whole = has_all_wraps(x, ld.r, people[i]);
+    Str m = if (whole) { "" } else { put_wraps(x, ld.r.coll_id, ld.r.version, ld.key, [people[i]], 0) };
+    return fill_wraps(x, ld, people, i + 1, added + (if (whole || str_len(m) > 0) { 0 } else { 1 }));
+}
+
+@requires(network, clock(readonly), declassify)
+Bool has_all_wraps(Ctx x, Roster r, List(Int) member) {
+    Option(List(Int)) wb = blob_get(relay_ep(x.c), wrap_blob(member, hex_encode(r.coll_id)));
+    Option(WrapSet) ows = wraps_of(wb else { [] });
+    return match ows { None => false, Some(ws) => ws.roster_version == r.version && covered(x, ws, member) };
+}
+
+@requires(network, clock(readonly), declassify)
+Bool covered(Ctx x, WrapSet ws, List(Int) member) {
+    Result(VerifiedHead, Str) rh = head_of(x.c, x.vh, member);
+    return match rh {
+        Err(_) => true,                  // nothing to wrap to that would verify
+        Ok(mh) => all_wrapped(ws.wraps, devices_of(mh.head.quorum.parties, 0, ListBuf()), 0)
+    };
+}
+
+Bool all_wrapped(List(ShareWrap) ws, List(Party) ds, Int i) {
+    if (i >= ds.len()) { return true; }
+    return match wrap_to(ws, ds[i].id, 0) { None => false, Some(_) => all_wrapped(ws, ds, i + 1) };
+}
+
+// ─── Commands ───────────────────────────────────────────────────
+
+Bool label_ok(Str s) { return str_len(s) >= 1 && str_len(s) <= 64; }
+
+// `symbolon device share new DIR NAME`: the PIN on stdin; prints the new
+// folder's id. The owner is its only member until they add people.
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+pub Int share_new(Str dir, Str name) {
+    if (!label_ok(name)) { return dfail("a name of 1-64 characters"); }
+    return done(make_share(dir, name));
+}
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+Result(Int, Str) make_share(Str dir, Str name) {
+    Ctx x = unlocked(dir)?;
+    List(Int) id = random_bytes(16);
+    List(Secret(UInt(8))) key = random_secret(32);
+    Roster r = signed_roster(x, id, (UInt(64))1, own_name(x.c), [], key, name, false)?;
+    Str m = put_wraps(x, id, r.version, key, [x.c.log_id], 0);
+    if (str_len(m) > 0) { return Err(m); }
+    if (!blob_put(relay_ep(x.c), roster_blob(hex_encode(id)), cbor_or_empty(to_cbor(r)))) { return Err("the relay refused the roster"); }
+    _ = filesystem.write_all(place_local(dir, hex_encode(id)) + ".roster", f"{r.version}");
+    println(hex_encode(id));
+    return Ok(0);
+}
+
+// The name on this person's card, or "".
+@requires(network, clock(readonly), declassify)
+Str own_name(DeviceConfig c) {
+    Option(List(Int)) b = blob_get(relay_ep(c), card_blob(c.log_id));
+    Option(Card) ok = card_of(b else { [] });
+    return match ok { None => "", Some(k) => if (bytes_eq(k.log_id, c.log_id)) { k.name } else { "" } };
+}
+
+// `symbolon device share list DIR`: the PIN on stdin; per folder this
+// device can open, "ID NAME-HEX owner|member PEOPLE", with " duress" when
+// this device opens it under the duress PIN too; per folder it has no key
+// for yet, "ID - waiting WHY-HEX". Adds the wraps that devices added since
+// are missing; on the owner's device, removes the members who left (a new
+// key). Under the duress PIN: only the folders chosen for it, unmarked.
+// Offline: the folders as this device last saw them, saying why on
+// standard error.
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+pub Int share_list(Str dir) { return done(list_all(dir)); }
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+Result(Int, Str) list_all(Str dir) {
+    Dev d = unlocked_dev(dir)?;
+    Result(Ctx, Str) rx = online(d);
+    return match rx {
+        Err(m) => Ok(list_local(dir, d, m)),
+        Ok(x) => Ok(list_shares(dir, x, ids_after(blob_list(relay_ep(x.c), "wrap-" + hex_encode(x.c.log_id) + "-"), str_len(hex_encode(x.c.log_id)) + 6, 0, ListBuf()), 0))
+    };
+}
+
+@requires(filesystem, declassify)
+Int list_local(Str dir, Dev d, Str why) {
+    eprintln("local copy: " + why + "; showing the shared folders as this device last saw them");
+    return print_kept(dir, d.u, sort(key_ids(filesystem.list_dir(dir), 0, ListBuf())), 0);
+}
+
+// The ids of the share-<id>.key files.
+List(Str) key_ids(List(Str) names, Int i, ListBuf(Str) acc) {
+    if (i >= names.len()) { return acc.finish(); }
+    Str n = names[i];
+    Bool ok = str_len(n) == 42 && str_slice(n, 0, 6) == "share-" && str_slice(n, 38, 42) == ".key" && share_id_ok(str_slice(n, 6, 38));
+    return key_ids(names, i + 1, if (ok) { acc.push(str_slice(n, 6, 38)) } else { acc });
+}
+
+@requires(filesystem, declassify)
+Int print_kept(Str dir, Unlocked u, List(Str) ids, Int i) {
+    if (i >= ids.len()) { return 0; }
+    Option(KeyRec) ok = kept_key(dir, u, cose_hex_decode(ids[i]));
+    _ = match ok { None => 0, Some(k) => say(folder_line(ids[i], k.name, k.owner, k.people, k.duress && u.kind == 1)) };
+    return print_kept(dir, u, ids, i + 1);
+}
+
+Str folder_line(Str cid, Str name, Bool owner, Int people, Bool duress) {
+    return cid + " " + hex_encode(utf8(name)) + " " + (if (owner) { "owner" } else { "member" }) + f" {people}" + (if (duress) { " duress" } else { "" });
+}
+
+List(Str) ids_after(List(Str) names, Int k, Int i, ListBuf(Str) acc) {
+    if (i >= names.len()) { return acc.finish(); }
+    Str id = if (str_len(names[i]) > k) { str_slice(names[i], k, str_len(names[i])) } else { "" };
+    return ids_after(names, k, i + 1, if (share_id_ok(id)) { acc.push(id) } else { acc });
+}
+
+@requires(filesystem, network, device, declassify, clock, environment)
+Int list_shares(Str dir, Ctx x, List(Str) ids, Int i) {
+    if (i >= ids.len()) { return 0; }
+    Result(Loaded, Str) rl = load_share(dir, x, ids[i]);
+    _ = match rl {
+        Err(m) => if (gone(m) || x.u.kind == 2) { 0 } else { say(ids[i] + " - waiting " + hex_encode(utf8(m))) },
+        Ok(ld) => listed(dir, x, ids[i], ld)
+    };
+    return list_shares(dir, x, ids, i + 1);
+}
+
+Int say(Str s) { println(s); return 0; }
+
+@requires(filesystem, network, device, declassify, clock, environment)
+Int listed(Str dir, Ctx x, Str cid, Loaded ld) {
+    if (x.u.kind != 1) { return print_loaded(dir, x, cid, ld); }
+    List(List(Int)) quit = if (bytes_eq(ld.r.owner, x.c.log_id)) { leavers(x, ld.r, 0, ListBuf()) } else { [] };
+    if (quit.len() == 0) {
+        _ = fill_wraps(x, ld, people_of(ld.r), 0, 0);
+        return print_loaded(dir, x, cid, ld);
+    }
+    _ = remove_all(dir, x, cid, quit, 0);
+    Result(Loaded, Str) again = load_share(dir, x, cid);
+    return match again { Err(m) => say(cid + " - waiting " + hex_encode(utf8(m))), Ok(l2) => print_loaded(dir, x, cid, l2) };
+}
+
+@requires(filesystem, declassify)
+Int print_loaded(Str dir, Ctx x, Str cid, Loaded ld) {
+    Bool duress = x.u.kind == 1 && match kept_key(dir, x.u, ld.r.coll_id) { Some(k) => k.duress, None => false };
+    return say(folder_line(cid, ld.name, bytes_eq(ld.r.owner, x.c.log_id), 1 + ld.r.members.len(), duress));
+}
+
+// The owner's device removes the members who left, one after another.
+@requires(filesystem, network, device, declassify, clock, environment)
+Int remove_all(Str dir, Ctx x, Str cid, List(List(Int)) ls, Int i) {
+    if (i >= ls.len()) { return 0; }
+    Result(Int, Str) r = remove_in(dir, x, cid, ls[i]);
+    _ = match r { Ok(_) => 0, Err(m) => dfail(m) };
+    return remove_all(dir, x, cid, ls, i + 1);
+}
+
+// `symbolon device share members DIR ID`: the PIN on stdin; "LOG-ID
+// NAME-HEX FINGERPRINT owner|member" per person, the owner first.
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+pub Int share_members(Str dir, Str cid) { return done(members_of(dir, cid)); }
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+Result(Int, Str) members_of(Str dir, Str cid) {
+    Ctx x = unlocked(dir)?;
+    Loaded ld = load_share(dir, x, cid)?;
+    println(hex_encode(ld.r.owner) + " " + hex_or_dash(ld.r.owner_label) + " " + fingerprint(ld.r.owner) + " owner");
+    return Ok(print_members(ld.r.members, 0));
+}
+
+Str hex_or_dash(Str s) { return if (str_len(s) == 0) { "-" } else { hex_encode(utf8(s)) }; }
+
+Int print_members(List(Member) ms, Int i) {
+    if (i >= ms.len()) { return 0; }
+    println(hex_encode(ms[i].log_id) + " " + hex_or_dash(ms[i].label) + " " + fingerprint(ms[i].log_id) + " member");
+    return print_members(ms, i + 1);
+}
+
+// `symbolon device share add DIR ID LOG-ID NAME`: the PIN on stdin; the
+// owner adds the person whose log is LOG-ID, named NAME in the folder.
+// Their devices come from their verified log.
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+pub Int share_add(Str dir, Str cid, Str who, Str label) { return done(add_member(dir, cid, who, label)); }
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+Result(Int, Str) add_member(Str dir, Str cid, Str who, Str label) {
+    if (!log_hex_ok(who)) { return Err("a person is named by their log id, 64 hex digits"); }
+    if (!label_ok(label)) { return Err("a name of 1-64 characters"); }
+    Ctx x = unlocked(dir)?;
+    Loaded ld = load_share(dir, x, cid)?;
+    List(Int) l = cose_hex_decode(who);
+    if (!bytes_eq(ld.r.owner, x.c.log_id)) { return Err("only the folder's owner adds people"); }
+    if (member_in(ld.r, l)) { return Err("already in the folder"); }
+    VerifiedHead known = head_of(x.c, x.vh, l)?;
+    // A record from when they left before would otherwise count again.
+    _ = blob_put(relay_ep(x.c), leave_blob(cid, l), []);
+    return change_members(dir, x, ld, ld.r.members.concat([Member {.log_id = l, .label = label}]), ld.key, []);
+}
+
+// A new roster version with members `ms` and key `key`, wraps for
+// everyone in it, and empty wraps for `gone`.
+@requires(filesystem, network, device, declassify, clock, environment)
+Result(Int, Str) change_members(Str dir, Ctx x, Loaded ld, List(Member) ms, List(Secret(UInt(8))) key, List(List(Int)) gone) {
+    UInt(64) v = ld.r.version + (UInt(64))1;
+    Roster r = signed_roster(x, ld.r.coll_id, v, own_name(x.c), ms, key, ld.name, false)?;
+    Str m = put_wraps(x, r.coll_id, v, key, people_of(r), 0);
+    if (str_len(m) > 0) { return Err(m); }
+    if (!clear_wraps(x, r.coll_id, v, gone, 0)) { return Err("the relay refused a key wrap"); }
+    Str cid = hex_encode(r.coll_id);
+    if (!blob_put(relay_ep(x.c), roster_blob(cid), cbor_or_empty(to_cbor(r)))) { return Err("the relay refused the roster"); }
+    _ = filesystem.write_all(place_local(dir, cid) + ".roster", f"{r.version}");
+    println(f"shared folder version {v}, {1 + ms.len()} people");
+    return Ok(0);
+}
+
+// `symbolon device share remove DIR ID LOG-ID`: the PIN on stdin; the
+// owner removes a person. The folder gets a new key: every item is sealed
+// again under it, and only the people still in it get the key.
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+pub Int share_remove(Str dir, Str cid, Str who) { return done(remove_member(dir, cid, who)); }
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+Result(Int, Str) remove_member(Str dir, Str cid, Str who) {
+    if (!log_hex_ok(who)) { return Err("a person is named by their log id, 64 hex digits"); }
+    Ctx x = unlocked(dir)?;
+    return remove_in(dir, x, cid, cose_hex_decode(who));
+}
+
+@requires(filesystem, network, device, declassify, clock, environment)
+Result(Int, Str) remove_in(Str dir, Ctx x, Str cid, List(Int) l) {
+    Opened o = opened_in(dir, x, cid)?;
+    Loaded ld = load_share(dir, x, cid)?;
+    if (!bytes_eq(ld.r.owner, x.c.log_id)) { return Err("only the folder's owner removes people"); }
+    if (member_at(ld.r.members, l, 0) < 0) { return Err("not in the folder"); }
+    List(Secret(UInt(8))) key = random_secret(32);
+    List(Item) items = reseal(ld.key, key, o.p.vid, o.st.items, 0, ListBuf())?;
+    Opened next = Opened {.c = o.c, .u = o.u, .vh = o.vh, .st = o.st, .pin = o.pin, .p = Place {.share = cid, .vk = key, .vid = o.p.vid}};
+    if (publish_items(dir, next, items) != 0) { return Ok(1); }
+    Int r = change_members(dir, x, ld, without_member(ld.r.members, l, 0, ListBuf()), key, [l])?;
+    _ = blob_put(relay_ep(x.c), leave_blob(cid, l), []);
+    _ = load_share(dir, x, cid);         // this device's copy of the new key
+    return Ok(r);
+}
+
+List(Member) without_member(List(Member) ms, List(Int) l, Int i, ListBuf(Member) acc) {
+    if (i >= ms.len()) { return acc.finish(); }
+    return without_member(ms, l, i + 1, if (bytes_eq(ms[i].log_id, l)) { acc } else { acc.push(ms[i]) });
+}
+
+// Every item opened under the old key and sealed under the new one; an
+// item's id comes from the key and its name, so it gets a new id too.
+@requires(declassify)
+Result(List(Item), Str) reseal(List(Secret(UInt(8))) old, List(Secret(UInt(8))) key, List(Int) vid, List(Item) items, Int i, ListBuf(Item) acc) {
+    if (i >= items.len()) { return Ok(acc.finish()); }
+    Result(List(FieldPlain), SymbolonError) rf = item_open(old, vid, items[i]);
+    Result(Item, Str) rs = match rf { Err(_) => Err("an item does not open under the folder's key"), Ok(fs) => sealed_again(key, vid, fs) };
+    return match rs {
+        Err(m) => fail_items(acc, m),
+        Ok(it) => reseal(old, key, vid, items, i + 1, acc.push(it))
+    };
+}
+
+@requires(declassify)
+Result(Item, Str) sealed_again(List(Secret(UInt(8))) key, List(Int) vid, List(FieldPlain) fs) {
+    Result(Item, SymbolonError) rs = item_seal(key, vid, item_id_of(key, name_in(fs, 0)), (UInt(64))1, "password", fs, false, None);
+    return match rs { Err(e) => Err(err_text(e)), Ok(it) => Ok(it) };
+}
+
+Result(List(Item), Str) fail_items(ListBuf(Item) acc, Str m) { acc.discard(); return Err(m); }
+
+@requires(declassify)
+Str name_in(List(FieldPlain) fs, Int i) {
+    if (i >= fs.len()) { return ""; }
+    if (fs[i].name == "name") { return text_of(reveal(fs[i].value)); }
+    return name_in(fs, i + 1);
+}
+
+// `symbolon device share delete DIR ID`: the PIN on stdin; the owner
+// deletes the folder: its items and everyone's keys go.
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+pub Int share_delete(Str dir, Str cid) { return done(delete_share(dir, cid)); }
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+Result(Int, Str) delete_share(Str dir, Str cid) {
+    Ctx x = unlocked(dir)?;
+    Opened o = opened_in(dir, x, cid)?;
+    Loaded ld = load_share(dir, x, cid)?;
+    if (!bytes_eq(ld.r.owner, x.c.log_id)) { return Err("only the folder's owner deletes it"); }
+    if (publish_items(dir, o, []) != 0) { return Ok(1); }
+    UInt(64) v = ld.r.version + (UInt(64))1;
+    Roster r = signed_roster(x, ld.r.coll_id, v, ld.r.owner_label, [], ld.key, ld.name, true)?;
+    if (!clear_wraps(x, r.coll_id, v, people_of(ld.r), 0)) { return Err("the relay refused a key wrap"); }
+    if (!blob_put(relay_ep(x.c), roster_blob(cid), cbor_or_empty(to_cbor(r)))) { return Err("the relay refused the roster"); }
+    println("shared folder deleted");
+    return Ok(0);
+}
+
+// `symbolon device share leave DIR ID`: the PIN on stdin; a member
+// leaves. Their devices stop opening the folder and forget their copies at
+// once; the owner's device gives it a new key when it next lists its
+// folders (until then the key they held still opens what is there).
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+pub Int share_leave(Str dir, Str cid) { return done(leave_share(dir, cid)); }
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+Result(Int, Str) leave_share(Str dir, Str cid) {
+    Ctx x = unlocked(dir)?;
+    Loaded ld = load_share(dir, x, cid)?;
+    if (bytes_eq(ld.r.owner, x.c.log_id)) { return Err("the owner cannot leave: remove the others, or delete the folder"); }
+    Leave v0 = Leave {.coll_id = ld.r.coll_id, .log_id = x.c.log_id, .roster_version = ld.r.version, .log_sequence = x.vh.head.sequence, .signer = x.c.party, .sig = []};
+    List(Int) sig = dk_sign(x.c, x.u.real, x.u.st, leave_tbs(v0))?;
+    if (!blob_put(relay_ep(x.c), leave_blob(cid, x.c.log_id), cbor_or_empty(to_cbor(leave_signed(v0, sig))))) { return Err("the relay refused the record"); }
+    _ = forget(dir, cid);
+    println("left the shared folder");
+    return Ok(0);
+}
+
+// `symbolon device share duress DIR ID on|off`: the PIN on stdin; whether
+// this device opens the folder under its duress PIN too (SPEC 14.2: a real
+// subset chosen in advance), read only there.
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+pub Int share_duress(Str dir, Str cid, Str on) { return done(mark_duress(dir, cid, on)); }
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+Result(Int, Str) mark_duress(Str dir, Str cid, Str on) {
+    if (on != "on" && on != "off") { return Err("on or off"); }
+    Ctx x = unlocked(dir)?;
+    Loaded ld = load_share(dir, x, cid)?;
+    if (on == "on" && x.u.real.duress_hpke_pub.len() == 0) { return Err("this device has no duress PIN"); }
+    KeyRec k = need(kept_key(dir, x.u, ld.r.coll_id), "this device cannot keep the folder's key")?;
+    KeyRec m = KeyRec {.key = k.key, .duress = on == "on", .owner = k.owner, .people = k.people, .name = k.name};
+    if (!write_key(dir, x.u, ld.r.coll_id, m)) { return Err("this device cannot keep the folder's key"); }
+    println(if (on == "on") { "usable under the duress PIN on this device" } else { "not usable under the duress PIN" });
+    return Ok(0);
+}
+
+// `symbolon device vault move DIR NAME TO [--share FROM]`: the PIN on
+// stdin; moves an item from the own vault (or the folder FROM) to the own
+// vault (TO "own") or the folder TO. It is written at TO first, then
+// removed from where it was, so a failure in between leaves it in both,
+// never in neither.
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+pub Int vault_move(Str dir, Str name, Str to, Str from) { return done(move_item(dir, name, if (to == "own") { "" } else { to }, from)); }
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+Result(Int, Str) move_item(Str dir, Str name, Str to, Str from) {
+    if (to == from) { return Err("the item is already there"); }
+    if (str_len(to) > 0 && !share_id_ok(to)) { return Err("move to own, or to a shared folder's id"); }
+    Ctx x = unlocked(dir)?;
+    Opened src = place_in(dir, x, from)?;
+    Opened dst = place_in(dir, x, to)?;
+    List(Int) id = item_id_of(src.p.vk, name);
+    Item it = need(item_by_id(src.st.items, id, 0), "no such item")?;
+    Result(List(FieldPlain), SymbolonError) rf = item_open(src.p.vk, src.p.vid, it);
+    List(FieldPlain) fs = match rf { Err(e) => Err(err_text(e)), Ok(v) => Ok(v) }?;
+    if (has_named(fs, "pending", 0)) { return Err("a password change is under way for this item: let it finish first"); }
+    if (match item_by_id(dst.st.items, item_id_of(dst.p.vk, name), 0) { Some(_) => true, None => false }) { return Err("there is already an item of that name there"); }
+    Item moved = sealed_again(dst.p.vk, dst.p.vid, fs)?;
+    if (publish_items(dir, dst, dst.st.items.concat([moved])) != 0) { return Ok(1); }
+    if (publish_items(dir, src, without_item(src.st.items, id, 0, ListBuf())) != 0) { return Err("written at the destination but not removed from where it was: delete it there"); }
+    return Ok(0);
+}
+
+Bool has_named(List(FieldPlain) fs, Str n, Int i) { return i < fs.len() && (fs[i].name == n || has_named(fs, n, i + 1)); }
+
+// ─── People ─────────────────────────────────────────────────────
+
+// `symbolon device share card DIR NAME`: the PIN on stdin; publishes the
+// name others see this person by, signed by this device.
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+pub Int share_card(Str dir, Str name) { return done(publish_card(dir, name)); }
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+Result(Int, Str) publish_card(Str dir, Str name) {
+    if (!label_ok(name)) { return Err("a name of 1-64 characters"); }
+    Ctx x = unlocked(dir)?;
+    Card k0 = Card {.log_id = x.c.log_id, .name = name, .log_sequence = x.vh.head.sequence, .signer = x.c.party, .sig = []};
+    List(Int) sig = dk_sign(x.c, x.u.real, x.u.st, card_tbs(k0))?;
+    Card k = Card {.log_id = k0.log_id, .name = name, .log_sequence = k0.log_sequence, .signer = k0.signer, .sig = sig};
+    if (!blob_put(relay_ep(x.c), card_blob(x.c.log_id), cbor_or_empty(to_cbor(k)))) { return Err("the relay refused the card"); }
+    println(hex_encode(x.c.log_id) + " " + fingerprint(x.c.log_id));
+    return Ok(0);
+}
+
+// `symbolon device share me DIR`: "LOG-ID FINGERPRINT", for comparing
+// with someone who shares with this person.
+@requires(filesystem)
+pub Int share_me(Str dir) { return done(print_me(dir)); }
+
+@requires(filesystem)
+Result(DeviceConfig, Str) set_up(Str dir) {
+    DeviceConfig c = need(load_config(dir), "not set up (device new, device init)")?;
+    if (c.log_id.len() == 0) { return Err("not set up (device new, device init)"); }
+    return Ok(c);
+}
+
+@requires(filesystem)
+Result(Int, Str) print_me(Str dir) {
+    DeviceConfig c = set_up(dir)?;
+    println(hex_encode(c.log_id) + " " + fingerprint(c.log_id));
+    return Ok(0);
+}
+
+// `symbolon device share people DIR`: everyone with a card at the relay
+// whose card verifies under their log: "LOG-ID NAME-HEX FINGERPRINT
+// me|-". A card proves only that the log's owner chose the name; the
+// fingerprint is what proves who it is.
+@requires(filesystem, network, clock(readonly), declassify)
+pub Int share_people(Str dir) {
+    Result(DeviceConfig, Str) rc = set_up(dir);
+    return match rc { Err(m) => dfail(m), Ok(c) => print_people(c, blob_list(relay_ep(c), "card-"), 0) };
+}
+
+@requires(network, clock(readonly), declassify)
+Int print_people(DeviceConfig c, List(Str) names, Int i) {
+    if (i >= names.len()) { return 0; }
+    Option(Card) ok = card_of(blob_get(relay_ep(c), names[i]) else { [] });
+    _ = match ok { None => 0, Some(k) => if (card_ok(c, names[i], k)) { print_card(c, k) } else { 0 } };
+    return print_people(c, names, i + 1);
+}
+
+@requires(network, clock(readonly), declassify)
+Bool card_ok(DeviceConfig c, Str blob, Card k) {
+    if (blob != card_blob(k.log_id) || !label_ok(k.name)) { return false; }
+    Result(VerifiedHead, SymbolonError) rv = verified_log(relay_ep(c), k.log_id);
+    return match rv { Err(_) => false, Ok(vh) => card_signed(vh, k) };
+}
+
+@requires(declassify)
+Bool card_signed(VerifiedHead vh, Card k) {
+    if (k.log_sequence > vh.head.sequence) { return false; }
+    return match device_party(vh.head.quorum.parties, k.signer, 0) {
+        None => false,
+        Some(d) => ecdsa_verify_raw(P256, Sha256, d.auth_key, card_tbs(k), k.sig)
+    };
+}
+
+Int print_card(DeviceConfig c, Card k) {
+    println(hex_encode(k.log_id) + " " + hex_encode(utf8(k.name)) + " " + fingerprint(k.log_id) + (if (bytes_eq(k.log_id, c.log_id)) { " me" } else { " -" }));
+    return 0;
+}

@@ -1,0 +1,259 @@
+import "../types.resid";
+import "log.resid";
+import "hash.resid";
+import "ecdsa.resid";
+import "crypto.resid";
+
+// Fixed private keys: scalar 1 + n in the last byte.
+List(Int) priv(Int n) {
+    return ([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                              0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, n]);
+}
+
+List(Int) pubk(Int n) { return ec_public_key(P256, priv(n)); }
+
+List(Int) sign(Int n, List(Int) msg) {
+    EcSig s = ecdsa_sign_digest(P256, Sha256, priv(n), hash_bytes(Sha256, msg));
+    return ecdsa_raw_of(P256, s);
+}
+
+List(Int) id32(Int n) { return sha256_bytes([n]); }
+
+Party test_device(Int n) {
+    return Party {
+        .id = id32(n), .kind = party_kind_device(), .auth_key = pubk(n), .hpke_key = pubk(n),
+        .label = "d", .attestation = NoAttestation };
+}
+
+Quorum quorum2() {
+    return Quorum {
+        .parties = [test_device(2), test_device(3)], .t = 2, .root_pubkey = pubk(9),
+        .epoch = 0, .transcript_digest = id32(99) };
+}
+
+Policy policy(UInt(64) delay) {
+    return Policy {
+        .device_sigs_for_authority = 2, .recovery_delay_sec = delay, .guardians = [],
+        .guardian_threshold = 0, .witnesses = [WitnessRef {.url = "w1", .key = pubk(7)}, WitnessRef {.url = "w2", .key = pubk(8)}, WitnessRef {.url = "w3", .key = pubk(11)}],
+        .duress_window_sec = 3600, .cosigner_policy = NoCosignerPolicy };
+}
+
+List(Int) enc(Int tag) { return [tag, 1, 2, 3, 4, 5, 6, 7]; }
+
+List(EventSig) sigs(List(Int) who, List(Int) msg, Int i, List(EventSig) acc) {
+    if (i >= who.len()) { return acc; }
+    return sigs(who, msg, i + 1, acc.concat([EventSig {.signer = id32(who[i]), .sig = sign(who[i], msg)}]));
+}
+
+List(WitnessCosignature) cosig(List(Int) l, UInt(64) seq, List(Int) d, UInt(64) time) {
+    return [WitnessCosignature {
+                .log_id = l, .sequence = seq, .digest = d, .witness_key = pubk(7),
+                .signature = sign(7, witness_message(l, seq, d)), .witness_time = time },
+            WitnessCosignature {
+                .log_id = l, .sequence = seq, .digest = d, .witness_key = pubk(8),
+                .signature = sign(8, witness_message(l, seq, d)), .witness_time = time }];
+}
+
+SignedEvent e0(List(Int) who) {
+    List(Int) encoded = enc(0);
+    List(Int) l = sha256_bytes(encoded);
+    EventPayload ep = EventPayload {
+        .log_id = None, .sequence = 0, .predecessor_digest = None, .suite = 1,
+        .body = InceptionBody(quorum2(), policy(86400)),
+        .next_recovery_key_digests = [id32(50)], .advisory_time = 0 };
+    return SignedEvent {
+        .payload = ep, .encoded = encoded, .sigs = sigs(who, encoded, 0, []),
+        .cosigs = cosig(l, 0, l, 1000) };
+}
+
+List(Int) log_id() { return sha256_bytes(enc(0)); }
+
+SignedEvent next(Int tag, UInt(64) seq, List(Int) prev_enc, EventBody body, List(Int) who, UInt(64) time) {
+    List(Int) encoded = enc(tag);
+    List(Int) l = log_id();
+    List(Int) d = sha256_bytes(encoded);
+    EventPayload ep = EventPayload {
+        .log_id = Some(l), .sequence = seq, .predecessor_digest = Some(sha256_bytes(prev_enc)),
+        .suite = 1, .body = body, .next_recovery_key_digests = [id32(50)], .advisory_time = 0 };
+    return SignedEvent {
+        .payload = ep, .encoded = encoded, .sigs = sigs(who, encoded, 0, []),
+        .cosigs = cosig(l, seq, d, time) };
+}
+
+Bool no_approvals(RecoverBodyInner r) { return false; }
+
+Bool ok(Result(VerifiedHead, SymbolonError) r) {
+    return match r { Ok(_) => true, Err(_) => false };
+}
+
+Int pending_n(Result(VerifiedHead, SymbolonError) r) {
+    return match r { Ok(v) => v.pending.len(), Err(_) => -1 };
+}
+
+Int delay_of(Result(VerifiedHead, SymbolonError) r) {
+    return match r { Ok(v) => (Int)v.head.policy.recovery_delay_sec, Err(_) => -1 };
+}
+
+test "inception signed by every party is accepted" {
+    List(Int) l = log_id();
+    expect(ok(il_verify(l, [e0([2, 3])], 1000, lambda(r) { false }))).toBeTrue();
+}
+
+test "inception missing a party signature is refused" {
+    List(Int) l = log_id();
+    expect(ok(il_verify(l, [e0([2])], 1000, lambda(r) { false }))).toBeFalse();
+}
+
+test "wrong log id is refused" {
+    expect(ok(il_verify(id32(1), [e0([2, 3])], 1000, lambda(r) { false }))).toBeFalse();
+}
+
+test "set-policy with two device signatures takes effect at once" {
+    List(Int) l = log_id();
+    SignedEvent ev = next(1, 1, enc(0), SetPolicyBody(policy(172800)), [2, 3], 2000);
+    Result(VerifiedHead, SymbolonError) r = il_verify(l, [e0([2, 3]), ev], 2000, lambda(x) { false });
+    expect(ok(r)).toBeTrue();
+    expect(delay_of(r)).toEqual(172800);
+}
+
+test "set-policy with one signature is delayed, then applies" {
+    List(Int) l = log_id();
+    SignedEvent ev = next(1, 1, enc(0), SetPolicyBody(policy(172800)), [2], 2000);
+    Result(VerifiedHead, SymbolonError) early = il_verify(l, [e0([2, 3]), ev], 2000 + 86399, lambda(x) { false });
+    expect(pending_n(early)).toEqual(1);
+    expect(delay_of(early)).toEqual(86400);
+    Result(VerifiedHead, SymbolonError) late = il_verify(l, [e0([2, 3]), ev], 2000 + 86400, lambda(x) { false });
+    expect(pending_n(late)).toEqual(0);
+    expect(delay_of(late)).toEqual(172800);
+}
+
+test "a weakening set-policy is delayed even with two signatures" {
+    List(Int) l = log_id();
+    SignedEvent ev = next(1, 1, enc(0), SetPolicyBody(policy(86400)), [2, 3], 2000);
+    // policy(86400) equals the current one: not weakening, immediate.
+    expect(pending_n(il_verify(l, [e0([2, 3]), ev], 2000, lambda(x) { false }))).toEqual(0);
+    SignedEvent first = next(1, 1, enc(0), SetPolicyBody(policy(172800)), [2, 3], 2000);
+    SignedEvent weaker = next(2, 2, enc(1), SetPolicyBody(policy(86400)), [2, 3], 3000);
+    Result(VerifiedHead, SymbolonError) r = il_verify(l, [e0([2, 3]), first, weaker], 3000, lambda(x) { false });
+    expect(pending_n(r)).toEqual(1);
+    expect(delay_of(r)).toEqual(172800);
+}
+
+test "a veto removes a delayed event" {
+    List(Int) l = log_id();
+    SignedEvent ev = next(1, 1, enc(0), SetPolicyBody(policy(172800)), [2], 2000);
+    SignedEvent veto = next(2, 2, enc(1), VetoBody(1), [3], 3000);
+    Result(VerifiedHead, SymbolonError) r = il_verify(l, [e0([2, 3]), ev, veto], 2000 + 90000, lambda(x) { false });
+    expect(pending_n(r)).toEqual(0);
+    expect(delay_of(r)).toEqual(86400);
+}
+
+test "a forged signature is refused" {
+    List(Int) l = log_id();
+    // Signed by key 4, claimed as device 3.
+    SignedEvent ev = next(1, 1, enc(0), SetPolicyBody(policy(172800)), [2], 2000);
+    SignedEvent forged = SignedEvent {
+        .payload = ev.payload, .encoded = ev.encoded,
+        .sigs = [EventSig {.signer = id32(2), .sig = sign(2, ev.encoded)},
+                 EventSig {.signer = id32(3), .sig = sign(4, ev.encoded)}],
+        .cosigs = ev.cosigs };
+    Result(VerifiedHead, SymbolonError) r = il_verify(l, [e0([2, 3]), forged], 2000, lambda(x) { false });
+    // One valid signature: delayed, not immediate.
+    expect(pending_n(r)).toEqual(1);
+}
+
+test "too few witnesses is refused" {
+    List(Int) l = log_id();
+    SignedEvent ev = next(1, 1, enc(0), SetPolicyBody(policy(172800)), [2, 3], 2000);
+    SignedEvent bare = SignedEvent {
+        .payload = ev.payload, .encoded = ev.encoded, .sigs = ev.sigs, .cosigs = [] };
+    expect(ok(il_verify(l, [e0([2, 3]), bare], 2000, lambda(x) { false }))).toBeFalse();
+}
+
+// Kit key is scalar 20; E0's field 6 holds sha256(pubk(20)).
+SignedEvent e0_kit(List(Int) who) {
+    SignedEvent base = e0(who);
+    EventPayload p = base.payload;
+    EventPayload kp = EventPayload {
+        .log_id = p.log_id, .sequence = p.sequence, .predecessor_digest = p.predecessor_digest,
+        .suite = p.suite, .body = p.body,
+        .next_recovery_key_digests = [sha256_bytes(pubk(20))], .advisory_time = 0 };
+    return SignedEvent {.payload = kp, .encoded = base.encoded, .sigs = base.sigs, .cosigs = base.cosigs};
+}
+
+SignedEvent recover_ev(Int tag, UInt(64) seq, List(Int) prev_enc, Int kit, UInt(64) time) {
+    RecoverBodyInner r = RecoverBodyInner {
+        .path = recover_path_kit(), .new_parties = [test_device(4)],
+        .revealed_recovery_key = Some(pubk(kit)), .guardian_approvals = [] };
+    return next(tag, seq, prev_enc, RecoverBody(r), [kit], time);
+}
+
+// next() uses field 6 = [id32(50)]; a recover must carry fresh digests that
+// exclude the spent key, and non-recover events must keep the current ones.
+test "kit recovery is delayed, then installs the new quorum" {
+    List(Int) l = log_id();
+    SignedEvent ev = recover_ev(1, 1, enc(0), 20, 2000);
+    Result(VerifiedHead, SymbolonError) early = il_verify(l, [e0_kit([2, 3]), ev], 2000 + 86399, lambda(x) { false });
+    expect(pending_n(early)).toEqual(1);
+    Result(VerifiedHead, SymbolonError) late = il_verify(l, [e0_kit([2, 3]), ev], 2000 + 86400, lambda(x) { false });
+    expect(pending_n(late)).toEqual(0);
+    expect(epoch_of(late)).toEqual(1);
+}
+
+test "a recovery by a key whose digest is not in field 6 is refused" {
+    List(Int) l = log_id();
+    SignedEvent ev = recover_ev(1, 1, enc(0), 21, 2000);
+    expect(ok(il_verify(l, [e0_kit([2, 3]), ev], 2000, lambda(x) { false }))).toBeFalse();
+}
+
+SignedEvent with_digests(SignedEvent e, List(List(Int)) ds) {
+    EventPayload p = e.payload;
+    return SignedEvent {
+        .payload = EventPayload {
+            .log_id = p.log_id, .sequence = p.sequence, .predecessor_digest = p.predecessor_digest,
+            .suite = p.suite, .body = p.body, .next_recovery_key_digests = ds, .advisory_time = 0 },
+        .encoded = e.encoded, .sigs = e.sigs, .cosigs = e.cosigs };
+}
+
+test "a vetoed recovery does not install" {
+    List(Int) l = log_id();
+    SignedEvent ev = recover_ev(1, 1, enc(0), 20, 2000);
+    SignedEvent veto = with_digests(next(2, 2, enc(1), VetoBody(1), [2], 3000), [sha256_bytes(pubk(20))]);
+    Result(VerifiedHead, SymbolonError) r = il_verify(l, [e0_kit([2, 3]), ev, veto], 2000 + 200000, lambda(x) { false });
+    expect(ok(r)).toBeTrue();
+    expect(pending_n(r)).toEqual(0);
+    expect(epoch_of(r)).toEqual(0);
+}
+
+Int epoch_of(Result(VerifiedHead, SymbolonError) r) {
+    return match r { Ok(v) => (Int)v.head.quorum.epoch, Err(_) => -1 };
+}
+
+Policy two_witness_policy() {
+    Policy p = policy(86400);
+    return Policy {
+        .device_sigs_for_authority = p.device_sigs_for_authority, .recovery_delay_sec = p.recovery_delay_sec,
+        .guardians = [], .guardian_threshold = 0,
+        .witnesses = [WitnessRef {.url = "w1", .key = pubk(7)}, WitnessRef {.url = "w2", .key = pubk(8)}],
+        .duress_window_sec = 3600, .cosigner_policy = NoCosignerPolicy };
+}
+
+test "a policy naming fewer than three witnesses is refused (SPEC 20.3)" {
+    List(Int) encoded = enc(0);
+    List(Int) l = sha256_bytes(encoded);
+    EventPayload ep = EventPayload {
+        .log_id = None, .sequence = 0, .predecessor_digest = None, .suite = 1,
+        .body = InceptionBody(quorum2(), two_witness_policy()),
+        .next_recovery_key_digests = [id32(50)], .advisory_time = 0 };
+    SignedEvent e = SignedEvent {
+        .payload = ep, .encoded = encoded, .sigs = sigs([2, 3], encoded, 0, []), .cosigs = cosig(l, 0, l, 1000) };
+    expect(ok(il_verify(l, [e], 1000, lambda(x) { false }))).toBeFalse();
+}
+
+test "one co-signature out of three witnesses is not a majority" {
+    List(Int) l = log_id();
+    SignedEvent ev = next(1, 1, enc(0), SetPolicyBody(policy(172800)), [2, 3], 2000);
+    SignedEvent one = SignedEvent {
+        .payload = ev.payload, .encoded = ev.encoded, .sigs = ev.sigs, .cosigs = [ev.cosigs[0]] };
+    expect(ok(il_verify(l, [e0([2, 3]), one], 2000, lambda(x) { false }))).toBeFalse();
+}

@@ -1,0 +1,79 @@
+// The relay, a witness and HPKE envelopes, end to end on loopback. The
+// servers are `symbolon relay serve` and `symbolon witness serve`, started
+// by tests/net_e2e.sh, which passes SYM_RELAY_PORT, SYM_WITNESS_PORT and
+// SYM_WITNESS_KEY (the witness's public key, hex).
+
+import "../types.resid";
+import "../core/log.resid";
+import "services.resid";
+import "envelope.resid";
+import "proto.resid";
+import "httpserv.resid";
+import "cose.resid";
+import "hpkeg.resid";
+import "word.resid";
+import "ecdsa.resid";
+import "crypto.resid";
+
+List(Int) rep(Int b, Int n) { return if (n == 0) { [] } else { [b].concat(rep(b, n - 1)) }; }
+
+@requires(environment)
+Endpoint relay_at() { return Endpoint {.host = "127.0.0.1", .port = str_parse_int(environment.get("SYM_RELAY_PORT")), .ca = ""}; }
+
+@requires(environment)
+Endpoint witness_at() { return Endpoint {.host = "127.0.0.1", .port = str_parse_int(environment.get("SYM_WITNESS_PORT")), .ca = ""}; }
+
+@requires(network, environment, declassify, clock(readonly))
+test "relay: mailboxes in order, append-only log, blobs; names are checked" {
+    Endpoint e = relay_at();
+    List(Int) to = random_bytes(32);
+    expect(mbox_put(e, to, [1, 2, 3])).toEqual(0);
+    expect(mbox_put(e, to, [4])).toEqual(1);
+    expect(hex_encode(mbox_get(e, to, 1) else { [] })).toEqual("04");
+    expect(match mbox_get(e, to, 2) { Some(_) => "found", None => "none" }).toEqual("none");
+    List(Int) l = random_bytes(32);
+    expect(log_put(e, l, 0, [9, 9])).toBeTrue();
+    expect(log_put(e, l, 0, [8, 8])).toBeFalse();
+    expect(hex_encode(log_get(e, l, 0) else { [] })).toEqual("0909");
+    expect(blob_put(e, "vault.head", [7])).toBeTrue();
+    expect(hex_encode(blob_get(e, "vault.head") else { [] })).toEqual("07");
+    expect(http_call_bytes(e.host, e.port, "GET", "/blob/..%2fetc", []).status).toEqual(404);
+    expect(http_call_bytes(e.host, e.port, "GET", "/mbox/XYZ/0", []).status).toEqual(404);
+}
+
+@requires(network, environment, declassify, clock(readonly))
+test "witness: one digest per (log, seq), signatures verify under its key" {
+    Endpoint e = witness_at();
+    List(Int) wpub = cose_hex_decode(environment.get("SYM_WITNESS_KEY"));
+    List(Int) l = random_bytes(32);
+    Option(WitnessCosignature) a = cosign_from(e, wpub, l, 3, rep(2, 32));
+    Option(WitnessCosignature) again = cosign_from(e, wpub, l, 3, rep(2, 32));
+    Option(WitnessCosignature) fork = cosign_from(e, wpub, l, 3, rep(3, 32));
+    Option(WitnessCosignature) wrong_key = cosign_from(e, ec_public_key(P256, rep(6, 32)), l, 4, rep(2, 32));
+    expect(match a { Some(c) => c.sequence == 3, None => false }).toBeTrue();
+    expect(match again { Some(_) => true, None => false }).toBeTrue();
+    expect(match fork { Some(_) => "signed", None => "refused" }).toEqual("refused");
+    expect(match wrong_key { Some(_) => "accepted", None => "refused" }).toEqual("refused");
+}
+
+@requires(network, filesystem, declassify, clock(readonly))
+test "envelopes: mode_auth through the relay; only the named pair opens them" {
+    HpkeKeyPairG(Secret(UInt(8))) a = hpkeg_derive_keypair(16, secret_bytes(rep(1, 32)));
+    HpkeKeyPairG(Secret(UInt(8))) b = hpkeg_derive_keypair(16, secret_bytes(rep(2, 32)));
+    HpkeKeyPairG(Secret(UInt(8))) c = hpkeg_derive_keypair(16, secret_bytes(rep(3, 32)));
+    List(Int) ida = rep(10, 32);
+    List(Int) idb = rep(11, 32);
+    List(Secret(UInt(8))) fresh = [];
+    Envelope env = seal(ida, a.sk, idb, b.pk, WRefused(rep(4, 32)), fresh) else { Envelope {.from = [], .to = [], .enc = [], .ct = []} };
+    Envelope back = envelope_decode(envelope_encode(env)) else { Envelope {.from = [], .to = [], .enc = [], .ct = []} };
+    Str got = match open(back, idb, b.sk, a.pk) { Some(w) => match w { WRefused(s) => hex_encode(s), _ => "other" }, None => "none" };
+    expect(got).toEqual(hex_encode(rep(4, 32)));
+    // Another recipient key, another claimed sender, a changed byte: refused.
+    expect(match open(back, idb, c.sk, a.pk) { Some(_) => "opened", None => "refused" }).toEqual("refused");
+    expect(match open(back, idb, b.sk, c.pk) { Some(_) => "opened", None => "refused" }).toEqual("refused");
+    List(Int) ct2 = back.ct[0..3].concat([back.ct[3] ^ 1]).concat(back.ct[4..back.ct.len()]);
+    Envelope bad = Envelope {.from = back.from, .to = back.to, .enc = back.enc, .ct = ct2};
+    expect(match open(bad, idb, b.sk, a.pk) { Some(_) => "opened", None => "refused" }).toEqual("refused");
+    Envelope rerouted = Envelope {.from = rep(12, 32), .to = back.to, .enc = back.enc, .ct = back.ct};
+    expect(match open(rerouted, idb, b.sk, a.pk) { Some(_) => "opened", None => "refused" }).toEqual("refused");
+}

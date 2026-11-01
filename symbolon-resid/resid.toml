@@ -1,0 +1,83 @@
+[package]
+name = "symbolon"
+version = "0.1.0"
+description = "Symbolon credential agent - continuity of control"
+authors = ["Larry Dewey <larry@symbolon.dev>"]
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/larrydewey/symbolon"
+edition = "2024"
+
+[capabilities]
+# This package's own capabilities (what its code may use)
+grant = [
+    "device",           # TPM / Secure Enclave operations
+    "filesystem",       # Encrypted storage
+    "network",          # TLS, sync service, cosigner
+    "display",          # Consent UI (web)
+    "terminal",         # Consent UI (CLI)
+    "declassify",       # Named publication points for secret values
+]
+
+# Core crypto from stdlib (already in .resid/lib)
+# symbolon uses: crypto, ed25519, x25519, chacha, aesgcm, hpke, rsa, ec256, der, x509, chain, tls, http, cbor, cose, cbor_head
+# Packages, from the working copies beside this checkout: the importers
+# read other password managers' exports with them (src/agent/importers.resid).
+# tools/depmap.sh writes the dependency map residc takes (-depmap).
+[dependencies.resid-json]
+path = "../../resid-json"
+
+[dependencies.resid-csv]
+path = "../../resid-csv"
+
+[reduction]
+# Knowledge cache for compile-time reduction
+knowledge_cache = true
+# Residual notes for debugging what stays residual
+residual_notes = true
+residual_notes_format = "json"
+
+[target]
+triple = "x86_64-unknown-linux-gnu"
+# Also build for aarch64 (Android/iOS via Flutter)
+# Use: residc --target aarch64-linux-android / --target aarch64-apple-ios
+
+[signing]
+keyring = "keys/symbolon.gpg"
+require_signatures = true
+
+[profiles.debug]
+opt_level = 0
+debug_assertions = true
+secret_mode = true
+
+[profiles.release]
+opt_level = 2
+debug_assertions = false
+secret_mode = true
+elide_capability_checks = true
+
+[profiles.check]
+opt_level = 0
+debug_assertions = true
+secret_mode = true
+type_check_only = true
+
+[workspace]
+members = [
+    "src/core",
+    "src/hw",
+    "src/store",
+    "src/net",
+    "src/ui",
+    "src/bridge",
+    "src/threshold",
+    "src/vault",
+    "src/sync",
+    "src/cosigner",
+    "src/recovery",
+    "src/duress",
+    "src/attestation",
+    "src/rotation",
+    "src/recipe",
+]

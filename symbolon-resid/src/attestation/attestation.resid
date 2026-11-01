@@ -1,0 +1,188 @@
+// Symbolon agent attestation (SPEC Section 21).
+//
+// Device evidence: TPM2_Certify of the device's DK by an attestation key the
+// verifier already trusts (proven by credential activation against the
+// manufacturer's EK root, lib/verify/tpm.resid tpm_verify_ak), with
+// extraData binding the certification to the enrolling device's challenge.
+// Build evidence: the agent's provenance record, accepted only when its
+// build is one the policy pins. Agent updates: a threshold of release keys,
+// a transparency-log inclusion proof, and matching hashes from independent
+// rebuilders (SPEC 21.4).
+
+import "../types.resid";
+import "../core/log.resid";
+import "../recipe/recipe.resid";
+import "verify/tpm.resid";
+import "dev/tpm_wire.resid";
+import "cose.resid";
+import "cosesig.resid";
+import "crypto.resid";
+
+// ============================================================================
+// The DK's certification (SPEC 11.1, 21.1)
+// ============================================================================
+
+// extraData = SHA-256(["symbolon v1 enroll", challenge, log_id]).
+pub List(Int) enroll_extra(List(Int) challenge, List(Int) log_id) {
+    return sha256_bytes(cbe_bytes(log_id, cbe_bytes(challenge, cbe_text("symbolon v1 enroll", cbe_array(3, [])))));
+}
+
+pub type DkEvidence = {
+    List(UInt(8)) attest;                // TPMS_ATTEST (CERTIFY)
+    List(UInt(8)) sig;                   // TPMT_SIGNATURE by the AK
+    List(UInt(8)) dk_public;             // the DK's TPMT_PUBLIC
+};
+
+// TPMA_OBJECT bits (TPM 2.0 Part 2, 8.3).
+Int attr_fixed_tpm() { return 2; }
+Int attr_fixed_parent() { return 16; }
+Int attr_sensitive_origin() { return 32; }
+Int attr_user_with_auth() { return 64; }
+Int attr_decrypt() { return 131072; }
+Int attr_sign() { return 262144; }
+
+Str verify_text(VerifyError e) { return verify_error_text(e); }
+
+// The policy every DK carries: PolicyAuthValue alone, so the DK signs only
+// with pin_stretch as its authValue (SPEC 9.1).
+List(Int) policy_auth_value() { return u8_ints(tpm_policy_auth_value_digest(), 0, ListBuf()); }
+
+List(Int) u8_ints(List(UInt(8)) b, Int i, ListBuf(Int) acc) {
+    if (i >= b.len()) { return acc.finish(); }
+    return u8_ints(b, i + 1, acc.push((Int)b[i]));
+}
+
+// The DK in `ev` is the device's `auth_key`, fixed to a TPM whose AK is
+// `ak_public` (already trusted), a signing key that cannot decrypt, and
+// usable only through its policy (userWithAuth clear, authPolicy the
+// PolicyAuthValue digest: the PIN-bound policy of SPEC 9.1, A-04).
+pub Result(Int, SymbolonError) dk_certified(DkEvidence ev, List(UInt(8)) ak_public, List(Int) auth_key, List(Int) challenge, List(Int) log_id) {
+    Result(PubKey, VerifyError) ak = tpm_ak_pubkey(ak_public);
+    return match ak {
+        Err(e) => Err(ErrAttestationFailed(verify_text(e))),
+        Ok(k) => dk_check(ev, k, auth_key, challenge, log_id)
+    };
+}
+
+Result(Int, SymbolonError) dk_check(DkEvidence ev, PubKey ak, List(Int) auth_key, List(Int) challenge, List(Int) log_id) {
+    Result(TpmCertified, VerifyError) r = tpm_verify_certify(ev.attest, ev.sig, ak, ev.dk_public, enroll_extra(challenge, log_id));
+    return match r {
+        Err(e) => Err(ErrAttestationFailed(verify_text(e))),
+        Ok(c) => dk_rules(c, auth_key)
+    };
+}
+
+Result(Int, SymbolonError) dk_rules(TpmCertified c, List(Int) auth_key) {
+    Int must = attr_fixed_tpm() | attr_fixed_parent() | attr_sensitive_origin() | attr_sign();
+    if ((c.attributes & must) != must) { return Err(ErrAttestationFailed("the DK is not a signing key generated in and fixed to its TPM")); }
+    if ((c.attributes & attr_decrypt()) != 0) { return Err(ErrAttestationFailed("the DK can decrypt")); }
+    if ((c.attributes & attr_user_with_auth()) != 0 || !bytes_eq(c.auth_policy, policy_auth_value())) { return Err(ErrAttestationFailed("the DK is usable without its unlock policy")); }
+    if (c.point.len() != 65 || !bytes_eq(c.point, auth_key)) { return Err(ErrAttestationFailed("the certified key is not the device's DK")); }
+    return Ok(0);
+}
+
+// ============================================================================
+// Provenance records and pinned builds (SPEC 21.1, 21.4)
+// ============================================================================
+
+List(Int) texts(List(Str) xs, Int i, List(Int) acc) {
+    if (i >= xs.len()) { return acc; }
+    return texts(xs, i + 1, cbe_text(xs[i], acc));
+}
+
+List(Int) blist(List(List(Int)) xs, Int i, List(Int) acc) {
+    if (i >= xs.len()) { return acc; }
+    return blist(xs, i + 1, cbe_bytes(xs[i], acc));
+}
+
+List(Int) caches(List(CacheProvenance) cs, Int i, List(Int) acc) {
+    if (i >= cs.len()) { return acc; }
+    CacheProvenance c = cs[i];
+    List(Int) a = cbe_bytes(c.hash, cbe_uint(2, cbe_text(c.key, cbe_uint(1, cbe_map(3, acc)))));
+    return caches(cs, i + 1, texts(c.capabilities, 0, cbe_array(c.capabilities.len(), cbe_uint(3, a))));
+}
+
+// The record's bytes, signature excluded:
+// {1: name, 2: version, 3: source hash, 4: [dependency hashes], 5: [capabilities],
+//  6: {1: compiler, 2: version, 3: reproducible}, 7: [{1: key, 2: hash, 3: [capabilities]}]}
+pub List(Int) provenance_cbor(ProvenanceRecord p) {
+    List(Int) a = cbe_text(p.package_version, cbe_uint(2, cbe_text(p.package_name, cbe_uint(1, cbe_map(7, [])))));
+    List(Int) b = cbe_bytes(p.source_hash, cbe_uint(3, a));
+    List(Int) c = blist(p.dependency_hashes, 0, cbe_array(p.dependency_hashes.len(), cbe_uint(4, b)));
+    List(Int) d = texts(p.capability_requirements, 0, cbe_array(p.capability_requirements.len(), cbe_uint(5, c)));
+    CompilerInfo ci = p.compiler_info;
+    List(Int) e = cbe_head(7, if (ci.reproducible) { 21 } else { 20 }, cbe_uint(3, cbe_text(ci.version, cbe_uint(2, cbe_text(ci.name, cbe_uint(1, cbe_map(3, cbe_uint(6, d))))))));
+    return caches(p.cache_entry_provenance, 0, cbe_array(p.cache_entry_provenance.len(), cbe_uint(7, e)));
+}
+
+// A build's identity: SHA-256 of its provenance bytes.
+pub List(Int) build_id(ProvenanceRecord p) { return sha256_bytes(provenance_cbor(p)); }
+
+// Peers refuse a device or update whose build the policy does not pin
+// (SPEC 21.4).
+pub Result(Int, SymbolonError) build_pinned(ProvenanceRecord p, List(List(Int)) pinned) {
+    if (!p.compiler_info.reproducible) { return Err(ErrAttestationFailed("build not reproducible")); }
+    return if (has(pinned, build_id(p), 0)) { Ok(0) } else { Err(ErrAttestationFailed("build not pinned by policy")) };
+}
+
+Bool has(List(List(Int)) xs, List(Int) x, Int i) {
+    if (i >= xs.len()) { return false; }
+    if (bytes_eq(xs[i], x)) { return true; }
+    return has(xs, x, i + 1);
+}
+
+// ============================================================================
+// Agent updates (SPEC 21.4, A-15)
+// ============================================================================
+
+pub type UpdatePolicy = {
+    List(List(Int)) release_keys; Int release_threshold;
+    List(Int) log_key;
+    List(List(Int)) rebuilder_keys; Int rebuilders_needed;
+};
+
+pub type UpdateBundle = {
+    List(Int) provenance;                // provenance_cbor of the release
+    List(List(Int)) release_sigs;        // COSE_Sign1 over `provenance`, one per release key
+    Int log_time; Int index; Int size; List(List(Int)) path; List(Int) root; List(Int) tree_head;
+    List(List(Int)) rebuilds;            // COSE_Sign1 by rebuilders over SHA-256(provenance)
+};
+
+PubKey ec_pk(List(Int) sec1) { return PubKey {.kind = pubkey_ec(), .curve = P256, .point = sec1, .n = [], .e = [], .pss_only = false}; }
+
+Int key_index(List(List(Int)) keys, List(Int) m, List(Int) payload, Int i) {
+    if (i >= keys.len()) { return -1; }
+    Bool ok = match cose_sign1_open(m, ec_pk(keys[i]), []) { None => false, Some(p) => bytes_eq(p, payload) };
+    return if (ok) { i } else { key_index(keys, m, payload, i + 1) };
+}
+
+Int distinct(List(List(Int)) keys, List(List(Int)) ms, List(Int) payload, Int i, List(Int) seen) {
+    if (i >= ms.len()) { return seen.len(); }
+    Int k = key_index(keys, ms[i], payload, 0);
+    Bool fresh = k >= 0 && !int_has(seen, k, 0);
+    return distinct(keys, ms, payload, i + 1, if (fresh) { seen.concat([k]) } else { seen });
+}
+
+Bool int_has(List(Int) xs, Int x, Int i) {
+    if (i >= xs.len()) { return false; }
+    if (xs[i] == x) { return true; }
+    return int_has(xs, x, i + 1);
+}
+
+// An update installs only when every condition of SPEC 21.4 holds.
+pub Result(List(Int), SymbolonError) accept_update(UpdatePolicy pol, UpdateBundle u) {
+    if (pol.release_threshold < 1 || distinct(pol.release_keys, u.release_sigs, u.provenance, 0, []) < pol.release_threshold) {
+        return Err(ErrAttestationFailed("update not signed by the release threshold"));
+    }
+    Option(List(Int)) th = cose_sign1_open(u.tree_head, ec_pk(pol.log_key), []);
+    Bool head_ok = match th { None => false, Some(p) => bytes_eq(p, tree_head_payload(u.size, u.root)) };
+    if (!head_ok) { return Err(ErrAttestationFailed("tree head not signed by the log")); }
+    if (!inclusion_ok(u.index, u.size, entry_cbor(LogEntry {.time = u.log_time, .payload = u.provenance}), u.path, u.root)) {
+        return Err(ErrAttestationFailed("update not in the transparency log"));
+    }
+    List(Int) h = sha256_bytes(u.provenance);
+    if (pol.rebuilders_needed < 1 || distinct(pol.rebuilder_keys, u.rebuilds, h, 0, []) < pol.rebuilders_needed) {
+        return Err(ErrAttestationFailed("too few independent rebuilds match"));
+    }
+    return Ok(h);
+}

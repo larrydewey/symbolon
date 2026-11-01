@@ -301,7 +301,7 @@ suite is a new format version adopted by a signed `migrate` event.
 | Hash, KDF | SHA-256, HKDF-SHA256 |
 | AEAD | AES-256-GCM |
 | Public-key encryption | HPKE (RFC 9180) DHKEM(P-256), HKDF-SHA256, AES-256-GCM; mode_auth between parties |
-| Local stretching | Argon2id (RFC 9106), m = 256 MiB, t = 3, p = 1 |
+| Local stretching | Argon2id (RFC 9106), m = 256 MiB, t = 3, p = 1 (the reference agent currently uses m = 19 MiB, t = 2, OWASP's minimum, until its Argon2id is fast enough; each device records its parameters) |
 | Continuity tokens | Publicly verifiable blind RSA tokens (Privacy Pass, RFC 9578 type 2) |
 | Random | getrandom, optionally mixed with the hardware RNG |
 
@@ -329,8 +329,17 @@ The threshold protocol MUST:
   aborts that identify no one, they MUST stop and alert, since selective
   aborts can leak share material in some protocols.
 
-Candidate families are the oblivious-transfer-based DKLs line and the
-CGGMP line; the choice is open (Section 28). Published attacks on
+**Decision (2026-10-14): the CGGMP21 line** (Canetti, Gennaro, Goldfeder,
+Makriyannis, Peled, ePrint 2021/060): Paillier-based, with identifiable
+abort and proactive refresh, run over P-256. The oblivious-transfer-based
+DKLs line was the alternative; CGGMP was chosen by the maintainer. The
+protocol needs, per party, a Paillier key whose modulus is a product of two
+safe primes and Pedersen parameters, and every proof of the paper:
+Paillier-Blum modulus (mod), Pedersen parameters (prm), no small factors
+(fac), Paillier encryption in range (enc), affine operation with group
+commitment (aff-g), discrete-log consistency (log*), and decryption (dec).
+The implementation plan and its verification are in `PLAN-CGGMP.md`.
+Published attacks on
 deployed threshold ECDSA libraries came from omitted or weakened proofs and
 parameter checks; the implementation requirements in Section 23 exist
 because of them.
@@ -481,6 +490,28 @@ it MUST NOT leave the device. A device without a TPM or secure element MAY
 run the **unprotected-device profile** (`unlock_key` from `pin_stretch`
 alone), which the interface MUST show.
 
+On Android the hardware is the Keystore, which the app reaches and the
+agent (a separate process) does not; the app serves it to the agent on
+loopback behind a per-start token (the **Keystore profile**). Two
+non-exportable HMAC-SHA256 keys, in StrongBox where present and the TEE
+otherwise, take the TPM's place: `hw_secret = HMAC(K_a, pin_stretch ||
+salt_local)` (`K_b` for the duress blob), and the DK is a Keystore P-256
+key. On a phone with a secure lock screen (Android 11+) all three are
+usable only within 30 seconds of a biometric or lock-screen check of the
+person (the platform's user-verification gate A-04 allows); when a key
+refuses for want of one, the app asks for it and retries, so long
+operations (an inception) ask again rather than fail. Code running as
+the app on an unlocked phone therefore cannot try PINs, or use the DK,
+without the person. Without a secure lock screen the keys are usable
+whenever the phone is unlocked, and the interface says so. The Keystore
+keeps no count of wrong PINs itself; the per-use check stands in for the
+TPM's lockout.
+
+The PIN MAY be kept on the phone for biometric unlock: encrypted under a
+Keystore AES key that the same check opens and that a new biometric
+enrollment destroys (the PIN is then typed again). It never leaves the
+phone (Section 9.1).
+
 ### 9.2 Duress PIN
 
 The principal MAY set a duress PIN at setup. It is sealed exactly like the
@@ -554,8 +585,20 @@ adversary can predict or choose the tweak; the construction relies on `τ`
 being a pseudorandom function output under `cc`, and its proof is an open
 item (Sections 27.3 C-01 and 28, A-10).
 
-In signing, the designated device party adds `τ` to its additive share
-inside the protocol; no other party learns `τ` or `P`. Because the tweak
+In signing, the designated device party (the initiator) applies `τ`
+inside the protocol; no other party learns `τ`, `τG` or `P`. Moving the
+designated party's public share by `τG`, the obvious construction, would
+hand every co-signer `τG` and so `P`, a per-credential linking handle
+(Section 12.2). Instead (2026-10-29), every share and public share stays
+untweaked, and in presigning the designated party sends a Paillier
+encryption `T = Enc(τ)` and runs one more MtA with each other signer on
+that signer's `K_j`, proven with the aff-p proof against `T` (no group
+element). Each signer adds its MtA output to its `χ` share, so the `χ`
+shares sum to `k(x + τ)`. The `S` points, whose sum is `P`, the signature
+shares, and the abort-2 openings (which would let a co-signer solve for
+`τG`) go to the designated party only, and only it checks `Σ S = P` and
+names a culprit. This is Symbolon's addition to CGGMP21, not part of the
+paper; it needs its own review (C-01). Because the tweak
 is additive and unhardened, **a credential's private key, if ever
 assembled, together with `cc`, would reveal `x`.** Therefore:
 
@@ -740,7 +783,14 @@ credential.
 ### 13.2 R2: Recovery kit
 
 The kit holds static keys only (Section 10.6): a recovery signing key
-whose digest is in the log's field 6, and an HPKE key. To recover, a new
+whose digest (SHA-256 of its SEC1 encoding) is in the log's field 6, and
+an HPKE key. Both derive from a 32-byte kit seed, the only thing printed or
+stored on the token: the signing scalar is
+`HKDF(seed, nil, "symbolon v1 kit sign", 48) mod (n - 1) + 1`, the HPKE key
+pair `DeriveKeyPair(HKDF(seed, nil, "symbolon v1 kit hpke", 32))`. The chain
+code and vault recovery key are sealed under `k_K` with AES-256-GCM (nonce
+`HKDF(k_K, nil, "symbolon v1 kit nonce" || epoch, 12)`, aad
+`["symbolon v1 kit secrets", log-id, epoch]`). To recover, a new
 device:
 
 1. reads the kit (printed words, QR, or hardware token) and fetches the
@@ -756,9 +806,13 @@ device:
 
 ### 13.3 R3: Guardians
 
-A `recover` by path 2 carries COSE_Sign1 approvals over `H(payload)` from
-`policy[4]` guardians, each verified against that guardian's own log
-head. A guardian's agent MUST show the requester's attestation summary and
+A `recover` by path 2 carries COSE_Sign1 (ES256) approvals from
+`policy[4]` distinct guardians named in `policy[3]`, each by a device of
+that guardian's own verified log head. An approval's payload is
+`["symbolon v1 guardian approval", H(p)]`, where `p` is the event payload
+with its guardian-approvals list empty; `p` binds the log id, sequence and
+predecessor, so an approval cannot be replayed into another log or
+another position. A guardian's agent MUST show the requester's attestation summary and
 require out-of-band confirmation with the principal before approving.
 Guardians that are also parties contribute their shares to the re-share
 after the delay.
@@ -773,6 +827,10 @@ after the delay, measured by witness time, without a valid `veto`.
   through the sync service, at an interval no longer than a quarter of the
   delay, so a sync service that suppresses the event cannot hide it (A-05).
   Guardians are notified through their own agents.
+- **Witness time.** "Now", for every delay, is the median of the times a
+  majority of the policy's witnesses sign for a fresh nonce (`["symbolon
+  v1 witness time", nonce, time]`), never a party's local clock, so a
+  tampered clock on the cosigner's host cannot shorten a delay.
 - **Release.** The cosigner MUST NOT release its half of the kit's
   material, or take part in any session with the recovering device, until
   the event carries co-signatures from a majority of the policy's witnesses
@@ -980,6 +1038,20 @@ item = {
 }
 ```
 
+The agent writes kind `"password"` for every item, so the relay learns
+nothing about what an item is. The item's type -- `login`, `card`,
+`identity`, `note`, `bank`, `wifi` or `secret` -- is a sealed field
+`type`, next to the sealed `name`; other field names are `[a-z0-9_]{1,32}`,
+at most 40 per item, each value at most 64 KiB. A login has at least one
+of `origin` (scheme://host[:port]), `username` and `current` (the password
+rotation reads; rotation needs `origin` and `current`), and may have
+`totp`; a card has `number`, a secret `secret`, a note `text`. An item
+without `type` predates it: a secret if it has `secret`, else a login.
+Fields the user adds are `custom_N`, the value being label, 0x1F, `1`
+(hidden) or `0`, 0x1F, text; the agent stores them like any other field.
+An item's folder is the sealed field `folder`, its levels joined by `/`
+("Work/Clients"); like the type, the relay never sees it.
+
 ### 18.3 Encryption
 
 `aad = CBOR([1, vault_id, item_id, item_version, kind, field_name])`;
@@ -1006,7 +1078,16 @@ a device removed since cannot sign an acceptable head, whatever sequence
 it states (A-14) -- the
 version is no lower than any it has accepted, the recomputed root matches,
 and the suite is format version 1's (G6-G8). KDF parameters are never read
-from storage. Partial fetches carry inclusion proofs; absence is never
+from storage.
+
+After a kit recovery (Section 13.2) every device of the recovered quorum is
+new, so no current device signed the head. The recovered device accepts,
+once, the head under the quorum in force before the `recover` event,
+provided the head's field 5 is a sequence before that event (a head a
+removed device signs afterwards stays unacceptable), and re-signs it at
+the next version; later accepts follow the rule above. Residual risk: an
+older pre-recovery head cannot be told from the latest, since the new
+device has no history (Section 24.2). Partial fetches carry inclusion proofs; absence is never
 deletion without a head proving it.
 
 ### 18.5 Duress
@@ -1025,6 +1106,51 @@ new head, wrap to current parties only.
 
 Computed in the core (RFC 6238); the seed never leaves it.
 
+### 18.8 Offline reading
+
+After every state it accepts or publishes, a device keeps that state in
+its directory (`vault.cache`) with `HMAC-SHA256(HKDF(vault_key, "symbolon
+v1 vault cache", 32), cbor)` beside it (`vault.tag`). When the relay, the
+log or the witnesses cannot be had, or the relay's state does not verify,
+reading -- list, get, show -- falls back to that copy and says why; the
+copy is used only if its tag verifies. A change always needs the relay and
+the verified log, so it is refused offline. Signing never works offline:
+it needs the cosigner (Section 7). Residual risk: someone who can write
+the device's directory can put back an older copy with its tag; it is
+read-only and only as old as one this device itself accepted.
+
+### 18.9 Importing
+
+`device vault import DIR FILE` reads another password manager's export
+and adds every entry to the vault as one new vault version (one head
+signature, however many items); nothing already in the vault is replaced:
+a name in use, in the vault or earlier in the same import, becomes "Name
+(2)", "Name (3)" and so on. With `--dry-run` it reads and checks the file
+without the PIN, for the app to show what will come across.
+
+Sources: Bitwarden and Vaultwarden JSON (logins, cards, identities, notes,
+SSH keys; folders, and an organization's collections where an item has no
+folder; custom fields, hidden ones kept hidden), and any CSV whose header
+names its columns -- Bitwarden, LastPass, 1Password, Chrome, Edge,
+Firefox, Safari, KeePassXC, Proton Pass and Dashlane all write one. LastPass
+secure notes are read by their `NoteType`: credit cards, bank accounts,
+addresses, Wi-Fi, passports, licences and social security numbers become
+the matching types; others become notes that keep every field. The first
+web address of a login gives its `origin`; the others, and app addresses,
+become custom fields. Parsing uses the resid-json and resid-csv packages.
+
+Not imported, and said so: the source's passkeys (a Symbolon passkey's key
+is split between the device and the cosigner, and a whole private key is
+never split after the fact: the person registers a new passkey at each
+site), and a password-protected Bitwarden export (it is exported again
+unencrypted). An entry that cannot be stored (a field over 64 KiB, a card
+without a number) is left out with the reason; a card without a number
+comes across as a note.
+
+The export file holds every secret in clear. The agent reads it and
+writes nothing of it outside the sealed vault; the app removes the copy the
+platform's file picker made and tells the person to delete the original.
+
 ---
 
 ## 19. Sharing
@@ -1034,9 +1160,106 @@ principals. A member's DEKs MUST come from the member's verified log head,
 checked against the policy's witnesses or a fingerprint compared out of
 band (G5); never from the sync service alone. The collection key is
 wrapped with HPKE mode_auth, `info = "symbolon v1 share" || vault_id ||
-member log-id || u64(vault_version)`. The recipient MUST verify that the
+member log-id || u64(roster_version)`. The recipient MUST verify that the
 sender key used by mode_auth belongs to a device in the sender's verified
 log head. Removing a member rotates the key.
+
+### 19.1 Objects
+
+```
+coll_id    : 16 random bytes
+vault_id   = SHA-256("symbolon v1 collection" || coll_id)
+roster     = { coll_id, version, owner log-id, owner label,
+               members: [ { log-id, label } ], name_ct, deleted,
+               log_sequence, signer, sig }
+wrap set   = { coll_id, roster_version, member log-id,
+               wraps: [ { to party, from log-id, from party, enc, ct } ] }
+card       = { log-id, name, log_sequence, signer, sig }
+```
+
+At the relay: `roster-<id>`, `wrap-<member log>-<id>` (one per member,
+holding a wrap for each device of the member's verified quorum: devices
+only, never the cosigner, the kit or a guardian), `coll-<id>` (the
+collection's items: a vault state as in Section 18, under the collection
+key) and `card-<log>`. The relay lists blob names by prefix, so a device
+finds its collections (`wrap-<own log>-`) and the people with cards
+(`card-`); a listing is a hint, every object is verified.
+
+The roster and the card are signed by a device's DK over `"symbolon v1
+roster"` (or `"symbolon v1 card"`) followed by the record's deterministic
+CBOR without `sig`; the signer must be a device of the owner's (the
+card's log's) verified quorum, at a sequence already verified. The
+collection's name is a sealed field (`field_seal` with item id `coll_id`,
+kind `"share"`, field `"name"`, version the roster version), so the relay
+learns no names but the people's own.
+
+### 19.2 Rules
+
+- Only the owner's devices sign rosters. The version strictly increases
+  with every change of members, name or key; a device keeps the highest
+  version it saw and refuses a lower one.
+- A wrap set is accepted only at the roster's current version. Any member's
+  device that holds the key may add the wraps a member's newer devices
+  lack (an enrolment, a recovery); wraps are authenticated by mode_auth
+  and the sender check above, not by the roster.
+- The collection's vault head is signed by a device of anyone in the
+  current roster; the device checks it against that person's verified log
+  (Section 18.4, with that log in place of its own) and keeps the highest
+  version it accepted.
+- Removing a member: a new key, every item opened and sealed again under
+  it (new item ids, which come from the key), a new head, a new roster
+  without them, wraps for those remaining and an empty wrap set for the
+  removed one. Deleting: an empty item list, a roster marked deleted, and
+  empty wrap sets for everyone.
+- Leaving: a member publishes `leave-<id>-<log>` = { coll_id, log-id,
+  roster_version, log_sequence, signer, sig }, signed like a card over
+  `"symbolon v1 leave"`. Their devices stop opening the collection and
+  forget their copies at once. The owner's device, when it next lists its
+  collections, removes every member with a valid record (as above: a new
+  key) and clears the record; adding someone clears any old record of
+  theirs. The owner cannot leave; they delete. Until the owner's device
+  re-keys, the key the leaver held still opens what is there.
+- Moving an item between the own vault and a collection (or between two
+  collections) opens it under one key and seals it under the other (a new
+  id), writes it at the destination first and then removes it from the
+  source, so a failure in between leaves it in both, never in neither. An
+  item with a password change under way does not move.
+- Rotation (Section 26) works in a collection as in the own vault; the
+  lease and the failed sign-ins live in the item, so they hold across
+  every member's devices.
+- Offline reading: after a collection loads, a device keeps
+  `share-<id>.key`, the key with the collection's name, role and number of
+  people, sealed (AES-GCM, random IV) under `HKDF(vault_key, "symbolon v1
+  share record", 32)` with AAD `"symbolon v1 share record" || coll_id`,
+  and a copy of the items with its tag as in Section 18.8
+  (`share-<id>.cache`, `.tag`). Reading and listing fall back to these as
+  the own vault does, and say why; a change needs the relay. A device
+  forgets them when the collection is deleted, it is removed, or it left.
+- Duress: beside each `.key` the device keeps `share-<id>.dkey`, the same
+  record sealed by HPKE base mode (suite 16,1,2) to the duress profile's
+  HPKE key when the person chose the collection for the duress PIN on
+  this device, and otherwise random bytes of the same length, so the files
+  do not tell whether a duress profile exists or what its subset holds.
+  Under the duress PIN the device lists and reads only those collections,
+  from `.dkey`, and changes nothing: a change fails as one the relay did
+  not take (Section 14.3). The choice is per device and is kept when the
+  key changes (the device re-seals `.dkey` the next time it loads the
+  collection under the PIN).
+
+### 19.3 Who is who
+
+On Symbolon Home the relay and the witnesses are one box, so a verified
+log proves only that the log is consistent, not whose it is: the box could
+present a log of its own under a person's name. People therefore compare
+fingerprints out of band before adding someone: six groups of five
+decimal digits from `SHA-256("symbolon v1 fingerprint" || log-id)`, three
+bytes per group modulo 100000. The app shows a person's own fingerprint
+and, when adding someone, theirs, and asks whether they match. Residual
+risks: someone removed keeps what they could read before; a member can
+copy the key or the items out; the relay can withhold objects or serve
+stale ones down to the versions a device last saw; and it can put back a
+member's old leave record after they were added again, which removes
+them again (a denial of service it could do by withholding anyway).
 
 ---
 
@@ -1055,6 +1278,17 @@ TLS 1.3. Protocol messages between parties are additionally HPKE
 mode_auth encrypted end to end between the parties' keys; the service
 relays ciphertext.
 
+The agent's configuration names one trust anchor (a CA certificate) for
+the service and the policy's witnesses; with it, every call to them is
+TLS 1.3 with the server's certificate checked against that anchor and the
+host name or IP address. TLS adds no trust the protocol relies on: log
+events are signed and witnessed, envelopes are authenticated end to end
+and witness times are signed, so a service or witness that a network
+attacker impersonates can only withhold. What TLS adds is confidentiality
+of the traffic's metadata and of the request patterns against a passive
+network observer. A deployment without the anchor (loopback tests) speaks
+plain HTTP.
+
 ### 20.3 Witnesses
 
 Witnesses co-sign `(log-id, seq, digest)` and refuse a second digest for
@@ -1069,6 +1303,36 @@ independent operators.
 Parties exchange their highest verified heads at every contact and alarm
 on a fork. A party that sees no newer witnessed head within a configured
 interval warns that it may be frozen.
+
+### 20.5 Symbolon Home
+
+A household MAY run every service on one box it owns (a NAS, a small
+computer): the relay, a cosigner per principal, and pairing. The box
+makes its own certificate authority (P-256, 20 years) and a server
+certificate under it (10 years) for the names and addresses its devices
+use; no public CA or domain is involved. A principal is invited with a
+one-time code (128 bits, a week) that the box shows as a QR code:
+
+```
+symbolon://pair?h=HOST&p=PORT&c=CODE&f=BASE64URL(SHA-256(server certificate DER))
+```
+
+The device connects to `https://HOST:PORT` and MUST accept only a server
+certificate whose SHA-256 is `f`, before sending the code, so a network
+attacker can neither read the code nor pose as the box. `GET /setup?c=`
+returns the relay, the principal's cosigner keys, the witnesses and the
+box's CA certificate, which the agent then trusts for TLS (Section 20.2);
+`POST /pair?c=` with the keys `device new` printed pins the device at the
+principal's cosigner as the inception party (Section 11.1 step 2, the
+out-of-band comparison being the QR code) and spends the code. The box
+keeps each cosigner's key on its disk; whoever holds the box and one of a
+principal's devices still needs the device's PIN (Section 9.1).
+
+Interim deviation: the box runs the policy's three witnesses itself, so
+they are not independent operators (Section 20.3): the box could present
+a forked log to devices that have no other contact. Independent public
+witnesses (an append-only public log for heads, signed public time for
+delays) replace them; until then the interface states it.
 
 ---
 
@@ -1119,6 +1383,18 @@ credential-provider interface where one exists, and as a CTAP 2
 authenticator (hybrid transport, USB/HID emulation where permitted)
 elsewhere. The browser extension, where needed, holds nothing and forwards
 requests over native messaging.
+
+On Android 14+ the app is a Credential Manager provider. The system asks
+it which passkeys it holds for an RP, answered from public data without
+the PIN; choosing one opens the agent-owned passkey screen, which shows
+the RP ID, the account and the requester's origin as Android reports it
+(a browser's page only for browsers on the privileged-browser list, else
+the app's `android:apk-key-hash`), takes the PIN (so UV is truthful), and
+has the agent form the response (`device webauthn register | assert`,
+Section 10.4). A browser supplies its own `clientDataHash`; for an app the
+client data is formed by the provider. Cross-device sign-in (hybrid, the
+QR code a computer shows) reaches the provider through the platform where
+the platform routes it to third-party providers.
 
 ### 22.2 Consent outside the page (G14)
 
@@ -1456,6 +1732,7 @@ recipe = COSE_Sign1 over {
   3 => password-rules,                       ; length, classes, forbidden characters
   4 => [+ step],
   5 => [* tstr],                             ; origins the procedure may visit (same site only)
+  ? 6 => [+ step],                           ; sign-in procedure for 26.3 step 3
 }
 
 step = [0, url: tstr]                        ; navigate (must be in field 5)
@@ -1464,8 +1741,15 @@ step = [0, url: tstr]                        ; navigate (must be in field 5)
      / [3, condition]                        ; expect: URL, element, or text present/absent
      / [4, passkey-register: true]           ; run the site's passkey registration (26.6)
 
-slot = "username" / "old" / "new" / "totp"
+slot = "username" / "old" / "new" / "totp" / "password"
 ```
+
+Field 6 is the sign-in procedure that step 3 of 26.3 runs in a fresh
+session, once per candidate; it fills the slot `password` (the candidate)
+and never `old` or `new`, may not register a passkey, and must end in an
+expectation like field 4. A recipe without field 6 cannot be verified, so
+the agent does not run it. Field 6 is present only when not empty, so a
+recipe without it keeps its five-entry canonical encoding.
 
 Rules:
 
@@ -1480,7 +1764,7 @@ Rules:
 - A recipe can name only slots, never values. The agent substitutes values
   at fill time, after checking the current top-level origin as the browser
   reports it, and only into fields of the matching type: `old` and `new`
-  into password inputs, `totp` into one-time-code inputs, `username` into
+  (and `password`) into password inputs, `totp` into one-time-code inputs, `username` into
   username or email inputs. A recipe cannot place a secret into a field
   the site would display or forward (A-09).
 - Click steps are reviewed in the repository; the agent refuses a click
@@ -1625,7 +1909,7 @@ compromise rules under which the lemma must hold.
 | L-18 | **Continuity-token unlinkability.** Redemptions at two RPs cannot be linked within the issuer's anonymity set; issuance does not depend on duress. | `MaliciousRP`, curious issuer with a single logged key | 1, ProVerif (equivalence) |
 | L-19 | **Update acceptance.** An honest device installs only a build that is threshold-signed and present in the log. | minority of release keys | 1, Tamarin |
 | L-20 | **Import containment (22.3).** An imported item enters the vault only as a device-signed item version; no import changes the log, quorum or policy; an imported origin is never filled or visited by a recipe before the principal consents at it; a merge never removes a value from item history. | malicious import source, sync service | 1, Tamarin |
-| C-01 | **Tweak lemma (A-10).** ECDSA under `x + τ` with `τ` a PRF output under `cc` is unforgeable for an adversary without `cc`, given signing oracles for other tweaks. | -- | 2, paper proof or EasyCrypt |
+| C-01 | **Tweak lemma (A-10).** ECDSA under `x + τ` with `τ` a PRF output under `cc` is unforgeable for an adversary without `cc`, given signing oracles for other tweaks; and the blind-tweak extension of Section 10.3 (the extra aff-p MtA, `S` points and abort-2 openings to the designated party only) keeps CGGMP21's security against the other signers and reveals nothing about `τ` to them. | -- | 2, paper proof or EasyCrypt |
 | C-02 | **Vault construction.** The key derivation and AEAD of 18.1-18.3 give authenticated encryption with key separation per (vault, item, field, version). | -- | 2, CryptoVerif |
 | C-03 | **Threshold ECDSA.** The chosen protocol's published security proof covers the variant implemented, including the designated party's tweak and output delivery to one party (6.2). | -- | 2, the paper's proof; any deviation needs its own proof |
 | C-04 | **Credential-ID MAC.** HMAC truncation to 16 bytes gives the binding L-16 assumes. | -- | 2, standard PRF argument (paper) |
@@ -1680,8 +1964,10 @@ compromise rules under which the lemma must hold.
 
 ## 28. Open issues
 
-1. Choice of threshold ECDSA protocol (DKLs line vs. CGGMP line), and an
-   audited implementation strategy.
+1. Threshold ECDSA: the CGGMP21 line is chosen (Section 6.2). Open: an
+   audited implementation strategy; the t-of-n construction (Shamir shares
+   converted to additive shares for each signing subset) and the P-256
+   instantiation of every proof; constant-time Paillier private operations.
 2. Re-registration after removing a device that knew the chain code:
    automatic at next sign-in, or a separately keyed chain code held only
    by non-device parties.

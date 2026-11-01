@@ -1,0 +1,142 @@
+// A WebSocket client (RFC 6455) for the browser's DevTools endpoint on
+// loopback: the opening handshake (Sec-WebSocket-Accept checked), masked
+// text frames out, text frames in (fragments joined, pings answered, a
+// close frame ends the connection). Nothing here is secret-aware: the
+// caller decides what it sends.
+
+import "json.resid";
+import "crypto.resid";
+import "httpserv.resid";
+
+pub type Ws = { Int fd; List(Int) buf; };
+
+// What a receive returned: a text message, or None when the connection
+// closed, the deadline passed or a frame was malformed.
+pub type WsGot = { Option(Str) msg; Ws ws; };
+
+pub Int ws_max_message() { return 16777216; }
+
+// base64(SHA-1(key || GUID)), RFC 6455 Section 4.2.2.
+pub Str ws_accept_of(Str key) {
+    List(Int) m = json_utf8(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
+    return base64_encode(sha1_bytes(m));
+}
+
+Int find_end(List(Int) b, Int i) {
+    if (i + 3 >= b.len()) { return -1; }
+    if (b[i] == 13 && b[i + 1] == 10 && b[i + 2] == 13 && b[i + 3] == 10) { return i; }
+    return find_end(b, i + 1);
+}
+
+@requires(network)
+List(Int) read_head(Int fd, List(Int) acc) {
+    if (find_end(acc, 0) >= 0 || acc.len() > 65536) { return acc; }
+    List(Int) chunk = resid_tcp_recv_some(fd, 65536);
+    if (chunk.len() == 0) { return acc; }
+    return read_head(fd, acc.concat(chunk));
+}
+
+Str header_value(List(Str) lines, Str name, Int i) {
+    if (i >= lines.len()) { return ""; }
+    List(Str) kv = str_split(lines[i], ":");
+    if (kv.len() >= 2 && str_to_lower(str_trim(kv[0])) == name) { return str_trim(kv[1]); }
+    return header_value(lines, name, i + 1);
+}
+
+// Opens ws://host:port/path.
+@requires(network)
+pub Option(Ws) ws_connect(Str host, Int port, Str path) {
+    Int fd = resid_tcp_connect(host, port);
+    if (fd < 0) { return None; }
+    Str key = base64_encode(random_bytes(16));
+    Str req = "GET " + path + " HTTP/1.1\r\nHost: " + host + ":" + f"{port}" + "\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+        + "Sec-WebSocket-Key: " + key + "\r\nSec-WebSocket-Version: 13\r\n\r\n";
+    _ = resid_tcp_send_bin(fd, json_utf8(req));
+    _ = resid_tcp_deadline(fd, 10000);
+    List(Int) raw = read_head(fd, []);
+    Int end = find_end(raw, 0);
+    if (end < 0) { _ = resid_tcp_close(fd); return None; }
+    List(Str) lines = str_split(http_text(raw, 0, end), "\r\n");
+    Bool ok = lines.len() > 0 && str_slice(lines[0], 0, 12) == "HTTP/1.1 101" && header_value(lines, "sec-websocket-accept", 1) == ws_accept_of(key);
+    if (!ok) { _ = resid_tcp_close(fd); return None; }
+    return Some(Ws {.fd = fd, .buf = raw[end + 4..raw.len()]});
+}
+
+List(Int) len_bytes(Int n) {
+    if (n < 126) { return [128 | n]; }
+    if (n < 65536) { return [128 | 126, (n >> 8) & 255, n & 255]; }
+    return [128 | 127, 0, 0, 0, 0, (n >> 24) & 255, (n >> 16) & 255, (n >> 8) & 255, n & 255];
+}
+
+List(Int) masked(List(Int) p, List(Int) k, Int i, ListBuf(Int) acc) {
+    if (i >= p.len()) { return acc.finish(); }
+    return masked(p, k, i + 1, acc.push(p[i] ^ k[i & 3]));
+}
+
+@requires(network)
+Bool send_frame(Ws w, Int opcode, List(Int) payload) {
+    List(Int) k = random_bytes(4);
+    List(Int) frame = [128 | opcode].concat(len_bytes(payload.len())).concat(k).concat(masked(payload, k, 0, ListBuf()));
+    return resid_tcp_send_bin(w.fd, frame);
+}
+
+// Sends one text message.
+@requires(network)
+pub Bool ws_send(Ws w, Str text) { return send_frame(w, 1, json_utf8(text)); }
+
+// A frame parsed from the front of a buffer: need > 0 asks for more bytes.
+pub type Frame = { Bool fin; Int opcode; List(Int) payload; Int used; Int need; };
+
+pub Frame frame_at(List(Int) b) {
+    if (b.len() < 2) { return Frame {.fin = false, .opcode = 0, .payload = [], .used = 0, .need = 1}; }
+    Int n0 = b[1] & 127;
+    Int hl = if (n0 == 126) { 4 } else { if (n0 == 127) { 10 } else { 2 } };
+    Bool mask = (b[1] & 128) != 0;
+    Int ml = if (mask) { 4 } else { 0 };
+    if (b.len() < hl + ml) { return Frame {.fin = false, .opcode = 0, .payload = [], .used = 0, .need = 1}; }
+    Int n = if (n0 == 126) { (b[2] << 8) | b[3] } else { if (n0 == 127) { be_at(b, 2, 8, 0) } else { n0 } };
+    if (n < 0 || n > ws_max_message()) { return Frame {.fin = false, .opcode = 0 - 1, .payload = [], .used = 0, .need = 0}; }
+    Int total = hl + ml + n;
+    if (b.len() < total) { return Frame {.fin = false, .opcode = 0, .payload = [], .used = 0, .need = total - b.len()}; }
+    List(Int) body = b[hl + ml..total];
+    List(Int) p = if (mask) { masked(body, b[hl..hl + 4], 0, ListBuf()) } else { body };
+    return Frame {.fin = (b[0] & 128) != 0, .opcode = b[0] & 15, .payload = p, .used = total, .need = 0};
+}
+
+Int be_at(List(Int) b, Int i, Int n, Int acc) {
+    if (n == 0) { return acc; }
+    return be_at(b, i + 1, n - 1, (acc << 8) | b[i]);
+}
+
+// The next text message, waiting at most `ms` milliseconds per read.
+@requires(network)
+pub WsGot ws_recv(Ws w, Int ms) {
+    _ = resid_tcp_deadline(w.fd, ms);
+    return recv_msg(w, [], 0);
+}
+
+@requires(network)
+WsGot recv_msg(Ws w, List(Int) frags, Int reads) {
+    Frame f = frame_at(w.buf);
+    if (f.opcode < 0 || reads > 100000) { return WsGot {.msg = None, .ws = w}; }
+    if (f.need > 0) {
+        List(Int) chunk = resid_tcp_recv_some(w.fd, 65536);
+        if (chunk.len() == 0) { return WsGot {.msg = None, .ws = w}; }
+        return recv_msg(Ws {.fd = w.fd, .buf = w.buf.concat(chunk)}, frags, reads + 1);
+    }
+    Ws rest = Ws {.fd = w.fd, .buf = w.buf[f.used..w.buf.len()]};
+    if (f.opcode == 8) { return WsGot {.msg = None, .ws = rest}; }
+    if (f.opcode == 9) { _ = send_frame(rest, 10, f.payload); return recv_msg(rest, frags, reads); }
+    if (f.opcode == 10) { return recv_msg(rest, frags, reads); }
+    List(Int) all = frags.concat(f.payload);
+    if (all.len() > ws_max_message()) { return WsGot {.msg = None, .ws = rest}; }
+    if (!f.fin) { return recv_msg(rest, all, reads); }
+    return WsGot {.msg = Some(http_text(all, 0, all.len())), .ws = rest};
+}
+
+@requires(network)
+pub Bool ws_close(Ws w) {
+    _ = send_frame(w, 8, [3, 232]);
+    _ = resid_tcp_close(w.fd);
+    return true;
+}

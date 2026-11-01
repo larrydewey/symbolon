@@ -1,0 +1,30 @@
+// Protocol messages on the wire (SPEC 20.2): CBOR through the Encode and
+// Decode instances resid-derive generated for the CGGMP21 messages
+// (lib/cggmp*_serial.resid) and for ThMsg (src/threshold/threshold_serial).
+//
+// Bytes from the network are untrusted: a message is refused before it is
+// decoded when it is larger than max_message() or is not exactly one
+// well-formed CBOR item of definite lengths nested at most 32 deep.
+
+import "../threshold/threshold.resid";
+import "../threshold/threshold_serial.resid";
+import "cggmp_serial.resid";
+import "../threshold/rsmsg_serial.resid";
+import "cggmp_blind_serial.resid";
+import "cggmp_proofs_serial.resid";
+import "cggmp_zk_serial.resid";
+import "cggmp_curve_serial.resid";
+import "bigint_serial.resid";
+import "cbor.resid";
+
+pub Int max_message() { return 1048576; }
+
+pub List(Int) msg_encode(ThMsg m) {
+    return match to_cbor(m) { Ok(b) => b, Err(_) => [] };
+}
+
+pub Option(ThMsg) msg_decode(List(Int) b) {
+    if (b.len() == 0 || b.len() > max_message() || !cbor_well_formed(b, 32)) { return None; }
+    Result(ThMsg, SerialError) r = from_cbor(b);
+    return match r { Ok(m) => Some(m), Err(_) => None };
+}

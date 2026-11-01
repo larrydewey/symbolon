@@ -1,0 +1,785 @@
+// The cosigner as a service (SPEC 12): `symbolon cosigner new | pair |
+// serve`. It reads its mailbox at the relay, runs key generation once (at
+// the inception its operator allowed by pairing a device), signs the
+// inception event it took part in, keeps its half of the kit's material,
+// and co-signs requests that src/cosigner/cosigner.resid's policy accepts.
+//
+// Files in its directory: cosigner.cbor (public configuration), root (32
+// secret bytes its DK and HPKE key derive from, mode 0600), cg-<epoch>.cfg
+// (its CGGMP21 configuration for each epoch it took part in, mode 0600;
+// layer 8 open: held as public types),
+// state.cbor (the policy state: verified head, sessions, records),
+// kit-half.cbor (its half of the kit's material).
+
+import "../types.resid";
+import "../core/log.resid";
+import "../core/event_decode.resid";
+import "../cosigner/cosigner.resid";
+import "../threshold/threshold.resid";
+import "../threshold/keygen.resid";
+import "../threshold/reshare.resid";
+import "../recovery/recovery.resid";
+import "../net/proto.resid";
+import "../net/services.resid";
+import "state.resid";
+import "common.resid";
+import "session.resid";
+import "cggmp_store.resid";
+import "hpkeg.resid";
+import "word.resid";
+import "crypto.resid";
+import "clock.resid";
+
+pub type Cosigner = { Str dir; CosignerConfig cfg; List(Secret(UInt(8))) root; };
+
+Endpoint relay_of(CosignerConfig c) { return Endpoint {.host = c.relay_host, .port = c.relay_port, .ca = c.ca}; }
+
+@requires(declassify)
+List(Secret(UInt(8))) cos_dk(List(Secret(UInt(8))) root) { return software_key(root, "symbolon v1 cosigner dk"); }
+
+@requires(declassify)
+HpkeKeyPairG(Secret(UInt(8))) cos_hpke(List(Secret(UInt(8))) root) { return hpkeg_derive_keypair(16, hk(root, "symbolon v1 cosigner hpke", 32)); }
+
+@requires(declassify)
+Local me_of(Cosigner c) { return Local {.party = c.cfg.party, .cg = 0, .hpke_sk = cos_hpke(c.root).sk}; }
+
+@requires(filesystem)
+Bool save_cfg(Str dir, CosignerConfig c) { return filesystem.write_bytes(dir + "/cosigner.cbor", cbor_of_cosigner(c)); }
+
+// `symbolon cosigner new DIR RELAY_HOST RELAY_PORT`: prints the cosigner's
+// public keys (PartyKeys, CBOR hex) for the device to pin.
+@requires(filesystem, declassify, provision)
+pub Int cosignerd_new(Str dir, Str host, Int port, Str ca) {
+    if (filesystem.exists(dir + "/root")) { eprintln("cosigner: already set up"); return 1; }
+    Str keys = cosigner_make(dir, host, port, ca);
+    if (str_len(keys) == 0) { eprintln("cosigner: cannot write the key"); return 1; }
+    println(keys);
+    return 0;
+}
+
+// A new cosigner in `dir`; its keys (PartyKeys, CBOR hex), or "".
+@requires(filesystem, provision, declassify)
+pub Str cosigner_make(Str dir, Str host, Int port, Str ca) {
+    _ = filesystem.create_dir(dir);
+    if (filesystem.exists(dir + "/root")) { return ""; }
+    List(Int) r = random_bytes(32);
+    if (!put_secret_file(dir + "/root", r)) { return ""; }
+    List(Secret(UInt(8))) root = provisioned_key(secret_bytes(r), "the cosigner's root key, drawn at cosigner new");
+    List(Int) dk = sw_public(cos_dk(root));
+    List(Int) hp = cos_hpke(root).pk;
+    CosignerConfig c = CosignerConfig {.relay_host = host, .relay_port = port, .ca = ca, .party = party_of_key(dk), .dk_pub = dk, .hpke_pub = hp,
+                                       .log_id = [], .mbox_next = 0, .peers = [], .accept_inception = false};
+    if (!save_cfg(dir, c)) { return ""; }
+    return hex_encode(cbor_of_keys(PartyKeys {.party = c.party, .auth_key = dk, .hpke_key = hp}));
+}
+
+@requires(filesystem, provision)
+Option(Cosigner) load(Str dir) {
+    Option(CosignerConfig) oc = cosigner_of_cbor(get_file(dir + "/cosigner.cbor"));
+    List(Int) r = get_file(dir + "/root");
+    return match oc { None => None, Some(c) => if (r.len() == 32) { Some(Cosigner {.dir = dir, .cfg = take_pairing(dir, c), .root = provisioned_key(secret_bytes(r), "the cosigner's root key from its key file")}) } else { None } };
+}
+
+// `symbolon cosigner pair DIR DEVICE_KEYS_HEX`: the operator pins the
+// device that will run the inception (the keys `symbolon device new`
+// printed, compared out of band, SPEC 11.1 step 2). The keys wait in
+// pair.keys until the cosigner takes them in at its next turn (load): the
+// cosigner is the only writer of its configuration, so a serving cosigner
+// cannot overwrite a pairing with the copy it read before.
+@requires(filesystem, provision)
+pub Int cosignerd_pair(Str dir, Str keys_hex) {
+    if (!filesystem.exists(dir + "/cosigner.cbor")) { return fail_msg("cosigner: not set up"); }
+    return match keys_of_cbor(cose_hex_decode(keys_hex)) {
+        None => fail_msg("cosigner: those are not party keys"),
+        Some(_) => if (filesystem.write_all(dir + "/pair.keys", keys_hex)) { 0 } else { 1 }
+    };
+}
+
+// A pairing waiting in pair.keys, taken into the configuration once; only
+// before an inception.
+@requires(filesystem)
+CosignerConfig take_pairing(Str dir, CosignerConfig c) {
+    Str k = str_trim(filesystem.read_all(dir + "/pair.keys"));
+    if (str_len(k) == 0) { return c; }
+    _ = filesystem.write_all(dir + "/pair.keys", "");
+    if (c.log_id.len() > 0) { eprintln("cosigner: a pairing after the inception is ignored"); return c; }
+    return match keys_of_cbor(cose_hex_decode(k)) {
+        None => c,
+        Some(p) => if (save_cfg(dir, with_peers(c, [p], true))) { with_peers(c, [p], true) } else { c }
+    };
+}
+
+Int fail_msg(Str m) { eprintln(m); return 1; }
+
+CosignerConfig with_peers(CosignerConfig c, List(PartyKeys) ps, Bool accept) {
+    return CosignerConfig {.relay_host = c.relay_host, .relay_port = c.relay_port, .ca = c.ca, .party = c.party, .dk_pub = c.dk_pub, .hpke_pub = c.hpke_pub,
+                           .log_id = c.log_id, .mbox_next = c.mbox_next, .peers = ps, .accept_inception = accept};
+}
+
+CosignerConfig with_log(CosignerConfig c, List(Int) l, Int next) {
+    return CosignerConfig {.relay_host = c.relay_host, .relay_port = c.relay_port, .ca = c.ca, .party = c.party, .dk_pub = c.dk_pub, .hpke_pub = c.hpke_pub,
+                           .log_id = l, .mbox_next = next, .peers = c.peers, .accept_inception = c.accept_inception};
+}
+
+List(Remote) remotes_of(List(PartyKeys) ps, Int i, List(Remote) acc) {
+    if (i >= ps.len()) { return acc; }
+    return remotes_of(ps, i + 1, acc.concat([Remote {.party = ps[i].party, .cg = i + 1, .hpke_pub = ps[i].hpke_key}]));
+}
+
+Int index_of(List(PartyKeys) ps, List(Int) p, Int i) {
+    if (i >= ps.len()) { return -1; }
+    if (bytes_eq(ps[i].party, p)) { return i; }
+    return index_of(ps, p, i + 1);
+}
+
+List(Remote) without_party(List(Remote) rs, List(Int) p, Int i, List(Remote) acc) {
+    if (i >= rs.len()) { return acc; }
+    return without_party(rs, p, i + 1, if (bytes_eq(rs[i].party, p)) { acc } else { acc.concat([rs[i]]) });
+}
+
+// ─── The loop ───────────────────────────────────────────────────
+
+// `symbolon cosigner serve DIR [PRIMES]`: PRIMES is a file holding this
+// party's two Paillier safe primes as hex on one line (tests); without it
+// they are generated at key generation (minutes).
+// The supervisor: `self` is this program's path; each child serves for
+// child_sec() and exits. Paths may not contain spaces (the command is split
+// on them; no shell runs). A child that cannot load the cosigner exits 2,
+// and the supervisor stops.
+@requires(filesystem, process, provision)
+pub Int cosignerd_serve(Str dir, Str primes_file, Str self) {
+    Option(Cosigner) oc = load(dir);
+    return match oc {
+        None => fail_msg("cosigner: not set up"),
+        Some(_) => supervise(self + " cosigner serve-for " + dir + " " + (if (str_len(primes_file) == 0) { "-" } else { primes_file }) + f" {child_sec()}")
+    };
+}
+
+pub Int child_sec() { return 60; }
+
+@requires(process)
+Int supervise(Str cmd) {
+    Int rc = process.run(cmd);
+    if (rc == 2) { return 1; }
+    return supervise(cmd);
+}
+
+// `symbolon cosigner serve-for DIR PRIMES SECONDS` (run by `serve`).
+@requires(network, filesystem, declassify, clock, provision)
+pub Int cosignerd_serve_for(Str dir, Str primes_file, Int secs) {
+    Option(Cosigner) oc = load(dir);
+    Str pf = if (primes_file == "-") { "" } else { primes_file };
+    return match oc {
+        None => 2,
+        Some(_) => serve_loop(dir, pf, [], 0, clock_now_seconds() + secs)
+    };
+}
+
+@requires(filesystem)
+pub List(List(UInt(64))) primes_of(Str f) { return primes_line(f, 0); }
+
+// Line `k` of a primes file (tests): "P Q" hex. The cosigner reads line 0
+// for key generation and line 1 for a re-share.
+@requires(filesystem)
+pub List(List(UInt(64))) primes_line(Str f, Int k) {
+    if (str_len(f) == 0) { return []; }
+    List(Str) lines = str_split(str_trim(filesystem.read_all(f)), "\n");
+    if (k >= lines.len()) { return []; }
+    List(Str) parts = str_split(str_trim(lines[k]), " ");
+    if (parts.len() != 2) { return []; }
+    return [bn_from_be(cose_hex_decode(parts[0])), bn_from_be(cose_hex_decode(parts[1]))];
+}
+
+// A finished signing session a peer keeps, in case the designated party
+// asks for abort-2 openings.
+type Kept = { List(Int) sid; ThState st; List(Remote) peers; };
+
+// One child process's share of the work (`cosigner serve-for`): turns until
+// `until` (seconds) has passed and no signing session is waiting for late
+// messages, then exit. There is no collector, and a loop that ran forever
+// kept every turn's allocations (gigabytes within minutes, regions
+// included), so `cosigner serve` runs these children one after another and
+// the kernel takes back each one's memory when it exits. The session state
+// in `kept` (nonce shares among it) only ever lives in memory.
+@requires(network, filesystem, declassify, clock, provision)
+Int serve_loop(Str dir, Str primes_file, List(Kept) kept, Int n, Int until) {
+    if (clock_now_seconds() >= until && kept.len() == 0) { return 0; }
+    List(Kept) next = serve_turn(dir, primes_file, kept, n);
+    // Idle, wait for mail in a loop that frees each poll's garbage (TLS
+    // polls every 200 ms in this loop kept hundreds of megabytes alive
+    // until a session began). Kept sessions keep the short turns.
+    _ = if (next.len() == 0) { idle_wait(dir, until) } else { clock_sleep_ms(200) };
+    return serve_loop(dir, primes_file, next, n + 1, until);
+}
+
+@requires(network, filesystem, declassify, clock, provision)
+Int idle_wait(Str dir, Int until) {
+    Option(Cosigner) oc = load(dir);
+    return match oc {
+        None => clock_sleep_ms(200),
+        Some(c) => wait_mail(c.cfg.relay_host, c.cfg.relay_port, c.cfg.ca, c.cfg.party, [c.cfg.mbox_next], until)
+    };
+}
+
+@requires(network, filesystem, declassify, clock, provision)
+List(Kept) serve_turn(Str dir, Str primes_file, List(Kept) kept, Int n) {
+    Option(Cosigner) oc = load(dir);
+    return match oc {
+        None => kept,
+        Some(c) => serve_once(c, primes_line(primes_file, 0), primes_line(primes_file, 1), kept, n)
+    };
+}
+
+@requires(network, filesystem, declassify, clock)
+List(Kept) serve_once(Cosigner c0, List(List(UInt(64))) primes, List(List(UInt(64))) primes2, List(Kept) kept, Int n) {
+    Cosigner c = if (n % 25 == 0) { refresh_peers(c0) } else { c0 };
+    Endpoint relay = relay_of(c.cfg);
+    List(Remote) known = remotes_of(c.cfg.peers, 0, []);
+    Cursor cur = Cursor {.party = c.cfg.party, .next = c.cfg.mbox_next};
+    Drained d0 = drain(relay, me_of(c), known, cur, ListBuf());
+    // An envelope from a party not known yet (a device a recover event or a
+    // reshare just named): learn the log's parties and read again.
+    Cosigner c1 = if (d0.unknown > 0) { refresh_peers(c) } else { c };
+    Drained d = if (d0.unknown > 0) { drain(relay, me_of(c1), remotes_of(c1.cfg.peers, 0, []), cur, ListBuf()) } else { d0 };
+    List(Got) gs = d.got;
+    Int next = d.cur.next;
+    Cosigner c2 = Cosigner {.dir = c1.dir, .cfg = with_log(c1.cfg, c1.cfg.log_id, next), .root = c1.root};
+    _ = save_cfg(c.dir, c2.cfg);
+    Handled h = handle_all(c2, gs, 0, primes, primes2, kept);
+    _ = save_cfg(c.dir, h.c.cfg);
+    return h.kept;
+}
+
+type Handled = { Cosigner c; List(Kept) kept; };
+
+@requires(network, filesystem, declassify, clock)
+Handled handle_all(Cosigner c, List(Got) gs, Int i, List(List(UInt(64))) primes, List(List(UInt(64))) primes2, List(Kept) kept) {
+    if (i >= gs.len()) { return Handled {.c = c, .kept = kept}; }
+    Packet w = gs[i].w;
+    List(Got) rest = gs[i + 1..gs.len()];
+    Handled h = match w {
+        WKeygen(inv) => Handled {.c = on_keygen(c, gs[i].from, inv, rest, primes), .kept = kept},
+        WSignEvent(b) => Handled {.c = on_sign_event(c, gs[i].from, b), .kept = kept},
+        WKitHalf(blob) => Handled {.c = on_kit_half(c, blob), .kept = kept},
+        WSign(inv) => on_sign(c, gs[i].from, inv, rest, kept),
+        WSession(m) => Handled {.c = c, .kept = on_late(c, gs[i].from, m, kept)},
+        WReshare(inv) => Handled {.c = on_reshare(c, gs[i].from, inv, rest, primes2), .kept = kept},
+        WKitKey(kb) => Handled {.c = on_kit_key(c, kb), .kept = kept},
+        WKitRelease(l) => Handled {.c = on_release(c, gs[i].from, l), .kept = kept},
+        WDuressKey(k) => Handled {.c = on_duress_key(c, gs[i].from, k), .kept = kept},
+        _ => Handled {.c = c, .kept = kept}
+    };
+    return handle_all(h.c, gs, i + 1, primes, primes2, h.kept);
+}
+
+// ─── Inception ──────────────────────────────────────────────────
+
+@requires(network, filesystem, declassify, clock)
+Cosigner on_keygen(Cosigner c, List(Int) from, KeygenInvite inv, List(Got) early, List(List(UInt(64))) primes) {
+    if (!c.cfg.accept_inception || c.cfg.log_id.len() > 0 || index_of(c.cfg.peers, from, 0) < 0) { eprintln("cosigner: keygen invite refused"); return c; }
+    Int mine = index_of(inv.parties, c.cfg.party, 0);
+    if (mine < 0 || inv.parties.len() < 2 || inv.parties.len() > 8) { eprintln("cosigner: not a party of that keygen"); return c; }
+    List(Int) ids = range_ids(inv.parties.len(), 1, []);
+    KgCtx kc = kg_ctx(mine + 1, ids, inv.threshold, [], inv.session_id, random_bytes(32), primes);
+    return match kg_begin(kc) {
+        Err(e) => cos_fail(c, "keygen start: " + e.why),
+        Ok(s) => run_keygen(c, inv, mine, s, early)
+    };
+}
+
+List(Int) range_ids(Int n, Int i, List(Int) acc) { return if (i > n) { acc } else { range_ids(n, i + 1, acc.concat([i])) }; }
+
+Cosigner cos_fail(Cosigner c, Str m) { eprintln("cosigner: " + m); return c; }
+
+@requires(network, filesystem, declassify, clock)
+Cosigner run_keygen(Cosigner c, KeygenInvite inv, Int mine, KgStep s, List(Got) early) {
+    List(Remote) rs = without_party(remotes_of(inv.parties, 0, []), c.cfg.party, 0, []);
+    Local me = Local {.party = c.cfg.party, .cg = mine + 1, .hpke_sk = cos_hpke(c.root).sk};
+    Seat(KgState) seat = Seat {.me = me, .st = s.state, .round = 1, .out = s.out, .done = false};
+    // From the start of the mailbox: batches that arrived with the invite
+    // from parties the cosigner did not know yet (the kit) were skipped by
+    // the drain that found the invite. The session id filters the rest.
+    Run(KgState) r = run_session(relay_of(c.cfg), inv.session_id, [seat], rs, [Cursor {.party = c.cfg.party, .next = 0}], early,
+        lambda(st, msgs) { kg_adapt(st, msgs) }, 1800);
+    if (str_len(r.fail) > 0) { return cos_fail(c, "keygen: " + r.fail); }
+    Option(CgConfig) cfg = kg_result(r.seats[0].st);
+    return match cfg {
+        None => cos_fail(c, "keygen did not finish"),
+        Some(x) => keygen_done(c, inv, x)
+    };
+}
+
+@requires(filesystem)
+Cosigner keygen_done(Cosigner c, KeygenInvite inv, CgConfig x) {
+    if (!put_secret_file(c.dir + "/cg-1.cfg", cg_cfg_encode(x))) { return cos_fail(c, "cannot store the configuration"); }
+    println("cosigner: key generation done");
+    return Cosigner {.dir = c.dir, .cfg = with_peers(c.cfg, inv.parties, true), .root = c.root};
+}
+
+pub Result(Stepped(KgState), CgFail) kg_adapt(KgState st, List(ThMsg) msgs) {
+    KgStep n = kg_step(st, msgs)?;
+    Bool done = match kg_result(n.state) { Some(_) => true, None => false };
+    return Ok(Stepped {.st = n.state, .out = n.out, .done = done});
+}
+
+@requires(filesystem)
+Option(CgConfig) my_cg(Cosigner c) { return cg_at(c, 1); }
+
+// The newest configuration at epoch `e` or before.
+@requires(filesystem)
+Option(CgConfig) latest_cg(Cosigner c, Int e) {
+    if (e < 1) { return None; }
+    Option(CgConfig) x = cg_at(c, e);
+    return match x { Some(v) => Some(v), None => latest_cg(c, e - 1) };
+}
+
+// The configuration of epoch `e` (the verified log's, when signing).
+@requires(filesystem)
+Option(CgConfig) cg_at(Cosigner c, Int e) { return cg_cfg_decode(get_file(c.dir + "/cg-" + f"{e}" + ".cfg")); }
+
+// The inception event: signed only when it is the log of the key the
+// cosigner just generated, with the cosigner as one of its parties.
+@requires(network, filesystem, declassify, clock)
+Cosigner on_sign_event(Cosigner c, List(Int) from, List(Int) encoded) {
+    Option(EventPayload) op = payload_decode(encoded);
+    Option(CgConfig) cg = my_cg(c);
+    return match op {
+        None => cos_fail(c, "event does not decode"),
+        Some(p) => match cg {
+            None => cos_fail(c, "no key yet"),
+            Some(x) => if (p.sequence == 0) { sign_inception(c, from, p, encoded, x) } else { sign_reshare_event(c, from, p, encoded) }
+        }
+    };
+}
+
+@requires(network, filesystem, declassify, clock)
+Cosigner sign_inception(Cosigner c, List(Int) from, EventPayload p, List(Int) encoded, CgConfig x) {
+    if (c.cfg.log_id.len() > 0) { return cos_fail(c, "already in a log"); }
+    EventBody b = p.body;
+    Bool ok = match b {
+        InceptionBody(q, pol) => p.sequence == 0 && bytes_eq(q.root_pubkey, cfg_root_pubkey(x, range_ids(q.parties.len(), 1, [])))
+            && has_me(q.parties, c.cfg, 0) && q.parties.len() == c.cfg.peers.len(),
+        _ => false
+    };
+    if (!ok) { return cos_fail(c, "not the inception of this key"); }
+    List(Int) sig = sw_sign(cos_dk(c.root), encoded);
+    Option(Remote) r = remote_by_party(remotes_of(c.cfg.peers, 0, []), from, 0);
+    _ = match r { None => false, Some(rr) => send_to(relay_of(c.cfg), me_of(c), rr, WEventSig(sig)) };
+    println("cosigner: signed the inception event " + hex_encode(sha256_bytes(encoded)));
+    return Cosigner {.dir = c.dir, .cfg = with_log(c.cfg, sha256_bytes(encoded), c.cfg.mbox_next), .root = c.root};
+}
+
+Bool has_me(List(Party) ps, CosignerConfig c, Int i) {
+    if (i >= ps.len()) { return false; }
+    Party p = ps[i];
+    if (bytes_eq(p.id, c.party)) { return p.kind == party_kind_cosigner() && bytes_eq(p.auth_key, c.dk_pub) && bytes_eq(p.hpke_key, c.hpke_pub); }
+    return has_me(ps, c, i + 1);
+}
+
+@requires(filesystem)
+Cosigner on_kit_half(Cosigner c, WrappedBlob b) {
+    _ = put_secret_file(c.dir + "/kit-half.cbor", cbor_of_blob(b));
+    return c;
+}
+
+// ─── Co-signing (SPEC 10.4, 12.3) ───────────────────────────────
+
+// The policy state, with the duress sub-keys the devices registered.
+@requires(filesystem)
+CosignerState load_state(Cosigner c, VerifiedHead vh) {
+    Option(CosignerState) os = state_of_cbor(get_file(c.dir + "/state.cbor"));
+    List(DuressKey) keys = duress_keys_of(c);
+    CosignerState s0 = match os {
+        None => cosigner_new(vh, keys),
+        Some(s) => match cosigner_update_head(s, vh) { Ok(x) => x, Err(_) => s }
+    };
+    return CosignerState {.verified = s0.verified, .duress_keys = keys, .duress = s0.duress, .seen_sessions = s0.seen_sessions, .records = s0.records};
+}
+
+@requires(filesystem)
+List(DuressKey) duress_keys_of(Cosigner c) {
+    List(Int) b = get_file(c.dir + "/duress-keys");
+    return dk_list(b, 0, []);
+}
+
+// duress-keys: party id (32) || key (65), repeated.
+List(DuressKey) dk_list(List(Int) b, Int i, List(DuressKey) acc) {
+    if (i + 97 > b.len()) { return acc; }
+    return dk_list(b, i + 97, acc.concat([DuressKey {.party = b[i..i + 32], .subkey = b[i + 32..i + 97]}]));
+}
+
+List(Int) dk_bytes(List(DuressKey) ks, Int i, List(Int) acc) {
+    if (i >= ks.len()) { return acc; }
+    return dk_bytes(ks, i + 1, acc.concat(ks[i].party).concat(ks[i].subkey));
+}
+
+List(DuressKey) dk_without(List(DuressKey) ks, List(Int) p, Int i, List(DuressKey) acc) {
+    if (i >= ks.len()) { return acc; }
+    return dk_without(ks, p, i + 1, if (bytes_eq(ks[i].party, p)) { acc } else { acc.concat([ks[i]]) });
+}
+
+// A device's duress sub-key (SPEC 14.2): one per device, the latest kept.
+@requires(filesystem)
+Cosigner on_duress_key(Cosigner c, List(Int) from, List(Int) k) {
+    if (k.len() != 65) { return c; }
+    List(DuressKey) ks = dk_without(duress_keys_of(c), from, 0, []).concat([DuressKey {.party = from, .subkey = k}]);
+    _ = put_secret_file(c.dir + "/duress-keys", dk_bytes(ks, 0, []));
+    return c;
+}
+
+// Now, for the policy (rate limits, duress windows): the witnesses' time.
+@requires(network, clock(readonly), declassify, filesystem)
+Int policy_now(Cosigner c, VerifiedHead vh) { return witness_now(witnesses_at(vh.head.policy.witnesses, local_host(c.dir)), c.cfg.ca, random_bytes(32)); }
+
+// A cosigner on a Symbolon Home box reaches the box's witnesses at the
+// address in its local_host file (the devices' address for the box may not
+// be reachable from the box itself); "" when there is none.
+@requires(filesystem)
+Str local_host(Str dir) { return str_trim(filesystem.read_all(dir + "/local_host")); }
+
+@requires(network, filesystem, declassify, clock)
+Handled on_sign(Cosigner c, List(Int) from, SignInvite inv, List(Got) early, List(Kept) kept) {
+    if (c.cfg.log_id.len() == 0) { return Handled {.c = cos_fail(c, "no log yet"), .kept = kept}; }
+    Result(VerifiedHead, SymbolonError) rv = verified_log_at(relay_of(c.cfg), c.cfg.log_id, local_host(c.dir));
+    return match rv {
+        Err(_) => Handled {.c = refuse(c, from, inv.session_id), .kept = kept},
+        Ok(vh) => decide(c, from, inv, vh, early, kept)
+    };
+}
+
+@requires(network, declassify, clock(readonly))
+Cosigner refuse(Cosigner c, List(Int) to, List(Int) sid) {
+    Option(Remote) r = remote_by_party(remotes_of(c.cfg.peers, 0, []), to, 0);
+    _ = match r { None => false, Some(rr) => send_to(relay_of(c.cfg), me_of(c), rr, WRefused(sid)) };
+    return c;
+}
+
+@requires(network, filesystem, declassify, clock)
+Handled decide(Cosigner c, List(Int) from, SignInvite inv, VerifiedHead vh, List(Got) early, List(Kept) kept) {
+    CosignerState st = load_state(c, vh);
+    if (!bytes_eq(from, inv.requester) || inv.epoch < 0 || inv.kind < 0 || inv.kind > 255) { return Handled {.c = refuse(c, from, inv.session_id), .kept = kept}; }
+    CosignRequest req = CosignRequest {.session_id = inv.session_id, .message = inv.message, .epoch = (UInt(32))inv.epoch,
+                                       .requester = inv.requester, .kind = (UInt(8))inv.kind, .sig = inv.sig};
+    CosignOutcome o = cosign_decide(st, req, policy_now(c, vh));
+    return match o {
+        Refuse(s, e) => Handled {.c = refused_saved(c, from, inv.session_id, s), .kept = kept},
+        Proceed(s) => cosign(c, inv, vh, s, early, kept)
+    };
+}
+
+@requires(network, filesystem, declassify, clock(readonly))
+Cosigner refused_saved(Cosigner c, List(Int) from, List(Int) sid, CosignerState s) {
+    _ = filesystem.write_bytes(c.dir + "/state.cbor", cbor_of_state(s));
+    return refuse(c, from, sid);
+}
+
+List(Remote) quorum_remotes(Quorum q, List(List(Int)) signers, List(Int) me, Int i, List(Remote) acc) {
+    if (i >= q.parties.len()) { return acc; }
+    Party p = q.parties[i];
+    Bool take = !bytes_eq(p.id, me) && in_list(signers, p.id, 0);
+    return quorum_remotes(q, signers, me, i + 1, if (take) { acc.concat([Remote {.party = p.id, .cg = i + 1, .hpke_pub = p.hpke_key}]) } else { acc });
+}
+
+Bool in_list(List(List(Int)) xs, List(Int) x, Int i) {
+    if (i >= xs.len()) { return false; }
+    if (bytes_eq(xs[i], x)) { return true; }
+    return in_list(xs, x, i + 1);
+}
+
+@requires(network, filesystem, declassify, clock)
+Handled cosign(Cosigner c, SignInvite inv, VerifiedHead vh, CosignerState s, List(Got) early, List(Kept) kept) {
+    _ = filesystem.write_bytes(c.dir + "/state.cbor", cbor_of_state(s));
+    Quorum q = vh.head.quorum;
+    Option(CgConfig) cg = cg_at(c, (Int)q.epoch);
+    CgConfig none = CgConfig {.id = 0, .threshold = 0, .ecdsa = [], .elgamal = [], .p = [], .q = [], .rid = [], .chain_key = [], .public = []};
+    CgConfig x = cg else { none };
+    Option(CgCtx) octx = th_ctx(x, q, inv.signers, inv.requester, [], inv.session_id, inv.message, random_bytes(32));
+    return match octx {
+        None => Handled {.c = cos_fail(c, "no session context"), .kept = kept},
+        Some(ctx) => run_cosign(c, inv, q, ctx, early, kept)
+    };
+}
+
+@requires(network, filesystem, declassify, clock)
+Handled run_cosign(Cosigner c, SignInvite inv, Quorum q, CgCtx ctx, List(Got) early, List(Kept) kept) {
+    ThStep st = th_start(ctx, th_role(ctx, q, inv.requester, []));
+    List(Remote) rs = quorum_remotes(q, inv.signers, c.cfg.party, 0, []);
+    Local me = Local {.party = c.cfg.party, .cg = ctx.self, .hpke_sk = cos_hpke(c.root).sk};
+    Seat(ThState) seat = Seat {.me = me, .st = st.state, .round = 1, .out = st.out, .done = false};
+    Run(ThState) r = run_session(relay_of(c.cfg), inv.session_id, [seat], rs, [Cursor {.party = c.cfg.party, .next = c.cfg.mbox_next}], early,
+        lambda(t, msgs) { sign_adapt(t, msgs) }, 120);
+    if (str_len(r.fail) > 0) { return Handled {.c = cos_fail(c, "session: " + r.fail), .kept = kept}; }
+    println("cosigner: co-signed session " + hex_encode(inv.session_id));
+    return Handled {.c = c, .kept = [Kept {.sid = inv.session_id, .st = r.seats[0].st, .peers = rs}]};
+}
+
+pub Result(Stepped(ThState), CgFail) sign_adapt(ThState st, List(ThMsg) msgs) {
+    ThStep n = th_step(st, msgs)?;
+    ThState s = n.state;
+    Bool done = match s { ThSigned(_) => true, ThPeerSent(_, _) => true, ThClosed => true, _ => false };
+    return Ok(Stepped {.st = s, .out = n.out, .done = done});
+}
+
+// An abort request for a session already finished here: answer with the
+// openings (to the designated party only, cggmp_blind).
+@requires(network, declassify, clock(readonly))
+List(Kept) on_late(Cosigner c, List(Int) from, SessionMsg m, List(Kept) kept) {
+    if (kept.len() == 0 || !bytes_eq(kept[0].sid, m.session_id) || m.round != 7) { return kept; }
+    return match th_step(kept[0].st, m.msgs) {
+        Err(_) => [],
+        Ok(n) => answer(c, from, m.session_id, n.out, kept[0].peers)
+    };
+}
+
+@requires(network, declassify, clock(readonly))
+List(Kept) answer(Cosigner c, List(Int) to, List(Int) sid, List(ThMsg) out, List(Remote) peers) {
+    Option(Remote) r = remote_by_party(peers, to, 0);
+    _ = match r { None => false, Some(rr) => send_to(relay_of(c.cfg), me_of(c), rr, WSession(SessionMsg {.session_id = sid, .round = 7, .msgs = out})) };
+    return [];
+}
+
+// ─── Re-share (SPEC 11.3) ───────────────────────────────────────
+
+Option(Party) party_at(List(Party) ps, List(Int) id, Int i) {
+    if (i >= ps.len()) { return None; }
+    if (bytes_eq(ps[i].id, id)) { return Some(ps[i]); }
+    return party_at(ps, id, i + 1);
+}
+
+pub Int pos1(List(Party) ps, List(Int) id, Int i) {
+    if (i >= ps.len()) { return 0; }
+    if (bytes_eq(ps[i].id, id)) { return i + 1; }
+    return pos1(ps, id, i + 1);
+}
+
+Bool has_int(List(Int) xs, Int x, Int i) {
+    if (i >= xs.len()) { return false; }
+    if (xs[i] == x) { return true; }
+    return has_int(xs, x, i + 1);
+}
+
+// The other online parties of a re-share, addressed by their new ids.
+pub List(Remote) session_remotes(List(Party) np, List(Int) receivers, List(Int) me, Int i, List(Remote) acc) {
+    if (i >= np.len()) { return acc; }
+    Party p = np[i];
+    Bool take = has_int(receivers, i + 1, 0) && !bytes_eq(p.id, me);
+    return session_remotes(np, receivers, me, i + 1, if (take) { acc.concat([Remote {.party = p.id, .cg = i + 1, .hpke_pub = p.hpke_key}]) } else { acc });
+}
+
+@requires(network, filesystem, declassify, clock)
+Cosigner on_reshare(Cosigner c, List(Int) from, ReshareInvite inv, List(Got) early, List(List(UInt(64))) primes) {
+    if (c.cfg.log_id.len() == 0 || !bytes_eq(inv.log_id, c.cfg.log_id)) { return cos_fail(c, "re-share of another log"); }
+    Result(VerifiedHead, SymbolonError) rv = verified_log_at(relay_of(c.cfg), c.cfg.log_id, local_host(c.dir));
+    return match rv {
+        Err(_) => refuse(c, from, inv.session_id),
+        Ok(vh) => reshare_decide(c, from, inv, vh, early, primes)
+    };
+}
+
+@requires(network, filesystem, declassify, clock)
+Cosigner reshare_decide(Cosigner c, List(Int) from, ReshareInvite inv, VerifiedHead vh, List(Got) early, List(List(UInt(64))) primes) {
+    CosignerState st = load_state(c, vh);
+    Quorum q = vh.head.quorum;
+    if (!bytes_eq(from, inv.requester) || inv.epoch != (Int)q.epoch + 1) { return refuse(c, from, inv.session_id); }
+    CosignRequest req = CosignRequest {.session_id = inv.session_id, .message = reshare_message(inv), .epoch = q.epoch, .requester = inv.requester, .kind = request_reshare(), .sig = inv.sig};
+    CosignOutcome o = cosign_decide(st, req, policy_now(c, vh));
+    return match o {
+        Refuse(s, _) => refused_saved(c, from, inv.session_id, s),
+        Proceed(s) => run_reshare(c, inv, q, s, early, primes)
+    };
+}
+
+@requires(network, filesystem, declassify, clock)
+Cosigner run_reshare(Cosigner c, ReshareInvite inv, Quorum q, CosignerState s, List(Got) early, List(List(UInt(64))) primes) {
+    _ = filesystem.write_bytes(c.dir + "/state.cbor", cbor_of_state(s));
+    Int new_id = pos1(inv.new_parties, c.cfg.party, 0);
+    // The share dealt from: the newest configuration held (after a
+    // recovery the current epoch has none yet), at its own x-coordinate.
+    Option(CgConfig) old = latest_cg(c, (Int)q.epoch);
+    List(CgConfig) olds = match old { Some(x) => [x], None => [] };
+    Int old_id = match old { Some(x) => x.id, None => 0 };
+    RsCtx rc = RsCtx {.self = if (has_int(inv.receivers, new_id, 0)) { new_id } else { 0 }, .old_self = if (has_int(inv.dealers, old_id, 0)) { old_id } else { 0 },
+        .dealers = inv.dealers, .receivers = inv.receivers, .offline = inv.offline, .degree = inv.degree, .old = olds, .root = q.root_pubkey,
+        .session_id = inv.session_id, .seed = random_bytes(32), .primes = primes};
+    return match rs_start(rc) {
+        Err(e) => cos_fail(c, "re-share start: " + e.why),
+        Ok(st0) => after_reshare(c, inv, run_session(relay_of(c.cfg), inv.session_id,
+            [Seat {.me = Local {.party = c.cfg.party, .cg = new_id, .hpke_sk = cos_hpke(c.root).sk}, .st = st0.state, .round = 1, .out = st0.out, .done = false}],
+            session_remotes(inv.new_parties, inv.receivers, c.cfg.party, 0, []), [Cursor {.party = c.cfg.party, .next = 0}], early,
+            lambda(t, msgs) { rs_adapt(t, msgs) }, 1800))
+    };
+}
+
+pub Result(Stepped(RsState), CgFail) rs_adapt(RsState st, List(ThMsg) msgs) {
+    RsStep n = rs_step(st, msgs)?;
+    Bool done = match rs_result(n.state) { Some(_) => true, None => false };
+    return Ok(Stepped {.st = n.state, .out = n.out, .done = done});
+}
+
+// The re-share's outcome waits for the reshare event: the new
+// configuration, the transcript and the cosigner's kit contribution b are
+// kept for the new epoch, and become current when the log shows it.
+@requires(filesystem)
+Cosigner after_reshare(Cosigner c, ReshareInvite inv, Run(RsState) r) {
+    if (str_len(r.fail) > 0) { return cos_fail(c, "re-share: " + r.fail); }
+    Option(RsResult) or = rs_result(r.seats[0].st);
+    RsResult res = or else { RsResult {.cfg = None, .offline = [], .transcript = []} };
+    Str e = f"{inv.epoch}";
+    Option(CgConfig) ncfg = res.cfg;
+    Bool ok = match ncfg { Some(x) => put_secret_file(c.dir + "/cg-" + e + ".cfg", cg_cfg_encode(x)), None => true }
+        && filesystem.write_bytes(c.dir + "/pending-" + e + ".transcript", res.transcript)
+        && filesystem.write_all(c.dir + "/pending.epoch", e)
+        && (res.offline.len() == 0 || put_secret_file(c.dir + "/kit-b-" + e, bn_to_be(res.offline[0].share, 32)))
+        && filesystem.write_bytes(c.dir + "/pending-" + e + ".parties", ids_of(inv.new_parties, 0, []));
+    if (!ok) { return cos_fail(c, "cannot store the re-share"); }
+    println("cosigner: re-share to epoch " + e + " done");
+    return c;
+}
+
+List(Int) ids_of(List(Party) ps, Int i, List(Int) acc) {
+    if (i >= ps.len()) { return acc; }
+    return ids_of(ps, i + 1, acc.concat(ps[i].id));
+}
+
+// A reshare event: signed only for the re-share this cosigner took part in
+// (the epoch, the transcript digest and the party set it kept).
+@requires(network, filesystem, declassify, clock)
+Cosigner sign_reshare_event(Cosigner c, List(Int) from, EventPayload p, List(Int) encoded) {
+    Str e = str_trim(filesystem.read_all(c.dir + "/pending.epoch"));
+    EventBody b = p.body;
+    Bool ok = match b {
+        ReshareBody(nq) => str_len(e) > 0 && f"{nq.epoch}" == e
+            && bytes_eq(nq.transcript_digest, get_file(c.dir + "/pending-" + e + ".transcript"))
+            && bytes_eq(ids_of(nq.parties, 0, []), get_file(c.dir + "/pending-" + e + ".parties"))
+            && opt_is(p.log_id, c.cfg.log_id),
+        _ => false
+    };
+    if (!ok) { return cos_fail(c, "not the reshare event of the re-share taken part in"); }
+    List(Int) sig = sw_sign(cos_dk(c.root), encoded);
+    Option(Remote) r = remote_of_party(c, from);
+    _ = match r { None => false, Some(rr) => send_to(relay_of(c.cfg), me_of(c), rr, WEventSig(sig)) };
+    println("cosigner: signed the reshare event to epoch " + e);
+    // The new quorum's parties are its peers from now on.
+    EventBody b2 = p.body;
+    List(PartyKeys) ks = match b2 { ReshareBody(nq) => keys_of_parties(nq.parties, 0, []), _ => c.cfg.peers };
+    CosignerConfig nc = with_peers(c.cfg, ks, c.cfg.accept_inception);
+    _ = save_cfg(c.dir, nc);
+    return Cosigner {.dir = c.dir, .cfg = nc, .root = c.root};
+}
+
+List(PartyKeys) keys_of_parties(List(Party) ps, Int i, List(PartyKeys) acc) {
+    if (i >= ps.len()) { return acc; }
+    return keys_of_parties(ps, i + 1, acc.concat([PartyKeys {.party = ps[i].id, .auth_key = ps[i].auth_key, .hpke_key = ps[i].hpke_key}]));
+}
+
+Bool opt_is(Option(List(Int)) o, List(Int) v) { return match o { Some(x) => bytes_eq(x, v), None => false }; }
+
+// The sender's keys: a peer pinned at pairing or met at key generation, or a
+// party of the verified quorum.
+@requires(network, clock(readonly), declassify, filesystem)
+Option(Remote) remote_of_party(Cosigner c, List(Int) p) {
+    Option(Remote) r = remote_by_party(remotes_of(c.cfg.peers, 0, []), p, 0);
+    return match r {
+        Some(x) => Some(x),
+        None => match verified_log_at(relay_of(c.cfg), c.cfg.log_id, local_host(c.dir)) {
+            Err(_) => None,
+            Ok(vh) => match party_at(vh.head.quorum.parties, p, 0) { None => None, Some(pt) => Some(Remote {.party = pt.id, .cg = 0, .hpke_pub = pt.hpke_key}) }
+        }
+    };
+}
+
+// k_b for the pending epoch: with b, the cosigner's half of the kit's
+// material (SPEC 10.6).
+@requires(filesystem)
+Cosigner on_kit_key(Cosigner c, List(Int) kb) {
+    Str e = str_trim(filesystem.read_all(c.dir + "/pending.epoch"));
+    List(Int) b = get_file(c.dir + "/kit-b-" + e);
+    if (str_len(e) == 0 || b.len() != 32 || kb.len() != 32) { return cos_fail(c, "a kit key without a pending re-share"); }
+    _ = put_secret_file(c.dir + "/kit-half-" + e + ".raw", b.concat(kb));
+    return c;
+}
+
+// ─── Peers from the log, and the kit release (SPEC 10.6, 13.4) ──
+
+List(PartyKeys) merge_keys(List(PartyKeys) a, List(PartyKeys) b, Int i) {
+    if (i >= b.len()) { return a; }
+    Bool known = index_of(a, b[i].party, 0) >= 0;
+    return merge_keys(if (known) { a } else { a.concat([b[i]]) }, b, i + 1);
+}
+
+List(PartyKeys) recover_parties(List(SignedEvent) es, Int i, List(PartyKeys) acc) {
+    if (i >= es.len()) { return acc; }
+    EventBody b = es[i].payload.body;
+    List(PartyKeys) more = match b { RecoverBody(r) => keys_of_parties(r.new_parties, 0, []), _ => [] };
+    return recover_parties(es, i + 1, merge_keys(acc, more, 0));
+}
+
+// The quorum's parties and every party a recover event names: the
+// cosigner opens their envelopes (and answers a recovering device, if only
+// to refuse it).
+@requires(network, filesystem, clock(readonly), declassify)
+Cosigner refresh_peers(Cosigner c) {
+    if (c.cfg.log_id.len() == 0) { return c; }
+    Result(VerifiedHead, SymbolonError) rv = verified_log_at(relay_of(c.cfg), c.cfg.log_id, local_host(c.dir));
+    List(SignedEvent) es = fetch_log(relay_of(c.cfg), c.cfg.log_id, 0, []);
+    return match rv {
+        Err(_) => c,
+        Ok(vh) => with_known(c, merge_keys(merge_keys(c.cfg.peers, keys_of_parties(vh.head.quorum.parties, 0, []), 0), recover_parties(es, 0, []), 0))
+    };
+}
+
+@requires(filesystem)
+Cosigner with_known(Cosigner c, List(PartyKeys) ps) {
+    if (ps.len() == c.cfg.peers.len()) { return c; }
+    CosignerConfig nc = with_peers(c.cfg, ps, c.cfg.accept_inception);
+    _ = save_cfg(c.dir, nc);
+    return Cosigner {.dir = c.dir, .cfg = nc, .root = c.root};
+}
+
+// The cosigner's half b || k_b for the latest epoch it holds one for.
+@requires(filesystem, declassify)
+Option(Half) my_half(Cosigner c) {
+    Str e = str_trim(filesystem.read_all(c.dir + "/pending.epoch"));
+    List(Int) raw = if (str_len(e) > 0) { get_file(c.dir + "/kit-half-" + e + ".raw") } else { [] };
+    if (raw.len() == 64) { return half_of(raw); }
+    Option(WrappedBlob) ob = blob_of_cbor(get_file(c.dir + "/kit-half.cbor"));
+    return match ob {
+        None => None,
+        Some(b) => match offline_unwrap(reveal(cos_hpke(c.root).sk), c.cfg.log_id, 1, c.cfg.party, Wrapped {.enc = b.enc, .ct = b.ct}) {
+            None => None,
+            Some(pt) => half_of(pt)
+        }
+    };
+}
+
+@requires(network, filesystem, declassify, clock)
+Cosigner on_release(Cosigner c, List(Int) from, List(Int) l) {
+    if (!bytes_eq(l, c.cfg.log_id)) { return refuse(c, from, l); }
+    List(SignedEvent) es = fetch_log(relay_of(c.cfg), l, 0, []);
+    Result(VerifiedHead, SymbolonError) rv = verified_log_at(relay_of(c.cfg), l, local_host(c.dir));
+    Option(Half) h = my_half(c);
+    return match rv {
+        Err(_) => refuse(c, from, l),
+        Ok(vh) => match h {
+            None => cos_fail(c, "no kit half held"),
+            Some(half) => match cosigner_release(es, vh, from, half, random_bytes(32)) {
+                Err(e) => release_refused(c, from, l, e),
+                Ok(w) => release_sent(c, from, w)
+            }
+        }
+    };
+}
+
+@requires(network, declassify, clock(readonly))
+Cosigner release_refused(Cosigner c, List(Int) from, List(Int) l, SymbolonError e) {
+    eprintln("cosigner: kit release refused: " + match e { ErrRecoveryFailed(s) => s, _ => "error" });
+    return refuse(c, from, l);
+}
+
+@requires(network, declassify, clock(readonly), filesystem)
+Cosigner release_sent(Cosigner c, List(Int) from, Wrapped w) {
+    Option(Remote) r = remote_of_party(c, from);
+    _ = match r { None => false, Some(rr) => send_to(relay_of(c.cfg), me_of(c), rr, WKitHalf(WrappedBlob {.enc = w.enc, .ct = w.ct})) };
+    println("cosigner: released its kit half to " + hex_encode(from));
+    return c;
+}

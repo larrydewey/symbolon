@@ -1,0 +1,376 @@
+// Legacy vault (SPEC Section 18).
+//
+// Keys and plaintexts are List(Secret(UInt(8))). Only the AEAD output and the
+// one-time code leave the secret type, each through a named declassify
+// point, so every function that seals or computes a code is
+// @requires(declassify) and so is everything that calls it.
+
+import "../types.resid";
+import "../core/log.resid";
+import "word.resid";
+import "sha256g.resid";
+import "sha1g.resid";
+import "aesgcmg.resid";
+import "crypto.resid";
+import "cose.resid";
+import "ecdsa.resid";
+import "hash.resid";
+
+
+pub type FieldPlain = { Str name; List(Secret(UInt(8))) value; };
+
+// One step of an inclusion proof: the sibling hash and which side it is on.
+pub type ProofStep = { List(Int) hash; Bool left; };
+
+// ============================================================================
+// Encodings
+// ============================================================================
+
+List(Int) u64be_from(UInt(64) v, Int i, ListBuf(Int) acc) {
+    if (i >= 8) { return acc.finish(); }
+    UInt(64) shifted = v >> u64(56 - 8 * i);
+    Int b = (Int)(shifted & 255);
+    return u64be_from(v, i + 1, acc.push(b));
+}
+
+pub List(Int) u64be(UInt(64) v) { return u64be_from(v, 0, ListBuf()); }
+
+ListBuf(Int) push_utf8(Int c, ListBuf(Int) acc) {
+    if (c < 128) { return acc.push(c); }
+    if (c < 2048) { return acc.push(192 | (c >> 6)).push(128 | (c & 63)); }
+    if (c < 65536) { return acc.push(224 | (c >> 12)).push(128 | ((c >> 6) & 63)).push(128 | (c & 63)); }
+    return acc.push(240 | (c >> 18)).push(128 | ((c >> 12) & 63)).push(128 | ((c >> 6) & 63)).push(128 | (c & 63));
+}
+
+List(Int) utf8_from(Str s, Int i, ListBuf(Int) acc) {
+    if (i >= str_len(s)) { return acc.finish(); }
+    return utf8_from(s, i + 1, push_utf8(str_char_at(s, i), acc));
+}
+
+pub List(Int) utf8(Str s) { return utf8_from(s, 0, ListBuf()); }
+
+List(Int) ints_of(List(UInt(8)) bs, Int i, ListBuf(Int) acc) {
+    if (i >= bs.len()) { return acc.finish(); }
+    return ints_of(bs, i + 1, acc.push((Int)bs[i]));
+}
+
+// ============================================================================
+// Key derivation (SPEC 18.1)
+// ============================================================================
+
+List(Secret(UInt(8))) hkdf_secret(List(Secret(UInt(8))) salt, List(Secret(UInt(8))) ikm, List(Int) info, Int n) {
+    List(Secret(UInt(8))) prk = hkdf256g_extract(salt, ikm);
+    return hkdf256g_expand(prk, secret_bytes(info), n);
+}
+
+pub List(Secret(UInt(8))) item_key(List(Secret(UInt(8))) vault_key, List(Int) vault_id, List(Int) item_id) {
+    return hkdf_secret(secret_bytes(vault_id), vault_key, utf8("symbolon v1 item").concat(item_id), 32);
+}
+
+List(Secret(UInt(8))) field_key(List(Secret(UInt(8))) ik, Str field, UInt(64) version) {
+    List(Secret(UInt(8))) nil = [];
+    return hkdf_secret(nil, ik, utf8("symbolon v1 field").concat(utf8(field)).concat(u64be(version)), 32);
+}
+
+List(Secret(UInt(8))) field_nonce(List(Secret(UInt(8))) ik, Str field, UInt(64) version) {
+    List(Secret(UInt(8))) nil = [];
+    return hkdf_secret(nil, ik, utf8("symbolon v1 nonce").concat(utf8(field)).concat(u64be(version)), 12);
+}
+
+// aad = CBOR([1, vault_id, item_id, item_version, kind, field_name])
+pub List(Int) field_aad(List(Int) vault_id, List(Int) item_id, UInt(64) version, Str kind, Str field) {
+    List(Int) a = cbe_uint(1, cbe_array(6, []));
+    List(Int) b = cbe_bytes(vault_id, a);
+    List(Int) c = cbe_bytes(item_id, b);
+    List(Int) d = cbe_uint((Int)version, c);
+    List(Int) e = cbe_text(kind, d);
+    return cbe_text(field, e);
+}
+
+// ============================================================================
+// Field encryption (SPEC 18.3)
+// ============================================================================
+
+@requires(declassify)
+pub List(Int) field_seal(List(Secret(UInt(8))) vault_key, List(Int) vault_id, List(Int) item_id, UInt(64) version, Str kind, Str field, List(Secret(UInt(8))) plaintext) {
+    List(Secret(UInt(8))) ik = item_key(vault_key, vault_id, item_id);
+    List(Secret(UInt(8))) ct = aes_gcmg_seal_ivb(field_key(ik, field, version), field_nonce(ik, field, version), plaintext,
+                                       field_aad(vault_id, item_id, version, kind, field));
+    return ints_of(declassify(secret_join(ct), "AEAD output is public"), 0, ListBuf());
+}
+
+@requires(declassify)
+pub Result(List(Secret(UInt(8))), SymbolonError) field_open(List(Secret(UInt(8))) vault_key, List(Int) vault_id, List(Int) item_id, UInt(64) version, Str kind, Str field, List(Int) ct) {
+    List(Secret(UInt(8))) ik = item_key(vault_key, vault_id, item_id);
+    Option(List(Secret(UInt(8)))) pt = aes_gcmg_decrypt_ivb(field_key(ik, field, version), field_nonce(ik, field, version), ct,
+                                                  field_aad(vault_id, item_id, version, kind, field));
+    return match pt {
+        Some(p) => Ok(p),
+        None => Err(ErrVaultIntegrity("field authentication failed: " + field))
+    };
+}
+
+// ============================================================================
+// Items
+// ============================================================================
+
+@requires(declassify)
+Result(Map(Str, List(Int)), SymbolonError) seal_fields(List(Secret(UInt(8))) vault_key, List(Int) vault_id, List(Int) item_id, UInt(64) version, Str kind, List(FieldPlain) fs, Int i, Map(Str, List(Int)) acc) {
+    if (i >= fs.len()) { return Ok(acc); }
+    if (acc.contains(fs[i].name)) { return Err(ErrVaultIntegrity("duplicate field " + fs[i].name)); }
+    List(Int) ct = field_seal(vault_key, vault_id, item_id, version, kind, fs[i].name, fs[i].value);
+    return seal_fields(vault_key, vault_id, item_id, version, kind, fs, i + 1, acc.insert(fs[i].name, ct));
+}
+
+@requires(declassify)
+pub Result(Item, SymbolonError) item_seal(List(Secret(UInt(8))) vault_key, List(Int) vault_id, List(Int) item_id, UInt(64) version, Str kind, List(FieldPlain) fs, Bool in_duress_subset, Option(Str) handling) {
+    if (item_id.len() != 16) { return Err(ErrVaultIntegrity("item id is 16 bytes")); }
+    Map(Str, List(Int)) fields = seal_fields(vault_key, vault_id, item_id, version, kind, fs, 0, {})?;
+    return Ok(Item {
+        .id = item_id, .version = version, .kind = kind, .fields = fields,
+        .in_duress_subset = in_duress_subset, .handling_policy = handling });
+}
+
+@requires(declassify)
+Result(List(FieldPlain), SymbolonError) open_fields(List(Secret(UInt(8))) vault_key, List(Int) vault_id, Item it, List(Str) names, Int i, ListBuf(FieldPlain) acc) {
+    if (i >= names.len()) { return Ok(acc.finish()); }
+    List(Int) ct = it.fields[names[i]] else { [] };
+    List(Secret(UInt(8))) pt = field_open(vault_key, vault_id, it.id, it.version, it.kind, names[i], ct)?;
+    return open_fields(vault_key, vault_id, it, names, i + 1, acc.push(FieldPlain {.name = names[i], .value = pt}));
+}
+
+@requires(declassify)
+pub Result(List(FieldPlain), SymbolonError) item_open(List(Secret(UInt(8))) vault_key, List(Int) vault_id, Item it) {
+    return open_fields(vault_key, vault_id, it, sort(it.fields.keys()), 0, ListBuf());
+}
+
+// New key, version + 1, same content (rotation 18.6, duress subset 18.5).
+@requires(declassify)
+pub Result(Item, SymbolonError) item_reencrypt(List(Secret(UInt(8))) old_key, List(Secret(UInt(8))) new_key, List(Int) vault_id, Item it) {
+    List(FieldPlain) plain = item_open(old_key, vault_id, it)?;
+    return item_seal(new_key, vault_id, it.id, it.version + 1, it.kind, plain, it.in_duress_subset, it.handling_policy);
+}
+
+@requires(declassify)
+Result(List(Item), SymbolonError) reencrypt_all(List(Secret(UInt(8))) old_key, List(Secret(UInt(8))) new_key, List(Int) vault_id, List(Item) items, Bool subset_only, Int i, ListBuf(Item) acc) {
+    if (i >= items.len()) { return Ok(acc.finish()); }
+    if (subset_only && !items[i].in_duress_subset) {
+        return reencrypt_all(old_key, new_key, vault_id, items, subset_only, i + 1, acc);
+    }
+    Item it = item_reencrypt(old_key, new_key, vault_id, items[i])?;
+    return reencrypt_all(old_key, new_key, vault_id, items, subset_only, i + 1, acc.push(it));
+}
+
+// 18.6: everything under a new vault key, versions incremented.
+@requires(declassify)
+pub Result(List(Item), SymbolonError) vault_rotate(List(Secret(UInt(8))) old_key, List(Secret(UInt(8))) new_key, List(Int) vault_id, List(Item) items) {
+    return reencrypt_all(old_key, new_key, vault_id, items, false, 0, ListBuf());
+}
+
+// 18.5: only the items marked for duress, under the duress vault key.
+@requires(declassify)
+pub Result(List(Item), SymbolonError) duress_subset(List(Secret(UInt(8))) vault_key, List(Secret(UInt(8))) duress_key, List(Int) vault_id, List(Item) items) {
+    return reencrypt_all(vault_key, duress_key, vault_id, items, true, 0, ListBuf());
+}
+
+// ============================================================================
+// Canonical item encoding and Merkle tree (SPEC 18.4)
+// ============================================================================
+
+List(Int) enc_fields(Item it, List(Str) names, Int i, List(Int) acc) {
+    if (i >= names.len()) { return acc; }
+    List(Int) ct = it.fields[names[i]] else { [] };
+    return enc_fields(it, names, i + 1, cbe_bytes(ct, cbe_text(names[i], acc)));
+}
+
+List(Int) enc_handling(Option(Str) h) {
+    return match h { Some(s) => cbe_text(s, []), None => cbe_head(7, 22, []) };
+}
+
+// item = {1: id, 2: version, 3: kind, 4: {name: ct}, 5: bool, 6: policy / null}
+pub List(Int) item_cbor(Item it) {
+    List(Str) names = sort(it.fields.keys());
+    List(Int) h = cbe_map(6, []);
+    List(Int) a = cbe_bytes(it.id, cbe_uint(1, h));
+    List(Int) b = cbe_uint((Int)it.version, cbe_uint(2, a));
+    List(Int) c = cbe_text(it.kind, cbe_uint(3, b));
+    List(Int) d = enc_fields(it, names, 0, cbe_map(names.len(), cbe_uint(4, c)));
+    List(Int) e = cbe_head(7, if (it.in_duress_subset) { 21 } else { 20 }, cbe_uint(5, d));
+    return cbe_uint(6, e).concat(enc_handling(it.handling_policy));
+}
+
+// H(0x00 || item_id || u64(version) || H(CBOR(item)))
+pub List(Int) merkle_leaf(Item it) {
+    return sha256_bytes([0].concat(it.id).concat(u64be(it.version)).concat(sha256_bytes(item_cbor(it))));
+}
+
+// H(0x01 || l || r)
+pub List(Int) merkle_node(List(Int) l, List(Int) r) {
+    return sha256_bytes([1].concat(l).concat(r));
+}
+
+Bool bytes_lt(List(Int) a, List(Int) b, Int i) {
+    if (i >= a.len() || i >= b.len()) { return a.len() < b.len(); }
+    if (a[i] != b[i]) { return a[i] < b[i]; }
+    return bytes_lt(a, b, i + 1);
+}
+
+List(Item) insert_sorted(List(Item) sorted, Item it, Int i) {
+    if (i >= sorted.len()) { return sorted.concat([it]); }
+    if (bytes_lt(it.id, sorted[i].id, 0)) {
+        return sorted[0..i].concat([it]).concat(sorted[i..]);
+    }
+    return insert_sorted(sorted, it, i + 1);
+}
+
+List(Item) sort_items(List(Item) items, Int i, List(Item) acc) {
+    if (i >= items.len()) { return acc; }
+    return sort_items(items, i + 1, insert_sorted(acc, items[i], 0));
+}
+
+List(List(Int)) leaves_of(List(Item) sorted, Int i, ListBuf(List(Int)) acc) {
+    if (i >= sorted.len()) { return acc.finish(); }
+    return leaves_of(sorted, i + 1, acc.push(merkle_leaf(sorted[i])));
+}
+
+// Pairs left to right; an odd node moves up unchanged.
+List(List(Int)) next_level(List(List(Int)) level, Int i, ListBuf(List(Int)) acc) {
+    if (i >= level.len()) { return acc.finish(); }
+    if (i + 1 >= level.len()) { return acc.push(level[i]).finish(); }
+    return next_level(level, i + 2, acc.push(merkle_node(level[i], level[i + 1])));
+}
+
+List(Int) root_of(List(List(Int)) level) {
+    if (level.len() == 0) { return sha256_bytes([]); }
+    if (level.len() == 1) { return level[0]; }
+    return root_of(next_level(level, 0, ListBuf()));
+}
+
+// Items need not be pre-sorted: the root is over items sorted by id.
+pub List(Int) merkle_root(List(Item) items) {
+    return root_of(leaves_of(sort_items(items, 0, []), 0, ListBuf()));
+}
+
+List(ProofStep) proof_levels(List(List(Int)) level, Int idx, ListBuf(ProofStep) acc) {
+    if (level.len() <= 1) { return acc.finish(); }
+    Int sib = if (idx % 2 == 0) { idx + 1 } else { idx - 1 };
+    ListBuf(ProofStep) next = if (sib < level.len()) {
+        acc.push(ProofStep {.hash = level[sib], .left = idx % 2 == 1})
+    } else { acc };
+    return proof_levels(next_level(level, 0, ListBuf()), idx / 2, next);
+}
+
+Int index_of_id(List(Item) sorted, List(Int) id, Int i) {
+    if (i >= sorted.len()) { return -1; }
+    if (bytes_eq(sorted[i].id, id)) { return i; }
+    return index_of_id(sorted, id, i + 1);
+}
+
+// Inclusion proof for one item, or None if it is not in the vault.
+pub Option(List(ProofStep)) merkle_proof(List(Item) items, List(Int) id) {
+    List(Item) sorted = sort_items(items, 0, []);
+    Int idx = index_of_id(sorted, id, 0);
+    if (idx < 0) { return None; }
+    return Some(proof_levels(leaves_of(sorted, 0, ListBuf()), idx, ListBuf()));
+}
+
+List(Int) fold_proof(List(Int) h, List(ProofStep) proof, Int i) {
+    if (i >= proof.len()) { return h; }
+    List(Int) up = if (proof[i].left) { merkle_node(proof[i].hash, h) } else { merkle_node(h, proof[i].hash) };
+    return fold_proof(up, proof, i + 1);
+}
+
+pub Bool merkle_verify(List(Int) root, Item it, List(ProofStep) proof) {
+    return bytes_eq(root, fold_proof(merkle_leaf(it), proof, 0));
+}
+
+// ============================================================================
+// The vault head (SPEC 18.4)
+// ============================================================================
+
+List(Int) head_payload(VaultHead h) {
+    List(Int) m = cbe_map(6, []);
+    List(Int) a = cbe_bytes(h.vault_id, cbe_uint(1, m));
+    List(Int) b = cbe_uint((Int)h.version, cbe_uint(2, a));
+    List(Int) c = cbe_bytes(h.merkle_root, cbe_uint(3, b));
+    List(Int) d = cbe_bytes(h.log_id, cbe_uint(4, c));
+    List(Int) e = cbe_uint((Int)h.log_sequence, cbe_uint(5, d));
+    return cbe_uint((Int)h.suite, cbe_uint(6, e));
+}
+
+// COSE protected header {1: -7} (ES256).
+List(Int) es256_protected() { return [161, 1, 38]; }
+
+// The bytes a device signs: COSE Sig_structure over the payload. The
+// device layer produces the r || s signature; this module only verifies.
+pub List(Int) head_tbs(VaultHead h) {
+    return cose_sig_structure(es256_protected(), head_payload(h));
+}
+
+Option(PubKeyHolder) device_key(Quorum q, List(Int) id, Int i) {
+    if (i >= q.parties.len()) { return None; }
+    if (bytes_eq(q.parties[i].id, id) && q.parties[i].kind == party_kind_device()) {
+        return Some(PubKeyHolder {.key = q.parties[i].auth_key});
+    }
+    return device_key(q, id, i + 1);
+}
+
+type PubKeyHolder = { List(Int) key; };
+
+// A device accepts a vault state only if: the head is for this vault and the
+// verified log; it is signed by the DK of a device in the quorum of the
+// device's own highest verified log head (a device removed since cannot
+// sign an acceptable head, whatever sequence it states: A-14); the version
+// is no lower than any accepted; the suite is format version 1's; and the
+// recomputed root matches.
+pub Result(VaultState, SymbolonError) vault_accept(VaultState st, List(Int) vault_id, LogHead verified, UInt(64) accepted_version) {
+    VaultHead h = st.head;
+    if (!bytes_eq(h.vault_id, vault_id)) { return Err(ErrVaultIntegrity("head is for another vault")); }
+    if (!bytes_eq(h.log_id, verified.log_id)) { return Err(ErrVaultIntegrity("head is for another log")); }
+    if (h.suite != 1) { return Err(ErrVaultIntegrity("unsupported suite")); }
+    if (h.log_sequence > verified.sequence) { return Err(ErrVaultIntegrity("head cites a log sequence not yet verified")); }
+    if (h.version < accepted_version) { return Err(ErrVaultIntegrity("vault version went backwards")); }
+    Option(PubKeyHolder) dk = device_key(verified.quorum, h.signer, 0);
+    return match dk {
+        None => Err(ErrVaultIntegrity("signer is not a device of the current quorum")),
+        Some(k) => vault_accept_signed(st, k.key)
+    };
+}
+
+Result(VaultState, SymbolonError) vault_accept_signed(VaultState st, List(Int) key) {
+    VaultHead h = st.head;
+    if (!ecdsa_verify_raw(P256, Sha256, key, head_tbs(h), h.sig)) {
+        return Err(ErrInvalidSignature("vault head signature"));
+    }
+    if (!bytes_eq(merkle_root(st.items), h.merkle_root)) {
+        return Err(ErrVaultIntegrity("Merkle root does not match the items"));
+    }
+    return Ok(st);
+}
+
+// ============================================================================
+// TOTP (SPEC 18.7, RFC 6238 with HMAC-SHA-256)
+// ============================================================================
+
+// RFC 4226 dynamic truncation. The code is public by design; the MAC it is
+// cut from is released only inside this function, as one declassified list.
+@requires(declassify)
+Int truncate_mac(List(Secret(UInt(8))) mac, Int digits) {
+    List(Int) m = ints_of(declassify(secret_join(mac), "HOTP truncation: only a 31-bit code leaves"), 0, ListBuf());
+    Int off = m[m.len() - 1] & 15;
+    Int bin = ((m[off] & 127) << 24) | (m[off + 1] << 16) | (m[off + 2] << 8) | m[off + 3];
+    return bin % pow10(digits);
+}
+
+// HMAC-SHA-1 (what authenticator apps and most sites use) and HMAC-SHA-256.
+@requires(declassify)
+pub Int totp_code(List(Secret(UInt(8))) seed, Int unix_time, Int step, Int digits, Bool sha1) {
+    List(Secret(UInt(8))) counter = secret_bytes(u64be(u64(unix_time / step)));
+    List(Secret(UInt(8))) mac = if (sha1) { hmac1g(seed, counter) } else { hmac256g(seed, counter) };
+    return truncate_mac(mac, digits);
+}
+
+Int pow10(Int n) {
+    if (n <= 0) { return 1; }
+    return 10 * pow10(n - 1);
+}

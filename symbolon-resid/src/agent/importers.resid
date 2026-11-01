@@ -1,0 +1,655 @@
+// Moving in from another password manager (SPEC 18.9): `symbolon device
+// vault import DIR FILE [--format F] [--dry-run]`. Reads the export, maps
+// every entry onto Symbolon's item types (logins, cards, identities, notes,
+// bank accounts, Wi-Fi, secrets), keeps the source's folders, and publishes
+// all of it as one new vault version: one signature, however many items.
+//
+// Sources: Bitwarden and Vaultwarden (JSON, or CSV), LastPass (CSV, its
+// typed secure notes included), and the CSV that Chrome, Edge, Firefox,
+// Safari, 1Password, KeePassXC, Proton Pass and Dashlane write. The format
+// is told from the text unless --format names it.
+//
+// What does not come across, and is said so: a source's passkeys (their
+// private keys are whole keys, and a Symbolon passkey is split between the
+// device and the cosigner: the person makes a new one at each site), and a
+// password-protected Bitwarden export (export it again unencrypted).
+//
+// With --dry-run nothing is unlocked or published: each item prints as
+// "item TYPE NAME-HEX FOLDER-HEX". Both forms print "skip NAME-HEX
+// REASON-HEX" for what is left out, "warn TEXT-HEX" for what the person
+// should know, and "total N".
+
+import "../types.resid";
+import "../vault/vault.resid";
+import "../recipe/recipe.resid";
+import "state.resid";
+import "common.resid";
+import "device.resid";
+import "vaultcli.resid";
+import "vaultitems.resid";
+import "sharecli.resid";
+import "crypto.resid";
+import "resid-json/json.resid";
+import "serial_value.resid";
+import "resid-csv/csv.resid";
+
+// ─── The neutral item ───────────────────────────────────────────────
+
+type ImpField = { Str name; Str value; };
+type ImpCustom = { Str label; Bool hidden; Str value; };
+
+// An entry as read from a source, before it is checked and sealed.
+type Imp = { Str name; Str kind; Str folder; List(ImpField) fields; List(ImpCustom) custom; };
+
+// What a source gave: the entries, and what the person should know.
+type ImpRead = { List(Imp) items; List(Str) warnings; };
+
+ListBuf(ImpField) fput(ListBuf(ImpField) acc, Str name, Str value) {
+    return if (str_len(str_trim(value)) == 0) { acc } else { acc.push(ImpField {.name = name, .value = value}) };
+}
+
+ListBuf(ImpCustom) cput(ListBuf(ImpCustom) acc, Str label, Str value, Bool hidden) {
+    return if (str_len(str_trim(value)) == 0) { acc } else { acc.push(ImpCustom {.label = label, .hidden = hidden, .value = value}) };
+}
+
+Imp imp(Str name, Str kind, Str folder, ListBuf(ImpField) fs, ListBuf(ImpCustom) cs) {
+    return Imp {.name = str_trim(name), .kind = kind, .folder = str_trim(folder), .fields = fs.finish(), .custom = cs.finish()};
+}
+
+Str field_of(Imp x, Str n) { return field_at(x.fields, n, 0); }
+Str field_at(List(ImpField) fs, Str n, Int i) {
+    if (i >= fs.len()) { return ""; }
+    if (fs[i].name == n) { return fs[i].value; }
+    return field_at(fs, n, i + 1);
+}
+
+// ─── Small text helpers ─────────────────────────────────────────────
+
+Str digits_only(Str s) { return digits_at(s, 0, str_len(s), StrBuf()); }
+Str digits_at(Str s, Int i, Int n, StrBuf acc) {
+    if (i >= n) { return acc.finish(); }
+    Int c = str_char_at(s, i);
+    return digits_at(s, i + 1, n, if (c >= 48 && c <= 57) { acc.push_char(c) } else { acc });
+}
+
+Str two(Str s) { return if (str_len(s) == 1) { "0" + s } else { s }; }
+
+// MM/YY from a month (1-12, or a month's English name) and a year (2 or 4
+// digits); "" when either is missing.
+Str expiry_of(Str month, Str year) {
+    Str m = month_number(str_trim(month));
+    Str y = digits_only(year);
+    if (str_len(m) == 0 || str_len(y) < 2) { return ""; }
+    return m + "/" + str_slice(y, str_len(y) - 2, str_len(y));
+}
+
+Str month_number(Str m) {
+    Str d = digits_only(m);
+    if (str_len(d) > 0 && str_len(d) <= 2 && str_parse_int(d) >= 1 && str_parse_int(d) <= 12) { return two(f"{str_parse_int(d)}"); }
+    List(Str) names = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
+    Str l = str_to_lower(m);
+    return month_named(names, if (str_len(l) >= 3) { str_slice(l, 0, 3) } else { l }, 0);
+}
+
+Str month_named(List(Str) names, Str p, Int i) {
+    if (i >= names.len()) { return ""; }
+    if (names[i] == p) { return two(f"{i + 1}"); }
+    return month_named(names, p, i + 1);
+}
+
+// A site address as a login keeps it: a bare host ("example.com", as
+// Bitwarden allows) is read as https.
+Str web_origin(Str uri) {
+    Str u = str_trim(uri);
+    Bool bare = !str_contains(u, "://") && str_contains(u, ".") && !str_contains(u, " ");
+    return origin_of(if (bare) { "https://" + u } else { u });
+}
+
+// A name for an entry that has none: the site's host, else the username.
+Str name_or(Str name, Str origin, Str user) {
+    if (str_len(str_trim(name)) > 0) { return name; }
+    if (str_len(origin) > 0) { return str_replace(str_replace(str_replace(origin, "https://", ""), "http://", ""), "www.", ""); }
+    if (str_len(str_trim(user)) > 0) { return user; }
+    return "Untitled";
+}
+
+Str join_lines(List(Str) xs, Int i, StrBuf acc, Bool first) {
+    if (i >= xs.len()) { return acc.finish(); }
+    if (str_len(str_trim(xs[i])) == 0) { return join_lines(xs, i + 1, acc, first); }
+    return join_lines(xs, i + 1, (if (first) { acc } else { acc.push("\n") }).push(str_trim(xs[i])), false);
+}
+
+Str join_words(List(Str) xs, Int i, StrBuf acc, Bool first) {
+    if (i >= xs.len()) { return acc.finish(); }
+    if (str_len(str_trim(xs[i])) == 0) { return join_words(xs, i + 1, acc, first); }
+    return join_words(xs, i + 1, (if (first) { acc } else { acc.push(" ") }).push(str_trim(xs[i])), false);
+}
+
+Str words(List(Str) xs) { return join_words(xs, 0, StrBuf(), true); }
+Str lines(List(Str) xs) { return join_lines(xs, 0, StrBuf(), true); }
+
+// ─── JSON values ────────────────────────────────────────────────────
+
+Str val_text(Value v) {
+    return match v {
+        VStr(s) => s,
+        VInt(i) => f"{i}",
+        VUInt(u) => f"{u}",
+        VBool(b) => if (b) { "true" } else { "false" },
+        _ => ""
+    };
+}
+
+Str jt(Value v, Str key) { return match value_field(v, key) { Some(x) => val_text(x), None => "" }; }
+
+List(Value) jl(Value v, Str key) {
+    return match value_field(v, key) {
+        Some(x) => match x { VSeq(xs) => xs, _ => [] },
+        None => []
+    };
+}
+
+// The object at `key`, or unit when it is absent or null.
+Value jo(Value v, Str key) { return match value_field(v, key) { Some(x) => x, None => VUnit }; }
+
+// ─── Bitwarden and Vaultwarden, JSON ────────────────────────────────
+// {"encrypted": false, "folders": [{"id", "name"}], "items": [{"type": 1
+// login | 2 note | 3 card | 4 identity | 5 SSH key, "name", "notes",
+// "folderId", "fields": [{"name", "value", "type": 0 text | 1 hidden | 2
+// boolean | 3 linked}], "login" | "card" | "identity" | "sshKey": {...}}]}.
+// An organization's export has "collections" and "collectionIds": an item
+// with no folder takes its first collection's name.
+
+Result(ImpRead, Str) bitwarden_json(Value top) {
+    if (jt(top, "encrypted") == "true") {
+        return Err("this Bitwarden export is password-protected: export again as .json (not encrypted), import it, then delete the file");
+    }
+    if (match value_field(top, "items") { None => true, Some(_) => false }) { return Err("this JSON has no \"items\": export from Bitwarden or Vaultwarden as .json"); }
+    List(Value) folders = jl(top, "folders").concat(jl(top, "collections"));
+    List(Value) items = jl(top, "items");
+    return Ok(ImpRead {.items = bw_items(items, folders, 0, ListBuf()), .warnings = bw_warnings(items)});
+}
+
+List(Imp) bw_items(List(Value) xs, List(Value) folders, Int i, ListBuf(Imp) acc) {
+    if (i >= xs.len()) { return acc.finish(); }
+    return bw_items(xs, folders, i + 1, acc.push(bw_item(xs[i], folders)));
+}
+
+Str name_by_id(List(Value) xs, Str id, Int i) {
+    if (str_len(id) == 0 || i >= xs.len()) { return ""; }
+    if (jt(xs[i], "id") == id) { return jt(xs[i], "name"); }
+    return name_by_id(xs, id, i + 1);
+}
+
+Str bw_folder(Value it, List(Value) folders) {
+    Str f = name_by_id(folders, jt(it, "folderId"), 0);
+    if (str_len(f) > 0) { return f; }
+    List(Value) cs = jl(it, "collectionIds");
+    return if (cs.len() == 0) { "" } else { name_by_id(folders, val_text(cs[0]), 0) };
+}
+
+// A Bitwarden item's custom fields.
+ListBuf(ImpCustom) bw_fields(List(Value) fs, Int i, ListBuf(ImpCustom) acc) {
+    if (i >= fs.len()) { return acc; }
+    Str t = jt(fs[i], "type");
+    Str label = if (str_len(str_trim(jt(fs[i], "name"))) == 0) { "Field" } else { jt(fs[i], "name") };
+    return bw_fields(fs, i + 1, if (t == "3") { acc } else { cput(acc, label, jt(fs[i], "value"), t == "1") });
+}
+
+Imp bw_item(Value it, List(Value) folders) {
+    Str t = jt(it, "type");
+    Str name = jt(it, "name");
+    Str notes = jt(it, "notes");
+    Str folder = bw_folder(it, folders);
+    ListBuf(ImpCustom) cs = bw_fields(jl(it, "fields"), 0, ListBuf());
+    if (t == "1") { return bw_login(jo(it, "login"), name, notes, folder, cs); }
+    if (t == "3") { return bw_card(jo(it, "card"), name, notes, folder, cs); }
+    if (t == "4") { return bw_identity(jo(it, "identity"), name, notes, folder, cs); }
+    if (t == "5") { return bw_ssh(jo(it, "sshKey"), name, notes, folder, cs); }
+    return note_item(name, notes, folder, cs);
+}
+
+// A note; one without text keeps its name as the text, so its fields
+// still have an item to belong to.
+Imp note_item(Str name, Str notes, Str folder, ListBuf(ImpCustom) cs) {
+    Str text = if (str_len(str_trim(notes)) == 0) { name_or(name, "", "") } else { notes };
+    return imp(name_or(name, "", ""), "note", folder, fput(ListBuf(), "text", text), cs);
+}
+
+// Every web address of a login: the first is its origin, the rest custom
+// fields.
+List(Str) bw_uris(List(Value) us, Int i, ListBuf(Str) acc) {
+    if (i >= us.len()) { return acc.finish(); }
+    Str u = str_trim(jt(us[i], "uri"));
+    return bw_uris(us, i + 1, if (str_len(u) == 0) { acc } else { acc.push(u) });
+}
+
+Imp bw_login(Value l, Str name, Str notes, Str folder, ListBuf(ImpCustom) cs) {
+    return login_item(name, bw_uris(jl(l, "uris"), 0, ListBuf()), jt(l, "username"), jt(l, "password"), jt(l, "totp"), notes, folder, cs);
+}
+
+// A login from its parts. The first web address gives the origin; the
+// others, and the first one when it says more than its origin (a path, an
+// app's address), are kept as "Website" fields.
+Imp login_item(Str name, List(Str) uris, Str user, Str password, Str totp, Str notes, Str folder, ListBuf(ImpCustom) cs) {
+    Int k = first_web(uris, 0);
+    Str origin = if (k < 0) { "" } else { web_origin(uris[k]) };
+    ListBuf(ImpField) fs = fput(fput(fput(fput(fput(ListBuf(), "origin", origin), "username", user), "current", password), "totp", totp), "notes", notes);
+    return imp(name_or(name, origin, user), "login", folder, fs, extra_sites(uris, k, origin, 0, cs));
+}
+
+Int first_web(List(Str) us, Int i) {
+    if (i >= us.len()) { return -1; }
+    if (str_len(web_origin(us[i])) > 0) { return i; }
+    return first_web(us, i + 1);
+}
+
+ListBuf(ImpCustom) extra_sites(List(Str) us, Int k, Str origin, Int i, ListBuf(ImpCustom) acc) {
+    if (i >= us.len()) { return acc; }
+    // The origin's own address ("https://x.com" or "https://x.com/") says
+    // nothing more; a bare host does not either.
+    Bool same = i == k && (us[i] == origin || us[i] == origin + "/" || "https://" + us[i] == origin || "https://" + us[i] == origin + "/");
+    return extra_sites(us, k, origin, i + 1, if (same) { acc } else { cput(acc, "Website", us[i], false) });
+}
+
+Imp bw_card(Value c, Str name, Str notes, Str folder, ListBuf(ImpCustom) cs) {
+    return card_item(name, jt(c, "cardholderName"), jt(c, "number"), expiry_of(jt(c, "expMonth"), jt(c, "expYear")), jt(c, "code"), "", notes, folder,
+                     cput(cs, "Brand", jt(c, "brand"), false));
+}
+
+// A card; one without a number cannot be a card, so it comes across as a
+// note that keeps what it has.
+Imp card_item(Str name, Str holder, Str number, Str expiry, Str cvv, Str pin, Str notes, Str folder, ListBuf(ImpCustom) cs) {
+    Str n = digits_only(number);
+    if (str_len(n) == 0) {
+        return note_item(name, notes, folder, cput(cput(cput(cput(cs, "Name on card", holder, false), "Expiry", expiry, false), "Security code", cvv, true), "Card PIN", pin, true));
+    }
+    ListBuf(ImpField) fs = fput(fput(fput(fput(fput(fput(ListBuf(), "cardholder", holder), "number", n), "expiry", expiry), "cvv", cvv), "pin", pin), "notes", notes);
+    return imp(name_or(name, "", "Card " + str_slice(n, if (str_len(n) > 4) { str_len(n) - 4 } else { 0 }, str_len(n))), "card", folder, fs, cs);
+}
+
+Imp bw_identity(Value d, Str name, Str notes, Str folder, ListBuf(ImpCustom) cs) {
+    Str full = words([jt(d, "title"), jt(d, "firstName"), jt(d, "middleName"), jt(d, "lastName")]);
+    Str addr = lines([jt(d, "address1"), jt(d, "address2"), jt(d, "address3"), words([jt(d, "city"), jt(d, "state"), jt(d, "postalCode")]), jt(d, "country")]);
+    ListBuf(ImpField) fs = fput(fput(fput(fput(fput(fput(ListBuf(), "full_name", full), "email", jt(d, "email")), "phone", jt(d, "phone")), "address", addr),
+                                "document", jt(d, "passportNumber")), "notes", notes);
+    ListBuf(ImpCustom) more = cput(cput(cput(cput(cs, "Company", jt(d, "company"), false), "Username", jt(d, "username"), false), "Social Security number", jt(d, "ssn"), true),
+                                   "Driver's license", jt(d, "licenseNumber"), true);
+    return imp(name_or(name, "", full), "identity", folder, fs, more);
+}
+
+Imp bw_ssh(Value k, Str name, Str notes, Str folder, ListBuf(ImpCustom) cs) {
+    Str key = jt(k, "privateKey");
+    if (str_len(str_trim(key)) == 0) { return note_item(name, notes, folder, cput(cs, "Public key", jt(k, "publicKey"), false)); }
+    return imp(name_or(name, "", "SSH key"), "secret", folder, fput(fput(ListBuf(), "secret", key), "notes", notes),
+               cput(cput(cs, "Public key", jt(k, "publicKey"), false), "Fingerprint", jt(k, "keyFingerprint"), false));
+}
+
+// Passkeys stay behind; say how many.
+List(Str) bw_warnings(List(Value) items) {
+    Int n = bw_passkeys(items, 0, 0);
+    return if (n == 0) { [] } else { [passkey_warning(n)] };
+}
+
+Str passkey_warning(Int n) {
+    return f"{n} passkey{if (n == 1) { "" } else { "s" }} did not come across: a Symbolon passkey is split between this device and your cosigner, so make a new one at each of those sites";
+}
+
+Int bw_passkeys(List(Value) xs, Int i, Int n) {
+    if (i >= xs.len()) { return n; }
+    return bw_passkeys(xs, i + 1, n + jl(jo(xs[i], "login"), "fido2Credentials").len());
+}
+
+// ─── CSV, whoever wrote it ──────────────────────────────────────────
+// One reader for every CSV: each source's columns are found by their
+// header (in any case), from the names these managers use. LastPass's
+// secure notes and Bitwarden's "fields" column are read apart.
+
+// The column of the first header in `names` that the table has, or -1.
+Int col(CsvTable t, List(Str) names) { return col_at(lower_all(t.header, 0, ListBuf()), names, 0); }
+
+List(Str) lower_all(List(Str) xs, Int i, ListBuf(Str) acc) {
+    if (i >= xs.len()) { return acc.finish(); }
+    return lower_all(xs, i + 1, acc.push(str_to_lower(str_trim(xs[i]))));
+}
+
+Int col_at(List(Str) h, List(Str) names, Int i) {
+    if (i >= names.len()) { return -1; }
+    Int k = index_in(h, names[i], 0);
+    return if (k >= 0) { k } else { col_at(h, names, i + 1) };
+}
+
+Int index_in(List(Str) xs, Str x, Int i) {
+    if (i >= xs.len()) { return -1; }
+    if (xs[i] == x) { return i; }
+    return index_in(xs, x, i + 1);
+}
+
+Str cell(List(Str) row, Int k) { return if (k < 0 || k >= row.len()) { "" } else { row[k] }; }
+
+type Cols = { Int name; Int url; Int user; Int email; Int pass; Int totp; Int notes; Int folder; Int kind; Int fields; Int extra; Bool lastpass; };
+
+Cols cols_of(CsvTable t) {
+    Int extra = col(t, ["extra"]);
+    Int grouping = col(t, ["grouping"]);
+    return Cols {
+        .name = col(t, ["name", "title"]),
+        .url = col(t, ["url", "login_uri", "website", "uri", "login url", "web site"]),
+        .user = col(t, ["username", "login_username", "login name", "user name", "login", "username1"]),
+        .email = col(t, ["email", "e-mail"]),
+        .pass = col(t, ["password", "login_password"]),
+        .totp = col(t, ["totp", "login_totp", "otpauth", "otp", "otpsecret", "one-time password", "otpurl"]),
+        .notes = col(t, ["notes", "note", "comments", "comment", "extra"]),
+        .folder = col(t, ["folder", "grouping", "group", "vault", "path", "category"]),
+        .kind = col(t, ["type"]),
+        .fields = col(t, ["fields"]),
+        .extra = extra,
+        .lastpass = extra >= 0 && grouping >= 0
+    };
+}
+
+Result(ImpRead, Str) any_csv(CsvTable t) {
+    Cols c = cols_of(t);
+    if (c.pass < 0 && c.notes < 0 && c.url < 0) { return Err("this CSV has no password, notes or address column: it does not look like a password manager's export"); }
+    return Ok(ImpRead {.items = csv_items(t.rows, c, 0, ListBuf()), .warnings = []});
+}
+
+List(Imp) csv_items(List(List(Str)) rows, Cols c, Int i, ListBuf(Imp) acc) {
+    if (i >= rows.len()) { return acc.finish(); }
+    return csv_items(rows, c, i + 1, acc.push(csv_item(rows[i], c)));
+}
+
+// A folder path as Symbolon keeps it: "/" between levels (LastPass writes
+// "\"), without KeePass's "Root".
+Str folder_path(Str f) {
+    Str s = str_trim(str_replace(f, "\\", "/"));
+    if (s == "Root") { return ""; }
+    return if (str_starts_with(s, "Root/")) { str_slice(s, 5, str_len(s)) } else { s };
+}
+
+Imp csv_item(List(Str) row, Cols c) {
+    Str name = cell(row, c.name);
+    Str url = cell(row, c.url);
+    Str folder = folder_path(cell(row, c.folder));
+    Str notes = cell(row, c.notes);
+    Str kind = str_to_lower(cell(row, c.kind));
+    if (c.lastpass && str_trim(url) == "http://sn") { return lastpass_note(name, notes, folder); }
+    ListBuf(ImpCustom) cs = bw_csv_fields(str_split(cell(row, c.fields), "\n"), 0, ListBuf());
+    if (kind == "note" || kind == "securenote" || kind == "secure note") { return note_item(name, notes, folder, cs); }
+    Str user0 = cell(row, c.user);
+    Str email = cell(row, c.email);
+    Str user = if (str_len(str_trim(user0)) == 0) { email } else { user0 };
+    ListBuf(ImpCustom) cs2 = if (str_len(str_trim(user0)) == 0 || email == user0) { cs } else { cput(cs, "Email", email, false) };
+    List(Str) uris = str_split(url, ",");
+    return login_item(name, uris, user, cell(row, c.pass), cell(row, c.totp), notes, folder, cs2);
+}
+
+// Bitwarden CSV custom fields: "name: value" lines.
+ListBuf(ImpCustom) bw_csv_fields(List(Str) ls, Int i, ListBuf(ImpCustom) acc) {
+    if (i >= ls.len()) { return acc; }
+    Int k = str_index_of(ls[i], ": ", 0);
+    ListBuf(ImpCustom) a = if (k <= 0) { cput(acc, "Field", ls[i], false) } else { cput(acc, str_slice(ls[i], 0, k), str_slice(ls[i], k + 2, str_len(ls[i])), false) };
+    return bw_csv_fields(ls, i + 1, a);
+}
+
+// ─── LastPass secure notes ──────────────────────────────────────────
+// "NoteType:Credit Card\nName on Card:...\n...\nNotes:free text", the
+// notes running to the end; a note without a NoteType line is plain text.
+
+type Kv = { Str key; Str value; };
+
+List(Kv) lp_pairs(List(Str) ls, Int i, ListBuf(Kv) acc) {
+    if (i >= ls.len()) { return acc.finish(); }
+    Int k = str_index_of(ls[i], ":", 0);
+    if (k <= 0) { return lp_pairs(ls, i + 1, acc); }
+    Str key = str_slice(ls[i], 0, k);
+    if (key == "Notes") {
+        Str first = str_slice(ls[i], k + 1, str_len(ls[i]));
+        return acc.push(Kv {.key = "Notes", .value = rest_lines(ls, i + 1, StrBuf().push(first))}).finish();
+    }
+    return lp_pairs(ls, i + 1, acc.push(Kv {.key = key, .value = str_slice(ls[i], k + 1, str_len(ls[i]))}));
+}
+
+Str rest_lines(List(Str) ls, Int i, StrBuf acc) {
+    if (i >= ls.len()) { return acc.finish(); }
+    return rest_lines(ls, i + 1, acc.push("\n").push(ls[i]));
+}
+
+Str kv(List(Kv) ps, Str key) { return kv_at(ps, key, 0); }
+Str kv_at(List(Kv) ps, Str key, Int i) {
+    if (i >= ps.len()) { return ""; }
+    if (ps[i].key == key) { return ps[i].value; }
+    return kv_at(ps, key, i + 1);
+}
+
+// The pairs not named in `used`, as custom fields (hidden when they look
+// like a secret).
+ListBuf(ImpCustom) lp_rest(List(Kv) ps, List(Str) used, Int i, ListBuf(ImpCustom) acc) {
+    if (i >= ps.len()) { return acc; }
+    // LastPass writes an unset date as ",".
+    Bool blank = str_len(str_trim(str_replace(ps[i].value, ",", ""))) == 0;
+    Bool skip = blank || ps[i].key == "NoteType" || ps[i].key == "Notes" || ps[i].key == "Language" || used.contains(ps[i].key);
+    return lp_rest(ps, used, i + 1, if (skip) { acc } else { cput(acc, ps[i].key, ps[i].value, looks_secret(ps[i].key)) });
+}
+
+Bool looks_secret(Str key) {
+    Str k = str_to_lower(key);
+    return str_contains(k, "password") || str_contains(k, "pin") || str_contains(k, "secret") || str_contains(k, "code") || str_contains(k, "key")
+        || str_contains(k, "account number") || k == "number";
+}
+
+// LastPass dates: "January,2027" or "January,15,2027".
+Str lp_expiry(Str d) {
+    List(Str) p = str_split(d, ",");
+    return if (p.len() < 2) { "" } else { expiry_of(p[0], p[p.len() - 1]) };
+}
+
+Imp lastpass_note(Str name, Str extra, Str folder) {
+    List(Str) ls = str_split(str_replace(extra, "\r\n", "\n"), "\n");
+    if (ls.len() == 0 || !str_starts_with(ls[0], "NoteType:")) { return note_item(name, extra, folder, ListBuf()); }
+    List(Kv) ps = lp_pairs(ls, 0, ListBuf());
+    Str t = kv(ps, "NoteType");
+    Str notes = kv(ps, "Notes");
+    if (t == "Credit Card") {
+        List(Str) used = ["Name on Card", "Number", "Security Code", "Expiration Date"];
+        return card_item(name, kv(ps, "Name on Card"), kv(ps, "Number"), lp_expiry(kv(ps, "Expiration Date")), kv(ps, "Security Code"), "", notes, folder,
+                         lp_rest(ps, used, 0, ListBuf()));
+    }
+    if (t == "Bank Account") {
+        List(Str) used = ["Bank Name", "Account Number", "Routing Number", "SWIFT Code", "IBAN Number"];
+        ListBuf(ImpField) fs = fput(fput(fput(fput(fput(fput(ListBuf(), "bank_name", kv(ps, "Bank Name")), "account_number", kv(ps, "Account Number")),
+                                                    "routing", digits_only(kv(ps, "Routing Number"))), "swift", kv(ps, "SWIFT Code")), "iban", str_replace(kv(ps, "IBAN Number"), " ", "")), "notes", notes);
+        return imp(name_or(name, "", kv(ps, "Bank Name")), "bank", folder, fs, lp_rest(ps, used, 0, ListBuf()));
+    }
+    if (t == "Address") {
+        List(Str) used = ["Title", "First Name", "Middle Name", "Last Name", "Email Address", "Phone", "Address 1", "Address 2", "Address 3", "City / Town", "State", "Zip / Postal Code", "Country"];
+        Str full = words([kv(ps, "Title"), kv(ps, "First Name"), kv(ps, "Middle Name"), kv(ps, "Last Name")]);
+        Str addr = lines([kv(ps, "Address 1"), kv(ps, "Address 2"), kv(ps, "Address 3"), words([kv(ps, "City / Town"), kv(ps, "State"), kv(ps, "Zip / Postal Code")]), kv(ps, "Country")]);
+        ListBuf(ImpField) fs = fput(fput(fput(fput(fput(ListBuf(), "full_name", full), "email", kv(ps, "Email Address")), "phone", lp_phone(kv(ps, "Phone"))), "address", addr), "notes", notes);
+        return imp(name_or(name, "", full), "identity", folder, fs, lp_rest(ps, used, 0, ListBuf()));
+    }
+    if (t == "Wi-Fi Password") {
+        List(Str) used = ["SSID", "Password", "Authentication"];
+        if (str_len(str_trim(kv(ps, "SSID"))) > 0) {
+            ListBuf(ImpField) fs = fput(fput(fput(fput(ListBuf(), "ssid", kv(ps, "SSID")), "password", kv(ps, "Password")), "security", kv(ps, "Authentication")), "notes", notes);
+            return imp(name_or(name, "", kv(ps, "SSID")), "wifi", folder, fs, lp_rest(ps, used, 0, ListBuf()));
+        }
+    }
+    if (t == "Passport" || t == "Driver's License") {
+        List(Str) used = ["Name", "Number"];
+        ListBuf(ImpField) fs = fput(fput(fput(ListBuf(), "full_name", kv(ps, "Name")), "document", kv(ps, "Number")), "notes", notes);
+        return imp(name_or(name, "", t), "identity", folder, fs, lp_rest(ps, used, 0, ListBuf()));
+    }
+    if (t == "Social Security") {
+        List(Str) used = ["Name"];
+        ListBuf(ImpField) fs = fput(fput(ListBuf(), "full_name", kv(ps, "Name")), "notes", notes);
+        return imp(name_or(name, "", t), "identity", folder, fs, lp_rest(ps, used, 0, ListBuf()));
+    }
+    // Servers, databases, licences, memberships and the rest: a note that
+    // keeps every field.
+    return note_item(name, notes, folder, cput(lp_rest(ps, [], 0, ListBuf()), "Kind", t, false));
+}
+
+// LastPass keeps a phone as {"num":"...","ext":"...","cc3l":"..."}.
+Str lp_phone(Str p) {
+    if (!str_starts_with(str_trim(p), "{")) { return p; }
+    Result(Value, SerialError) r = from_json(p);
+    return match r { Err(_) => p, Ok(v) => jt(v, "num") };
+}
+
+// ─── Telling the format, and reading ────────────────────────────────
+
+pub Bool import_format_ok(Str f) { return f == "auto" || f == "bitwarden-json" || f == "csv"; }
+
+Result(ImpRead, Str) read_export(Str text, Str format) {
+    Str t = str_trim(text);
+    Str bom = str_from_code(65279);
+    Str body = if (str_starts_with(t, bom)) { str_trim(str_slice(t, 1, str_len(t))) } else { t };
+    Bool json = format == "bitwarden-json" || (format == "auto" && str_starts_with(body, "{"));
+    if (json) {
+        Result(Value, SerialError) r = from_json(body);
+        return match r {
+            Err(e) => Err("the file is not valid JSON: " + error_text(e)),
+            Ok(v) => bitwarden_json(v)
+        };
+    }
+    Result(CsvTable, Str) rt = csv_table(text);
+    return match rt { Err(m) => Err(m), Ok(tab) => any_csv(tab) };
+}
+
+// ─── Checking and sealing ───────────────────────────────────────────
+
+// The fields an entry is stored with: name, type, folder, its fields, and
+// its custom fields as the app keeps them (custom_N = label, 0x1f, "1" or
+// "0", 0x1f, the value).
+List(ImpField) stored_fields(Imp x, Str name) {
+    ListBuf(ImpField) a0 = ListBuf();
+    ListBuf(ImpField) a = a0.push(ImpField {.name = "name", .value = name}).push(ImpField {.name = "type", .value = x.kind});
+    ListBuf(ImpField) b = if (str_len(x.folder) == 0) { a } else { a.push(ImpField {.name = "folder", .value = x.folder}) };
+    return customs(x.custom, 0, x.fields.len(), push_all(x.fields, 0, b)).finish();
+}
+
+ListBuf(ImpField) push_all(List(ImpField) fs, Int i, ListBuf(ImpField) acc) {
+    if (i >= fs.len()) { return acc; }
+    return push_all(fs, i + 1, acc.push(fs[i]));
+}
+
+// Custom fields, while there is room under the limit of fields.
+ListBuf(ImpField) customs(List(ImpCustom) cs, Int i, Int used, ListBuf(ImpField) acc) {
+    if (i >= cs.len() || used + i + 3 >= 40) { return acc; }
+    Str us = str_from_code(31);
+    Str v = cs[i].label + us + (if (cs[i].hidden) { "1" } else { "0" }) + us + cs[i].value;
+    return customs(cs, i + 1, used, acc.push(ImpField {.name = f"custom_{i}", .value = v}));
+}
+
+// Why an entry cannot be stored, or "".
+Str problem_of(Imp x, List(ImpField) fs) {
+    if (fits(fs, 0) == false) { return "a field is longer than 64 KiB"; }
+    return missing_for(x.kind, plain_fields(x.fields, 0, ListBuf()));
+}
+
+Bool fits(List(ImpField) fs, Int i) {
+    if (i >= fs.len()) { return true; }
+    if (utf8(fs[i].value).len() > 65536) { return false; }
+    return fits(fs, i + 1);
+}
+
+List(FieldPlain) plain_fields(List(ImpField) fs, Int i, ListBuf(FieldPlain) acc) {
+    if (i >= fs.len()) { return acc.finish(); }
+    return plain_fields(fs, i + 1, acc.push(FieldPlain {.name = fs[i].name, .value = secret_bytes(utf8(fs[i].value))}));
+}
+
+// A name not yet taken, in the vault (by item id) or by this import:
+// "Name", then "Name (2)", "Name (3)"... Names are cut to 120 characters.
+@requires(declassify)
+Str free_name(Str base, Int n, Set(Str) taken, List(Secret(UInt(8))) vk, List(Item) items, Bool check_vault) {
+    Str b = if (str_len(base) > 120) { str_slice(base, 0, 120) } else { base };
+    Str cand = if (n == 1) { b } else { b + f" ({n})" };
+    Bool in_vault = check_vault && match item_by_id(items, item_id_of(vk, cand), 0) { Some(_) => true, None => false };
+    if (taken.contains(cand) || in_vault) { return free_name(base, n + 1, taken, vk, items, check_vault); }
+    return cand;
+}
+
+// An entry ready to seal, or why it is left out.
+type Ready = { Str name; Str kind; Str folder; List(ImpField) fields; Str problem; };
+
+@requires(declassify)
+List(Ready) prepare(List(Imp) xs, Int i, Set(Str) taken, List(Secret(UInt(8))) vk, List(Item) items, Bool check_vault, ListBuf(Ready) acc) {
+    if (i >= xs.len()) { return acc.finish(); }
+    Str name = free_name(xs[i].name, 1, taken, vk, items, check_vault);
+    List(ImpField) fs = stored_fields(xs[i], name);
+    Str p = problem_of(xs[i], fs);
+    Ready r = Ready {.name = name, .kind = xs[i].kind, .folder = xs[i].folder, .fields = fs, .problem = p};
+    return prepare(xs, i + 1, if (str_len(p) == 0) { taken.insert(name) } else { taken }, vk, items, check_vault, acc.push(r));
+}
+
+Int report(List(Ready) rs, List(Str) warnings, Bool dry, Int i, Int ok) {
+    if (i >= rs.len()) {
+        for (Str w in warnings) { println("warn " + hex_encode(utf8(w))); }
+        println(f"total {ok}");
+        return 0;
+    }
+    Ready r = rs[i];
+    if (str_len(r.problem) > 0) { println("skip " + hex_encode(utf8(r.name)) + " " + hex_encode(utf8(r.problem))); }
+    else { if (dry) { println("item " + r.kind + " " + hex_encode(utf8(r.name)) + " " + (if (str_len(r.folder) == 0) { "-" } else { hex_encode(utf8(r.folder)) })); } }
+    return report(rs, warnings, dry, i + 1, if (str_len(r.problem) == 0) { ok + 1 } else { ok });
+}
+
+@requires(declassify)
+Result(List(Item), Str) seal_all(List(Ready) rs, Int i, List(Secret(UInt(8))) vk, List(Int) vid, ListBuf(Item) acc) {
+    if (i >= rs.len()) { return Ok(acc.finish()); }
+    if (str_len(rs[i].problem) > 0) { return seal_all(rs, i + 1, vk, vid, acc); }
+    Result(Item, SymbolonError) ri = item_seal(vk, vid, item_id_of(vk, rs[i].name), (UInt(64))1, "password", plain_fields(rs[i].fields, 0, ListBuf()), false, None);
+    return match ri {
+        Err(e) => seal_fail(acc, err_text(e)),
+        Ok(it) => seal_all(rs, i + 1, vk, vid, acc.push(it))
+    };
+}
+
+Result(List(Item), Str) seal_fail(ListBuf(Item) acc, Str m) { acc.discard(); return Err(m); }
+
+// ─── The command ────────────────────────────────────────────────────
+
+// `symbolon device vault import DIR FILE [--format F] [--dry-run] [--share
+// ID]`: the PIN on standard input (not with --dry-run); with --share, into
+// that shared folder.
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+pub Int vault_import(Str dir, Str file, Str format, Bool dry, Str share) {
+    if (!import_format_ok(format)) { return dfail("unknown format " + format + " (auto, bitwarden-json, csv)"); }
+    List(Int) b = get_file(file);
+    if (b.len() == 0) { return dfail("cannot read " + file); }
+    if (b.len() > 16777216) { return dfail("the export is larger than 16 MiB"); }
+    Result(ImpRead, Str) rr = read_export(text_of(b), format);
+    return match rr {
+        Err(m) => dfail(m),
+        Ok(got) => if (got.items.len() == 0) { dfail("the export has no items") } else { import_items(dir, got, dry, share) }
+    };
+}
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+Int import_items(Str dir, ImpRead got, Bool dry, Str share) {
+    if (dry) {
+        List(Secret(UInt(8))) none = [];
+        Set(Str) taken = {};
+        return report(prepare(got.items, 0, taken, none, [], false, ListBuf()), got.warnings, true, 0, 0);
+    }
+    Result(Opened, Str) ro = open_place(dir, share);
+    return match ro { Err(m) => dfail(m), Ok(o) => import_into(dir, o, got) };
+}
+
+@requires(filesystem, network, device, declassify, clock, environment)
+Int import_into(Str dir, Opened o, ImpRead got) {
+    List(Secret(UInt(8))) vk = o.p.vk;
+    Set(Str) taken = {};
+    List(Ready) rs = prepare(got.items, 0, taken, vk, o.st.items, true, ListBuf());
+    Result(List(Item), Str) sealed = seal_all(rs, 0, vk, o.p.vid, ListBuf());
+    return match sealed {
+        Err(m) => dfail(m),
+        Ok(items) => if (items.len() == 0) { report(rs, got.warnings, false, 0, 0) } else { published(publish_items(dir, o, o.st.items.concat(items)), rs, got.warnings) }
+    };
+}
+
+Int published(Int rc, List(Ready) rs, List(Str) warnings) {
+    if (rc != 0) { return rc; }
+    return report(rs, warnings, false, 0, 0);
+}

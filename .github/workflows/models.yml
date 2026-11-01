@@ -1,0 +1,26 @@
+name: models
+
+# SPEC Section 27.5: every model is re-run on each change to the
+# specification or the models; a lemma that regresses fails the build.
+on:
+  push:
+    paths: ["SPEC.md", "models/**", ".github/workflows/models.yml"]
+  pull_request:
+    paths: ["SPEC.md", "models/**", ".github/workflows/models.yml"]
+
+jobs:
+  prove:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v31
+      - name: Run every model
+        working-directory: models
+        run: nix develop --command ./run.sh
+      - name: Keep prover output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: prover-output
+          path: models/out/

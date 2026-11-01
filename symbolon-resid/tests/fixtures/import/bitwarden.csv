@@ -1,0 +1,4 @@
+folder,favorite,type,name,notes,fields,reprompt,login_uri,login_username,login_password,login_totp
+Social,1,login,Mastodon,,"pin: 1234
+color: blue",0,"https://mastodon.social,https://joinmastodon.org",me,"pa,ss",
+,,note,Wifi at home,"SSID home, password x",,0,,,,

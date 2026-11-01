@@ -1,0 +1,218 @@
+// The threshold glue (src/threshold/threshold.resid) against values made by an
+// independent implementation (tests/gen_threshold_ref.py): key derivation,
+// info bytes, and a dealer's 2-of-3 sharing for whole signing sessions.
+// Generated; do not edit by hand.
+
+import "../types.resid";
+import "../core/log.resid";
+import "threshold.resid";
+import "crypto.resid";
+import "ecdsa.resid";
+import "word.resid";
+import "../net/wire.resid";
+
+Str hx(List(Int) b) { return hex_encode(b); }
+List(UInt(64)) nat(Str h) { return bn_from_be(cose_hex_decode(h)); }
+CvPt pt(Str h) { return match cv_dec(cose_hex_decode(h)) { Some(p) => p, None => cv_inf() }; }
+List(Secret(UInt(8))) chain_code() { return secret_bytes(rt [180, 32, 220, 232, 175, 131, 197, 200, 20, 214, 12, 52, 0, 135, 246, 4, 161, 218, 117, 121, 183, 226, 123, 17, 191, 180, 175, 100, 122, 18, 64, 170]); }
+
+@requires(declassify)
+test "credential tag and ID equal the reference (HMAC under HKDF(cc))" {
+    expect(hx(credential_tag(chain_code(), "login.example.com", [50, 185, 196, 129, 49, 116, 171, 111, 241, 56, 213, 180, 146, 122, 133, 182]))).toEqual("1444b776512d1d0d1ed140726ccfa898");
+    expect(hx(credential_id(chain_code(), "login.example.com", [50, 185, 196, 129, 49, 116, 171, 111, 241, 56, 213, 180, 146, 122, 133, 182]))).toEqual("32b9c4813174ab6ff138d5b4927a85b61444b776512d1d0d1ed140726ccfa898");
+}
+
+@requires(declassify)
+Str nonce_of(Str rp, List(Int) cid) {
+    return match credential_nonce(chain_code(), rp, cid) { Some(n) => hx(n), None => "refused" };
+}
+
+@requires(declassify)
+test "a credential ID is accepted only with the RP ID it was made for (A-12)" {
+    expect(nonce_of("login.example.com", [50, 185, 196, 129, 49, 116, 171, 111, 241, 56, 213, 180, 146, 122, 133, 182, 20, 68, 183, 118, 81, 45, 29, 13, 30, 209, 64, 114, 108, 207, 168, 152])).toEqual("32b9c4813174ab6ff138d5b4927a85b6");
+    expect(nonce_of("evil.example.net", [50, 185, 196, 129, 49, 116, 171, 111, 241, 56, 213, 180, 146, 122, 133, 182, 20, 68, 183, 118, 81, 45, 29, 13, 30, 209, 64, 114, 108, 207, 168, 152])).toEqual("refused");
+    expect(nonce_of("login.example.com", [50, 185, 196, 129, 49, 116, 171, 111, 241, 56, 213, 180, 146, 122, 133, 182, 20, 68, 183, 118, 81, 45, 29, 13, 30, 209, 64, 114, 108, 207, 168, 153])).toEqual("refused");
+    expect(nonce_of("login.example.com", [50, 185, 196, 129, 49, 116, 171, 111, 241, 56, 213, 180, 146, 122, 133, 182, 20, 68, 183, 118, 81, 45, 29, 13, 30, 209, 64, 114, 108, 207, 168])).toEqual("refused");
+}
+
+@requires(declassify)
+test "tau equals the reference: HKDF(cc, nil, tweak || rp || nonce, 48) mod q" {
+    expect(hx(bn_to_be(tweak_scalar(chain_code(), "login.example.com", [50, 185, 196, 129, 49, 116, 171, 111, 241, 56, 213, 180, 146, 122, 133, 182]), 32))).toEqual("b848738f99d5bc55a6e1df53134d1bcb96a16d01990f65166a72a2fe50c219b7");
+    expect(hx(bn_to_be(tweak_scalar(chain_code(), "evil.example.net", [50, 185, 196, 129, 49, 116, 171, 111, 241, 56, 213, 180, 146, 122, 133, 182]), 32))).toEqual("8d570d30edb03e506400c439181b04c4284d3d3f42aff0ce656b3f106142654f");
+}
+
+@requires(declassify)
+test "P = X + tau G equals the reference" {
+    expect(hx(credential_pubkey([4, 28, 46, 244, 29, 171, 122, 106, 51, 151, 132, 124, 190, 95, 52, 241, 152, 190, 33, 117, 178, 29, 71, 105, 184, 126, 141, 11, 0, 125, 120, 171, 211, 162, 22, 17, 181, 109, 175, 12, 189, 181, 106, 183, 251, 18, 210, 8, 93, 234, 35, 85, 223, 122, 72, 43, 66, 212, 245, 85, 101, 25, 96, 36, 76], tweak_scalar(chain_code(), "login.example.com", [50, 185, 196, 129, 49, 116, 171, 111, 241, 56, 213, 180, 146, 122, 133, 182])))).toEqual("046fdd5b9daa11133337ec84e8348ff0a6f4a59c1bf8077efcd7a2545f3cffcbdec16f4de1470402f2a5cf14caf4829b1a26dcdbe6e08ace77d2a346c96f49bb6e");
+    expect(credential_pubkey([4, 1, 2], [1]).len()).toEqual(0);
+    // A point off the curve (Y changed) is refused.
+    expect(credential_pubkey([4, 28, 46, 244, 29, 171, 122, 106, 51, 151, 132, 124, 190, 95, 52, 241, 152, 190, 33, 117, 178, 29, 71, 105, 184, 126, 141, 11, 0, 125, 120, 171, 211, 162, 22, 17, 181, 109, 175, 12, 189, 181, 106, 183, 251, 18, 210, 8, 93, 234, 35, 85, 223, 122, 72, 43, 66, 212, 245, 85, 101, 25, 96, 36, 77], [1]).len()).toEqual(0);
+}
+
+@requires(declassify)
+test "offline-material info bytes equal the reference" {
+    expect(hx(offline_info([133, 113, 58, 106, 194, 248, 129, 76, 227, 7, 87, 42, 38, 136, 243, 223, 187, 16, 135, 241, 161, 11, 124, 108, 177, 220, 94, 90, 240, 101, 65, 50], 7, [69, 176, 200, 55, 136, 227, 0, 62, 212, 34, 189, 10, 135, 21, 71, 92, 251, 102, 253, 232, 5, 37, 89, 77, 173, 23, 120, 31, 193, 63, 11, 45]))).toEqual("847373796d626f6c6f6e207631206f66666c696e65582085713a6ac2f8814ce307572a2688f3dfbb1087f1a10b7c6cb1dc5e5af065413207582045b0c83788e3003ed422bd0a8715475cfb66fde80525594dad17781fc13f0b2d");
+}
+
+Party party_of(List(Int) id, UInt(8) kind) {
+    return Party { .id = id, .kind = kind, .auth_key = [], .hpke_key = [], .label = "p", .attestation = NoAttestation };
+}
+
+Quorum quorum() {
+    return Quorum { .parties = [party_of([12, 201, 97, 213, 187, 45, 176, 173, 225, 34, 33, 242, 136, 32, 83, 104, 116, 216, 241, 101, 151, 3, 58, 6, 128, 109, 190, 241, 109, 170, 205, 19], party_kind_device()), party_of([212, 166, 176, 3, 55, 10, 159, 24, 111, 1, 17, 25, 196, 237, 97, 45, 141, 202, 178, 19, 33, 155, 159, 26, 226, 237, 208, 170, 46, 129, 215, 191], party_kind_device()),
+                                 party_of([50, 193, 193, 90, 151, 15, 15, 97, 64, 114, 44, 3, 216, 218, 213, 216, 65, 78, 192, 235, 134, 75, 38, 20, 123, 65, 36, 8, 70, 62, 65, 149], party_kind_cosigner())],
+                     .t = 2, .root_pubkey = [4, 28, 46, 244, 29, 171, 122, 106, 51, 151, 132, 124, 190, 95, 52, 241, 152, 190, 33, 117, 178, 29, 71, 105, 184, 126, 141, 11, 0, 125, 120, 171, 211, 162, 22, 17, 181, 109, 175, 12, 189, 181, 106, 183, 251, 18, 210, 8, 93, 234, 35, 85, 223, 122, 72, 43, 66, 212, 245, 85, 101, 25, 96, 36, 76], .epoch = 3, .transcript_digest = [] };
+}
+
+List(CgPublicCfg) publics() { return [CgPublicCfg { .id = 1, .ecdsa = pt("03f394cdebf414f02d27f71d56a66c8393995700be1e6944d021bb372d89520700"), .elgamal = pt("02442740efb73dd60dce2b6a8ca30b198c0c7c3a4493df511096dafba94a36e66e"), .n = nat("9b2ea78ac4676322c181fea5e5f96de746fa5c060e27cb1f664f7afeda65b7128f1d84627411763a4ae475793cd1169f50bec9b5f487edf195330475cd19bfb372d31cbebde021065197cee51256f64189d4913b1735c33b9777153428ced95e3e17953cfccebc9e0c6af8dd3fb16fa262ece9e7aa884906b8a8106e9c0c37176c471ed26b71469c2a0f3901058f16cb30b8111ebde4851d3c1fad566f8e24a89337792219802b2b2804f9fbc2783c187d0e12cddb2ac925ad9be942d3970c5510b68b9332af9d5c1b77cf2c4c56e75931a6e51ddfcbdc9c834bdd0829c77e1054b36e43cebeb0d0e8e6111ec9471ac1b53724c93447dba0742bb6cddabd1215"), .ped = Pedersen { .n = nat("9b2ea78ac4676322c181fea5e5f96de746fa5c060e27cb1f664f7afeda65b7128f1d84627411763a4ae475793cd1169f50bec9b5f487edf195330475cd19bfb372d31cbebde021065197cee51256f64189d4913b1735c33b9777153428ced95e3e17953cfccebc9e0c6af8dd3fb16fa262ece9e7aa884906b8a8106e9c0c37176c471ed26b71469c2a0f3901058f16cb30b8111ebde4851d3c1fad566f8e24a89337792219802b2b2804f9fbc2783c187d0e12cddb2ac925ad9be942d3970c5510b68b9332af9d5c1b77cf2c4c56e75931a6e51ddfcbdc9c834bdd0829c77e1054b36e43cebeb0d0e8e6111ec9471ac1b53724c93447dba0742bb6cddabd1215"), .s = nat("86b74f9f60690cea5aea79c575a494206ff5dd91897be65a7652d280ea0e375ecb4de6b5f8cc6d8acb83eeabe5d48b487f0b88188c6030afbbc649c42fecf504f8dd3b02ae2b7299dd0488329a15b97771e2726eedf6a3c31f2b23f4624f83fe983a4bb2c6791f3535b2e09026b49972ed6cf869a027072379b72d95a45c8b0c5e2b1c661a9c1eb2a70090151ca1aba7bd24afd1fd82e78dddc5044ca282204bd6a273c08647e49ca51a1dc2a0c899c86f96d2351a619681dfcf9ac2a11e458f2b0e2e14514cc6a194346d372194bbd6df01d605223f7b2feafd980bc098026888546474969e3e1e78bfe8ffa958eac61085f0782980118926501bdf39c653d6"), .t = nat("298f4985c52f08c72357887f5dbfa0685770fb390300815e7d4c27540ac8bcda1e69328280be7ae82e09f1356833abe441bfcafd82925efcc53410e5d9487c73c83bd009a223ba3f602d929a3fb1967d83a374f7b390eb19dc4d018fed36922a760af3389c7e83e892cbbfbb2346c637453364f3f02b9abf2e2fcc29ab085330972cf5d7b6007dd29a90d2b45ee1fdbea06c1ff4babff64a481c12b267c702732dcfa542b35a4e248e61633d69fdf50e117910366937f310f7e6edc63d962de40ec099de7105e594fb32d44697f043f69824bdcef4a1532823e971a8efc5935b44b04503a89a4effbe1dd38667c4387f070fde33cd42e34409bcf617e05dbe98") } }, CgPublicCfg { .id = 2, .ecdsa = pt("03eed386a2eff2a46435f8a2f5dda4fbd78861fd4ba321c8094afc703de315d18c"), .elgamal = pt("03b08386ea09f9ef50adee236b1b396c479c89be03119b271e0397b8f9b9dcf9d6"), .n = nat("bbe79b36541755dc64e104982f14428956d00cfb424c5c6710c423a4a2c95438348fa92b6bd895023bb37f4662337e3307c9f69d5643b7bcea39ba5b3eb920cc77f41f313270e9d19937911074cec44ea7f93744c60eb53a7f01dd138928d81b196f220476905ab0ca3cc1a5c5e1a7fb95e3015b140ddd8c740e9a91cb88ccfbc9c6fe8fd63c11043a4e78a8a3e12cfbf1a03bcefcf00df50a51c72662db881dcc0b091ad8e82412a65dddcdbfcb541785ce82607ffcea986e5abc3ddd985e3883efe9de78975853ba3c2a11e758e10d7f014e1a8c19a8d8845e0c4d93ac8e265bafa5dd3dfedc32506be9fb6eb37a611f460e8ffbad8a5672538bad82d107a9"), .ped = Pedersen { .n = nat("bbe79b36541755dc64e104982f14428956d00cfb424c5c6710c423a4a2c95438348fa92b6bd895023bb37f4662337e3307c9f69d5643b7bcea39ba5b3eb920cc77f41f313270e9d19937911074cec44ea7f93744c60eb53a7f01dd138928d81b196f220476905ab0ca3cc1a5c5e1a7fb95e3015b140ddd8c740e9a91cb88ccfbc9c6fe8fd63c11043a4e78a8a3e12cfbf1a03bcefcf00df50a51c72662db881dcc0b091ad8e82412a65dddcdbfcb541785ce82607ffcea986e5abc3ddd985e3883efe9de78975853ba3c2a11e758e10d7f014e1a8c19a8d8845e0c4d93ac8e265bafa5dd3dfedc32506be9fb6eb37a611f460e8ffbad8a5672538bad82d107a9"), .s = nat("b64e719b54766ff89362f0f731e2b22d996de8dfd157ab39e532dae07b3b14176ab8c8f68c691ff04ee6edec8e41a2ca0933ba7f95e0cd5e624a0c277327748a3d178fc894af7f21e9e84cf30df19c911c33a0309496bf1fb29191acdd510da44fbbfa1cff7395abc7885fafc4cc2e86b4d4877361c789e95891499f7026c7874501d495aa70ddc1ff49e7ac16d76234110fac8c0a3aa046a1e8d5d72e261f5152c52c4f8050cb4df4eb888e71b2ab3ac1bcb1e5c3c405a1590094f969f41993fe599ffdc34e77941233a6a87bdb1859a701e6c73eebb3d3db9bf457ed64380f8d6a0db01cf8c97e711d31f07c9be77b74e9531c09145efcabece8c4bcad0487"), .t = nat("6d90b3065d23d6c7de92e37b8a826c894efc4d92b5df9856b56ef843bf9544295b375d1107f8e4b7c0f02face37f3f13d59aa0d4e9aefc22c61c5ba372f266384096e5c3a39133beb7e5553d780e4a11db63b3798515b541b1f058c772e3d2684dd019e31d6eaca50d87418fe5a4392195bb4ec0ff6203dc3e20b871327ba5761b50315809b3085d4f9698018b2e078e25b2ffea62106148a69a655ec7731ce42a236484551dc88fc793d42198d536208667d5450d62f2e32f129eddfff38c28a2860667483605101d42164505597f18030eeff7feb11f58a650ec4d6cc917519af799f8eb3eb92bc26ee00fd4c87746b1f52d505ff47b425eafd6c36048de4c") } }, CgPublicCfg { .id = 3, .ecdsa = pt("03190d7e87cc1479ae9fae2368ef487c272755eb703d67c97c33c92fd285201d9a"), .elgamal = pt("03668c6d48b15156dbaab81cf1ae826ce41a9ec171480ff6336c6424cea5dfbe06"), .n = nat("c3702f8b337dfd8985866e44fab60deb25e488531875e7708ebd7d74d70bbb189dd9f6ad51d5dc87803668a5b9d207d806ebc39c6d3d3df10c8afe0171b3c5dc337c013866391e9d49e1a5a33fa94c43ef1c2e4f0dda0a320697d788e9bc00ec19117782879fc2da658e335f757a8bb7cd6303ebb15a8620e87e434c71bd9b6ffb502d16a4b2e7a7dad0e0cd0342c221494ddc71ee6f7478326f21f6fb5aeef3cac3a2703749ceb9b24dc036d8ed6c25798de1f1722e89ba7575b8f8131adf568b0302184e42964debd4fb3dbff113a37914ff2b055402631120d63b6f2e922699c6c2dd8d4b2cd5e0cdf7b34cddee4b7417122730c6509c67f9f153703b8645"), .ped = Pedersen { .n = nat("c3702f8b337dfd8985866e44fab60deb25e488531875e7708ebd7d74d70bbb189dd9f6ad51d5dc87803668a5b9d207d806ebc39c6d3d3df10c8afe0171b3c5dc337c013866391e9d49e1a5a33fa94c43ef1c2e4f0dda0a320697d788e9bc00ec19117782879fc2da658e335f757a8bb7cd6303ebb15a8620e87e434c71bd9b6ffb502d16a4b2e7a7dad0e0cd0342c221494ddc71ee6f7478326f21f6fb5aeef3cac3a2703749ceb9b24dc036d8ed6c25798de1f1722e89ba7575b8f8131adf568b0302184e42964debd4fb3dbff113a37914ff2b055402631120d63b6f2e922699c6c2dd8d4b2cd5e0cdf7b34cddee4b7417122730c6509c67f9f153703b8645"), .s = nat("14d40632b6b0b9317f62da6341169abc88396c2cc4376e5e8d64993f6784b9536a408018ce643df50b22cac5c6e45333a49931fef3cdeb62ea32fffbf540e1b727ba63f47fa721db13a798b2e12acab3f20c50b4d49471358216dc529693ede62bb8d32b2cd975bfeebe0ba5a44e2c1047566d1e5748faa448d026b429482c97dab58881081936e82c50486ea00bcd3a1f504e8505328f646e01f6d003f88eabc332a43bd57338776e2219b7383713c00d721515291a0cf5a3eb2c380586411a5fb0b5ffc11248f2a1af6e36942b2fa5193218f8ca97fa1d653064ee174b742eb23a783df834f17edc7ad98a9bf50f37b17684752162fa3fc8e52056e85a3b38"), .t = nat("5366522736d8326bf3d6bb3fe6b4c6cef443dfe2458b82972ab67be6eb6785e66e624abd71c17a1554fc984d75f6f3ae770ca912a098cfbda123b2c107c7d16a19334602cfe2b1832ae1335779e2fa896d4af95461ac8cfdeb15ec751972be5695f49898c1032791c4199ca655ea8981fe22e40caacf5207bc6c24c3fdc488e38cf0a1b358947f3b88cbb9643226546cbd6020496fcd25f703f7f9c1cb79fe408a93f265f36dc2a46db9ab2635246e93bee32d30154d8d36b3a71fb8cad66176a142d126d2b69a3aefe42729bc1f7fa3068e478181192d50641d81382940971765c2ff67769778c49d0f9823a43fc75b5401d3c3a28a6c3a3d8b1139ef9ca482") } }]; }
+
+CgConfig config(Int i) {
+    if (i == 1) { return CgConfig { .id = 1, .threshold = 1, .ecdsa = nat("4abdd223646ed1dccd4671599eaff1484b3d2dcf44438624aacf0f92d97a75f1"), .elgamal = nat("be7526b89f574580dad64c0317daac42eee124a8d0f265c51bda40a5d9e13f47"), .p = nat("c7a0a26d66491aa191e208dacad5e78e23c25b4ba562ef4b3b221ff8145257be0fa8ed3d39a016c37525162e12a61ebadecb27eb243f3a34fc42d1d0b9166d8fdcb4e7811efe5f11ad35501c444f9d0675e9af4a0ceceadda6b85f5875aa5704ec6ec283301faa4bf44de4b5ec0fa15447042f413cf862f1978ffebc030cd8b3"), .q = nat("c701021e91631cbcb4777dbcb122eae89fd1c3c3bff6621ecefd132929afbbdc64468d3fddfd3cb4c7a4f5c8c014916f8a3eb850e8d38089f9e5f58922ccbdd12912e610192914bd7d841f86e12a53d30a70f41290f85a11639f5c4f45d11ed12ea3d76ed22012dbe8b73a90fa3bea819dcc99b2a7378dc48019b415561cfe17"), .rid = [], .chain_key = [], .public = publics() }; }
+    if (i == 2) { return CgConfig { .id = 2, .threshold = 1, .ecdsa = nat("303d9a7201458ee40a7d4714ed731c401a9678707e426978c4e122e52a96ead2"), .elgamal = nat("9c51c26267848e8a3dc697a5b210ca507cff7e5e2d616987b83a016f497282f8"), .p = nat("f90233cda18f309bd2ccb22e617dc9963f1b9866d7f02b854f4d9e30ec0d12981e60395b58845807f3ce4401723869f2533d790ac64cdeb5c0524e956e99a42c575cb6790f97e8dc7f53b4ab8c6f3a3427c4fb7cfc6e0061165d247efb403dcfe5d289fe45aea3bd221b38a2f438bfed2f2b37a4a1c89561ecdc2713e0f84fe7"), .q = nat("c12e35370a6d8ecc176a17150877d3b0ebfef52ba4fc1431f6d4945b59f8e144b16d5973544318faa40611bfce8ee72f9867258aa926fd2044e132dfbde15cfab284940d99c338bf1e6ad582cb9431cedfccd2574ad8909edbf7fae45082a3bca84c63f0b17903a10f71dc257578becd9849a3ef294c9728b871b0ba2eac39ef"), .rid = [], .chain_key = [], .public = publics() }; }
+    if (i == 3) { return CgConfig { .id = 3, .threshold = 1, .ecdsa = nat("15bd62c09e1c4beb47b41cd03c364737e9efc311b8414cccdef336377bb35fb3"), .elgamal = nat("0ef8347d67d0cfd3454441863acf42c17da4aad1e971b305b07f9658b8c40964"), .p = nat("f859b2dec115412a690d45d00c683e33233e09ab7d7aec6ed44798dc9743b91959c93d6cec66279846cbd519234a379c267b535464a073607221daf0dc2419e31991d0af903c4e744a00dfff2d577ba9caac5c58e1089cd1f3fb98e3bb015fe1758cda4440eefd3694b87841f8d5e48ebede66232dd12035911e56914ff500ff"), .q = nat("c975431cf1aefae6c7cfc517303b6980fcc49bae30e18808c3f6e3b52bfcce94422e88602458044488a2e41963fd70052a9b7ede945060ad9e06db7e35c88aa0a5fe17e2c80ce2a1ccfa05bf97ec00fbde00a818ecbdd2ed4fdd979d961ae380e757678e0c112ea49beba271fac9e8ff56edf17ac2845ed4d0a6d76babf034bb"), .rid = [], .chain_key = [], .public = publics() }; }
+    return CgConfig { .id = 0, .threshold = 0, .ecdsa = [], .elgamal = [], .p = [], .q = [], .rid = [], .chain_key = [], .public = [] };
+}
+
+@requires(declassify)
+test "signers map to ascending CGGMP ids; a stranger or a repeat gives none" {
+    expect(cg_ids(quorum(), [[50, 193, 193, 90, 151, 15, 15, 97, 64, 114, 44, 3, 216, 218, 213, 216, 65, 78, 192, 235, 134, 75, 38, 20, 123, 65, 36, 8, 70, 62, 65, 149], [12, 201, 97, 213, 187, 45, 176, 173, 225, 34, 33, 242, 136, 32, 83, 104, 116, 216, 241, 101, 151, 3, 58, 6, 128, 109, 190, 241, 109, 170, 205, 19]], 0, [])).toEqual([1, 3]);
+    List(Int) ids = cg_ids(quorum(), [[50, 193, 193, 90, 151, 15, 15, 97, 64, 114, 44, 3, 216, 218, 213, 216, 65, 78, 192, 235, 134, 75, 38, 20, 123, 65, 36, 8, 70, 62, 65, 149], [12, 201, 97, 213, 187, 45, 176, 173, 225, 34, 33, 242, 136, 32, 83, 104, 116, 216, 241, 101, 151, 3, 58, 6, 128, 109, 190, 241, 109, 170, 205, 19]], 0, []);
+    expect(ids.len()).toEqual(2);
+    expect(ids[0]).toEqual(1);
+    expect(ids[1]).toEqual(3);
+    expect(cg_ids(quorum(), [[12, 201, 97, 213, 187, 45, 176, 173, 225, 34, 33, 242, 136, 32, 83, 104, 116, 216, 241, 101, 151, 3, 58, 6, 128, 109, 190, 241, 109, 170, 205, 19], [214, 249, 12, 85, 74, 118, 60, 77, 145, 247, 250, 235, 158, 209, 230, 93, 6, 219, 249, 250, 208, 175, 191, 154, 157, 201, 192, 18, 137, 72, 239, 200]], 0, []).len()).toEqual(0);
+    expect(cg_ids(quorum(), [[12, 201, 97, 213, 187, 45, 176, 173, 225, 34, 33, 242, 136, 32, 83, 104, 116, 216, 241, 101, 151, 3, 58, 6, 128, 109, 190, 241, 109, 170, 205, 19], [12, 201, 97, 213, 187, 45, 176, 173, 225, 34, 33, 242, 136, 32, 83, 104, 116, 216, 241, 101, 151, 3, 58, 6, 128, 109, 190, 241, 109, 170, 205, 19]], 0, []).len()).toEqual(0);
+}
+
+// ─── Whole sessions, every party in this process ────────────────
+
+type Party3 = { CgCtx ctx; ThState st; };
+
+Bool for_me(ThMsg m, Int me) {
+    return match m {
+        ThCg(c) => c.from != me && (c.to == 0 || c.to == me),
+        ThTw(t) => t.to == me,
+        ThAbortReq(f) => f != me,
+        ThRs(r) => r.from != me && (r.to == 0 || r.to == me)
+    };
+}
+
+List(ThMsg) inbox(List(ThMsg) all, Int me, Int i, ListBuf(ThMsg) acc) {
+    if (i >= all.len()) { return acc.finish(); }
+    return inbox(all, me, i + 1, if (for_me(all[i], me)) { acc.push(all[i]) } else { acc });
+}
+
+type Round = { List(Party3) ps; List(ThMsg) out; Str fail; List(Int) culprits; };
+
+Round step_all(List(Party3) ps, List(ThMsg) in, Int i, ListBuf(Party3) acc, List(ThMsg) out) {
+    if (i >= ps.len()) { return Round { .ps = acc.finish(), .out = out, .fail = "", .culprits = [] }; }
+    Party3 p = ps[i];
+    return match th_step(p.st, inbox(in, p.ctx.self, 0, ListBuf())) {
+        Err(e) => failed(acc, e),
+        Ok(s) => step_all(ps, in, i + 1, acc.push(Party3 { .ctx = p.ctx, .st = s.state }), out.concat(s.out))
+    };
+}
+
+Round failed(ListBuf(Party3) acc, CgFail e) {
+    _ = acc.finish();
+    return Round { .ps = [], .out = [], .fail = e.why, .culprits = e.culprits };
+}
+
+Str signed_by(List(Party3) ps, Int i) {
+    if (i >= ps.len()) { return ""; }
+    ThState st = ps[i].st;
+    return match st { ThSigned(sig) => hx(th_sig_raw(sig)), _ => signed_by(ps, i + 1) };
+}
+
+Int signed_count(List(Party3) ps, Int i, Int acc) {
+    if (i >= ps.len()) { return acc; }
+    ThState st = ps[i].st;
+    return signed_count(ps, i + 1, acc + match st { ThSigned(_) => 1, _ => 0 });
+}
+
+// Every message crosses the wire: encoded, then decoded from the bytes.
+List(ThMsg) through_wire(List(ThMsg) ms, Int i, ListBuf(ThMsg) acc) {
+    if (i >= ms.len()) { return acc.finish(); }
+    Option(ThMsg) d = msg_decode(msg_encode(ms[i]));
+    return through_wire(ms, i + 1, match d { Some(m) => acc.push(m), None => acc });
+}
+
+Round run(List(Party3) ps, List(ThMsg) in, Int rounds) {
+    if (rounds == 0) { return Round { .ps = ps, .out = in, .fail = "", .culprits = [] }; }
+    Round r = step_all(ps, through_wire(in, 0, ListBuf()), 0, ListBuf(), []);
+    if (str_len(r.fail) > 0) { return r; }
+    return run(r.ps, r.out, rounds - 1);
+}
+
+Option(Party3) start(List(List(Int)) signers, List(Int) who, List(Int) initiator, List(UInt(64)) tau, List(Int) sid) {
+    Quorum q = quorum();
+    Int id = cg_id_of(q, who, 0);
+    List(UInt(64)) mine = if (bytes_eq(who, initiator)) { tau } else { [] };
+    Option(CgCtx) oc = th_ctx(config(id), q, signers, initiator, mine, sid, [83, 130, 189, 108, 162, 154, 7, 175, 26, 54, 117, 52, 16, 94, 216, 116, 224, 173, 64, 236, 204, 89, 25, 75, 15, 53, 26, 252, 214, 81, 119, 232], sha256_bytes(who.concat(sid)));
+    return match oc {
+        None => None,
+        Some(c) => Some(Party3 { .ctx = c, .st = th_start(c, th_role(c, q, initiator, mine)).state })
+    };
+}
+
+List(ThMsg) starts_out(List(Party3) ps, Int i, List(ThMsg) acc) {
+    if (i >= ps.len()) { return acc; }
+    ThState st = ps[i].st;
+    List(ThMsg) out = match st { ThR1(s, _) => wrap_start(s.out, 0, ListBuf()), _ => [] };
+    return starts_out(ps, i + 1, acc.concat(out));
+}
+
+List(ThMsg) wrap_start(List(CgMsg) ms, Int i, ListBuf(ThMsg) acc) {
+    if (i >= ms.len()) { return acc.finish(); }
+    return wrap_start(ms, i + 1, acc.push(ThCg(ms[i])));
+}
+
+@requires(declassify)
+Str session(List(List(Int)) signers, List(Int) initiator) {
+    List(UInt(64)) tau = tweak_scalar(chain_code(), "login.example.com", [50, 185, 196, 129, 49, 116, 171, 111, 241, 56, 213, 180, 146, 122, 133, 182]);
+    List(Int) sid = [51, 55, 17, 188, 174, 75, 0, 133, 179, 81, 20, 211, 246, 165, 75, 136, 131, 169, 209, 57, 105, 90, 118, 144, 125, 235, 174, 79, 184, 57, 74, 90];
+    List(Party3) ps = start_all(signers, initiator, tau, sid, 0, ListBuf());
+    if (ps.len() != signers.len()) { return "no context"; }
+    Round r = run(ps, starts_out(ps, 0, []), 6);
+    if (str_len(r.fail) > 0) { return "fail: " + r.fail; }
+    if (signed_count(r.ps, 0, 0) != 1) { return f"signed by {signed_count(r.ps, 0, 0)} parties"; }
+    return signed_by(r.ps, 0);
+}
+
+List(Party3) start_all(List(List(Int)) signers, List(Int) initiator, List(UInt(64)) tau, List(Int) sid, Int i, ListBuf(Party3) acc) {
+    if (i >= signers.len()) { return acc.finish(); }
+    return match start(signers, signers[i], initiator, tau, sid) {
+        None => start_all(signers, initiator, tau, sid, i + 1, acc),
+        Some(p) => start_all(signers, initiator, tau, sid, i + 1, acc.push(p))
+    };
+}
+
+test "the wire refuses truncated, oversized and non-CBOR bytes" {
+    List(Int) b = msg_encode(ThAbortReq(3));
+    Bool ok = match msg_decode(b) { Some(m) => match m { ThAbortReq(f) => f == 3, _ => false }, None => false };
+    expect(ok).toBeTrue();
+    expect(match msg_decode(b[0..b.len() - 1]) { Some(_) => false, None => true }).toBeTrue();
+    expect(match msg_decode([255]) { Some(_) => false, None => true }).toBeTrue();
+    expect(match msg_decode([]) { Some(_) => false, None => true }).toBeTrue();
+}
+
+@requires(declassify)
+test "device and cosigner sign: one signature, at the initiator, valid under P and not under X" {
+    Str sig = session([[12, 201, 97, 213, 187, 45, 176, 173, 225, 34, 33, 242, 136, 32, 83, 104, 116, 216, 241, 101, 151, 3, 58, 6, 128, 109, 190, 241, 109, 170, 205, 19], [50, 193, 193, 90, 151, 15, 15, 97, 64, 114, 44, 3, 216, 218, 213, 216, 65, 78, 192, 235, 134, 75, 38, 20, 123, 65, 36, 8, 70, 62, 65, 149]], [12, 201, 97, 213, 187, 45, 176, 173, 225, 34, 33, 242, 136, 32, 83, 104, 116, 216, 241, 101, 151, 3, 58, 6, 128, 109, 190, 241, 109, 170, 205, 19]);
+    expect(str_len(sig)).toEqual(128);
+    List(Int) raw = cose_hex_decode(sig);
+    expect(ecdsa_verify_digest(P256, [4, 111, 221, 91, 157, 170, 17, 19, 51, 55, 236, 132, 232, 52, 143, 240, 166, 244, 165, 156, 27, 248, 7, 126, 252, 215, 162, 84, 95, 60, 255, 203, 222, 193, 111, 77, 225, 71, 4, 2, 242, 165, 207, 20, 202, 244, 130, 155, 26, 38, 220, 219, 230, 224, 138, 206, 119, 210, 163, 70, 201, 111, 73, 187, 110], [83, 130, 189, 108, 162, 154, 7, 175, 26, 54, 117, 52, 16, 94, 216, 116, 224, 173, 64, 236, 204, 89, 25, 75, 15, 53, 26, 252, 214, 81, 119, 232], ecdsa_sig_raw(P256, raw))).toBeTrue();
+    expect(ecdsa_verify_digest(P256, [4, 28, 46, 244, 29, 171, 122, 106, 51, 151, 132, 124, 190, 95, 52, 241, 152, 190, 33, 117, 178, 29, 71, 105, 184, 126, 141, 11, 0, 125, 120, 171, 211, 162, 22, 17, 181, 109, 175, 12, 189, 181, 106, 183, 251, 18, 210, 8, 93, 234, 35, 85, 223, 122, 72, 43, 66, 212, 245, 85, 101, 25, 96, 36, 76], [83, 130, 189, 108, 162, 154, 7, 175, 26, 54, 117, 52, 16, 94, 216, 116, 224, 173, 64, 236, 204, 89, 25, 75, 15, 53, 26, 252, 214, 81, 119, 232], ecdsa_sig_raw(P256, raw))).toBeFalse();
+}
+
+@requires(declassify)
+test "two devices sign, the second one initiating" {
+    Str sig = session([[12, 201, 97, 213, 187, 45, 176, 173, 225, 34, 33, 242, 136, 32, 83, 104, 116, 216, 241, 101, 151, 3, 58, 6, 128, 109, 190, 241, 109, 170, 205, 19], [212, 166, 176, 3, 55, 10, 159, 24, 111, 1, 17, 25, 196, 237, 97, 45, 141, 202, 178, 19, 33, 155, 159, 26, 226, 237, 208, 170, 46, 129, 215, 191]], [212, 166, 176, 3, 55, 10, 159, 24, 111, 1, 17, 25, 196, 237, 97, 45, 141, 202, 178, 19, 33, 155, 159, 26, 226, 237, 208, 170, 46, 129, 215, 191]);
+    List(Int) raw = cose_hex_decode(sig);
+    expect(ecdsa_verify_digest(P256, [4, 111, 221, 91, 157, 170, 17, 19, 51, 55, 236, 132, 232, 52, 143, 240, 166, 244, 165, 156, 27, 248, 7, 126, 252, 215, 162, 84, 95, 60, 255, 203, 222, 193, 111, 77, 225, 71, 4, 2, 242, 165, 207, 20, 202, 244, 130, 155, 26, 38, 220, 219, 230, 224, 138, 206, 119, 210, 163, 70, 201, 111, 73, 187, 110], [83, 130, 189, 108, 162, 154, 7, 175, 26, 54, 117, 52, 16, 94, 216, 116, 224, 173, 64, 236, 204, 89, 25, 75, 15, 53, 26, 252, 214, 81, 119, 232], ecdsa_sig_raw(P256, raw))).toBeTrue();
+}
+
+@requires(declassify)
+test "an initiator outside the signers gives no context" {
+    expect(session([[12, 201, 97, 213, 187, 45, 176, 173, 225, 34, 33, 242, 136, 32, 83, 104, 116, 216, 241, 101, 151, 3, 58, 6, 128, 109, 190, 241, 109, 170, 205, 19], [50, 193, 193, 90, 151, 15, 15, 97, 64, 114, 44, 3, 216, 218, 213, 216, 65, 78, 192, 235, 134, 75, 38, 20, 123, 65, 36, 8, 70, 62, 65, 149]], [212, 166, 176, 3, 55, 10, 159, 24, 111, 1, 17, 25, 196, 237, 97, 45, 141, 202, 178, 19, 33, 155, 159, 26, 226, 237, 208, 170, 46, 129, 215, 191])).toEqual("no context");
+}

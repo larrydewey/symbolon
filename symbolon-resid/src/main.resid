@@ -1,0 +1,311 @@
+// symbolon: the Linux command-line agent and its services.
+//
+//   symbolon relay serve DIR PORT [--tls CERT KEY] [--bind ADDR]   the sync service (SPEC 20.1)
+//   symbolon witness keygen KEYFILE            a witness's signing key; prints its public key
+//   symbolon witness serve DIR PORT KEYFILE [OFFSET] [--tls CERT KEY] [--bind ADDR]
+//                                              a witness (SPEC 20.3); OFFSET seconds added to its
+//                                              clock (tests: time passing)
+//       --tls: serve HTTPS with the PEM certificate chain CERT and private key KEY;
+//       --bind: the address to listen on (default 127.0.0.1)
+//   symbolon cosigner new DIR RELAY_HOST RELAY_PORT [--ca CA.pem]   prints the cosigner's keys
+//   symbolon cosigner pair DIR DEVICE_KEYS              pins the device that runs the inception
+//   symbolon cosigner serve DIR [PRIMES]
+//   symbolon device new DIR RELAY_HOST RELAY_PORT [--unprotected] [--fast-kdf] [--ca CA.pem]
+//       --ca: speak TLS to the relay and the witnesses, trusting the PEM anchor CA.pem
+//                                              PIN and duress PIN on stdin; prints the device's keys
+//   symbolon device init DIR COSIGNER_KEYS W1 W2 W3 [DEVICE_PRIMES KIT_PRIMES]
+//                                              W as host:port:keyhex; PIN on stdin
+//   symbolon device register DIR RP [--duress] PIN on stdin; prints a credential ID and public key;
+//                                              --duress puts it in the duress subset
+//   symbolon device sign DIR RP CID MESSAGE    PIN on stdin; prints r || s
+//   symbolon device status DIR
+//   symbolon device forget DIR
+//   symbolon device vault login DIR NAME ORIGIN USERNAME     (PIN, password on stdin)
+//   symbolon device rotate DIR NAME BUNDLE REPOSITORY [CHROMIUM] [--share ID]   (PIN on stdin)
+//   symbolon device vault put DIR NAME         PIN then the secret on stdin
+//   symbolon device vault get DIR NAME         PIN on stdin; prints the secret
+//   symbolon device vault list DIR [--kinds|--long]  PIN on stdin; prints the names (--kinds: TYPE NAME;
+//                                              --long: TYPE NAME-HEX DETAIL-HEX FOLDER-HEX); offline, this device's copy
+//   symbolon device vault show DIR NAME        PIN on stdin; prints "FIELD VALUE-HEX" per field
+//   symbolon device vault set DIR NAME TYPE    PIN, then "FIELD VALUE-HEX" lines, on stdin (card, identity,
+//                                              note, bank, wifi, secret, login)
+//   symbolon device vault delete DIR NAME      PIN on stdin
+//   symbolon device vault import DIR FILE [--format auto|bitwarden-json|csv] [--dry-run]
+//                                              PIN on stdin (not with --dry-run): another password
+//                                              manager's export, as one new vault version
+//   symbolon device vault move DIR NAME TO     PIN on stdin; to the own vault (TO "own") or the shared folder TO
+//       list, show, set, delete, import and move take a last `--share ID`: in (from) that shared folder
+//   symbolon device share new DIR NAME         PIN on stdin; a shared folder (SPEC 19); prints its ID
+//   symbolon device share list DIR             PIN on stdin; "ID NAME-HEX owner|member PEOPLE" per folder
+//                                              ("ID - waiting WHY-HEX": no key for this device yet)
+//   symbolon device share members DIR ID       PIN on stdin; "LOG-ID NAME-HEX FINGERPRINT owner|member"
+//   symbolon device share add DIR ID LOG-ID NAME   PIN on stdin; the owner adds a person
+//   symbolon device share remove DIR ID LOG-ID PIN on stdin; the owner removes a person (new key)
+//   symbolon device share delete DIR ID        PIN on stdin; the owner deletes the folder
+//   symbolon device share leave DIR ID         PIN on stdin; a member leaves (the owner's device then re-keys)
+//   symbolon device share duress DIR ID on|off PIN on stdin; read the folder under the duress PIN on this device
+//   symbolon device share card DIR NAME        PIN on stdin; the name others see; prints LOG-ID FINGERPRINT
+//   symbolon device share me DIR               prints LOG-ID FINGERPRINT
+//   symbolon device share people DIR           "LOG-ID NAME-HEX FINGERPRINT me|-" per card at the relay
+//   symbolon home init DIR HOST [HOST...] [--ports BASE] [--bind ADDR]   Symbolon Home: the box's CA, certificates, witnesses
+//   symbolon home invite DIR NAME              a cosigner for NAME; prints the pairing link (QR)
+//   symbolon home serve DIR                    pairing, relay, three witnesses and every cosigner
+//   symbolon device webauthn register DIR RP_ID [--uv] [--duress]          PIN on stdin; adds authenticator-data
+//                                              and attestation-object (fmt none) to what register prints
+//   symbolon device webauthn assert DIR RP_ID CREDENTIAL_ID CDH [--uv]   PIN on stdin; authenticator-data,
+//                                              signature-der, then r || s
+//   symbolon device enroll DIR NEW_KEYS [PRIMES]   PIN on stdin; adds the device NEW_KEYS (re-share)
+//   symbolon device join DIR ENROLLER_KEYS [PRIMES] PIN on stdin; joins when that device enrolls this one
+//   symbolon device recover DIR KIT_SEED LOG_ID    a new device starts a kit recovery (SPEC 13.2)
+//   symbolon device veto DIR                   PIN on stdin; vetoes the latest pending event
+//   symbolon device recover-release DIR        PIN on stdin; asks the cosigner for its kit half
+//   symbolon device recover-finish DIR KIT_SEED [PRIMES]  PIN on stdin; after the delay: release, re-share
+//
+// Services listen on 127.0.0.1 only; put a TLS terminator in front of them
+// for anything else (SPEC 20.2: envelopes are end to end, objects signed).
+
+import "net/services.resid";
+import "agent/state.resid";
+import "agent/device.resid";
+import "agent/cosignerd.resid";
+import "agent/vaultcli.resid";
+import "agent/enroll.resid";
+import "agent/recover.resid";
+import "agent/rotatecli.resid";
+import "agent/vaultitems.resid";
+import "agent/importers.resid";
+import "agent/sharecli.resid";
+import "agent/webauthn.resid";
+import "agent/home.resid";
+import "httpserv.resid";
+import "ecdsa.resid";
+import "crypto.resid";
+import "cose.resid";
+import "wire.resid";
+import "tlswire.resid";
+import "tlskey.resid";
+
+Int usage() {
+    eprintln("usage: symbolon relay|witness|cosigner|device ... (see the header of src/main.resid)");
+    return 2;
+}
+
+// The TLS configuration from --tls CERT KEY; None when not asked for. A
+// server asked for TLS whose files do not load refuses to start.
+pub type Tls = { Bool on; Bool ok; TlsCfg cfg; };
+
+@requires(filesystem, declassify, provision)
+Tls tls_from(Str cert, Str key) {
+    if (str_len(cert) == 0) { return Tls {.on = false, .ok = true, .cfg = tls_cfg_none()}; }
+    Option(ServerKey) k = tls_key_load(key);
+    List(List(Int)) chain = tls_chain_load(cert);
+    return match k {
+        None => Tls {.on = true, .ok = false, .cfg = tls_cfg_none()},
+        Some(x) => Tls {.on = true, .ok = chain.len() > 0 && tls_key_cert_matches(x, chain[0]), .cfg = tls_cfg(x, chain, ["http/1.1"])}
+    };
+}
+
+TlsCfg tls_cfg_none() {
+    List(Secret(UInt(8))) none = [];
+    return tls_cfg(EdKey(none), [], []);
+}
+
+// A server listens once and answers in child processes, batch_conns()
+// connections each, on the listening socket they inherit (opened without
+// close-on-exec): there is no collector, and an accept loop that ran
+// forever kept its per-connection state (gigabytes within minutes under
+// TLS), regions included. Connections that arrive between two children
+// wait in the listen backlog. `self` is this program's path; paths may not
+// contain spaces (the child's command is split on them; no shell runs).
+Int batch_conns() { return 100; }
+
+Str tls_args(Str cert, Str key) { return if (str_len(cert) == 0) { "" } else { " --tls " + cert + " " + key }; }
+
+@requires(process)
+Int supervise_children(Str cmd) {
+    Int rc = process.run(cmd);
+    if (rc != 0) { eprintln(f"server: a child exited with {rc}; stopping"); return 1; }
+    return supervise_children(cmd);
+}
+
+@requires(network, filesystem, declassify, provision, process)
+Int relay_serve(Str dir, Int port, Str bind, Str cert, Str key, Str self) {
+    Tls t = tls_from(cert, key);
+    if (!t.ok) { eprintln("relay: the TLS certificate or key does not load, or they do not match"); return 1; }
+    _ = filesystem.create_dir(dir);
+    Int lfd = http_listen_at(bind, port);
+    if (lfd < 0) { eprintln(f"relay: cannot listen on {port}"); return 1; }
+    println(f"relay listening on {bind}:{http_bound_port(lfd)}" + if (t.on) { " (TLS)" } else { "" });
+    return supervise_children(self + " relay child " + dir + f" {lfd}" + tls_args(cert, key));
+}
+
+// `symbolon relay child DIR FD [--tls CERT KEY]` (run by `relay serve`).
+@requires(network, filesystem, declassify, provision)
+Int relay_child(Str dir, Int lfd, Str cert, Str key) {
+    Tls t = tls_from(cert, key);
+    if (!t.ok) { return 2; }
+    Int n = if (t.on) { tls_accept_loop(lfd, t.cfg, lambda(q) { relay_handle(dir, q) }, http_limits(), batch_conns()) }
+            else { http_accept_loop(lfd, lambda(q) { relay_handle(dir, q) }, http_limits(), batch_conns()) };
+    return if (n > 0) { 0 } else { 3 };
+}
+
+@requires(filesystem)
+Int witness_keygen(Str keyfile) {
+    List(Int) priv = ec_generate(P256);
+    if (priv.len() != 32 || !filesystem.write_secret(keyfile, priv)) { eprintln("witness: cannot write the key"); return 1; }
+    println(hex_encode(ec_public_key(P256, priv)));
+    return 0;
+}
+
+@requires(network, filesystem, clock(readonly), declassify, provision, process)
+Int witness_serve(Str dir, Int port, Str keyfile, Int offset, Str bind, Str cert, Str key, Str self) {
+    Tls t = tls_from(cert, key);
+    if (!t.ok) { eprintln("witness: the TLS certificate or key does not load, or they do not match"); return 1; }
+    List(Int) raw = filesystem.read_bytes(keyfile);
+    if (raw.len() != 32) { eprintln("witness: no key"); return 1; }
+    List(Secret(UInt(8))) priv = provisioned_key(secret_bytes(raw), "the witness key from its key file (witness keygen)");
+    _ = filesystem.create_dir(dir);
+    Int lfd = http_listen_at(bind, port);
+    if (lfd < 0) { eprintln(f"witness: cannot listen on {port}"); return 1; }
+    println(f"witness listening on {bind}:{http_bound_port(lfd)} key {hex_encode(ec_public_keyg(P256, priv))}" + if (t.on) { " (TLS)" } else { "" });
+    return supervise_children(self + " witness child " + dir + f" {lfd} " + keyfile + f" {offset}" + tls_args(cert, key));
+}
+
+// `symbolon witness child DIR FD KEYFILE OFFSET [--tls CERT KEY]` (run by `witness serve`).
+@requires(network, filesystem, clock(readonly), declassify, provision)
+Int witness_child(Str dir, Int lfd, Str keyfile, Int offset, Str cert, Str key) {
+    Tls t = tls_from(cert, key);
+    List(Int) raw = filesystem.read_bytes(keyfile);
+    if (!t.ok || raw.len() != 32) { return 2; }
+    List(Secret(UInt(8))) priv = provisioned_key(secret_bytes(raw), "the witness key from its key file (witness keygen)");
+    Int n = if (t.on) { tls_accept_loop(lfd, t.cfg, lambda(q) { witness_handle(dir, priv, offset, q) }, http_limits(), batch_conns()) }
+            else { http_accept_loop(lfd, lambda(q) { witness_handle(dir, priv, offset, q) }, http_limits(), batch_conns()) };
+    return if (n > 0) { 0 } else { 3 };
+}
+
+Option(WitnessEp) witness_arg(Str s) {
+    List(Str) p = str_split(s, ":");
+    if (p.len() != 3) { return None; }
+    List(Int) k = cose_hex_decode(p[2]);
+    return if (k.len() == 65) { Some(WitnessEp {.host = p[0], .port = str_parse_int(p[1]), .key = k}) } else { None };
+}
+
+List(WitnessEp) witness_args(List(Str) ss, Int i, List(WitnessEp) acc) {
+    if (i >= ss.len()) { return acc; }
+    return witness_args(ss, i + 1, match witness_arg(ss[i]) { Some(w) => acc.concat([w]), None => acc });
+}
+
+// The argument after flag `f`, or "" (`k` = 1, 2: the first or second).
+@requires(args)
+Str flag_arg(Str f, Int k, Int i) {
+    if (i + k >= args.count()) { return ""; }
+    if (args.get(i) == f) { return args.get(i + k); }
+    return flag_arg(f, k, i + 1);
+}
+
+// The number of arguments before the first flag.
+@requires(args)
+Int positional(Int i) {
+    if (i >= args.count()) { return i; }
+    if (str_len(args.get(i)) > 2 && str_slice(args.get(i), 0, 2) == "--") { return i; }
+    return positional(i + 1);
+}
+
+// The PEM text of --ca FILE, or "".
+@requires(args, filesystem)
+Str ca_text() {
+    Str f = flag_arg("--ca", 1, 3);
+    return if (str_len(f) == 0) { "" } else { filesystem.read_all(f) };
+}
+
+// Arguments i..e-1.
+@requires(args)
+List(Str) arg_list(Int i, Int e, ListBuf(Str) acc) {
+    if (i >= e) { return acc.finish(); }
+    return arg_list(i + 1, e, acc.push(args.get(i)));
+}
+
+Str bind_or_all(Str b) { return if (str_len(b) == 0) { "0.0.0.0" } else { b }; }
+
+Str bind_or(Str b) { return if (str_len(b) == 0) { "127.0.0.1" } else { b }; }
+
+@requires(args)
+Bool has_flag(Str f, Int i) {
+    if (i >= args.count()) { return false; }
+    if (args.get(i) == f) { return true; }
+    return has_flag(f, i + 1);
+}
+
+@requires(args, environment, network, filesystem, device, declassify, clock, process, provision)
+Int main() {
+    Str a1 = args.get(1);
+    Str a2 = args.get(2);
+    Int n = args.count();
+    if (a1 == "home" && a2 == "init" && n >= 5) { Int hp = positional(4); return home_init(args.get(3), arg_list(4, hp, ListBuf()), if (str_len(flag_arg("--ports", 1, hp)) > 0) { str_parse_int(flag_arg("--ports", 1, hp)) } else { home_default_base() }, bind_or_all(flag_arg("--bind", 1, hp))); }
+    if (a1 == "home" && a2 == "invite" && n == 5) { return home_invite(args.get(3), args.get(4)); }
+    if (a1 == "home" && a2 == "serve" && n == 4) { return home_serve(args.get(3), args.get(0)); }
+    if (a1 == "home" && a2 == "pair-serve" && n == 4) { return home_pair_serve(args.get(3), args.get(0)); }
+    if (a1 == "home" && a2 == "pair-child" && n == 5) { return home_pair_child(args.get(3), str_parse_int(args.get(4))); }
+    if (a1 == "cosigner" && a2 == "new" && positional(3) == 6) { return cosignerd_new(args.get(3), args.get(4), str_parse_int(args.get(5)), ca_text()); }
+    if (a1 == "cosigner" && a2 == "pair" && n == 5) { return cosignerd_pair(args.get(3), args.get(4)); }
+    if (a1 == "cosigner" && a2 == "serve" && (n == 4 || n == 5)) { return cosignerd_serve(args.get(3), if (n == 5) { args.get(4) } else { "" }, args.get(0)); }
+    if (a1 == "cosigner" && a2 == "serve-for" && n == 6) { return cosignerd_serve_for(args.get(3), args.get(4), str_parse_int(args.get(5))); }
+    if (a1 == "device" && a2 == "new" && n >= 6) { return device_new(args.get(3), args.get(4), str_parse_int(args.get(5)), has_flag("--unprotected", 6), has_flag("--keystore", 6), has_flag("--fast-kdf", 6), ca_text()); }
+    if (a1 == "device" && a2 == "init" && (n == 8 || n == 10)) {
+        return device_init(args.get(3), InitArgs {.cosigner_keys = args.get(4), .witnesses = witness_args([args.get(5), args.get(6), args.get(7)], 0, []),
+                                                   .device_primes = if (n == 10) { args.get(8) } else { "" }, .kit_primes = if (n == 10) { args.get(9) } else { "" }});
+    }
+    if (a1 == "device" && a2 == "register" && (n == 5 || n == 6)) { return device_register(args.get(3), args.get(4), has_flag("--duress", 5)); }
+    if (a1 == "device" && a2 == "sign" && n == 7) { return device_sign(args.get(3), args.get(4), args.get(5), args.get(6)); }
+    if (a1 == "device" && a2 == "status" && n == 4) { return device_status(args.get(3)); }
+    if (a1 == "device" && a2 == "forget" && n == 4) { return device_forget(args.get(3)); }
+    if (a1 == "device" && a2 == "vault" && n == 8 && args.get(3) == "login") { return vault_login(args.get(4), args.get(5), args.get(6), args.get(7)); }
+    if (a1 == "device" && a2 == "vault" && args.get(3) == "put" && n == 6) { return vault_put(args.get(4), args.get(5)); }
+    if (a1 == "device" && a2 == "vault" && args.get(3) == "get" && n == 6) { return vault_get(args.get(4), args.get(5)); }
+    // `--share ID` comes last: the folder the vault command works in.
+    Str share = if (n >= 6 && args.get(n - 2) == "--share") { args.get(n - 1) } else { "" };
+    Int ns = if (str_len(share) > 0) { n - 2 } else { n };
+    if (a1 == "device" && a2 == "rotate" && (ns == 7 || ns == 8)) { return device_rotate(args.get(3), args.get(4), args.get(5), args.get(6), if (ns == 8) { args.get(7) } else { "chromium" }, share); }
+    if (a1 == "device" && a2 == "vault" && args.get(3) == "move" && ns == 7) { return vault_move(args.get(4), args.get(5), args.get(6), share); }
+    if (a1 == "device" && a2 == "vault" && args.get(3) == "list" && ns == 5) { return vault_list_at(args.get(4), 0, share); }
+    if (a1 == "device" && a2 == "vault" && args.get(3) == "list" && ns == 6 && args.get(5) == "--kinds") { return vault_list_at(args.get(4), 1, share); }
+    if (a1 == "device" && a2 == "vault" && args.get(3) == "list" && ns == 6 && args.get(5) == "--long") { return vault_list_at(args.get(4), 2, share); }
+    if (a1 == "device" && a2 == "webauthn" && args.get(3) == "register" && n >= 6) { return device_wa_register(args.get(4), args.get(5), has_flag("--uv", 6), has_flag("--duress", 6)); }
+    if (a1 == "device" && a2 == "webauthn" && args.get(3) == "assert" && n >= 8) { return device_wa_assert(args.get(4), args.get(5), args.get(6), args.get(7), has_flag("--uv", 8)); }
+    if (a1 == "device" && a2 == "vault" && args.get(3) == "show" && ns == 6) { return vault_show(args.get(4), args.get(5), share); }
+    if (a1 == "device" && a2 == "vault" && args.get(3) == "set" && ns == 7) { return vault_set(args.get(4), args.get(5), args.get(6), share); }
+    if (a1 == "device" && a2 == "vault" && args.get(3) == "delete" && ns == 6) { return vault_delete(args.get(4), args.get(5), share); }
+    if (a1 == "device" && a2 == "vault" && args.get(3) == "import" && n >= 6) {
+        Str fmt = flag_arg("--format", 1, 6);
+        return vault_import(args.get(4), args.get(5), if (str_len(fmt) == 0) { "auto" } else { fmt }, has_flag("--dry-run", 6), share);
+    }
+    if (a1 == "device" && a2 == "share" && args.get(3) == "new" && n == 6) { return share_new(args.get(4), args.get(5)); }
+    if (a1 == "device" && a2 == "share" && args.get(3) == "list" && n == 5) { return share_list(args.get(4)); }
+    if (a1 == "device" && a2 == "share" && args.get(3) == "members" && n == 6) { return share_members(args.get(4), args.get(5)); }
+    if (a1 == "device" && a2 == "share" && args.get(3) == "add" && n == 8) { return share_add(args.get(4), args.get(5), args.get(6), args.get(7)); }
+    if (a1 == "device" && a2 == "share" && args.get(3) == "remove" && n == 7) { return share_remove(args.get(4), args.get(5), args.get(6)); }
+    if (a1 == "device" && a2 == "share" && args.get(3) == "delete" && n == 6) { return share_delete(args.get(4), args.get(5)); }
+    if (a1 == "device" && a2 == "share" && args.get(3) == "leave" && n == 6) { return share_leave(args.get(4), args.get(5)); }
+    if (a1 == "device" && a2 == "share" && args.get(3) == "duress" && n == 7) { return share_duress(args.get(4), args.get(5), args.get(6)); }
+    if (a1 == "device" && a2 == "share" && args.get(3) == "card" && n == 6) { return share_card(args.get(4), args.get(5)); }
+    if (a1 == "device" && a2 == "share" && args.get(3) == "me" && n == 5) { return share_me(args.get(4)); }
+    if (a1 == "device" && a2 == "share" && args.get(3) == "people" && n == 5) { return share_people(args.get(4)); }
+    if (a1 == "device" && a2 == "enroll" && (n == 5 || n == 6)) { return device_enroll(args.get(3), args.get(4), if (n == 6) { args.get(5) } else { "" }); }
+    if (a1 == "device" && a2 == "join" && (n == 5 || n == 6)) { return device_join(args.get(3), args.get(4), if (n == 6) { args.get(5) } else { "" }); }
+    if (a1 == "device" && a2 == "recover" && n == 6) { return device_recover(args.get(3), args.get(4), args.get(5)); }
+    if (a1 == "device" && a2 == "veto" && n == 4) { return device_veto(args.get(3)); }
+    if (a1 == "device" && a2 == "recover-release" && n == 4) { return device_recover_release(args.get(3)); }
+    if (a1 == "device" && a2 == "recover-finish" && (n == 5 || n == 6)) { return device_recover_finish(args.get(3), args.get(4), if (n == 6) { args.get(5) } else { "" }); }
+    if (a1 == "relay" && a2 == "serve" && positional(3) == 5) { return relay_serve(args.get(3), str_parse_int(args.get(4)), bind_or(flag_arg("--bind", 1, 5)), flag_arg("--tls", 1, 5), flag_arg("--tls", 2, 5), args.get(0)); }
+    if (a1 == "relay" && a2 == "child" && positional(3) == 5) { return relay_child(args.get(3), str_parse_int(args.get(4)), flag_arg("--tls", 1, 5), flag_arg("--tls", 2, 5)); }
+    if (a1 == "witness" && a2 == "keygen" && args.count() == 4) { return witness_keygen(args.get(3)); }
+    Int np = positional(3);
+    if (a1 == "witness" && a2 == "serve" && (np == 6 || np == 7)) {
+        return witness_serve(args.get(3), str_parse_int(args.get(4)), args.get(5), if (np == 7) { str_parse_int(args.get(6)) } else { 0 },
+            bind_or(flag_arg("--bind", 1, np)), flag_arg("--tls", 1, np), flag_arg("--tls", 2, np), args.get(0));
+    }
+    if (a1 == "witness" && a2 == "child" && np == 7) {
+        return witness_child(args.get(3), str_parse_int(args.get(4)), args.get(5), str_parse_int(args.get(6)), flag_arg("--tls", 1, 7), flag_arg("--tls", 2, 7));
+    }
+    return usage();
+}

@@ -1,0 +1,215 @@
+// The Resid vault (src/vault/vault.resid) against an independent
+// implementation of SPEC Section 18: HKDF, AES-GCM and ECDSA from Python's
+// cryptography package, hashlib, and a separate CBOR encoder. Every expected
+// value below was produced by tests/gen_vault_ref.py, not by the code under
+// test. Generated; do not edit by hand.
+
+import "../types.resid";
+import "vault.resid";
+import "word.resid";
+import "crypto.resid";
+
+Str hx(List(Int) b) { return hex_encode(b); }
+
+List(Int) widen_u8(List(UInt(8)) b, Int i, ListBuf(Int) acc) {
+    if (i >= b.len()) { return acc.finish(); }
+    return widen_u8(b, i + 1, acc.push((Int) b[i]));
+}
+
+@requires(declassify)
+List(Int) opened(List(Secret(UInt(8))) b) {
+    return widen_u8(declassify(secret_join(b), "test compares to the reference plaintext"), 0, ListBuf());
+}
+
+List(Secret(UInt(8))) vault_key_bytes() { return secret_bytes(rt [92, 62, 229, 171, 122, 101, 250, 252, 93, 245, 151, 234, 135, 100, 129, 60, 166, 89, 120, 86, 121, 102, 187, 103, 252, 110, 153, 135, 3, 175, 207, 112]); }
+List(Int) vault_id() { return [207, 177, 139, 138, 155, 58, 144, 244, 74, 253, 82, 97, 105, 223, 67, 208, 245, 51, 103, 132, 173, 240, 45, 251, 75, 244, 77, 250, 40, 127, 47, 180]; }
+
+Bool has_all(List(FieldPlain) got, Int i) { return true; }
+
+Item ref_item_0() {
+    return Item {
+        .id = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1], .version = 1, .kind = "login",
+        .fields = {"password": [201, 51, 19, 73, 52, 11, 165, 98, 192, 126, 160, 149, 159, 90, 215, 111, 99, 42, 216, 213, 64, 34, 52], "user": [133, 34, 33, 127, 21, 36, 77, 31, 88, 39, 100, 16, 163, 182, 235, 217, 190, 220, 81, 211, 170]},
+        .in_duress_subset = false, .handling_policy = None };
+}
+
+Item ref_item_1() {
+    return Item {
+        .id = [2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2], .version = 3, .kind = "login",
+        .fields = {"note": [51, 15, 191, 13, 212, 218, 112, 11, 106, 101, 186, 144, 242, 198, 14, 175, 235, 13, 170, 108, 236, 97, 22, 70, 182, 34, 29, 133, 1, 13, 60, 95, 65, 59, 154, 244, 98, 227, 50, 103, 19, 228, 50, 226, 55, 252, 103, 31, 131, 123, 52, 129, 250, 59, 126, 199], "pässwörd": [180, 239, 89, 141, 230, 76, 232, 171, 143, 70, 143, 41, 132, 84, 174, 188, 199, 129, 18, 188, 152], "user": [28, 195, 151, 97, 59, 230, 220, 211, 175, 40, 250, 207, 233, 237, 212, 28, 89, 214, 0]},
+        .in_duress_subset = true, .handling_policy = Some("confirm") };
+}
+
+Item ref_item_2() {
+    return Item {
+        .id = [3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3], .version = 7, .kind = "totp",
+        .fields = {"seed": [146, 184, 85, 66, 234, 117, 55, 85, 83, 175, 82, 111, 78, 14, 236, 33, 103, 132, 149, 157, 161, 77, 238, 120, 42, 238, 72, 197, 178, 53, 104, 233, 180, 85, 13, 58]},
+        .in_duress_subset = false, .handling_policy = None };
+}
+
+Item ref_item_3() {
+    return Item {
+        .id = [4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4], .version = 2, .kind = "note",
+        .fields = {"text": [41, 184, 89, 182, 15, 20, 13, 102, 34, 147, 145, 244, 118, 219, 183, 114, 36, 139, 45, 242, 48, 64, 2, 153, 83, 65, 157, 170, 5, 110, 153, 206, 75, 240, 102, 90, 229, 175, 40, 98, 111, 26, 26, 229, 251, 179, 148, 134, 18, 102, 246, 131, 111, 201, 129, 162, 83, 169, 248, 189, 236, 199, 120, 156, 20, 35, 186, 234, 229, 84, 157, 207, 210, 105, 142, 58, 238, 31, 38, 20, 92, 244, 136, 162, 243, 178, 109, 11, 88, 242, 191, 210, 225, 36, 135, 81, 96, 47, 44, 199, 185, 133, 187, 219, 59, 188, 240, 66, 155, 6, 177, 204, 150, 90, 97, 251, 33, 236, 206, 38, 91, 217, 212, 243, 7, 130, 7, 225, 45, 65, 218, 176, 68, 243, 33, 206, 89, 26, 236, 30, 153, 241, 31, 200, 183, 62, 176, 48, 119, 169, 209, 233, 121, 69, 12, 135, 61, 153, 184, 52, 255, 223, 109, 9, 180, 162, 160, 168, 254, 170, 194, 248, 94, 31, 78, 161, 124, 248, 212, 116, 10, 22, 245, 114, 151, 236, 150, 7, 109, 28, 220, 60, 41, 128, 194, 108, 164, 99, 89, 63, 152, 81, 219, 122, 33, 117, 155, 187, 59, 140, 50, 204, 157, 219, 79, 169, 61, 79, 39, 125, 221, 96, 20, 22, 43, 197, 186, 90, 165, 10, 17, 247, 45, 212, 112, 177, 173, 49, 106, 203, 109, 79, 1, 160, 100, 20, 24, 7, 68, 38, 235, 64, 236, 10, 76, 97, 24, 141, 32, 203, 57, 101, 25, 52, 79, 231, 60, 181, 65, 163, 39, 98, 15, 90, 197, 217, 18, 5, 56, 36, 232, 212, 224, 12, 135, 114, 6, 134, 216, 242, 48, 127, 20, 174, 10, 18, 125, 122, 227, 240, 110, 120, 224, 185, 76, 60, 75, 65, 168, 194, 195, 176, 114, 164, 48, 70]},
+        .in_duress_subset = true, .handling_policy = None };
+}
+
+Item ref_item_4() {
+    return Item {
+        .id = [5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5], .version = 1, .kind = "card",
+        .fields = {"cvv": [36, 13, 247, 160, 204, 145, 227, 108, 66, 1, 179, 225, 31, 249, 1, 104, 230, 88, 180], "name": [234, 167, 215, 39, 59, 26, 69, 255, 125, 23, 99, 74, 190, 186, 190, 170, 39, 164, 169, 196, 156, 62, 155, 43, 30, 54, 230, 57, 226, 173, 23, 25, 107, 222, 52, 75, 155, 22, 125, 179, 250], "number": [94, 109, 134, 87, 217, 153, 49, 33, 85, 187, 233, 106, 159, 33, 40, 240, 199, 175, 107, 185, 117, 150, 164, 80, 19, 154, 151, 111, 212, 23, 122, 186], "pin": [54, 200, 216, 64, 146, 157, 110, 35, 171, 87, 92, 158, 177, 161, 172, 205, 99, 30, 11, 205]},
+        .in_duress_subset = false, .handling_policy = Some("never") };
+}
+
+List(Item) ref_items() { return [ref_item_0(), ref_item_1(), ref_item_2(), ref_item_3(), ref_item_4()];  }
+List(Item) ref_items_shuffled() { return [ref_item_0(), ref_item_2(), ref_item_1(), ref_item_4(), ref_item_3()];  }
+
+@requires(declassify)
+test "item 0: the reference ciphertexts open to the reference plaintexts" {
+    List(Secret(UInt(8))) vk = vault_key_bytes();
+    Result(List(FieldPlain), SymbolonError) r = item_open(vk, vault_id(), ref_item_0());
+    List(FieldPlain) got = r else { [] };
+    expect(got.len()).toEqual(2);
+    expect(hx(field_named(got, "password"))).toEqual("68756e74657232");
+    expect(hx(field_named(got, "user"))).toEqual("616c696365");
+}
+
+@requires(declassify)
+test "item 1: the reference ciphertexts open to the reference plaintexts" {
+    List(Secret(UInt(8))) vk = vault_key_bytes();
+    Result(List(FieldPlain), SymbolonError) r = item_open(vk, vault_id(), ref_item_1());
+    List(FieldPlain) got = r else { [] };
+    expect(got.len()).toEqual(3);
+    expect(hx(field_named(got, "note"))).toEqual("68c903442cf4cccf5cc5d5428acbb849abad9a40de09d84a53da02ea330483d8cef5f1d44d73585a");
+    expect(hx(field_named(got, "pässwörd"))).toEqual("c3a9e282ac");
+    expect(hx(field_named(got, "user"))).toEqual("626f62");
+}
+
+@requires(declassify)
+test "item 2: the reference ciphertexts open to the reference plaintexts" {
+    List(Secret(UInt(8))) vk = vault_key_bytes();
+    Result(List(FieldPlain), SymbolonError) r = item_open(vk, vault_id(), ref_item_2());
+    List(FieldPlain) got = r else { [] };
+    expect(got.len()).toEqual(1);
+    expect(hx(field_named(got, "seed"))).toEqual("bc98fd1d2fb45b4d6c86275376429936bf21b7a8");
+}
+
+@requires(declassify)
+test "item 3: the reference ciphertexts open to the reference plaintexts" {
+    List(Secret(UInt(8))) vk = vault_key_bytes();
+    Result(List(FieldPlain), SymbolonError) r = item_open(vk, vault_id(), ref_item_3());
+    List(FieldPlain) got = r else { [] };
+    expect(got.len()).toEqual(1);
+    expect(hx(field_named(got, "text"))).toEqual("2d88b157cbd0d1058bde1783cd8c2d6e9153bf45e02d36a785ee2d7026efa1532f70bafbc2ce9de90a6168082acbba21068f6d7e47a0094275e48d08d95589d446ff7c8cf31fb31ce8959207616e0b55987860d2225a0ee87feb2af9f56a60e3a586dd984464c1a886be6d12204ac8222efc84b26cf42324b84daeab07dcb36612936b785d4db0670a1240a54c1c7b52ad9ba4a4aa8491b677f1bcd5d5ba3b8cee4e69fbb876ef9061f44b849dc4b084fb9e62960bc775c91737b61cc9d823d5b7f6b066da9ac87c287223dbae85d8b6a0bbb55e905812a10a60c47ca7f837f099a5492898738a71d1d069233ed4a0a2ad690f2c5354040343c73f456bd1cf70ad47c6dc18c268fda7e8ed1dd32e1580501f8a42ad390d1a0e389aaa8998e94aadc994292077d6234186a37e");
+}
+
+@requires(declassify)
+test "item 4: the reference ciphertexts open to the reference plaintexts" {
+    List(Secret(UInt(8))) vk = vault_key_bytes();
+    Result(List(FieldPlain), SymbolonError) r = item_open(vk, vault_id(), ref_item_4());
+    List(FieldPlain) got = r else { [] };
+    expect(got.len()).toEqual(4);
+    expect(hx(field_named(got, "cvv"))).toEqual("d75960");
+    expect(hx(field_named(got, "name"))).toEqual("47f2ed7b184cb0b98d5bc1e56fb97aa9f2c7b3fd7fdbc74af0");
+    expect(hx(field_named(got, "number"))).toEqual("1408e43ac2ac27d83c8a5e19a116996b");
+    expect(hx(field_named(got, "pin"))).toEqual("0bb85069");
+}
+
+@requires(declassify)
+List(Int) field_named(List(FieldPlain) fs, Str name) { return field_named_at(fs, name, 0); }
+
+@requires(declassify)
+List(Int) field_named_at(List(FieldPlain) fs, Str name, Int i) {
+    if (i >= fs.len()) { return []; }
+    if (fs[i].name == name) { return opened(fs[i].value); }
+    return field_named_at(fs, name, i + 1);
+}
+
+@requires(declassify)
+test "item 0: sealing the reference plaintexts gives the reference ciphertexts" {
+    List(Secret(UInt(8))) vk = vault_key_bytes();
+    List(FieldPlain) plain = [FieldPlain {.name = "password", .value = secret_bytes(rt [104, 117, 110, 116, 101, 114, 50])}, FieldPlain {.name = "user", .value = secret_bytes(rt [97, 108, 105, 99, 101])}];
+    Result(Item, SymbolonError) r = item_seal(vk, vault_id(), [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1], 1, "login", plain, false, None);
+    Item sealed = r else { ref_item_0() };
+    expect(r_ok(r)).toBeTrue();
+    expect(hx(item_cbor(sealed))).toEqual("a6015001010101010101010101010101010101020103656c6f67696e04a26870617373776f726457c9331349340ba562c07ea0959f5ad76f632ad8d54022346475736572558522217f15244d1f58276410a3b6ebd9bedc51d3aa05f406f6");
+}
+
+@requires(declassify)
+test "item 1: sealing the reference plaintexts gives the reference ciphertexts" {
+    List(Secret(UInt(8))) vk = vault_key_bytes();
+    List(FieldPlain) plain = [FieldPlain {.name = "note", .value = secret_bytes(rt [104, 201, 3, 68, 44, 244, 204, 207, 92, 197, 213, 66, 138, 203, 184, 73, 171, 173, 154, 64, 222, 9, 216, 74, 83, 218, 2, 234, 51, 4, 131, 216, 206, 245, 241, 212, 77, 115, 88, 90])}, FieldPlain {.name = "pässwörd", .value = secret_bytes(rt [195, 169, 226, 130, 172])}, FieldPlain {.name = "user", .value = secret_bytes(rt [98, 111, 98])}];
+    Result(Item, SymbolonError) r = item_seal(vk, vault_id(), [2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2], 3, "login", plain, true, Some("confirm"));
+    Item sealed = r else { ref_item_1() };
+    expect(r_ok(r)).toBeTrue();
+    expect(hx(item_cbor(sealed))).toEqual("a6015002020202020202020202020202020202020303656c6f67696e04a3646e6f74655838330fbf0dd4da700b6a65ba90f2c60eafeb0daa6cec611646b6221d85010d3c5f413b9af462e3326713e432e237fc671f837b3481fa3b7ec76a70c3a4737377c3b6726455b4ef598de64ce8ab8f468f298454aebcc78112bc986475736572531cc397613be6dcd3af28facfe9edd41c59d60005f50667636f6e6669726d");
+}
+
+@requires(declassify)
+test "item 2: sealing the reference plaintexts gives the reference ciphertexts" {
+    List(Secret(UInt(8))) vk = vault_key_bytes();
+    List(FieldPlain) plain = [FieldPlain {.name = "seed", .value = secret_bytes(rt [188, 152, 253, 29, 47, 180, 91, 77, 108, 134, 39, 83, 118, 66, 153, 54, 191, 33, 183, 168])}];
+    Result(Item, SymbolonError) r = item_seal(vk, vault_id(), [3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3], 7, "totp", plain, false, None);
+    Item sealed = r else { ref_item_2() };
+    expect(r_ok(r)).toBeTrue();
+    expect(hx(item_cbor(sealed))).toEqual("a601500303030303030303030303030303030302070364746f747004a16473656564582492b85542ea75375553af526f4e0eec216784959da14dee782aee48c5b23568e9b4550d3a05f406f6");
+}
+
+@requires(declassify)
+test "item 3: sealing the reference plaintexts gives the reference ciphertexts" {
+    List(Secret(UInt(8))) vk = vault_key_bytes();
+    List(FieldPlain) plain = [FieldPlain {.name = "text", .value = secret_bytes(rt [45, 136, 177, 87, 203, 208, 209, 5, 139, 222, 23, 131, 205, 140, 45, 110, 145, 83, 191, 69, 224, 45, 54, 167, 133, 238, 45, 112, 38, 239, 161, 83, 47, 112, 186, 251, 194, 206, 157, 233, 10, 97, 104, 8, 42, 203, 186, 33, 6, 143, 109, 126, 71, 160, 9, 66, 117, 228, 141, 8, 217, 85, 137, 212, 70, 255, 124, 140, 243, 31, 179, 28, 232, 149, 146, 7, 97, 110, 11, 85, 152, 120, 96, 210, 34, 90, 14, 232, 127, 235, 42, 249, 245, 106, 96, 227, 165, 134, 221, 152, 68, 100, 193, 168, 134, 190, 109, 18, 32, 74, 200, 34, 46, 252, 132, 178, 108, 244, 35, 36, 184, 77, 174, 171, 7, 220, 179, 102, 18, 147, 107, 120, 93, 77, 176, 103, 10, 18, 64, 165, 76, 28, 123, 82, 173, 155, 164, 164, 170, 132, 145, 182, 119, 241, 188, 213, 213, 186, 59, 140, 238, 78, 105, 251, 184, 118, 239, 144, 97, 244, 75, 132, 157, 196, 176, 132, 251, 158, 98, 150, 11, 199, 117, 201, 23, 55, 182, 28, 201, 216, 35, 213, 183, 246, 176, 102, 218, 154, 200, 124, 40, 114, 35, 219, 174, 133, 216, 182, 160, 187, 181, 94, 144, 88, 18, 161, 10, 96, 196, 124, 167, 248, 55, 240, 153, 165, 73, 40, 152, 115, 138, 113, 209, 208, 105, 35, 62, 212, 160, 162, 173, 105, 15, 44, 83, 84, 4, 3, 67, 199, 63, 69, 107, 209, 207, 112, 173, 71, 198, 220, 24, 194, 104, 253, 167, 232, 237, 29, 211, 46, 21, 128, 80, 31, 138, 66, 173, 57, 13, 26, 14, 56, 154, 170, 137, 152, 233, 74, 173, 201, 148, 41, 32, 119, 214, 35, 65, 134, 163, 126])}];
+    Result(Item, SymbolonError) r = item_seal(vk, vault_id(), [4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4], 2, "note", plain, true, None);
+    Item sealed = r else { ref_item_3() };
+    expect(r_ok(r)).toBeTrue();
+    expect(hx(item_cbor(sealed))).toEqual("a6015004040404040404040404040404040404020203646e6f746504a1647465787459013c29b859b60f140d66229391f476dbb772248b2df23040029953419daa056e99ce4bf0665ae5af28626f1a1ae5fbb394861266f6836fc981a253a9f8bdecc7789c1423baeae5549dcfd2698e3aee1f26145cf488a2f3b26d0b58f2bfd2e1248751602f2cc7b985bbdb3bbcf0429b06b1cc965a61fb21ecce265bd9d4f3078207e12d41dab044f321ce591aec1e99f11fc8b73eb03077a9d1e979450c873d99b834ffdf6d09b4a2a0a8feaac2f85e1f4ea17cf8d4740a16f57297ec96076d1cdc3c2980c26ca463593f9851db7a21759bbb3b8c32cc9ddb4fa93d4f277ddd6014162bc5ba5aa50a11f72dd470b1ad316acb6d4f01a0641418074426eb40ec0a4c61188d20cb396519344fe73cb541a327620f5ac5d912053824e8d4e00c87720686d8f2307f14ae0a127d7ae3f06e78e0b94c3c4b41a8c2c3b072a4304605f506f6");
+}
+
+@requires(declassify)
+test "item 4: sealing the reference plaintexts gives the reference ciphertexts" {
+    List(Secret(UInt(8))) vk = vault_key_bytes();
+    List(FieldPlain) plain = [FieldPlain {.name = "cvv", .value = secret_bytes(rt [215, 89, 96])}, FieldPlain {.name = "name", .value = secret_bytes(rt [71, 242, 237, 123, 24, 76, 176, 185, 141, 91, 193, 229, 111, 185, 122, 169, 242, 199, 179, 253, 127, 219, 199, 74, 240])}, FieldPlain {.name = "number", .value = secret_bytes(rt [20, 8, 228, 58, 194, 172, 39, 216, 60, 138, 94, 25, 161, 22, 153, 107])}, FieldPlain {.name = "pin", .value = secret_bytes(rt [11, 184, 80, 105])}];
+    Result(Item, SymbolonError) r = item_seal(vk, vault_id(), [5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5], 1, "card", plain, false, Some("never"));
+    Item sealed = r else { ref_item_4() };
+    expect(r_ok(r)).toBeTrue();
+    expect(hx(item_cbor(sealed))).toEqual("a6015005050505050505050505050505050505020103646361726404a46363767653240df7a0cc91e36c4201b3e11ff90168e658b4646e616d655829eaa7d7273b1a45ff7d17634abebabeaa27a4a9c49c3e9b2b1e36e639e2ad17196bde344b9b167db3fa666e756d62657258205e6d8657d999312155bbe96a9f2128f0c7af6bb97596a450139a976fd4177aba6370696e5436c8d840929d6e23ab575c9eb1a1accd631e0bcd05f406656e65766572");
+}
+
+Bool r_ok(Result(Item, SymbolonError) r) { return match r { Ok(_) => true, Err(_) => false }; }
+
+test "merkle root equals the reference, whatever the order" {
+    expect(hx(merkle_root(ref_items()))).toEqual("7ac7f3f90cf4d74d30cfeaabf51027329aa83cb28463b7b27e049572be8f758d");
+    expect(hx(merkle_root(ref_items_shuffled()))).toEqual("7ac7f3f90cf4d74d30cfeaabf51027329aa83cb28463b7b27e049572be8f758d");
+}
+
+List(Int) ref_dk() { return [4, 15, 81, 26, 190, 190, 31, 213, 248, 210, 186, 146, 211, 6, 107, 163, 112, 227, 101, 235, 209, 157, 249, 64, 6, 216, 201, 176, 11, 108, 45, 64, 24, 244, 166, 14, 144, 135, 61, 214, 124, 61, 68, 0, 208, 10, 204, 0, 2, 172, 52, 128, 127, 121, 204, 168, 225, 154, 161, 82, 29, 94, 74, 150, 179]; }
+
+LogHead ref_log_head(UInt(64) seq) {
+    Party p = Party { .id = [96, 72, 27, 85, 114, 47, 138, 84, 34, 12, 170, 123, 240, 126, 240, 6, 89, 77, 153, 205, 0, 0, 194, 217, 19, 103, 182, 145, 222, 56, 111, 158], .kind = party_kind_device(), .auth_key = ref_dk(),
+                      .hpke_key = [], .label = "d", .attestation = NoAttestation };
+    return LogHead {
+        .log_id = [120, 59, 156, 3, 23, 44, 244, 125, 220, 44, 192, 186, 21, 149, 23, 169, 93, 176, 120, 48, 65, 85, 122, 89, 174, 21, 223, 142, 200, 64, 249, 108], .sequence = seq, .digest = [],
+        .quorum = Quorum { .parties = [p], .t = 1, .root_pubkey = [], .epoch = 0, .transcript_digest = [] },
+        .policy = Policy { .device_sigs_for_authority = 1, .recovery_delay_sec = 86400, .guardians = [],
+                           .guardian_threshold = 0, .witnesses = [], .duress_window_sec = 0,
+                           .cosigner_policy = NoCosignerPolicy } };
+}
+
+VaultHead ref_head(List(Int) sig) {
+    return VaultHead {
+        .vault_id = vault_id(), .version = 9, .merkle_root = [122, 199, 243, 249, 12, 244, 215, 77, 48, 207, 234, 171, 245, 16, 39, 50, 154, 168, 60, 178, 132, 99, 183, 178, 126, 4, 149, 114, 190, 143, 117, 141], .log_id = [120, 59, 156, 3, 23, 44, 244, 125, 220, 44, 192, 186, 21, 149, 23, 169, 93, 176, 120, 48, 65, 85, 122, 89, 174, 21, 223, 142, 200, 64, 249, 108],
+        .log_sequence = 4, .suite = 1, .signer = [96, 72, 27, 85, 114, 47, 138, 84, 34, 12, 170, 123, 240, 126, 240, 6, 89, 77, 153, 205, 0, 0, 194, 217, 19, 103, 182, 145, 222, 56, 111, 158], .sig = sig };
+}
+
+Bool accepted(Result(VaultState, SymbolonError) r) { return match r { Ok(_) => true, Err(_) => false }; }
+
+test "head signed by Python's ECDSA: tbs bytes equal the reference" {
+    expect(hx(head_tbs(ref_head([193, 159, 180, 159, 172, 144, 102, 136, 36, 166, 41, 23, 30, 12, 249, 122, 197, 10, 134, 238, 143, 150, 12, 150, 177, 206, 202, 38, 159, 242, 206, 168, 68, 226, 37, 245, 195, 194, 142, 66, 130, 102, 66, 231, 50, 215, 127, 108, 59, 26, 250, 28, 69, 69, 114, 62, 114, 204, 74, 127, 166, 77, 68, 214])))).toEqual("846a5369676e61747572653143a10126405870a6015820cfb18b8a9b3a90f44afd526169df43d0f5336784adf02dfb4bf44dfa287f2fb402090358207ac7f3f90cf4d74d30cfeaabf51027329aa83cb28463b7b27e049572be8f758d045820783b9c03172cf47ddc2cc0ba159517a95db0783041557a59ae15df8ec840f96c05040601");
+}
+
+test "head signed by Python's ECDSA is accepted; a flipped signature bit is refused" {
+    VaultState good = VaultState { .head = ref_head([193, 159, 180, 159, 172, 144, 102, 136, 36, 166, 41, 23, 30, 12, 249, 122, 197, 10, 134, 238, 143, 150, 12, 150, 177, 206, 202, 38, 159, 242, 206, 168, 68, 226, 37, 245, 195, 194, 142, 66, 130, 102, 66, 231, 50, 215, 127, 108, 59, 26, 250, 28, 69, 69, 114, 62, 114, 204, 74, 127, 166, 77, 68, 214]), .items = ref_items() };
+    expect(accepted(vault_accept(good, vault_id(), ref_log_head(10), 9))).toBeTrue();
+    VaultState bad = VaultState { .head = ref_head([193, 159, 180, 159, 172, 144, 102, 136, 36, 166, 40, 23, 30, 12, 249, 122, 197, 10, 134, 238, 143, 150, 12, 150, 177, 206, 202, 38, 159, 242, 206, 168, 68, 226, 37, 245, 195, 194, 142, 66, 130, 102, 66, 231, 50, 215, 127, 108, 59, 26, 250, 28, 69, 69, 114, 62, 114, 204, 74, 127, 166, 77, 68, 214]), .items = ref_items() };
+    expect(accepted(vault_accept(bad, vault_id(), ref_log_head(10), 9))).toBeFalse();
+}

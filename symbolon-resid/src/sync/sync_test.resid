@@ -1,0 +1,67 @@
+import "../types.resid";
+import "sync.resid";
+
+LogHead head_of(Int log, UInt(64) seq, Int dig) {
+    Policy p = Policy {
+        .device_sigs_for_authority = 2, .recovery_delay_sec = 86400, .guardians = [], .guardian_threshold = 0,
+        .witnesses = [], .duress_window_sec = 0, .cosigner_policy = NoCosignerPolicy };
+    return LogHead {
+        .log_id = [log], .sequence = seq, .digest = [dig],
+        .quorum = Quorum {.parties = [], .t = 1, .root_pubkey = [], .epoch = 0, .transcript_digest = []},
+        .policy = p };
+}
+
+Str name(HeadObservation o) {
+    return match o {
+        FirstSeen => "first", Unchanged => "same", Advanced => "advanced",
+        Rollback => "rollback", Fork => "fork", OtherLog => "other"
+    };
+}
+
+test "a first head, the same head, a newer head" {
+    expect(name(observe_head(None, head_of(1, 5, 7)))).toEqual("first");
+    expect(name(observe_head(Some(head_of(1, 5, 7)), head_of(1, 5, 7)))).toEqual("same");
+    expect(name(observe_head(Some(head_of(1, 5, 7)), head_of(1, 6, 8)))).toEqual("advanced");
+}
+
+test "a lower sequence is a rollback, a second digest at one sequence is a fork" {
+    expect(name(observe_head(Some(head_of(1, 5, 7)), head_of(1, 4, 6)))).toEqual("rollback");
+    expect(name(observe_head(Some(head_of(1, 5, 7)), head_of(1, 5, 9)))).toEqual("fork");
+    expect(name(observe_head(Some(head_of(1, 5, 7)), head_of(2, 9, 9)))).toEqual("other");
+}
+
+test "alarms are rollback and fork only" {
+    expect(is_alarm(Fork)).toBeTrue();
+    expect(is_alarm(Rollback)).toBeTrue();
+    expect(is_alarm(Advanced)).toBeFalse();
+    expect(is_alarm(Unchanged)).toBeFalse();
+    expect(is_alarm(FirstSeen)).toBeFalse();
+}
+
+Int held_seq(Option(LogHead) h) { return match h { Some(x) => (Int)x.sequence, None => -1 }; }
+Int held_dig(Option(LogHead) h) { return match h { Some(x) => x.digest[0], None => -1 }; }
+
+test "a rollback or a fork never replaces the held head; a newer one does" {
+    Option(LogHead) held = Some(head_of(1, 5, 7));
+    expect(held_seq(next_seen(held, head_of(1, 4, 6)))).toEqual(5);
+    expect(held_dig(next_seen(held, head_of(1, 5, 9)))).toEqual(7);
+    expect(held_seq(next_seen(held, head_of(1, 6, 8)))).toEqual(6);
+    expect(held_seq(next_seen(None, head_of(3, 2, 1)))).toEqual(2);
+}
+
+test "contact compares each offered head with the one held for its log" {
+    List(LogHead) held = [head_of(1, 5, 7), head_of(2, 3, 4)];
+    List(LogHead) offered = [head_of(2, 3, 5), head_of(1, 6, 8), head_of(9, 1, 1)];
+    List(HeadObservation) obs = compare_contact(held, offered);
+    expect(obs.len()).toEqual(3);
+    expect(name(obs[0])).toEqual("fork");
+    expect(name(obs[1])).toEqual("advanced");
+    expect(name(obs[2])).toEqual("first");
+}
+
+test "freeze warning and the release delay" {
+    expect(may_be_frozen(1000, 1500, 600)).toBeFalse();
+    expect(may_be_frozen(1000, 1601, 600)).toBeTrue();
+    expect(delay_elapsed(1000, 87399, 86400)).toBeFalse();
+    expect(delay_elapsed(1000, 87400, 86400)).toBeTrue();
+}

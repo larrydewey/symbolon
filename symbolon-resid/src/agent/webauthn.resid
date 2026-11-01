@@ -1,0 +1,96 @@
+// WebAuthn responses (SPEC 10.4, 22.1): the authenticator data, the
+// attestation object of a new credential (format "none") and the message
+// an assertion signs, formed here in the agent, so that the relying
+// party's hash and the flags are the agent's, not the caller's.
+//   symbolon device webauthn register DIR RP_ID [--uv] [--duress]
+//   symbolon device webauthn assert DIR RP_ID CREDENTIAL_ID CLIENT_DATA_HASH [--uv]
+// Flags are truthful: UP (the caller obtained the gesture), BE and BS (a
+// threshold credential survives the loss of a device), UV only with --uv,
+// which the caller passes when it verified the PIN in this ceremony. The
+// sign count is 0.
+
+import "../types.resid";
+import "state.resid";
+import "common.resid";
+import "device.resid";
+import "crypto.resid";
+import "cose.resid";
+
+// Symbolon's AAGUID (random, fixed).
+pub List(Int) symbolon_aaguid() { return cose_hex_decode("5e7b0c1f4a2d4c8e9b316a0d2f87c4e1"); }
+
+pub Int wa_flags(Bool uv, Bool attested) {
+    return 1 + (if (uv) { 4 } else { 0 }) + 8 + 16 + (if (attested) { 64 } else { 0 });
+}
+
+pub List(Int) wa_auth_data(Str rp, Int flags, List(Int) attested) {
+    return sha256_bytes(utf8(rp)).concat([flags, 0, 0, 0, 0]).concat(attested);
+}
+
+List(Int) range_of(List(Int) b, Int i, Int end, ListBuf(Int) acc) {
+    if (i >= end) { return acc.finish(); }
+    return range_of(b, i + 1, end, acc.push(b[i]));
+}
+
+// The credential public key as a COSE_Key (EC2, ES256, P-256), from the
+// uncompressed point; its map in CTAP2 canonical order.
+pub List(Int) wa_cose_key(List(Int) pub65) {
+    return [165, 1, 2, 3, 38, 32, 1, 33, 88, 32].concat(range_of(pub65, 1, 33, ListBuf())).concat([34, 88, 32]).concat(range_of(pub65, 33, 65, ListBuf()));
+}
+
+pub List(Int) wa_attested(List(Int) cid, List(Int) pub65) {
+    return symbolon_aaguid().concat([cid.len() / 256, cid.len() % 256]).concat(cid).concat(wa_cose_key(pub65));
+}
+
+List(Int) bstr_head(Int n) {
+    return if (n < 24) { [64 + n] } else { if (n < 256) { [88, n] } else { [89, n / 256, n % 256] } };
+}
+
+// {"fmt": "none", "attStmt": {}, "authData": ad}, keys in canonical order.
+pub List(Int) wa_attestation_object(List(Int) ad) {
+    return [163, 99].concat(utf8("fmt")).concat([100]).concat(utf8("none")).concat([103]).concat(utf8("attStmt")).concat([160])
+        .concat([104]).concat(utf8("authData")).concat(bstr_head(ad.len())).concat(ad);
+}
+
+// `device webauthn register`: a new credential as `device register` makes
+// it, with its authenticator data and attestation object.
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+pub Int device_wa_register(Str dir, Str rp, Bool uv, Bool in_subset) {
+    Option(DeviceConfig) oc = load_config(dir);
+    return match oc {
+        None => dfail("not set up"),
+        Some(c) => wa_register_with(dir, c, rp, unlock_dir(dir, c, read_pin()), uv, in_subset)
+    };
+}
+
+@requires(filesystem, network, device, declassify, clock)
+Int wa_register_with(Str dir, DeviceConfig c, Str rp, Unlocked u, Bool uv, Bool in_subset) {
+    if (u.kind != 1) { return dfail("wrong PIN"); }
+    Result(VerifiedHead, SymbolonError) v = verified_log(relay_ep(c), c.log_id);
+    List(Int) nonce = random_bytes(16);
+    return match v {
+        Err(e) => dfail(err_text(e)),
+        Ok(vh) => if (print_credential(dir, u, rp, vh.head.quorum.root_pubkey, nonce, in_subset) != 0) { 1 } else {
+            wa_print_attestation(rp, uv, credential_id(u.real.cc, rp, nonce), credential_pubkey(vh.head.quorum.root_pubkey, tweak_scalar(u.real.cc, rp, nonce)))
+        }
+    };
+}
+
+Int wa_print_attestation(Str rp, Bool uv, List(Int) cid, List(Int) pub65) {
+    List(Int) ad = wa_auth_data(rp, wa_flags(uv, true), wa_attested(cid, pub65));
+    println("authenticator-data " + hex_encode(ad));
+    println("attestation-object " + hex_encode(wa_attestation_object(ad)));
+    return 0;
+}
+
+// `device webauthn assert`: prints the authenticator data, then signs
+// m = SHA-256(authenticatorData || clientDataHash) as `device sign` does
+// (its last lines: the signature in DER, then r || s).
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+pub Int device_wa_assert(Str dir, Str rp, Str cid_hex, Str cdh_hex, Bool uv) {
+    List(Int) cdh = cose_hex_decode(cdh_hex);
+    if (cdh.len() != 32) { return dfail("the client data hash is 32 bytes"); }
+    List(Int) ad = wa_auth_data(rp, wa_flags(uv, false), []);
+    println("authenticator-data " + hex_encode(ad));
+    return device_sign(dir, rp, cid_hex, hex_encode(sha256_bytes(ad.concat(cdh))));
+}

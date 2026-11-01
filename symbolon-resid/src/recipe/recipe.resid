@@ -1,0 +1,520 @@
+// Symbolon change-password recipes (SPEC Section 26.4).
+//
+// A recipe is a COSE_Sign1 (ES256) over
+//   {1: domain, 2: version, 3: rules, 4: [+ step], 5: [* origin] (, 6: [+ step])}
+//   rules = {1: min length, 2: max length, 3: required classes, 4: forbidden chars}
+//   step  = [0, url] / [1, selector, slot] / [2, selector] / [3, condition] / [4, true]
+//   condition = [0, url] / [1, selector] / [2, text] / [3, selector]   ; URL, element, text, absent
+// Field 6, present only when not empty, is the sign-in procedure that step 3
+// of the two-phase change (SPEC 26.3) runs in a fresh session; it fills the
+// slot "password" with the candidate being tried.
+// The repository signs each recipe with a threshold of its keys (one
+// COSE_Sign1 per key over the same payload) and logs it in a transparency
+// log (RFC 9162 Merkle tree). A log entry is CBOR [time, payload]; the log
+// head is a COSE_Sign1 by the log key over {1: tree size, 2: root}.
+//
+// Pure. The recipe runs in the isolated browser component (src/main.resid);
+// this module decides what it may do: which origins, which slots into which
+// inputs, which clicks.
+
+import "../types.resid";
+import "../core/log.resid";
+import "../vault/vault.resid";
+import "cose.resid";
+import "cosesig.resid";
+import "crypto.resid";
+import "ecdsa.resid";
+
+// ============================================================================
+// Encoding
+// ============================================================================
+
+List(Int) rules_cbor(PasswordRules r, List(Int) acc) {
+    List(Int) a = cbe_uint(r.max_length, cbe_uint(2, cbe_uint(r.min_length, cbe_uint(1, cbe_map(4, acc)))));
+    return cbe_text(r.forbidden_chars, cbe_uint(4, cbe_uint(r.required_classes, cbe_uint(3, a))));
+}
+
+List(Int) cond_cbor(ExpectCondition c, List(Int) acc) {
+    return match c {
+        ExpectUrl(u) => cbe_text(u, cbe_uint(0, cbe_array(2, acc))),
+        ExpectElement(s) => cbe_text(s, cbe_uint(1, cbe_array(2, acc))),
+        ExpectText(t) => cbe_text(t, cbe_uint(2, cbe_array(2, acc))),
+        ExpectAbsent(s) => cbe_text(s, cbe_uint(3, cbe_array(2, acc)))
+    };
+}
+
+List(Int) step_cbor(RecipeStep s, List(Int) acc) {
+    return match s {
+        StepNavigate(u) => cbe_text(u, cbe_uint(0, cbe_array(2, acc))),
+        StepFill(sel, slot) => cbe_text(slot, cbe_text(sel, cbe_uint(1, cbe_array(3, acc)))),
+        StepClick(sel) => cbe_text(sel, cbe_uint(2, cbe_array(2, acc))),
+        StepExpect(c) => cond_cbor(c, cbe_uint(3, cbe_array(2, acc))),
+        StepPasskeyRegister => cbe_head(7, 21, cbe_uint(4, cbe_array(2, acc)))
+    };
+}
+
+List(Int) steps_cbor(List(RecipeStep) ss, Int i, List(Int) acc) {
+    if (i >= ss.len()) { return acc; }
+    return steps_cbor(ss, i + 1, step_cbor(ss[i], acc));
+}
+
+List(Int) texts_cbor(List(Str) ts, Int i, List(Int) acc) {
+    if (i >= ts.len()) { return acc; }
+    return texts_cbor(ts, i + 1, cbe_text(ts[i], acc));
+}
+
+pub List(Int) recipe_cbor(RecipePayload r) {
+    Int n = if (r.sign_in.len() == 0) { 5 } else { 6 };
+    List(Int) a = cbe_uint((Int)r.version, cbe_uint(2, cbe_text(r.domain, cbe_uint(1, cbe_map(n, [])))));
+    List(Int) b = rules_cbor(r.password_rules, cbe_uint(3, a));
+    List(Int) c = steps_cbor(r.steps, 0, cbe_array(r.steps.len(), cbe_uint(4, b)));
+    List(Int) d = texts_cbor(r.allowed_origins, 0, cbe_array(r.allowed_origins.len(), cbe_uint(5, c)));
+    return if (n == 5) { d } else { steps_cbor(r.sign_in, 0, cbe_array(r.sign_in.len(), cbe_uint(6, d))) };
+}
+
+// ============================================================================
+// Decoding: a small strict reader for the shapes above
+// ============================================================================
+
+type Head = { Int major; Int val; Int next; };
+
+Head bad_head() { return Head {.major = -1, .val = 0, .next = -1}; }
+
+Head head_at(List(Int) b, Int p) {
+    if (p < 0 || p >= b.len()) { return bad_head(); }
+    Int ib = b[p];
+    Int major = ib >> 5;
+    Int ai = ib & 31;
+    if (ai < 24) { return Head {.major = major, .val = ai, .next = p + 1}; }
+    Int n = if (ai == 24) { 1 } else { if (ai == 25) { 2 } else { if (ai == 26) { 4 } else { if (ai == 27) { 8 } else { 0 } } } };
+    if (n == 0 || p + 1 + n > b.len()) { return bad_head(); }
+    Int v = be_int(b, p + 1, n, 0);
+    // Shortest form only (deterministic CBOR).
+    Bool shortest = (n == 1 && v >= 24) || (n == 2 && v > 255) || (n == 4 && v > 65535) || (n == 8 && v > 4294967295);
+    if (!shortest || v < 0) { return bad_head(); }
+    return Head {.major = major, .val = v, .next = p + 1 + n};
+}
+
+Int be_int(List(Int) b, Int p, Int n, Int acc) {
+    if (n == 0) { return acc; }
+    if (acc > 36028797018963967) { return -1; }
+    return be_int(b, p + 1, n - 1, acc * 256 + b[p]);
+}
+
+type RdUint = { Int v; Int next; };
+type RdText = { Str v; Int next; };
+
+RdUint rd_uint(List(Int) b, Int p) {
+    Head h = head_at(b, p);
+    return if (h.major == 0) { RdUint {.v = h.val, .next = h.next} } else { RdUint {.v = -1, .next = -1} };
+}
+
+RdUint rd_key(List(Int) b, Int p, Int want) {
+    RdUint k = rd_uint(b, p);
+    return if (k.v == want) { k } else { RdUint {.v = -1, .next = -1} };
+}
+
+RdText rd_text(List(Int) b, Int p) {
+    Head h = head_at(b, p);
+    if (h.major != 3 || h.next + h.val > b.len()) { return RdText {.v = "", .next = -1}; }
+    return RdText {.v = utf8_decode(b[h.next..h.next + h.val]), .next = h.next + h.val};
+}
+
+// Bytes as text; recipes are ASCII in practice, and a byte outside it is kept
+// as its code point (Latin-1), so a round trip through recipe_cbor fails
+// rather than passing an altered string.
+Str utf8_decode(List(Int) bs) { return dec_from(bs, 0, StrBuf()); }
+
+Str dec_from(List(Int) bs, Int i, StrBuf acc) {
+    if (i >= bs.len()) { return acc.finish(); }
+    return dec_from(bs, i + 1, acc.push(str_from_code(bs[i])));
+}
+
+type RdRules = { PasswordRules v; Int next; };
+
+RdRules rd_rules(List(Int) b, Int p) {
+    RdRules bad = RdRules {.v = PasswordRules {.min_length = 0, .max_length = 0, .required_classes = 0, .forbidden_chars = ""}, .next = -1};
+    Head h = head_at(b, p);
+    if (h.major != 5 || h.val != 4) { return bad; }
+    RdUint mn = rd_uint(b, rd_key(b, h.next, 1).next);
+    RdUint mx = rd_uint(b, rd_key(b, mn.next, 2).next);
+    RdUint rq = rd_uint(b, rd_key(b, mx.next, 3).next);
+    RdText fb = rd_text(b, rd_key(b, rq.next, 4).next);
+    if (fb.next < 0 || mn.v > 255 || mx.v > 255 || rq.v > 15) { return bad; }
+    return RdRules {.v = PasswordRules {.min_length = (UInt(8))mn.v, .max_length = (UInt(8))mx.v, .required_classes = (UInt(8))rq.v, .forbidden_chars = fb.v}, .next = fb.next};
+}
+
+type RdStep = { Option(RecipeStep) v; Int next; };
+
+RdStep no_step() { return RdStep {.v = None, .next = -1}; }
+
+RdStep rd_step(List(Int) b, Int p) {
+    Head h = head_at(b, p);
+    if (h.major != 4) { return no_step(); }
+    RdUint k = rd_uint(b, h.next);
+    if (k.v == 0 && h.val == 2) { RdText u = rd_text(b, k.next); return if (u.next < 0) { no_step() } else { RdStep {.v = Some(StepNavigate(u.v)), .next = u.next} }; }
+    if (k.v == 1 && h.val == 3) {
+        RdText s = rd_text(b, k.next);
+        RdText v = rd_text(b, s.next);
+        return if (v.next < 0) { no_step() } else { RdStep {.v = Some(StepFill(s.v, v.v)), .next = v.next} };
+    }
+    if (k.v == 2 && h.val == 2) { RdText s = rd_text(b, k.next); return if (s.next < 0) { no_step() } else { RdStep {.v = Some(StepClick(s.v)), .next = s.next} }; }
+    if (k.v == 3 && h.val == 2) { return rd_cond(b, k.next); }
+    if (k.v == 4 && h.val == 2 && k.next < b.len() && b[k.next] == 245) { return RdStep {.v = Some(StepPasskeyRegister), .next = k.next + 1}; }
+    return no_step();
+}
+
+RdStep rd_cond(List(Int) b, Int p) {
+    Head h = head_at(b, p);
+    if (h.major != 4 || h.val != 2) { return no_step(); }
+    RdUint k = rd_uint(b, h.next);
+    RdText t = rd_text(b, k.next);
+    if (t.next < 0) { return no_step(); }
+    Option(ExpectCondition) c = if (k.v == 0) { Some(ExpectUrl(t.v)) } else { if (k.v == 1) { Some(ExpectElement(t.v)) } else {
+        if (k.v == 2) { Some(ExpectText(t.v)) } else { if (k.v == 3) { Some(ExpectAbsent(t.v)) } else { None } } } };
+    return match c { None => no_step(), Some(x) => RdStep {.v = Some(StepExpect(x)), .next = t.next} };
+}
+
+type RdSteps = { List(RecipeStep) v; Int next; };
+
+RdSteps rd_steps(List(Int) b, Int p, Int n, ListBuf(RecipeStep) acc) {
+    if (n == 0) { return RdSteps {.v = acc.finish(), .next = p}; }
+    RdStep s = rd_step(b, p);
+    Option(RecipeStep) os = s.v;
+    return match os {
+        None => steps_fail(acc),
+        Some(x) => rd_steps(b, s.next, n - 1, acc.push(x))
+    };
+}
+
+RdSteps steps_fail(ListBuf(RecipeStep) acc) { _ = acc.finish(); return RdSteps {.v = [], .next = -1}; }
+
+type RdTexts = { List(Str) v; Int next; };
+
+RdTexts rd_texts(List(Int) b, Int p, Int n, List(Str) acc) {
+    if (n == 0) { return RdTexts {.v = acc, .next = p}; }
+    RdText t = rd_text(b, p);
+    if (t.next < 0) { return RdTexts {.v = [], .next = -1}; }
+    return rd_texts(b, t.next, n - 1, acc.concat([t.v]));
+}
+
+// The recipe in `b`, which must be exactly one canonical encoding: it is
+// re-encoded and compared, so no other spelling of the same recipe passes.
+pub Option(RecipePayload) recipe_decode(List(Int) b) {
+    Head h = head_at(b, 0);
+    if (h.major != 5 || (h.val != 5 && h.val != 6)) { return None; }
+    RdText d = rd_text(b, rd_key(b, h.next, 1).next);
+    RdUint v = rd_uint(b, rd_key(b, d.next, 2).next);
+    RdRules r = rd_rules(b, rd_key(b, v.next, 3).next);
+    Int sp = rd_key(b, r.next, 4).next;
+    Head sh = head_at(b, sp);
+    if (d.next < 0 || v.next < 0 || r.next < 0 || sh.major != 4 || sh.val < 1 || v.v > 4294967295) { return None; }
+    RdSteps ss = rd_steps(b, sh.next, sh.val, ListBuf());
+    Int op = rd_key(b, ss.next, 5).next;
+    Head oh = head_at(b, op);
+    if (ss.next < 0 || oh.major != 4) { return None; }
+    RdTexts os = rd_texts(b, oh.next, oh.val, []);
+    if (os.next < 0) { return None; }
+    RdSteps si = if (h.val == 6) { sign_in_at(b, rd_key(b, os.next, 6).next) } else { RdSteps {.v = [], .next = os.next} };
+    if (si.next != b.len()) { return None; }
+    RecipePayload rp = RecipePayload {.domain = d.v, .version = (UInt(32))v.v, .password_rules = r.v, .steps = ss.v, .allowed_origins = os.v, .sign_in = si.v};
+    return if (bytes_eq(recipe_cbor(rp), b)) { Some(rp) } else { None };
+}
+
+RdSteps sign_in_at(List(Int) b, Int at) {
+    if (at < 0) { return RdSteps {.v = [], .next = -1}; }
+    Head h = head_at(b, at);
+    if (h.major != 4 || h.val < 1) { return RdSteps {.v = [], .next = -1}; }
+    return rd_steps(b, h.next, h.val, ListBuf());
+}
+
+// ============================================================================
+// Repository signatures and the transparency log
+// ============================================================================
+
+PubKey ec_key(List(Int) sec1) { return PubKey {.kind = pubkey_ec(), .curve = P256, .point = sec1, .n = [], .e = [], .pss_only = false}; }
+
+Int signer_of(List(List(Int)) keys, List(Int) sig, List(Int) payload, Int i) {
+    if (i >= keys.len()) { return -1; }
+    Bool ok = match cose_sign1_open(sig, ec_key(keys[i]), []) { None => false, Some(p) => bytes_eq(p, payload) };
+    return if (ok) { i } else { signer_of(keys, sig, payload, i + 1) };
+}
+
+Int distinct_signers(List(List(Int)) keys, List(List(Int)) sigs, List(Int) payload, Int i, List(Int) seen) {
+    if (i >= sigs.len()) { return seen.len(); }
+    Int k = signer_of(keys, sigs[i], payload, 0);
+    Bool fresh = k >= 0 && !int_in(seen, k, 0);
+    return distinct_signers(keys, sigs, payload, i + 1, if (fresh) { seen.concat([k]) } else { seen });
+}
+
+Bool int_in(List(Int) xs, Int x, Int i) {
+    if (i >= xs.len()) { return false; }
+    if (xs[i] == x) { return true; }
+    return int_in(xs, x, i + 1);
+}
+
+// RFC 9162 Section 2.1.
+pub List(Int) leaf_hash(List(Int) leaf) { return sha256_bytes([0].concat(leaf)); }
+pub List(Int) node_hash(List(Int) l, List(Int) r) { return sha256_bytes([1].concat(l).concat(r)); }
+
+// RFC 9162 Section 2.1.3.2: verifying an inclusion proof.
+pub Bool inclusion_ok(Int index, Int size, List(Int) leaf, List(List(Int)) path, List(Int) root) {
+    if (index < 0 || index >= size) { return false; }
+    return incl(index, size - 1, leaf_hash(leaf), path, 0, root);
+}
+
+Bool incl(Int fn, Int sn, List(Int) r, List(List(Int)) path, Int i, List(Int) root) {
+    if (i >= path.len()) { return sn == 0 && bytes_eq(r, root); }
+    if (sn == 0) { return false; }
+    List(Int) p = path[i];
+    if ((fn & 1) == 1 || fn == sn) {
+        // Shift right while fn is even and non-zero, then once more.
+        Int k = if ((fn & 1) == 1) { 0 } else { evens(fn, 0) };
+        return incl(fn >> (k + 1), sn >> (k + 1), node_hash(p, r), path, i + 1, root);
+    }
+    return incl(fn >> 1, sn >> 1, node_hash(r, p), path, i + 1, root);
+}
+
+// The number of right shifts until fn is odd or zero.
+Int evens(Int fn, Int k) {
+    if (fn == 0 || (fn & 1) == 1) { return k; }
+    return evens(fn >> 1, k + 1);
+}
+
+pub type LogEntry = { Int time; List(Int) payload; };
+
+pub List(Int) entry_cbor(LogEntry e) { return cbe_bytes(e.payload, cbe_uint(e.time, cbe_array(2, []))); }
+
+// {1: tree size, 2: root}
+pub List(Int) tree_head_payload(Int size, List(Int) root) { return cbe_bytes(root, cbe_uint(2, cbe_uint(size, cbe_uint(1, cbe_map(2, []))))); }
+
+pub type RecipeBundle = {
+    List(Int) payload;                   // the recipe's canonical bytes
+    List(List(Int)) sigs;                // COSE_Sign1 by repository keys
+    Int log_time;                        // the entry's time
+    Int index; Int size; List(List(Int)) path; List(Int) root;
+    List(Int) tree_head;                 // COSE_Sign1 by the log key over {1: size, 2: root}
+};
+
+pub type Repository = { List(List(Int)) keys; Int threshold; List(Int) log_key; };
+
+// The files a device is given (src/agent/rotatecli.resid):
+//   repository = [[+ bstr key], uint threshold, bstr log key]
+//   bundle     = [bstr payload, [+ bstr sig], uint time, uint index, uint size, [* bstr path], bstr root, bstr tree head]
+
+type RdBytes = { List(Int) v; Int next; };
+type RdList = { List(List(Int)) v; Int next; };
+
+RdBytes rd_bstr(List(Int) b, Int p) {
+    Head h = head_at(b, p);
+    if (h.major != 2 || h.next + h.val > b.len()) { return RdBytes {.v = [], .next = -1}; }
+    return RdBytes {.v = b[h.next..h.next + h.val], .next = h.next + h.val};
+}
+
+RdList rd_bstrs(List(Int) b, Int p, Int n, ListBuf(List(Int)) acc) {
+    if (n == 0) { return RdList {.v = acc.finish(), .next = p}; }
+    RdBytes x = rd_bstr(b, p);
+    if (x.next < 0) { _ = acc.discard(); return RdList {.v = [], .next = -1}; }
+    return rd_bstrs(b, x.next, n - 1, acc.push(x.v));
+}
+
+RdList rd_bstr_array(List(Int) b, Int p) {
+    Head h = head_at(b, p);
+    if (h.major != 4 || h.val > 4096) { return RdList {.v = [], .next = -1}; }
+    return rd_bstrs(b, h.next, h.val, ListBuf());
+}
+
+pub Option(Repository) repository_decode(List(Int) b) {
+    Head h = head_at(b, 0);
+    if (h.major != 4 || h.val != 3) { return None; }
+    RdList ks = rd_bstr_array(b, h.next);
+    RdUint t = rd_uint(b, ks.next);
+    RdBytes lk = rd_bstr(b, t.next);
+    if (ks.next < 0 || t.next < 0 || lk.next != b.len()) { return None; }
+    return Some(Repository {.keys = ks.v, .threshold = t.v, .log_key = lk.v});
+}
+
+pub Option(RecipeBundle) bundle_decode(List(Int) b) {
+    Head h = head_at(b, 0);
+    if (h.major != 4 || h.val != 8) { return None; }
+    RdBytes pl = rd_bstr(b, h.next);
+    RdList sg = rd_bstr_array(b, pl.next);
+    RdUint tm = rd_uint(b, sg.next);
+    RdUint ix = rd_uint(b, tm.next);
+    RdUint sz = rd_uint(b, ix.next);
+    RdList pa = rd_bstr_array(b, sz.next);
+    RdBytes rt = rd_bstr(b, pa.next);
+    RdBytes th = rd_bstr(b, rt.next);
+    if (pl.next < 0 || sg.next < 0 || tm.next < 0 || ix.next < 0 || sz.next < 0 || pa.next < 0 || rt.next < 0 || th.next != b.len()) { return None; }
+    return Some(RecipeBundle {.payload = pl.v, .sigs = sg.v, .log_time = tm.v, .index = ix.v, .size = sz.v, .path = pa.v, .root = rt.v, .tree_head = th.v});
+}
+
+pub Int hold_sec() { return 7 * 86400; }
+
+// A bundle's recipe, verified: a threshold of repository signatures, and an
+// inclusion proof under a signed tree head.
+pub Result(RecipePayload, SymbolonError) verify_bundle(Repository repo, RecipeBundle b) {
+    if (repo.threshold < 1 || distinct_signers(repo.keys, b.sigs, b.payload, 0, []) < repo.threshold) {
+        return Err(ErrPolicyViolation("recipe not signed by the repository's threshold"));
+    }
+    Option(List(Int)) th = cose_sign1_open(b.tree_head, ec_key(repo.log_key), []);
+    Bool head_ok = match th { None => false, Some(p) => bytes_eq(p, tree_head_payload(b.size, b.root)) };
+    if (!head_ok) { return Err(ErrPolicyViolation("tree head not signed by the log")); }
+    if (!inclusion_ok(b.index, b.size, entry_cbor(LogEntry {.time = b.log_time, .payload = b.payload}), b.path, b.root)) {
+        return Err(ErrPolicyViolation("recipe not in the transparency log"));
+    }
+    Option(RecipePayload) r = recipe_decode(b.payload);
+    return match r { None => Err(ErrPolicyViolation("recipe does not decode")), Some(x) => Ok(x) };
+}
+
+// ============================================================================
+// Which version runs (SPEC 26.4, A-09)
+// ============================================================================
+
+Bool steps_eq(RecipeStep a, RecipeStep b) { return bytes_eq(step_cbor(a, []), step_cbor(b, [])); }
+
+// Whether `xs` is `ys` with some elements removed, order kept.
+Bool sub_steps(List(RecipeStep) xs, List(RecipeStep) ys, Int i, Int j) {
+    if (i >= xs.len()) { return true; }
+    if (j >= ys.len()) { return false; }
+    return if (steps_eq(xs[i], ys[j])) { sub_steps(xs, ys, i + 1, j + 1) } else { sub_steps(xs, ys, i, j + 1) };
+}
+
+pub Bool text_in(List(Str) xs, Str x, Int i) {
+    if (i >= xs.len()) { return false; }
+    if (xs[i] == x) { return true; }
+    return text_in(xs, x, i + 1);
+}
+
+Bool subset(List(Str) xs, List(Str) ys, Int i) {
+    if (i >= xs.len()) { return true; }
+    if (!text_in(ys, xs[i], 0)) { return false; }
+    return subset(xs, ys, i + 1);
+}
+
+// A version that only removes steps or origins (same domain and rules) needs
+// no hold.
+pub Bool only_removes(RecipePayload newer, RecipePayload older) {
+    return newer.domain == older.domain && bytes_eq(rules_cbor(newer.password_rules, []), rules_cbor(older.password_rules, []))
+        && sub_steps(newer.steps, older.steps, 0, 0) && subset(newer.allowed_origins, older.allowed_origins, 0);
+}
+
+// The recipe to run: the newest verified version for the domain that has
+// held 7 days (or only removes from the last version that worked), else the
+// last version that worked.
+pub Option(RecipePayload) choose(List(RecipePayload) verified, List(Int) times, Option(RecipePayload) last_worked, Str domain, Int now) {
+    return pick(verified, times, last_worked, domain, now, 0, last_worked);
+}
+
+Option(RecipePayload) pick(List(RecipePayload) vs, List(Int) ts, Option(RecipePayload) lw, Str d, Int now, Int i, Option(RecipePayload) best) {
+    if (i >= vs.len()) { return best; }
+    RecipePayload r = vs[i];
+    Bool held = now >= ts[i] + hold_sec();
+    Bool shrink = match lw { None => false, Some(w) => r.version > w.version && only_removes(r, w) };
+    Bool newer = match best { None => true, Some(b) => r.version > b.version };
+    Bool take = r.domain == d && newer && (held || shrink);
+    return pick(vs, ts, lw, d, now, i + 1, if (take) { Some(r) } else { best });
+}
+
+// ============================================================================
+// Running a recipe (SPEC 26.4)
+// ============================================================================
+
+// scheme://host[:port] of an absolute http(s) URL, lower-cased host; "" when
+// the URL has no such origin.
+pub Str origin_of(Str url) {
+    Int s = find(url, "://", 0);
+    if (s < 0) { return ""; }
+    Str scheme = str_to_lower(str_slice(url, 0, s));
+    if (scheme != "https" && scheme != "http") { return ""; }
+    Int start = s + 3;
+    Int end = first_of(url, start);
+    Str host = str_to_lower(str_slice(url, start, end));
+    if (str_len(host) == 0 || find(host, "@", 0) >= 0) { return ""; }
+    return scheme + "://" + host;
+}
+
+Int find(Str s, Str pat, Int i) {
+    if (i + str_len(pat) > str_len(s)) { return -1; }
+    if (str_slice(s, i, i + str_len(pat)) == pat) { return i; }
+    return find(s, pat, i + 1);
+}
+
+Int first_of(Str s, Int i) {
+    if (i >= str_len(s)) { return i; }
+    Str c = str_slice(s, i, i + 1);
+    if (c == "/" || c == "?" || c == "#") { return i; }
+    return first_of(s, i + 1);
+}
+
+List(Str) inter(List(Str) a, List(Str) b, Int i, List(Str) acc) {
+    if (i >= a.len()) { return acc; }
+    return inter(a, b, i + 1, if (text_in(b, a[i], 0) && !text_in(acc, a[i], 0)) { acc.concat([a[i]]) } else { acc });
+}
+
+// The origins the procedure may visit: the recipe's, intersected with the
+// exact origins saved with the vault item. A recipe cannot add one.
+pub List(Str) run_origins(RecipePayload r, List(Str) item_origins) { return inter(r.allowed_origins, item_origins, 0, []); }
+
+Bool slot_ok(Str s) { return s == "username" || s == "old" || s == "new" || s == "totp"; }
+
+// The plan check before any step runs: every navigation stays on the run
+// origins, every fill names a slot, and at least one step expects something.
+pub Result(List(Str), SymbolonError) check_plan(RecipePayload r, List(Str) item_origins) {
+    List(Str) os = run_origins(r, item_origins);
+    if (os.len() == 0) { return Err(ErrPolicyViolation("no origin the recipe and the item share")); }
+    Result(List(Str), SymbolonError) change = plan_steps(r.steps, os, 0, false, false);
+    return match change {
+        Err(e) => Err(e),
+        Ok(_) => if (r.sign_in.len() == 0) { Ok(os) } else { plan_steps(r.sign_in, os, 0, false, true) }
+    };
+}
+
+// The sign-in procedure (field 6) fills "password", never "old" or "new".
+Bool sign_in_slot_ok(Str s) { return s == "username" || s == "password" || s == "totp"; }
+
+Result(List(Str), SymbolonError) plan_steps(List(RecipeStep) ss, List(Str) os, Int i, Bool expects, Bool sign_in) {
+    if (i >= ss.len()) { return if (expects) { Ok(os) } else { Err(ErrPolicyViolation("a recipe must check its outcome")) }; }
+    RecipeStep s = ss[i];
+    Bool ok = match s {
+        StepNavigate(u) => text_in(os, origin_of(u), 0),
+        StepFill(_, slot) => if (sign_in) { sign_in_slot_ok(slot) } else { slot_ok(slot) },
+        StepPasskeyRegister => !sign_in,
+        _ => true
+    };
+    if (!ok) { return Err(ErrPolicyViolation(f"step {i} leaves the allowed origins or names no slot")); }
+    Bool e = expects || match s { StepExpect(_) => true, _ => false };
+    return plan_steps(ss, os, i + 1, e, sign_in);
+}
+
+// What the browser reports about the field a fill step targets.
+pub type InputInfo = { Str input_type; Str autocomplete; };
+
+// Fill-time check: the top-level origin is one of the run origins, and the
+// slot goes only into a field of its kind (SPEC 26.4).
+pub Bool fill_allowed(Str slot, InputInfo f, Str top_origin, List(Str) run) {
+    if (!text_in(run, top_origin, 0)) { return false; }
+    Str t = str_to_lower(f.input_type);
+    Str ac = str_to_lower(f.autocomplete);
+    if (slot == "old" || slot == "new" || slot == "password") { return t == "password"; }
+    if (slot == "totp") { return (t == "text" || t == "tel" || t == "number") && ac == "one-time-code"; }
+    if (slot == "username") { return t == "email" || ((t == "text") && (ac == "username" || ac == "email")); }
+    return false;
+}
+
+List(Str) destructive() {
+    return ["delete", "close account", "close your account", "unsubscribe all", "transfer", "remove two-factor",
+            "disable two-factor", "remove 2fa", "disable 2fa", "deactivate"];
+}
+
+Bool mentions(Str hay, List(Str) needles, Int i) {
+    if (i >= needles.len()) { return false; }
+    if (find(hay, needles[i], 0) >= 0) { return true; }
+    return mentions(hay, needles, i + 1);
+}
+
+// Click-time check: refuses a click whose target text or form action names
+// a destructive action. A backstop, not a guarantee.
+pub Bool click_allowed(Str target_text, Str form_action) {
+    return !mentions(str_to_lower(target_text), destructive(), 0) && !mentions(str_to_lower(form_action), destructive(), 0);
+}

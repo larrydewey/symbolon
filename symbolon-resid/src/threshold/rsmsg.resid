@@ -1,0 +1,31 @@
+// Messages of a re-share (src/threshold/reshare.resid), as they travel:
+// only types the CGGMP serializers already cover (CvPt, Pedersen and the
+// proofs), so the Paillier key is its modulus n.
+
+import "cggmp_zk.resid";
+import "cggmp_proofs.resid";
+import "cggmp_curve.resid";
+
+// A new party's announcement: Paillier modulus with mod proof, Pedersen
+// parameters with prm proof, ElGamal key with a Schnorr proof.
+//@ serial
+pub type RsAnnMsg = { Int id; List(UInt(64)) n; Pedersen ped; ModProof modp; PrmProof prm; CvPt elgamal; SchProof elg_proof; };
+
+// One encrypted contribution of a dealer to new party `to`.
+//@ serial
+pub type RsPartMsg = { Int to; List(UInt(64)) ct; };
+
+// A dealer's Feldman commitments and encrypted contributions.
+//@ serial
+pub type RsDealMsg = { Int dealer; List(CvPt) commits; List(RsPartMsg) parts; };
+
+// A new party's no-small-factor proof for its Paillier modulus, to `to`.
+//@ serial
+pub type RsFacMsg = { Int to; FacProof fac; };
+
+//@ serial
+pub type RsBody = RsAnn(RsAnnMsg) | RsDeal(RsDealMsg) | RsFac(RsFacMsg);
+
+// `to` is a new id, 0 for a broadcast.
+//@ serial
+pub type RsMsg = { Int from; Int to; RsBody body; };

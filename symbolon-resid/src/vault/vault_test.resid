@@ -1,0 +1,163 @@
+import "../types.resid";
+import "vault.resid";
+import "word.resid";
+import "hash.resid";
+import "ecdsa.resid";
+import "crypto.resid";
+
+List(Int) rep(Int b, Int n) {
+    if (n <= 0) { return []; }
+    return [b].concat(rep(b, n - 1));
+}
+
+List(Secret(UInt(8))) vk(Int b) { return secret_bytes(rep(b, 32)); }
+List(Int) vid() { return rep(7, 32); }
+List(Int) iid(Int n) { return rep(n, 16); }
+
+List(FieldPlain) login() {
+    return [FieldPlain {.name = "user", .value = secret_bytes(utf8("alice"))},
+            FieldPlain {.name = "password", .value = secret_bytes(utf8("hunter2"))}];
+}
+
+Bool is_ok(Result(Item, SymbolonError) r) { return match r { Ok(_) => true, Err(_) => false }; }
+Bool is_ok_p(Result(List(FieldPlain), SymbolonError) r) { return match r { Ok(_) => true, Err(_) => false }; }
+
+@requires(declassify)
+Item make(Int n, Int key) {
+    return item_seal(vk(key), vid(), iid(n), 1, "login", login(), false, None) else { fail_item() };
+}
+
+Item fail_item() {
+    return Item {.id = [], .version = 0, .kind = "", .fields = {}, .in_duress_subset = false, .handling_policy = None};
+}
+
+@requires(declassify)
+Int first_byte(Result(List(FieldPlain), SymbolonError) r, Str name) {
+    return match r {
+        Ok(fs) => first_of(fs, name, 0),
+        Err(_) => -1
+    };
+}
+
+@requires(declassify)
+Int first_of(List(FieldPlain) fs, Str name, Int i) {
+    if (i >= fs.len()) { return -2; }
+    if (fs[i].name == name) { return (Int)declassify(fs[i].value[0], "test reads one byte"); }
+    return first_of(fs, name, i + 1);
+}
+
+@requires(declassify)
+test "seal then open recovers the fields" {
+    Item it = make(1, 5);
+    expect(first_byte(item_open(vk(5), vid(), it), "password")).toEqual(104);
+    expect(first_byte(item_open(vk(5), vid(), it), "user")).toEqual(97);
+}
+
+@requires(declassify)
+test "the wrong vault key does not open" {
+    Item it = make(1, 5);
+    expect(is_ok_p(item_open(vk(6), vid(), it))).toBeFalse();
+}
+
+@requires(declassify)
+test "ciphertext moved to another item id does not open" {
+    Item it = make(1, 5);
+    Item moved = Item {.id = iid(2), .version = it.version, .kind = it.kind, .fields = it.fields,
+                       .in_duress_subset = false, .handling_policy = None};
+    expect(is_ok_p(item_open(vk(5), vid(), moved))).toBeFalse();
+}
+
+@requires(declassify)
+test "a bumped version does not open" {
+    Item it = make(1, 5);
+    Item bumped = Item {.id = it.id, .version = 2, .kind = it.kind, .fields = it.fields,
+                        .in_duress_subset = false, .handling_policy = None};
+    expect(is_ok_p(item_open(vk(5), vid(), bumped))).toBeFalse();
+}
+
+@requires(declassify)
+test "another vault id does not open" {
+    Item it = make(1, 5);
+    expect(is_ok_p(item_open(vk(5), rep(8, 32), it))).toBeFalse();
+}
+
+@requires(declassify)
+test "reencrypt moves to the new key and bumps the version" {
+    Item it = make(1, 5);
+    Result(Item, SymbolonError) r = item_reencrypt(vk(5), vk(6), vid(), it);
+    expect(is_ok(r)).toBeTrue();
+    Item n = r else { fail_item() };
+    expect(n.version).toEqual(2);
+    expect(is_ok_p(item_open(vk(5), vid(), n))).toBeFalse();
+    expect(first_byte(item_open(vk(6), vid(), n), "password")).toEqual(104);
+}
+
+@requires(declassify)
+test "merkle proofs verify and tampering fails" {
+    List(Item) items = [make(3, 5), make(1, 5), make(2, 5), make(4, 5), make(5, 5)];
+    List(Int) root = merkle_root(items);
+    Option(List(ProofStep)) p = merkle_proof(items, iid(4));
+    expect(match p { Some(pr) => merkle_verify(root, make(4, 5), pr), None => false }).toBeTrue();
+    expect(match p { Some(pr) => merkle_verify(root, make(2, 5), pr), None => true }).toBeFalse();
+    List(Int) other = merkle_root([make(3, 5), make(1, 5), make(2, 5), make(4, 6), make(5, 5)]);
+    expect(other == root).toBeFalse();
+    expect(merkle_root([make(3, 5), make(1, 5), make(2, 5), make(4, 5), make(5, 5)]) == root).toBeTrue();
+}
+
+@requires(declassify)
+test "RFC 6238 SHA-256 vector at t=59" {
+    List(Secret(UInt(8))) seed = secret_bytes(utf8("12345678901234567890123456789012"));
+    expect(totp_code(seed, 59, 30, 8, false)).toEqual(46119246);
+}
+
+List(Int) privk(Int n) {
+    return (rep(0, 31).concat([n]));
+}
+
+List(Int) idn(Int n) { return sha256_bytes([n]); }
+
+Quorum q2() {
+    Party a = Party {.id = idn(2), .kind = party_kind_device(), .auth_key = ec_public_key(P256, privk(2)),
+                     .hpke_key = [], .label = "a", .attestation = NoAttestation};
+    return Quorum {.parties = [a], .t = 1, .root_pubkey = [], .epoch = 0, .transcript_digest = []};
+}
+
+LogHead log_head(UInt(64) seq) {
+    return LogHead {.log_id = rep(9, 32), .sequence = seq, .digest = [], .quorum = q2(),
+                    .policy = Policy {.device_sigs_for_authority = 2, .recovery_delay_sec = 86400, .guardians = [],
+                                      .guardian_threshold = 0, .witnesses = [], .duress_window_sec = 0,
+                                      .cosigner_policy = NoCosignerPolicy}};
+}
+
+VaultHead signed_head(List(Item) items, UInt(64) ver, UInt(64) log_seq, Int signer_key) {
+    VaultHead unsigned = VaultHead {
+        .vault_id = vid(), .version = ver, .merkle_root = merkle_root(items), .log_id = rep(9, 32),
+        .log_sequence = log_seq, .suite = 1, .signer = idn(signer_key), .sig = [] };
+    EcSig s = ecdsa_sign_digest(P256, Sha256, privk(signer_key), hash_bytes(Sha256, head_tbs(unsigned)));
+    return VaultHead {
+        .vault_id = unsigned.vault_id, .version = unsigned.version, .merkle_root = unsigned.merkle_root,
+        .log_id = unsigned.log_id, .log_sequence = unsigned.log_sequence, .suite = 1,
+        .signer = unsigned.signer, .sig = ecdsa_raw_of(P256, s) };
+}
+
+Bool accepted(Result(VaultState, SymbolonError) r) { return match r { Ok(_) => true, Err(_) => false }; }
+
+@requires(declassify)
+test "vault head: accepted only when signed by a current device, root and version fine" {
+    List(Item) items = [make(1, 5), make(2, 5)];
+    VaultState good = VaultState {.head = signed_head(items, 3, 4, 2), .items = items};
+    expect(accepted(vault_accept(good, vid(), log_head(10), 3))).toBeTrue();
+    expect(accepted(vault_accept(good, vid(), log_head(10), 4))).toBeFalse();   // older than accepted
+    expect(accepted(vault_accept(good, vid(), log_head(3), 3))).toBeFalse();    // cites a later log sequence
+    VaultState removed = VaultState {.head = signed_head(items, 3, 4, 3), .items = items};
+    expect(accepted(vault_accept(removed, vid(), log_head(10), 3))).toBeFalse(); // signer not in quorum
+    VaultState swapped = VaultState {.head = signed_head(items, 3, 4, 2), .items = [make(1, 5), make(3, 5)]};
+    expect(accepted(vault_accept(swapped, vid(), log_head(10), 3))).toBeFalse(); // root mismatch
+}
+
+@requires(declassify)
+test "RFC 6238 SHA-1 vector at t=59 and t=1111111109" {
+    List(Secret(UInt(8))) seed = secret_bytes(utf8("12345678901234567890"));
+    expect(totp_code(seed, 59, 30, 8, true)).toEqual(94287082);
+    expect(totp_code(seed, 1111111109, 30, 8, true)).toEqual(7081804);
+}

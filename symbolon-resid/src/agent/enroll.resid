@@ -1,0 +1,401 @@
+// Enrolling a device (SPEC 11.1, 11.3): `symbolon device enroll` on a
+// device of the quorum, `symbolon device join` on the new one.
+//
+// The enrolling device X appends propose-party(N), then runs a re-share
+// with the cosigner and N (X and the cosigner deal; X, the cosigner and N
+// receive; the kit is offline and gets fresh material), collects every
+// participant's signature on the reshare event, publishes it, refreshes
+// the kit's material for the new epoch (SPEC 10.6), and sends N the chain
+// code and the vault key.
+//
+// Attestation of N (SPEC 21) is checked when N's evidence is given; an
+// unprotected-profile device has none, and `status` says so.
+
+import "../types.resid";
+import "../core/log.resid";
+import "../core/event.resid";
+import "../core/event_decode.resid";
+import "../cosigner/cosigner.resid";
+import "../threshold/threshold.resid";
+import "../threshold/reshare.resid";
+import "../recovery/recovery.resid";
+import "../duress/duress.resid";
+import "../net/proto.resid";
+import "../net/services.resid";
+import "state.resid";
+import "common.resid";
+import "session.resid";
+import "cosignerd.resid";
+import "device.resid";
+import "duresscli.resid";
+import "serials.resid";
+import "word.resid";
+import "crypto.resid";
+import "clock.resid";
+
+pub Party none_party() { return Party {.id = [], .kind = 0, .auth_key = [], .hpke_key = [], .label = "", .attestation = NoAttestation}; }
+
+Int count_devices(List(Party) ps, Int i, Int acc) {
+    if (i >= ps.len()) { return acc; }
+    return count_devices(ps, i + 1, acc + (if (ps[i].kind == party_kind_device()) { 1 } else { 0 }));
+}
+
+// Field 6 in force: the digests of the latest event that is not pending (a
+// pending recover carries the new kit's digest, in force only once it
+// takes effect).
+pub List(List(Int)) field6(List(SignedEvent) es) { return field6_in_force(es, [], es.len() - 1); }
+
+pub List(List(Int)) field6_in_force(List(SignedEvent) es, List(UInt(64)) pending, Int i) {
+    if (i < 0) { return []; }
+    Bool is_pending = in_seqs(pending, es[i].payload.sequence, 0);
+    return if (is_pending) { field6_in_force(es, pending, i - 1) } else { es[i].payload.next_recovery_key_digests };
+}
+
+Bool in_seqs(List(UInt(64)) xs, UInt(64) s, Int i) {
+    if (i >= xs.len()) { return false; }
+    if (xs[i] == s) { return true; }
+    return in_seqs(xs, s, i + 1);
+}
+
+EventPayload next_event(VerifiedHead vh, EventBody b, List(List(Int)) digests) {
+    return EventPayload {.log_id = Some(vh.head.log_id), .sequence = vh.head.sequence + 1, .predecessor_digest = Some(vh.head.digest),
+                         .suite = 1, .body = b, .next_recovery_key_digests = digests, .advisory_time = (UInt(64))0};
+}
+
+// An event signed by `sigs`, witnessed and published; then the log again.
+@requires(network, clock(readonly), declassify)
+pub Result(VerifiedHead, Str) publish_event(DeviceConfig c, EventPayload p, List(Int) enc, List(EventSig) sigs) {
+    List(WitnessCosignature) cs = cosigs_for(c.witnesses, c.ca, c.log_id, p.sequence, sha256_bytes(enc), 0, []);
+    if (cs.len() < 2) { return Err("too few witnesses co-signed"); }
+    if (!log_put(relay_ep(c), c.log_id, p.sequence, cbor_of_event(StoredEvent {.encoded = enc, .sigs = sigs, .cosigs = cs}))) { return Err("the relay refused the event"); }
+    return match verified_log(relay_ep(c), c.log_id) { Ok(v) => Ok(v), Err(e) => Err("the log does not verify: " + err_text(e)) };
+}
+
+// ─── `device enroll DIR NEW_DEVICE_KEYS [PRIMES]` ───────────────
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+pub Int device_enroll(Str dir, Str keys_hex, Str primes_file) {
+    Option(DeviceConfig) oc = load_config(dir);
+    Option(PartyKeys) ok = keys_of_cbor(cose_hex_decode(keys_hex));
+    return match oc {
+        None => dfail("not set up"),
+        Some(c) => match ok {
+            None => dfail("those are not a device's keys"),
+            Some(nk) => enroll_unlocked(dir, c, nk, read_pin(), primes_file)
+        }
+    };
+}
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+Int enroll_unlocked(Str dir, DeviceConfig c, PartyKeys nk, Str pin, Str primes_file) {
+    Unlocked u = unlock_dir(dir, c, pin);
+    if (u.kind != 1) { return dfail("wrong PIN"); }
+    Result(VerifiedHead, SymbolonError) rv = verified_log(relay_ep(c), c.log_id);
+    Option(CgConfig) cg = load_share(dir, u.real.dek);
+    return match rv {
+        Err(e) => dfail(err_text(e)),
+        Ok(vh) => match cg {
+            None => dfail("no share"),
+            Some(x) => propose(dir, c, u, x, vh, nk, pin, primes_file)
+        }
+    };
+}
+
+@requires(filesystem, network, device, declassify, clock, environment)
+Int propose(Str dir, DeviceConfig c, Unlocked u, CgConfig x, VerifiedHead vh, PartyKeys nk, Str pin, Str primes_file) {
+    Quorum q = vh.head.quorum;
+    if (pos1(q.parties, nk.party, 0) != 0) { return dfail("that device is already a party"); }
+    Party np = Party {.id = nk.party, .kind = party_kind_device(), .auth_key = nk.auth_key, .hpke_key = nk.hpke_key,
+                      .label = f"device {count_devices(q.parties, 0, 0) + 1}", .attestation = NoAttestation};
+    List(SignedEvent) es = fetch_log(relay_ep(c), c.log_id, 0, []);
+    EventPayload p = next_event(vh, ProposePartyBody(np, sha256_bytes(cbor_of_keys(nk))), field6_in_force(es, vh.pending, es.len() - 1));
+    List(Int) enc = payload_cbor(p) else { [] };
+    Result(List(Int), Str) s = dk_sign(c, u.real, u.st, enc);
+    return match s {
+        Err(m) => dfail(m),
+        Ok(sig) => match publish_event(c, p, enc, [EventSig {.signer = c.party, .sig = sig}]) {
+            Err(m) => dfail("propose-party: " + m),
+            Ok(vh2) => reshare_in(dir, c, u, x, vh2, q.parties.concat([np]), pin, primes_file)
+        }
+    };
+}
+
+pub List(Int) receivers_of(List(Party) ps, Int i, List(Int) acc) {
+    if (i >= ps.len()) { return acc; }
+    Bool offline = ps[i].kind == party_kind_kit() || ps[i].kind == party_kind_guardian();
+    return receivers_of(ps, i + 1, if (offline) { acc } else { acc.concat([i + 1]) });
+}
+
+pub List(Int) offline_of(List(Party) ps, Int i, List(Int) acc) {
+    if (i >= ps.len()) { return acc; }
+    Bool offline = ps[i].kind == party_kind_kit() || ps[i].kind == party_kind_guardian();
+    return offline_of(ps, i + 1, if (offline) { acc.concat([i + 1]) } else { acc });
+}
+
+pub Option(Party) kit_of(List(Party) ps, Int i) {
+    if (i >= ps.len()) { return None; }
+    if (ps[i].kind == party_kind_kit()) { return Some(ps[i]); }
+    return kit_of(ps, i + 1);
+}
+
+// X and the cosigner deal (t = 2 of the old quorum); every online party of
+// the new quorum receives.
+@requires(filesystem, network, device, declassify, clock, environment)
+Int reshare_in(Str dir, DeviceConfig c, Unlocked u, CgConfig x, VerifiedHead vh, List(Party) np, Str pin, Str primes_file) {
+    Quorum q = vh.head.quorum;
+    Party cos = cosigner_of(q.parties, 0) else { none_party() };
+    if (cos.id.len() == 0) { return dfail("no cosigner to re-share with"); }
+    List(Int) sid = random_bytes(32);
+    ReshareInvite inv0 = ReshareInvite {.session_id = sid, .log_id = c.log_id, .new_parties = np, .dealers = [pos1(q.parties, c.party, 0), pos1(q.parties, cos.id, 0)],
+        .receivers = receivers_of(np, 0, []), .offline = offline_of(np, 0, []), .degree = (Int)q.t - 1, .epoch = (Int)q.epoch + 1, .requester = c.party, .sig = []};
+    Result(List(Int), Str) rs = dk_sign(c, u.real, u.st, request_tbs(sid, reshare_message(inv0), q.epoch, c.party, request_reshare()));
+    List(Int) rsig = match rs { Ok(s) => s, Err(_) => [] };
+    if (rsig.len() != 64) { return dfail("the device key did not sign the request"); }
+    ReshareInvite inv = ReshareInvite {.session_id = sid, .log_id = c.log_id, .new_parties = np, .dealers = inv0.dealers, .receivers = inv0.receivers,
+        .offline = inv0.offline, .degree = inv0.degree, .epoch = inv0.epoch, .requester = c.party, .sig = rsig};
+    Endpoint relay = relay_ep(c);
+    Int me_new = pos1(np, c.party, 0);
+    Local me = Local {.party = c.party, .cg = me_new, .hpke_sk = device_hpke(u.real.dek).sk};
+    List(Remote) rem = session_remotes(np, inv.receivers, c.party, 0, []);
+    Int start = mailbox_end(relay, c.party, c.mbox_next);
+    if (!send_all_invites(relay, me, rem, WReshare(inv), 0)) { return dfail("cannot reach the relay"); }
+    println("device: re-sharing to the new quorum (Paillier keys: this can take minutes)...");
+    RsCtx rc = RsCtx {.self = me_new, .old_self = pos1(q.parties, c.party, 0), .dealers = inv.dealers, .receivers = inv.receivers, .offline = inv.offline,
+        .degree = inv.degree, .old = [x], .root = q.root_pubkey, .session_id = sid, .seed = random_bytes(32), .primes = primes_of(primes_file)};
+    return match rs_start(rc) {
+        Err(e) => dfail("re-share: " + e.why),
+        Ok(s0) => after_session(dir, c, u, vh, np, inv, rem, pin,
+            run_session(relay, sid, [Seat {.me = me, .st = s0.state, .round = 1, .out = s0.out, .done = false}], rem, [Cursor {.party = c.party, .next = start}], [],
+                        lambda(t, msgs) { rs_adapt(t, msgs) }, 1800))
+    };
+}
+
+@requires(network, declassify, clock(readonly))
+pub Bool send_all_invites(Endpoint relay, Local me, List(Remote) rs, Packet w, Int i) {
+    if (i >= rs.len()) { return true; }
+    return send_to(relay, me, rs[i], w) && send_all_invites(relay, me, rs, w, i + 1);
+}
+
+@requires(filesystem, network, device, declassify, clock, environment)
+pub Int after_session(Str dir, DeviceConfig c, Unlocked u, VerifiedHead vh, List(Party) np, ReshareInvite inv, List(Remote) rem, Str pin, Run(RsState) r) {
+    if (str_len(r.fail) > 0) { return dfail("re-share: " + r.fail); }
+    RsResult res = rs_result(r.seats[0].st) else { RsResult {.cfg = None, .offline = [], .transcript = []} };
+    Option(CgConfig) ocfg = res.cfg;
+    CgConfig ncfg = ocfg else { CgConfig {.id = 0, .threshold = 0, .ecdsa = [], .elgamal = [], .p = [], .q = [], .rid = [], .chain_key = [], .public = []} };
+    if (ncfg.ecdsa.len() == 0 || res.offline.len() != 1) { return dfail("the re-share gave no share"); }
+    Quorum q = vh.head.quorum;
+    Quorum nq = Quorum {.parties = np, .t = q.t, .root_pubkey = q.root_pubkey, .epoch = q.epoch + 1, .transcript_digest = res.transcript};
+    List(SignedEvent) es = fetch_log(relay_ep(c), c.log_id, 0, []);
+    EventPayload p = next_event(vh, ReshareBody(nq), field6_in_force(es, vh.pending, es.len() - 1));
+    List(Int) enc = payload_cbor(p) else { [] };
+    Endpoint relay = relay_ep(c);
+    Local me = Local {.party = c.party, .cg = 0, .hpke_sk = device_hpke(u.real.dek).sk};
+    Int start = mailbox_end(relay, c.party, c.mbox_next);
+    if (!send_all_invites(relay, me, rem, WSignEvent(enc), 0)) { return dfail("cannot reach the relay"); }
+    List(EventSig) theirs = collect_sigs(relay, me, rem, Cursor {.party = c.party, .next = start}, enc, 0, []);
+    if (theirs.len() != rem.len()) { return dfail("not every party signed the reshare event"); }
+    Result(List(Int), Str) ms = dk_sign(c, u.real, u.st, enc);
+    List(Int) mine = match ms { Ok(s) => s, Err(_) => [] };
+    return match publish_event(c, p, enc, [EventSig {.signer = c.party, .sig = mine}].concat(theirs)) {
+        Err(m) => dfail("reshare: " + m),
+        Ok(vh2) => finish_enroll(dir, c, u, vh2, ncfg, res, rem)
+    };
+}
+
+@requires(network, declassify, clock)
+List(EventSig) collect_sigs(Endpoint relay, Local me, List(Remote) rem, Cursor cur, List(Int) enc, Int i, List(EventSig) acc) {
+    if (i >= rem.len()) { return acc; }
+    // Each signature is checked by the log verifier when the event is published.
+    List(Int) s = wait_event_sig(relay, me, rem[i], cur, clock_now_seconds());
+    return collect_sigs(relay, me, rem, cur, enc, i + 1, if (s.len() == 64) { acc.concat([EventSig {.signer = rem[i].party, .sig = s}]) } else { acc });
+}
+
+// The new epoch: the kit's fresh material (a to the kit, k_b to the
+// cosigner, the kit secrets under the new k_K), the secrets to the new
+// device, and this device's new share.
+@requires(filesystem, network, device, declassify, clock)
+Int finish_enroll(Str dir, DeviceConfig c, Unlocked u, VerifiedHead vh, CgConfig ncfg, RsResult res, List(Remote) rem) {
+    Quorum nq = vh.head.quorum;
+    Party kit = kit_of(nq.parties, 0) else { none_party() };
+    Party cos = cosigner_of(nq.parties, 0) else { none_party() };
+    Endpoint relay = relay_ep(c);
+    Local me = Local {.party = c.party, .cg = 0, .hpke_sk = device_hpke(u.real.dek).sk};
+    List(Int) kk = random_bytes(32);
+    List(Int) kb = random_bytes(32);
+    List(Int) ka = kit_key(kk, kb);
+    Wrapped wa = offline_wrap(kit.hpke_key, c.log_id, nq.epoch, kit.id, half_bytes(res.offline[0].share, ka), random_bytes(32)) else { Wrapped {.enc = [], .ct = []} };
+    Bool ok = wa.ct.len() > 0
+        && blob_put(relay, "kit-" + hex_encode(c.log_id) + "-a", cbor_of_blob(WrappedBlob {.enc = wa.enc, .ct = wa.ct}))
+        && blob_put(relay, "kit-" + hex_encode(c.log_id) + "-secrets", kit_secrets_seal(secret_bytes(kk), c.log_id, nq.epoch, u.real.cc, u.real.vault_key))
+        && send_to(relay, me, Remote {.party = cos.id, .cg = 0, .hpke_pub = cos.hpke_key}, WKitKey(kb))
+        && send_secrets(relay, me, rem, cos.id, u, 0)
+        && store_share(dir, u.real.dek, ncfg) && store_dshare(dir, u.real, ncfg)
+        && save_config(dir, with_log(c, c.witnesses, c.log_id, mailbox_end(relay, c.party, c.mbox_next), c.peers));
+    if (!ok) { return dfail("cannot finish the enrollment"); }
+    println(f"enrolled: epoch {nq.epoch}, {nq.parties.len()} parties");
+    return 0;
+}
+
+// The chain code and vault key go to the new devices (every remote but the
+// cosigner).
+@requires(network, declassify, clock(readonly))
+Bool send_secrets(Endpoint relay, Local me, List(Remote) rem, List(Int) cos, Unlocked u, Int i) {
+    if (i >= rem.len()) { return true; }
+    if (bytes_eq(rem[i].party, cos)) { return send_secrets(relay, me, rem, cos, u, i + 1); }
+    Bool ok = send_to(relay, me, rem[i], WEnrollSecrets(EnrollSecrets {.cc = reveal(u.real.cc), .vault_key = reveal(u.real.vault_key)}));
+    return ok && send_secrets(relay, me, rem, cos, u, i + 1);
+}
+
+// ─── `device join DIR ENROLLING_DEVICE_KEYS [PRIMES]` ───────────
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+pub Int device_join(Str dir, Str keys_hex, Str primes_file) {
+    Option(DeviceConfig) oc = load_config(dir);
+    Option(PartyKeys) ok = keys_of_cbor(cose_hex_decode(keys_hex));
+    return match oc {
+        None => dfail("run `symbolon device new` first"),
+        Some(c) => match ok {
+            None => dfail("those are not a device's keys"),
+            Some(xk) => join_unlocked(dir, c, xk, read_pin(), primes_file)
+        }
+    };
+}
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+Int join_unlocked(Str dir, DeviceConfig c, PartyKeys xk, Str pin, Str primes_file) {
+    Unlocked u = unlock_dir(dir, c, pin);
+    if (u.kind != 1) { return dfail("wrong PIN"); }
+    Local me = Local {.party = c.party, .cg = 0, .hpke_sk = device_hpke(u.real.dek).sk};
+    Remote x = Remote {.party = xk.party, .cg = 0, .hpke_pub = xk.hpke_key};
+    println("device: waiting for the enrolling device...");
+    Waited w = wait_wire(relay_ep(c), me, [x], Cursor {.party = c.party, .next = c.mbox_next}, clock_now_seconds(), 600, 1);
+    Option(Packet) ow = w.w;
+    return match ow {
+        None => dfail("no re-share invitation"),
+        Some(wire) => match wire {
+            WReshare(inv) => join_session(dir, c, u, x, inv, w, pin, primes_file),
+            _ => dfail("unexpected message")
+        }
+    };
+}
+
+// The first Packet of kind `kind` (1 reshare invite, 2 sign event, 3 enroll
+// secrets) from one of `from`, and the messages read with it.
+pub type Waited = { Option(Packet) w; List(Got) all; Cursor cur; };
+
+Int kind_of(Packet w) { return match w { WReshare(_) => 1, WSignEvent(_) => 2, WEnrollSecrets(_) => 3, _ => 0 }; }
+
+Option(Packet) first_kind(List(Got) gs, Int kind, Int i) {
+    if (i >= gs.len()) { return None; }
+    if (kind_of(gs[i].w) == kind) { return Some(gs[i].w); }
+    return first_kind(gs, kind, i + 1);
+}
+
+@requires(network, declassify, clock)
+pub Waited wait_wire(Endpoint relay, Local me, List(Remote) from, Cursor cur, Int since, Int limit_s, Int kind) {
+    Drained d = drain(relay, me, from, cur, ListBuf());
+    Option(Packet) w = first_kind(d.got, kind, 0);
+    return match w {
+        Some(x) => Waited {.w = Some(x), .all = d.got, .cur = d.cur},
+        None => if (clock_now_seconds() - since > limit_s) { Waited {.w = None, .all = d.got, .cur = d.cur} } else { wait_more(relay, me, from, d.cur, since, limit_s, kind) }
+    };
+}
+
+@requires(network, declassify, clock)
+Waited wait_more(Endpoint relay, Local me, List(Remote) from, Cursor cur, Int since, Int limit_s, Int kind) {
+    _ = clock_sleep_ms(200);
+    return wait_wire(relay, me, from, cur, since, limit_s, kind);
+}
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+Int join_session(Str dir, DeviceConfig c, Unlocked u, Remote x, ReshareInvite inv, Waited w, Str pin, Str primes_file) {
+    Endpoint relay = relay_ep(c);
+    DeviceConfig c1 = with_log(c, c.witnesses, inv.log_id, w.cur.next, c.peers);
+    Result(VerifiedHead, SymbolonError) rv = verified_log(relay, inv.log_id);
+    VerifiedHead vh = match rv { Ok(v) => v, Err(_) => VerifiedHead {.head = LogHead {.log_id = [], .sequence = 0, .digest = [], .quorum = Quorum {.parties = [], .t = 0, .root_pubkey = [], .epoch = 0, .transcript_digest = []}, .policy = policy_of_e0([])}, .witness_cosigs = [], .pending = []} };
+    if (vh.head.log_id.len() == 0) { return dfail("the log does not verify"); }
+    Int me_new = pos1(inv.new_parties, c.party, 0);
+    if (me_new == 0 || (Int)vh.head.quorum.epoch + 1 != inv.epoch) { return dfail("this device is not in that re-share"); }
+    List(Remote) rem = session_remotes(inv.new_parties, inv.receivers, c.party, 0, []);
+    Local me = Local {.party = c.party, .cg = me_new, .hpke_sk = device_hpke(u.real.dek).sk};
+    RsCtx rc = RsCtx {.self = me_new, .old_self = 0, .dealers = inv.dealers, .receivers = inv.receivers, .offline = inv.offline, .degree = inv.degree,
+        .old = [], .root = vh.head.quorum.root_pubkey, .session_id = inv.session_id, .seed = random_bytes(32), .primes = primes_of(primes_file)};
+    return match rs_start(rc) {
+        Err(e) => dfail("re-share: " + e.why),
+        Ok(s0) => join_after(dir, c1, u, x, inv, vh, pin,
+            run_session(relay, inv.session_id, [Seat {.me = me, .st = s0.state, .round = 1, .out = s0.out, .done = false}], rem, [w.cur], w.all,
+                        lambda(t, msgs) { rs_adapt(t, msgs) }, 1800))
+    };
+}
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+Int join_after(Str dir, DeviceConfig c, Unlocked u, Remote x, ReshareInvite inv, VerifiedHead vh, Str pin, Run(RsState) r) {
+    if (str_len(r.fail) > 0) { return dfail("re-share: " + r.fail); }
+    RsResult res = rs_result(r.seats[0].st) else { RsResult {.cfg = None, .offline = [], .transcript = []} };
+    Option(CgConfig) ocfg = res.cfg;
+    CgConfig ncfg = ocfg else { CgConfig {.id = 0, .threshold = 0, .ecdsa = [], .elgamal = [], .p = [], .q = [], .rid = [], .chain_key = [], .public = []} };
+    if (ncfg.ecdsa.len() == 0) { return dfail("the re-share gave no share"); }
+    Endpoint relay = relay_ep(c);
+    Local me = Local {.party = c.party, .cg = 0, .hpke_sk = device_hpke(u.real.dek).sk};
+    Cursor cur = r.cursors[0];
+    Waited ev = wait_wire(relay, me, [x], cur, clock_now_seconds(), 600, 2);
+    Option(Packet) evw = ev.w;
+    List(Int) enc = match evw { Some(wv) => sign_event_of(wv), None => [] };
+    Option(EventPayload) op = payload_decode(enc);
+    Bool ok = match op {
+        None => false,
+        Some(p) => reshare_matches(p, res, inv)
+    };
+    if (!ok) { return dfail("not the reshare event of this re-share"); }
+    Result(List(Int), Str) s = dk_sign(c, u.real, u.st, enc);
+    List(Int) sig = match s { Ok(v) => v, Err(_) => [] };
+    if (sig.len() != 64 || !send_to(relay, me, x, WEventSig(sig))) { return dfail("cannot sign the reshare event"); }
+    Waited sec = wait_wire(relay, me, [x], ev.cur, clock_now_seconds(), 600, 3);
+    Option(Packet) sw = sec.w;
+    return match sw {
+        Some(wv) => match wv { WEnrollSecrets(es) => joined(dir, c, u, pin, ncfg, es, vh, sec.cur), _ => dfail("no secrets") },
+        None => dfail("no secrets from the enrolling device")
+    };
+}
+
+List(Int) sign_event_of(Packet w) { return match w { WSignEvent(b) => b, _ => [] }; }
+
+Bool reshare_matches(EventPayload p, RsResult res, ReshareInvite inv) {
+    EventBody b = p.body;
+    return match b { ReshareBody(nq) => bytes_eq(nq.transcript_digest, res.transcript) && (Int)nq.epoch == inv.epoch, _ => false };
+}
+
+// The new device's profile, resealed with the quorum's chain code and vault
+// key, and its share and configuration stored.
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+Int joined(Str dir, DeviceConfig c, Unlocked u, Str pin, CgConfig ncfg, EnrollSecrets es, VerifiedHead vh, Cursor cur) {
+    if (es.cc.len() != 32 || es.vault_key.len() != 32) { return dfail("malformed secrets"); }
+    RealProfile real = RealProfile {.share = u.real.share, .cc = secret_bytes(es.cc), .vault_key = secret_bytes(es.vault_key), .dek = u.real.dek, .duress_hpke_pub = u.real.duress_hpke_pub};
+    List(Secret(UInt(8))) k = unlock_key_for(c, u.st, true);
+    List(Secret(UInt(8))) rp = encode_real(real) else { [] };
+    // Which file held the real profile: the one this key opens.
+    Bool a_real = unlock(k, get_file(dir + "/blob_a"), []).kind == 1;
+    List(Int) blob = seal_blob(k, random_bytes(12), rp);
+    Bool ok = filesystem.write_bytes(dir + (if (a_real) { "/blob_a" } else { "/blob_b" }), blob)
+        && store_share(dir, u.real.dek, ncfg) && store_dshare(dir, real, ncfg)
+        && send_duress_key(dir, relay_ep(c), Local {.party = c.party, .cg = 0, .hpke_sk = device_hpke(u.real.dek).sk}, cos_remote(vh))
+        && save_config(dir, with_log(c, eps_of(vh.head.policy.witnesses, 0, []), c.log_id, cur.next, c.peers));
+    if (!ok) { return dfail("cannot store the enrollment"); }
+    println("joined the quorum: log " + hex_encode(c.log_id));
+    return 0;
+}
+
+pub Remote cos_remote(VerifiedHead vh) {
+    Party cos = cosigner_of(vh.head.quorum.parties, 0) else { none_party() };
+    return Remote {.party = cos.id, .cg = 0, .hpke_pub = cos.hpke_key};
+}
+
+// Witness endpoints from the policy's URLs (http://host:port).
+pub List(WitnessEp) eps_of(List(WitnessRef) ws, Int i, List(WitnessEp) acc) {
+    if (i >= ws.len()) { return acc; }
+    Str u = ws[i].url;
+    Str hp = if (str_len(u) > 7 && str_slice(u, 0, 7) == "http://") { str_slice(u, 7, str_len(u)) } else { u };
+    List(Str) parts = str_split(hp, ":");
+    List(WitnessEp) next = if (parts.len() == 2) { acc.concat([WitnessEp {.host = parts[0], .port = str_parse_int(parts[1]), .key = ws[i].key}]) } else { acc };
+    return eps_of(ws, i + 1, next);
+}

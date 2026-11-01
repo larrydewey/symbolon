@@ -1,0 +1,310 @@
+// Symbolon recovery (SPEC Section 13).
+//
+// The log verifier (src/core/log.resid) already enforces who may recover,
+// the delay, vetoes and contests. This module makes the events and checks
+// around it: the kit's keys, the recover and veto events, guardian
+// approvals, the cosigner's release of its half of the kit's material
+// (SPEC 10.6, 13.4), and the new device's assembly of the kit's share.
+//
+// Kit format (this draft): a 32-byte seed, printed or held in a token. Its
+// recovery signing key and HPKE key are derived from the seed, so the kit
+// holds static keys only (SPEC 10.6).
+
+import "../types.resid";
+import "../core/log.resid";
+import "../core/event.resid";
+import "../vault/vault.resid";
+import "../threshold/threshold.resid";
+import "cggmp_curve.resid";
+import "sha256g.resid";
+import "word.resid";
+import "hpke.resid";
+import "cose.resid";
+import "cosesig.resid";
+import "ecdsa.resid";
+import "crypto.resid";
+
+// ============================================================================
+// The kit (SPEC 10.6, 13.2)
+// ============================================================================
+
+pub type KitKeys = { List(Int) sign_priv; List(Int) sign_pub; List(Int) hpke_priv; List(Int) hpke_pub; };
+
+List(Int) hkdf_pub(List(Int) seed, Str label, Int n) { return hkdf_sha256([], seed, utf8(label), n); }
+
+// The recovery signing key: HKDF(seed, nil, "symbolon v1 kit sign", 48)
+// mod (n - 1) + 1, a P-256 scalar in [1, n - 1]. The HPKE key pair:
+// DeriveKeyPair(HKDF(seed, nil, "symbolon v1 kit hpke", 32)).
+pub Option(KitKeys) kit_keys(List(Int) seed) {
+    if (seed.len() != 32) { return None; }
+    List(UInt(64)) nm1 = bn_sub(cv_n(), [1]);
+    List(UInt(64)) d = bn_add(bn_mod(bn_from_be(hkdf_pub(seed, "symbolon v1 kit sign", 48)), nm1), [1]);
+    List(Int) priv = bn_to_be(d, 32);
+    HpkeKeyPair kp = hpke_derive_keypair(16, hkdf_pub(seed, "symbolon v1 kit hpke", 32));
+    if (!kp.ok) { return None; }
+    return Some(KitKeys {.sign_priv = priv, .sign_pub = ec_public_key(P256, priv), .hpke_priv = kp.sk, .hpke_pub = kp.pk});
+}
+
+// The digest of a recovery key in the log's field 6: SHA-256 of its SEC1
+// encoding (what the verifier compares, src/core/log.resid).
+pub List(Int) recovery_key_digest(List(Int) pubkey) { return sha256_bytes(pubkey); }
+
+// ============================================================================
+// Events
+// ============================================================================
+
+pub SignedEvent signed_event(EventPayload p, List(Int) encoded, List(EventSig) sigs) {
+    return SignedEvent {.payload = p, .encoded = encoded, .sigs = sigs, .cosigs = []};
+}
+
+// One signature r || s over the payload bytes.
+pub EventSig event_sig(List(Int) signer, List(Int) priv, List(Int) encoded) {
+    return EventSig {.signer = signer, .sig = ecdsa_sign_raw(P256, Sha256, priv, encoded)};
+}
+
+EventPayload next_payload(LogHead h, EventBody b, List(List(Int)) next_digests, UInt(64) time) {
+    return EventPayload {.log_id = Some(h.log_id), .sequence = h.sequence + 1, .predecessor_digest = Some(h.digest),
+                         .suite = 1, .body = b, .next_recovery_key_digests = next_digests, .advisory_time = time};
+}
+
+// R2 (SPEC 13.2 step 2): recover by the kit, revealing its key, signed by
+// it. `next_digests` names the new kit's key; the spent key must not be in it.
+pub Result(SignedEvent, SymbolonError) recover_by_kit(LogHead h, KitKeys kit, List(Party) new_parties, List(List(Int)) next_digests, UInt(64) time) {
+    RecoverBodyInner r = RecoverBodyInner {.path = recover_path_kit(), .new_parties = new_parties,
+                                           .revealed_recovery_key = Some(kit.sign_pub), .guardian_approvals = []};
+    EventPayload p = next_payload(h, RecoverBody(r), next_digests, time);
+    Option(List(Int)) oe = payload_cbor(p);
+    return match oe {
+        None => Err(ErrRecoveryFailed("a key in the event is not a P-256 point")),
+        Some(enc) => Ok(signed_event(p, enc, [event_sig(recovery_key_digest(kit.sign_pub), kit.sign_priv, enc)]))
+    };
+}
+
+// A veto of the pending event `target`, by a device of the quorum preceding
+// it (SPEC 13.4); a contested recovery needs two (src/core/log.resid).
+pub Result(SignedEvent, SymbolonError) veto(LogHead h, UInt(64) target, List(List(Int)) digests, UInt(64) time, List(Int) device_id, List(Int) dk_priv) {
+    EventPayload p = next_payload(h, VetoBody(target), digests, time);
+    Option(List(Int)) oe = payload_cbor(p);
+    return match oe {
+        None => Err(ErrInternal("veto payload")),
+        Some(enc) => Ok(signed_event(p, enc, [event_sig(device_id, dk_priv, enc)]))
+    };
+}
+
+pub SignedEvent add_signature(SignedEvent e, EventSig s) {
+    return SignedEvent {.payload = e.payload, .encoded = e.encoded, .sigs = e.sigs.concat([s]), .cosigs = e.cosigs};
+}
+
+// ============================================================================
+// R3: guardian approvals (SPEC 13.3)
+// ============================================================================
+
+EventPayload without_approvals(EventPayload p) {
+    EventBody b = p.body;
+    EventBody nb = match b {
+        RecoverBody(r) => RecoverBody(RecoverBodyInner {.path = r.path, .new_parties = r.new_parties, .revealed_recovery_key = r.revealed_recovery_key, .guardian_approvals = []}),
+        _ => b
+    };
+    return EventPayload {.log_id = p.log_id, .sequence = p.sequence, .predecessor_digest = p.predecessor_digest, .suite = p.suite,
+                         .body = nb, .next_recovery_key_digests = p.next_recovery_key_digests, .advisory_time = p.advisory_time};
+}
+
+// What a guardian signs: CBOR ["symbolon v1 guardian approval",
+// H(payload with no approvals)]. The payload binds the log, the sequence,
+// the predecessor and the new parties, so an approval cannot be replayed.
+pub Option(List(Int)) approval_payload(EventPayload p) {
+    List(Int) enc = payload_cbor(without_approvals(p))?;
+    return Some(cbe_bytes(sha256_bytes(enc), cbe_text("symbolon v1 guardian approval", cbe_array(2, []))));
+}
+
+// A guardian's approval: COSE_Sign1 (ES256) by one of its devices' DKs, kid
+// = that device's party id.
+pub Option(List(Int)) approve(EventPayload p, List(Int) device_id, List(Int) dk_priv) {
+    List(Int) body = approval_payload(p)?;
+    List(Int) m = cose_sign1_ecdsa(P256, dk_priv, body, device_id);
+    return if (m.len() == 0) { None } else { Some(m) };
+}
+
+pub EventPayload with_approvals(EventPayload p, List(List(Int)) approvals) {
+    EventBody b = p.body;
+    EventBody nb = match b {
+        RecoverBody(r) => RecoverBody(RecoverBodyInner {.path = r.path, .new_parties = r.new_parties, .revealed_recovery_key = r.revealed_recovery_key, .guardian_approvals = approvals}),
+        _ => b
+    };
+    return EventPayload {.log_id = p.log_id, .sequence = p.sequence, .predecessor_digest = p.predecessor_digest, .suite = p.suite,
+                         .body = nb, .next_recovery_key_digests = p.next_recovery_key_digests, .advisory_time = p.advisory_time};
+}
+
+// The guardian (index into `heads`) whose current device signed approval
+// `m` over `body`, or -1.
+Int approver(List(LogHead) heads, List(List(Int)) allowed, List(Int) m, List(Int) body, Int i) {
+    if (i >= heads.len()) { return -1; }
+    LogHead g = heads[i];
+    Bool listed_guardian = has_log(allowed, g.log_id, 0);
+    Bool ok = listed_guardian && signed_by_device(g.quorum.parties, m, body, 0);
+    return if (ok) { i } else { approver(heads, allowed, m, body, i + 1) };
+}
+
+Bool has_log(List(List(Int)) ls, List(Int) l, Int i) {
+    if (i >= ls.len()) { return false; }
+    if (bytes_eq(ls[i], l)) { return true; }
+    return has_log(ls, l, i + 1);
+}
+
+Bool signed_by_device(List(Party) ps, List(Int) m, List(Int) body, Int i) {
+    if (i >= ps.len()) { return false; }
+    Party p = ps[i];
+    Bool ok = p.kind == party_kind_device() && match cose_sign1_open(m, ec_pubkey(p.auth_key), []) {
+        None => false,
+        Some(pl) => bytes_eq(pl, body)
+    };
+    return ok || signed_by_device(ps, m, body, i + 1);
+}
+
+PubKey ec_pubkey(List(Int) sec1) {
+    return PubKey {.kind = pubkey_ec(), .curve = P256, .point = sec1, .n = [], .e = [], .pss_only = false};
+}
+
+Int count_guardians(List(LogHead) heads, List(List(Int)) allowed, List(List(Int)) approvals, List(Int) body, Int i, List(Int) seen) {
+    if (i >= approvals.len()) { return seen.len(); }
+    Int g = approver(heads, allowed, approvals[i], body, 0);
+    Bool fresh = g >= 0 && !int_in(seen, g, 0);
+    return count_guardians(heads, allowed, approvals, body, i + 1, if (fresh) { seen.concat([g]) } else { seen });
+}
+
+Bool int_in(List(Int) xs, Int x, Int i) {
+    if (i >= xs.len()) { return false; }
+    if (xs[i] == x) { return true; }
+    return int_in(xs, x, i + 1);
+}
+
+// The approval check the log verifier takes (il_verify): distinct guardians
+// named in `pol`, each by a device of its own verified log head, reach
+// policy[4]. `heads` are the guardians' heads as this device verified them.
+pub Bool guardian_approvals_ok(Policy pol, List(LogHead) heads, EventPayload p) {
+    if (pol.guardian_threshold == 0) { return false; }
+    Option(List(Int)) ob = approval_payload(p);
+    EventBody b = p.body;
+    List(List(Int)) approvals = match b { RecoverBody(r) => r.guardian_approvals, _ => [] };
+    return match ob {
+        None => false,
+        Some(body) => count_guardians(heads, pol.guardians, approvals, body, 0, []) >= (Int)pol.guardian_threshold
+    };
+}
+
+// ============================================================================
+// The cosigner's release (SPEC 10.6, 13.4)
+// ============================================================================
+
+Bool device_in(List(Party) ps, List(Int) id, Int i) {
+    if (i >= ps.len()) { return false; }
+    if (bytes_eq(ps[i].id, id) && ps[i].kind == party_kind_device()) { return true; }
+    return device_in(ps, id, i + 1);
+}
+
+Option(Party) party_named(List(Party) ps, List(Int) id, Int i) {
+    if (i >= ps.len()) { return None; }
+    if (bytes_eq(ps[i].id, id)) { return Some(ps[i]); }
+    return party_named(ps, id, i + 1);
+}
+
+Bool seq_pending(List(UInt(64)) ps, UInt(64) s, Int i) {
+    if (i >= ps.len()) { return false; }
+    if (ps[i] == s) { return true; }
+    return seq_pending(ps, s, i + 1);
+}
+
+// The latest kit recover naming `device` as a new device.
+Option(SignedEvent) kit_recover_for(List(SignedEvent) es, List(Int) dev, Int i, Option(SignedEvent) acc) {
+    if (i >= es.len()) { return acc; }
+    EventBody b = es[i].payload.body;
+    Bool hit = match b { RecoverBody(r) => r.path == recover_path_kit() && device_in(r.new_parties, dev, 0), _ => false };
+    return kit_recover_for(es, dev, i + 1, if (hit) { Some(es[i]) } else { acc });
+}
+
+// The HPKE key to which the cosigner may release its half of the kit's
+// material: that of the new device named in a kit recover that has taken
+// effect in the verified log `v` (its delay ran, by witness time, with no
+// veto; the device is now in the quorum). `events` is the log `v` was
+// verified from.
+pub Result(List(Int), SymbolonError) release_target(List(SignedEvent) events, VerifiedHead v, List(Int) dev) {
+    Option(SignedEvent) oe = kit_recover_for(events, dev, 0, None);
+    return match oe {
+        None => Err(ErrRecoveryFailed("no kit recovery names this device")),
+        Some(e) => release_after(e, v, dev)
+    };
+}
+
+Result(List(Int), SymbolonError) release_after(SignedEvent e, VerifiedHead v, List(Int) dev) {
+    if (e.payload.sequence > v.head.sequence) { return Err(ErrRecoveryFailed("the recovery is not in the verified log")); }
+    if (seq_pending(v.pending, e.payload.sequence, 0)) { return Err(ErrRecoveryFailed("the recovery delay has not run")); }
+    Option(Party) op = party_named(v.head.quorum.parties, dev, 0);
+    return match op {
+        None => Err(ErrRecoveryFailed("the device is not in the quorum (vetoed?)")),
+        Some(p) => if (p.kind == party_kind_device()) { Ok(p.hpke_key) } else { Err(ErrRecoveryFailed("not a device")) }
+    };
+}
+
+// The kit's halves as plaintext: scalar (32 bytes) || key half (32 bytes).
+pub List(Int) half_bytes(List(UInt(64)) share, List(Int) key) { return bn_to_be(share, 32).concat(key); }
+
+pub type Half = { List(UInt(64)) share; List(Int) key; };
+
+pub Option(Half) half_of(List(Int) b) {
+    if (b.len() != 64) { return None; }
+    return Some(Half {.share = bn_from_be(b[0..32]), .key = b[32..64]});
+}
+
+// The cosigner wraps b || k_b to the released device, bound to the log, the
+// epoch and the device.
+pub Result(Wrapped, SymbolonError) cosigner_release(List(SignedEvent) events, VerifiedHead v, List(Int) dev, Half b, List(Int) ikm_e) {
+    List(Int) to = release_target(events, v, dev)?;
+    Option(Wrapped) w = offline_wrap(to, v.head.log_id, v.head.quorum.epoch, dev, half_bytes(b.share, b.key), ikm_e);
+    return match w { None => Err(ErrRecoveryFailed("cannot wrap to the device's key")), Some(x) => Ok(x) };
+}
+
+// ============================================================================
+// The new device assembles the kit's material (SPEC 13.2 step 4)
+// ============================================================================
+
+// The chain code and the vault recovery key, sealed under k_K: AES-256-GCM,
+// key k_K, nonce HKDF(k_K, nil, "symbolon v1 kit nonce" || epoch, 12),
+// aad CBOR ["symbolon v1 kit secrets", log_id, epoch].
+List(Int) kit_aad(List(Int) log_id, UInt(32) epoch) {
+    return cbe_uint((Int)epoch, cbe_bytes(log_id, cbe_text("symbolon v1 kit secrets", cbe_array(3, []))));
+}
+
+List(Secret(UInt(8))) kit_nonce(List(Secret(UInt(8))) kk, UInt(32) epoch) {
+    List(Secret(UInt(8))) nil = [];
+    return hkdf256g_expand(hkdf256g_extract(nil, kk), secret_bytes(utf8("symbolon v1 kit nonce").concat(u64be((UInt(64))epoch))), 12);
+}
+
+@requires(declassify)
+pub List(Int) kit_secrets_seal(List(Secret(UInt(8))) kk, List(Int) log_id, UInt(32) epoch, List(Secret(UInt(8))) cc, List(Secret(UInt(8))) vault_rk) {
+    List(Secret(UInt(8))) ct = aes_gcmg_seal_ivb(kk, kit_nonce(kk, epoch), cc.concat(vault_rk), kit_aad(log_id, epoch));
+    return ints_out(declassify(secret_join(ct), "AEAD output is public"), 0, ListBuf());
+}
+
+List(Int) ints_out(List(UInt(8)) bs, Int i, ListBuf(Int) acc) {
+    if (i >= bs.len()) { return acc.finish(); }
+    return ints_out(bs, i + 1, acc.push((Int)bs[i]));
+}
+
+pub type KitSecrets = { List(Secret(UInt(8))) cc; List(Secret(UInt(8))) vault_rk; };
+
+@requires(declassify)
+pub Result(KitSecrets, SymbolonError) kit_secrets_open(List(Secret(UInt(8))) kk, List(Int) log_id, UInt(32) epoch, List(Int) sealed) {
+    Option(List(Secret(UInt(8)))) o = aes_gcmg_decrypt_ivb(kk, kit_nonce(kk, epoch), sealed, kit_aad(log_id, epoch));
+    return match o {
+        None => Err(ErrRecoveryFailed("kit secrets do not open")),
+        Some(pt) => if (pt.len() != 64) { Err(ErrRecoveryFailed("kit secrets length")) } else { Ok(KitSecrets {.cc = pt[0..32], .vault_rk = pt[32..64]}) }
+    };
+}
+
+// The kit's share and key from its own half a, k_a (opened with the kit's
+// HPKE key) and the cosigner's half b, k_b (opened with the new device's).
+pub Option(Half) kit_assemble(Half mine, Half cosigner) {
+    List(Int) k = kit_key(mine.key, cosigner.key);
+    if (k.len() != 32) { return None; }
+    return Some(Half {.share = kit_share(mine.share, cosigner.share), .key = k});
+}

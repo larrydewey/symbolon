@@ -1,0 +1,130 @@
+// Runs a recipe's steps on a page (SPEC 26.4). The plan was checked before
+// (check_plan); here each step is checked again against what the browser
+// reports at that moment: a fill goes in only when the top-level origin is
+// a run origin and the field is of the slot's kind (fill_allowed), and the
+// script that sets the value re-checks the origin and the field type in the
+// page, so a navigation in between cannot redirect the secret; a click is
+// refused when its text or form action names a destructive action; an
+// expectation waits up to ten seconds and otherwise aborts the run.
+
+import "../types.resid";
+import "../recipe/recipe.resid";
+import "json.resid";
+import "cdp.resid";
+import "crypto.resid";
+import "httpserv.resid";
+
+// A slot's value: the name a recipe uses and the secret that goes in.
+pub type SlotValue = { Str name; List(Secret(UInt(8))) value; };
+
+pub type Ran = { Browser b; Bool ok; Str error; };
+
+Ran fail_at(Browser b, Int i, Str why) { return Ran {.b = b, .ok = false, .error = f"step {i}: " + why}; }
+
+Option(List(Secret(UInt(8)))) slot_of(List(SlotValue) ss, Str n, Int i) {
+    if (i >= ss.len()) { return None; }
+    if (ss[i].name == n) { return Some(ss[i].value); }
+    return slot_of(ss, n, i + 1);
+}
+
+Str el(Str sel) { return "document.querySelector(" + json_quote(sel) + ")"; }
+
+@requires(declassify)
+Str text_of_secret(List(Secret(UInt(8))) v) {
+    List(UInt(8)) b = declassify(secret_join(v), "a slot's value, into the site's own field after the origin and field checks (SPEC 26.4)");
+    return http_text(ints_of_u8(b, 0, ListBuf()), 0, b.len());
+}
+
+List(Int) ints_of_u8(List(UInt(8)) b, Int i, ListBuf(Int) acc) {
+    if (i >= b.len()) { return acc.finish(); }
+    return ints_of_u8(b, i + 1, acc.push((Int)b[i]));
+}
+
+@requires(network, clock, declassify)
+pub Ran run_steps(Browser b, Page p, List(RecipeStep) steps, List(SlotValue) slots, List(Str) run, Int i) {
+    if (i >= steps.len()) { return Ran {.b = b, .ok = true, .error = ""}; }
+    RecipeStep s = steps[i];
+    Ran r = match s {
+        StepNavigate(u) => navigate_step(b, p, u, run, i),
+        StepFill(sel, slot) => fill_step(b, p, sel, slot, slots, run, i),
+        StepClick(sel) => click_step(b, p, sel, run, i),
+        StepExpect(c) => expect_step(b, p, c, i, 100),
+        StepPasskeyRegister => fail_at(b, i, "passkey registration in a recipe is not supported by this agent yet")
+    };
+    if (!r.ok) { return r; }
+    return run_steps(r.b, p, steps, slots, run, i + 1);
+}
+
+@requires(network, clock)
+Ran navigate_step(Browser b, Page p, Str u, List(Str) run, Int i) {
+    if (!text_in(run, origin_of(u), 0)) { return fail_at(b, i, "navigation outside the run origins"); }
+    Value v = page_navigate(b, p, u);
+    return if (str_len(v.error) > 0) { fail_at(v.b, i, v.error) } else { Ran {.b = v.b, .ok = true, .error = ""} };
+}
+
+@requires(network, clock, declassify)
+Ran fill_step(Browser b, Page p, Str sel, Str slot, List(SlotValue) slots, List(Str) run, Int i) {
+    Option(List(Secret(UInt(8)))) val = slot_of(slots, slot, 0);
+    if (match val { None => true, Some(_) => false }) { return fail_at(b, i, "no value for slot " + slot); }
+    Str probe = "(() => { const e = " + el(sel) + "; if (!e) return null; return JSON.stringify({t: (e.getAttribute('type') || e.type || '').toLowerCase(), "
+        + "a: (e.getAttribute('autocomplete') || '').toLowerCase(), o: location.origin}); })()";
+    Value v = page_eval(b, p, probe);
+    Option(Jv) info = parsed_info(v.v);
+    if (match info { None => true, Some(_) => false }) { return fail_at(v.b, i, "no field " + sel); }
+    Str t = jstr(jpath_o(info, "t"));
+    Str origin = jstr(jpath_o(info, "o"));
+    if (!fill_allowed(slot, InputInfo {.input_type = t, .autocomplete = jstr(jpath_o(info, "a"))}, origin, run)) {
+        return fail_at(v.b, i, "slot " + slot + " may not go into " + sel + " (type " + t + ") on " + origin);
+    }
+    Str set = "(() => { const e = " + el(sel) + "; if (!e || location.origin !== " + json_quote(origin) + " || (e.getAttribute('type') || e.type || '').toLowerCase() !== "
+        + json_quote(t) + ") return false; e.focus(); e.value = " + json_quote(text_of_secret(val else { [] })) + "; "
+        + "e.dispatchEvent(new Event('input', {bubbles: true})); e.dispatchEvent(new Event('change', {bubbles: true})); return true; })()";
+    Value w = page_eval(v.b, p, set);
+    return if (jbool(w.v)) { Ran {.b = w.b, .ok = true, .error = ""} } else { fail_at(w.b, i, "the field changed before the fill") };
+}
+
+Option(Jv) parsed_info(Option(Jv) v) { return match v { Some(x) => json_parse(json_utf8(str_of_jv(x))), None => None }; }
+
+Str str_of_jv(Jv v) { return match v { JStr(s) => s, _ => "" }; }
+
+Option(Jv) jpath_o(Option(Jv) v, Str k) { return match v { None => None, Some(x) => jget(x, k) }; }
+
+@requires(network, clock)
+Ran click_step(Browser b, Page p, Str sel, List(Str) run, Int i) {
+    Str probe = "(() => { const e = " + el(sel) + "; if (!e) return null; return JSON.stringify({x: (e.innerText || e.value || '').slice(0, 200), "
+        + "f: e.form ? (e.form.getAttribute('action') || '') : (e.getAttribute('formaction') || ''), o: location.origin}); })()";
+    Value v = page_eval(b, p, probe);
+    Option(Jv) info = parsed_info(v.v);
+    if (match info { None => true, Some(_) => false }) { return fail_at(v.b, i, "no element " + sel); }
+    if (!text_in(run, jstr(jpath_o(info, "o")), 0)) { return fail_at(v.b, i, "the page left the run origins"); }
+    if (!click_allowed(jstr(jpath_o(info, "x")), jstr(jpath_o(info, "f")))) { return fail_at(v.b, i, "refused a destructive click on " + sel); }
+    Value c = page_eval(v.b, p, "(() => { const e = " + el(sel) + "; if (!e) return false; e.click(); return true; })()");
+    if (!jbool(c.v)) { return fail_at(c.b, i, "the element went away before the click"); }
+    _ = sleep_ms_r(300);
+    return Ran {.b = page_settle(c.b, p, 100), .ok = true, .error = ""};
+}
+
+@requires(clock)
+Bool sleep_ms_r(Int ms) { _ = clock.sleep_ns(ms * 1000000); return true; }
+
+Str cond_js(ExpectCondition c) {
+    return match c {
+        ExpectUrl(u) => "location.href === " + json_quote(u) + " || location.href.startsWith(" + json_quote(u) + ")",
+        ExpectElement(s) => el(s) + " !== null",
+        ExpectText(t) => "!!document.body && document.body.innerText.includes(" + json_quote(t) + ")",
+        ExpectAbsent(s) => el(s) + " === null"
+    };
+}
+
+Str cond_text(ExpectCondition c) {
+    return match c { ExpectUrl(u) => "URL " + u, ExpectElement(s) => "element " + s, ExpectText(t) => "text \"" + t + "\"", ExpectAbsent(s) => "no element " + s };
+}
+
+@requires(network, clock)
+Ran expect_step(Browser b, Page p, ExpectCondition c, Int i, Int tries) {
+    Value v = page_eval(b, p, "(" + cond_js(c) + ") === true");
+    if (jbool(v.v)) { return Ran {.b = v.b, .ok = true, .error = ""}; }
+    if (tries <= 0) { return fail_at(v.b, i, "expected " + cond_text(c)); }
+    _ = sleep_ms_r(100);
+    return expect_step(v.b, p, c, i, tries - 1);
+}

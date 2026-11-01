@@ -1,0 +1,298 @@
+// Credential rotation from the command line (SPEC 26):
+//
+//   symbolon device vault login DIR NAME ORIGIN USERNAME
+//       the PIN, then the password, on stdin: a legacy login (fields name,
+//       username, origin, current)
+//   symbolon device rotate DIR NAME BUNDLE REPOSITORY [CHROMIUM] [--share ID]
+//       the PIN on stdin (with --share, a login in that shared folder): the two-phase change of the login's password
+//       (SPEC 26.3) by a signed, logged recipe (SPEC 26.4) in headless
+//       Chromium
+//
+// The vault holds a password the site accepts at every moment: Prepare
+// writes current and pending and publishes the vault (the relay copy is
+// what every other device reads) before the browser changes anything;
+// Verify signs in with pending, then with current, each in a fresh browser
+// context, and writes the outcome; neither working leaves both, marked
+// unresolved. A run that finds the item pending resumes at Verify. The
+// item carries the rotation lease (field "lease": holder party and expiry)
+// and the failed sign-ins (field "fails": times), counted across devices
+// because they live in the vault.
+
+import "../types.resid";
+import "../core/log.resid";
+import "../vault/vault.resid";
+import "../recipe/recipe.resid";
+import "../rotation/rotation.resid";
+import "../browser/json.resid";
+import "../browser/cdp.resid";
+import "../browser/runner.resid";
+import "state.resid";
+import "common.resid";
+import "device.resid";
+import "vaultcli.resid";
+import "sharecli.resid";
+import "serials.resid";
+import "crypto.resid";
+import "word.resid";
+import "httpserv.resid";
+
+// ============================================================================
+// Logins
+// ============================================================================
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+pub Int vault_login(Str dir, Str name, Str origin, Str user) {
+    if (origin_of(origin) != origin) { return dfail("the origin must be scheme://host[:port], as " + origin_of(origin)); }
+    Result(Opened, Str) ro = open_vault(dir);
+    return match ro { Err(m) => dfail(m), Ok(o) => put_login(dir, o, name, origin, user, read_pin()) };
+}
+
+@requires(filesystem, network, device, declassify, clock, environment)
+Int put_login(Str dir, Opened o, Str name, Str origin, Str user, Str pw) {
+    if (str_len(name) == 0 || str_len(pw) == 0) { return dfail("a name and a password"); }
+    List(FieldPlain) fs = [plain("name", name), plain("username", user), plain("origin", origin), plain("current", pw)];
+    return seal_publish(dir, o, name, fs);
+}
+
+FieldPlain plain(Str n, Str v) { return FieldPlain {.name = n, .value = secret_bytes(utf8(v))}; }
+
+@requires(filesystem, network, device, declassify, clock, environment)
+pub Int seal_publish(Str dir, Opened o, Str name, List(FieldPlain) fs) {
+    List(Secret(UInt(8))) vk = o.p.vk;
+    List(Int) id = item_id_of(vk, name);
+    Option(Item) old = item_by_id(o.st.items, id, 0);
+    UInt(64) version = match old { None => (UInt(64))1, Some(x) => x.version + (UInt(64))1 };
+    Result(Item, SymbolonError) ri = item_seal(vk, o.p.vid, id, version, "password", fs, false, None);
+    return match ri {
+        Err(e) => dfail(err_text(e)),
+        Ok(it) => publish_items(dir, o, without_item(o.st.items, id, 0, ListBuf()).concat([it]))
+    };
+}
+
+// The vault (or shared folder) again after this device published it.
+@requires(filesystem, network, clock, declassify)
+Result(Opened, Str) refetch(Str dir, Opened o) { return reopened(dir, o); }
+
+// ============================================================================
+// Rotation
+// ============================================================================
+
+@requires(declassify)
+Str text_field(List(FieldPlain) fs, Str n) {
+    Option(List(Secret(UInt(8)))) v = field_value(fs, n, 0);
+    return match v { None => "", Some(x) => text_of(reveal(x)) };
+}
+
+List(FieldPlain) set_field(List(FieldPlain) fs, Str n, Str v) { return drop_field(fs, n, 0, ListBuf()).concat([plain(n, v)]); }
+
+List(FieldPlain) drop_field(List(FieldPlain) fs, Str n, Int i, ListBuf(FieldPlain) acc) {
+    if (i >= fs.len()) { return acc.finish(); }
+    return drop_field(fs, n, i + 1, if (fs[i].name == n) { acc } else { acc.push(fs[i]) });
+}
+
+List(Attempt) fails_of(Str domain, Str text) { return attempts(domain, str_split(text, ","), 0, ListBuf()); }
+
+List(Attempt) attempts(Str d, List(Str) ts, Int i, ListBuf(Attempt) acc) {
+    if (i >= ts.len()) { return acc.finish(); }
+    Str t = str_trim(ts[i]);
+    return attempts(d, ts, i + 1, if (str_len(t) == 0) { acc } else { acc.push(Attempt {.domain = d, .time = str_parse_int(t)}) });
+}
+
+// The lease field: "holder-hex expiry".
+List(RotationLease) leases_of(List(Int) item, Str text) {
+    List(Str) p = str_split(str_trim(text), " ");
+    if (p.len() != 2) { return []; }
+    return [RotationLease {.item_id = item, .holder = cose_hex_decode(p[0]), .expires_at = (UInt(64))str_parse_int(p[1])}];
+}
+
+pub type Job = { Str dir; Opened o; Str name; List(Int) item; RecipePayload recipe; List(Str) run; Str chromium; Int now; };
+
+@requires(filesystem, network, device, declassify, clock, process, provision, environment)
+pub Int device_rotate(Str dir, Str name, Str bundle_file, Str repo_file, Str chromium, Str share) {
+    Option(Repository) repo = repository_decode(filesystem.read_bytes(repo_file));
+    Option(RecipeBundle) bundle = bundle_decode(filesystem.read_bytes(bundle_file));
+    if (match repo { None => true, Some(_) => false }) { return dfail("the repository file does not decode"); }
+    if (match bundle { None => true, Some(_) => false }) { return dfail("the recipe bundle does not decode"); }
+    Result(RecipePayload, SymbolonError) rv = verify_bundle(repo else { Repository {.keys = [], .threshold = 0, .log_key = []} },
+        bundle else { RecipeBundle {.payload = [], .sigs = [], .log_time = 0, .index = 0, .size = 0, .path = [], .root = [], .tree_head = []} });
+    Int log_time = match bundle { Some(b) => b.log_time, None => 0 };
+    return match rv {
+        Err(e) => dfail("recipe: " + err_text(e)),
+        Ok(r) => match open_place(dir, share) { Err(m) => dfail(m), Ok(o) => rotate_with(dir, o, name, r, log_time, chromium) }
+    };
+}
+
+@requires(filesystem, network, device, declassify, clock, process, environment)
+Int rotate_with(Str dir, Opened o, Str name, RecipePayload r, Int log_time, Str chromium) {
+    List(Int) id = item_id_of(o.p.vk, name);
+    Option(Item) it = item_by_id(o.st.items, id, 0);
+    return match it {
+        None => dfail("no such item"),
+        Some(x) => match item_open(o.p.vk, o.p.vid, x) {
+            Err(e) => dfail(err_text(e)),
+            Ok(fs) => rotate_item(dir, o, name, id, fs, r, log_time, chromium)
+        }
+    };
+}
+
+@requires(filesystem, network, device, declassify, clock, process, environment)
+Int rotate_item(Str dir, Opened o, Str name, List(Int) id, List(FieldPlain) fs, RecipePayload r, Int log_time, Str chromium) {
+    Str origin = text_field(fs, "origin");
+    Bool has_current = match field_value(fs, "current", 0) { Some(_) => true, None => false };
+    if (str_len(origin) == 0 || !has_current) { return dfail("not a login (vault login)"); }
+    Int now = witness_now(o.vh.head.policy.witnesses, o.c.ca, random_bytes(32));
+    Str host = str_slice(origin, find_from(origin, "://") + 3, str_len(origin));
+    Bool same_site = host_only(host) == r.domain || ends_with(host_only(host), "." + r.domain);
+    if (!same_site) { return dfail("the recipe is for " + r.domain + ", the login for " + origin); }
+    Option(RecipePayload) chosen = choose([r], [log_time], None, r.domain, now);
+    if (match chosen { None => true, Some(_) => false }) { return dfail("the recipe has not yet held for 7 days in the transparency log"); }
+    if (r.sign_in.len() == 0) { return dfail("the recipe has no sign-in procedure, so a change could not be verified"); }
+    Result(List(Str), SymbolonError) plan = check_plan(r, [origin]);
+    return match plan {
+        Err(e) => dfail("recipe: " + err_text(e)),
+        Ok(run) => leased(Job {.dir = dir, .o = o, .name = name, .item = id, .recipe = r, .run = run, .chromium = chromium, .now = now}, fs)
+    };
+}
+
+Int find_from(Str s, Str pat) { return find_at(s, pat, 0); }
+Int find_at(Str s, Str pat, Int i) {
+    if (i + str_len(pat) > str_len(s)) { return -1; }
+    if (str_slice(s, i, i + str_len(pat)) == pat) { return i; }
+    return find_at(s, pat, i + 1);
+}
+Str host_only(Str h) { Int c = find_from(h, ":"); return if (c < 0) { h } else { str_slice(h, 0, c) }; }
+Bool ends_with(Str s, Str t) { return str_len(s) >= str_len(t) && str_slice(s, str_len(s) - str_len(t), str_len(s)) == t; }
+
+pub Int lease_sec() { return 1800; }
+
+// Takes the lease, then Prepare unless a change is already pending.
+@requires(filesystem, network, device, declassify, clock, process, environment)
+Int leased(Job j, List(FieldPlain) fs) {
+    Result(List(RotationLease), SymbolonError) l = take_lease(leases_of(j.item, text_field(fs, "lease")), j.item, j.o.c.party, j.now, lease_sec());
+    if (match l { Err(_) => true, Ok(_) => false }) { return dfail("another device is rotating this item"); }
+    if (!may_attempt(fails_of(j.recipe.domain, text_field(fs, "fails")), j.recipe.domain, j.now)) {
+        return dfail("too many failed sign-ins at " + j.recipe.domain + " today; try later");
+    }
+    List(FieldPlain) with_lease = set_field(fs, "lease", hex_encode(j.o.c.party) + " " + f"{j.now + lease_sec()}");
+    Phase p = phase_of(fs);
+    return match p {
+        Idle => prepared(j, with_lease),
+        Unresolved => verify_run(j, with_lease, true),
+        _ => verify_run(j, with_lease, false)
+    };
+}
+
+// Step 1: the new password next to the current one, published before the
+// browser touches the site.
+@requires(filesystem, network, device, declassify, clock, process, environment)
+Int prepared(Job j, List(FieldPlain) fs) {
+    Option(Str) pw = generate_password(j.recipe.password_rules, random_bytes(1024));
+    if (match pw { None => true, Some(_) => false }) { return dfail("the site's rules allow no password"); }
+    Result(List(FieldPlain), SymbolonError) p = prepare(fs, secret_bytes(utf8(pw else { "" })));
+    return match p {
+        Err(e) => dfail(err_text(e)),
+        Ok(next) => if (seal_publish(j.dir, j.o, j.name, next) != 0) { 1 } else { changed(j, next) }
+    };
+}
+
+// Step 2: the site's change procedure.
+@requires(filesystem, network, device, declassify, clock, process, environment)
+Int changed(Job j, List(FieldPlain) fs) {
+    println("prepared: the vault holds the current and the pending password");
+    Result(Browser, Str) rb = browser_launch(j.chromium, j.dir);
+    return match rb {
+        Err(m) => dfail(m + " (the pending password stays; the next run resumes)"),
+        Ok(b) => after_change(j, fs, run_on_fresh_page(b, j.recipe.steps, slots_for(fs), j.run))
+    };
+}
+
+List(SlotValue) slots_for(List(FieldPlain) fs) {
+    List(SlotValue) base = [SlotValue {.name = "username", .value = field_value(fs, "username", 0) else { [] }}];
+    Option(List(Secret(UInt(8)))) cur = field_value(fs, "current", 0);
+    Option(List(Secret(UInt(8)))) pen = field_value(fs, "pending", 0);
+    return base.concat([SlotValue {.name = "old", .value = cur else { [] }}, SlotValue {.name = "new", .value = pen else { [] }}]);
+}
+
+@requires(network, clock, declassify)
+Ran run_on_fresh_page(Browser b, List(RecipeStep) steps, List(SlotValue) slots, List(Str) run) {
+    PageOpen po = page_new(b);
+    Option(Page) pg = po.page;
+    return match pg {
+        None => Ran {.b = po.b, .ok = false, .error = po.error},
+        Some(p) => closed_after(p, run_steps(po.b, p, steps, slots, run, 0))
+    };
+}
+
+@requires(network)
+Ran closed_after(Page p, Ran r) { return Ran {.b = page_close(r.b, p), .ok = r.ok, .error = r.error}; }
+
+@requires(filesystem, network, device, declassify, clock, process, environment)
+Int after_change(Job j, List(FieldPlain) fs, Ran r) {
+    println(if (r.ok) { "changed: the site's procedure ran to its expectation" } else { "the change procedure stopped: " + r.error });
+    return verify_with(j, fs, r.b, false);
+}
+
+// Step 3 when resuming: a browser of its own.
+@requires(filesystem, network, device, declassify, clock, process, environment)
+Int verify_run(Job j, List(FieldPlain) fs, Bool unresolved) {
+    println(if (unresolved) { "resuming an unresolved item: trying each password once" } else { "resuming a pending change at verification" });
+    Result(Browser, Str) rb = browser_launch(j.chromium, j.dir);
+    return match rb { Err(m) => dfail(m), Ok(b) => verify_with(j, fs, b, unresolved) };
+}
+
+@requires(network, clock, declassify)
+Ran sign_in_as(Browser b, Job j, List(FieldPlain) fs, List(Secret(UInt(8))) pw) {
+    List(SlotValue) slots = [SlotValue {.name = "username", .value = field_value(fs, "username", 0) else { [] }}, SlotValue {.name = "password", .value = pw}];
+    return run_on_fresh_page(b, j.recipe.sign_in, slots, j.run);
+}
+
+// Step 3: a fresh sign-in with pending; failing that, with current.
+@requires(filesystem, network, device, declassify, clock, process, environment)
+Int verify_with(Job j, List(FieldPlain) fs, Browser b, Bool unresolved) {
+    if (unresolved) { return resolve_with(j, fs, b, candidates(fs), 0); }
+    Ran n = sign_in_as(b, j, fs, field_value(fs, "pending", 0) else { [] });
+    if (n.ok) { return finish(j, fs, n.b, NewWorks, false); }
+    Ran o = sign_in_as(n.b, j, fs, field_value(fs, "current", 0) else { [] });
+    return finish(j, fs, o.b, if (o.ok) { OldWorks } else { NeitherWorks }, true);
+}
+
+@requires(filesystem, network, device, declassify, clock, process, environment)
+Int resolve_with(Job j, List(FieldPlain) fs, Browser b, List(List(Secret(UInt(8)))) cands, Int k) {
+    if (k >= cands.len()) { return finish_fields(j, b, record_fail(j, fs), "still unresolved: no password signed in; the principal must look", 2); }
+    Ran r = sign_in_as(b, j, fs, cands[k]);
+    if (!r.ok) { return resolve_with(j, fs, r.b, cands, k + 1); }
+    Result(List(FieldPlain), SymbolonError) res = resolve(fs, k);
+    return match res {
+        Err(e) => finish_fields(j, r.b, fs, err_text(e), 1),
+        Ok(x) => finish_fields(j, r.b, x, "resolved: a password from the item's history signs in and is current again", 0)
+    };
+}
+
+@requires(declassify)
+List(FieldPlain) record_fail(Job j, List(FieldPlain) fs) {
+    Str old = text_field(fs, "fails");
+    return set_field(fs, "fails", if (str_len(old) == 0) { f"{j.now}" } else { old + "," + f"{j.now}" });
+}
+
+@requires(filesystem, network, device, declassify, clock, process, environment)
+Int finish(Job j, List(FieldPlain) fs, Browser b, SignIn s, Bool failed_once) {
+    Result(List(FieldPlain), SymbolonError) v = verify(fs, s);
+    List(FieldPlain) counted = if (failed_once) { record_fail(j, match v { Ok(x) => x, Err(_) => fs }) } else { match v { Ok(x) => x, Err(_) => fs } };
+    Str msg = match s {
+        NewWorks => "rotated: the new password signs in and is current",
+        OldWorks => "not changed: the old password still signs in and stays current; retry later",
+        NeitherWorks => "unresolved: neither password signs in; both are kept and the principal is told"
+    };
+    Int code = match s { NewWorks => 0, OldWorks => 3, NeitherWorks => 2 };
+    return match v { Err(e) => finish_fields(j, b, fs, err_text(e), 1), Ok(_) => finish_fields(j, b, counted, msg, code) };
+}
+
+// Releases the lease, writes the item and closes the browser.
+@requires(filesystem, network, device, declassify, clock, process, environment)
+Int finish_fields(Job j, Browser b, List(FieldPlain) fs, Str msg, Int code) {
+    _ = browser_close(b);
+    Result(Opened, Str) ro = refetch(j.dir, j.o);
+    Int stored = match ro { Err(m) => dfail(m), Ok(o) => seal_publish(j.dir, o, j.name, drop_field(fs, "lease", 0, ListBuf())) };
+    println(msg);
+    return if (stored != 0) { 1 } else { code };
+}

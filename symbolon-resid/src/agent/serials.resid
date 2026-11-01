@@ -1,0 +1,21 @@
+// Every Encode/Decode instance the agent uses, in one import: each
+// generated *_serial file imports only its own types, and the instances
+// for the types they hold are in the others.
+
+import "../types_serial.resid";
+import "../core/log_serial.resid";
+import "../cosigner/cosigner_serial.resid";
+import "../net/proto_serial.resid";
+import "../threshold/threshold_serial.resid";
+import "state_serial.resid";
+import "sharetypes_serial.resid";
+import "cggmp_serial.resid";
+import "../threshold/rsmsg_serial.resid";
+import "cggmp_blind_serial.resid";
+import "cggmp_proofs_serial.resid";
+import "cggmp_zk_serial.resid";
+import "cggmp_curve_serial.resid";
+import "bigint_serial.resid";
+import "cbor.resid";
+
+pub Int serials_loaded() { return 1; }

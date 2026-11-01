@@ -1,0 +1,55 @@
+// The new device's side of a kit recovery (SPEC 13.2 step 4): it opens the
+// kit's half with the kit's HPKE key and the cosigner's half with its own,
+// assembles x_K and k_K, and opens the chain code and vault recovery key.
+
+import "../types.resid";
+import "../threshold/threshold.resid";
+import "recovery.resid";
+import "crypto.resid";
+import "hpke.resid";
+import "word.resid";
+
+Str hx(List(Int) b) { return hex_encode(b); }
+List(Int) rep(Int b, Int n) { return if (n == 0) { [] } else { [b].concat(rep(b, n - 1)) }; }
+
+Half none_half() { return Half {.share = [], .key = []}; }
+
+@requires(declassify)
+Str opened(List(Secret(UInt(8))) b) { return hx(ints(declassify(secret_join(b), "test output"), 0, [])); }
+
+List(Int) ints(List(UInt(8)) bs, Int i, List(Int) acc) {
+    if (i >= bs.len()) { return acc; }
+    return ints(bs, i + 1, acc.concat([(Int)bs[i]]));
+}
+
+@requires(declassify)
+test "kit half plus cosigner half give back the kit's share, the chain code and the vault recovery key" {
+    List(Int) log_id = rep(9, 32);
+    List(Int) dev = rep(3, 32);
+    KitKeys kit = kit_keys(rep(1, 32)) else { KitKeys {.sign_priv = [], .sign_pub = [], .hpke_priv = [], .hpke_pub = []} };
+    HpkeKeyPair newdev = hpke_derive_keypair(16, rep(2, 32));
+    List(UInt(64)) xk = sc_of_bytes(rep(77, 32));
+    List(Int) kk = rep(5, 32);
+    KitHalves h = kit_split(xk, kk, rep(19, 32), rep(200, 32));
+    // At the last DKG the online parties sealed the secrets under k_K and
+    // wrapped a, k_a to the kit; b, k_b were wrapped to the cosigner.
+    List(Int) sealed = kit_secrets_seal(secret_bytes(kk), log_id, 4, secret_bytes(rep(11, 32)), secret_bytes(rep(12, 32)));
+    Wrapped to_kit = offline_wrap(kit.hpke_pub, log_id, 4, rep(8, 32), half_bytes(h.a, h.ka), rep(21, 32)) else { Wrapped {.enc = [], .ct = []} };
+    // After the delay the cosigner wraps b, k_b to the new device.
+    Wrapped to_dev = offline_wrap(newdev.pk, log_id, 4, dev, half_bytes(h.b, h.kb), rep(22, 32)) else { Wrapped {.enc = [], .ct = []} };
+    Half mine = half_of(offline_unwrap(kit.hpke_priv, log_id, 4, rep(8, 32), to_kit) else { [] }) else { none_half() };
+    Half theirs = half_of(offline_unwrap(newdev.sk, log_id, 4, dev, to_dev) else { [] }) else { none_half() };
+    Half full = kit_assemble(mine, theirs) else { none_half() };
+    expect(hx(bn_to_be(full.share, 32))).toEqual(hx(bn_to_be(xk, 32)));
+    expect(hx(full.key)).toEqual(hx(kk));
+    Result(KitSecrets, SymbolonError) ks = kit_secrets_open(secret_bytes(full.key), log_id, 4, sealed);
+    Str cc = match ks { Ok(s) => opened(s.cc), Err(_) => "refused" };
+    Str vrk = match ks { Ok(s) => opened(s.vault_rk), Err(_) => "refused" };
+    expect(cc).toEqual(hx(rep(11, 32)));
+    expect(vrk).toEqual(hx(rep(12, 32)));
+    // The kit's half alone is not the key; nor does another epoch open.
+    Str alone = match kit_secrets_open(secret_bytes(mine.key), log_id, 4, sealed) { Ok(_) => "opened", Err(_) => "refused" };
+    Str stale = match kit_secrets_open(secret_bytes(full.key), log_id, 5, sealed) { Ok(_) => "opened", Err(_) => "refused" };
+    expect(alone).toEqual("refused");
+    expect(stale).toEqual("refused");
+}

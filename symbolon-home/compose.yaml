@@ -1,0 +1,14 @@
+# Symbolon Home. First run (once): see README.md.
+services:
+  symbolon-home:
+    image: symbolon-home
+    restart: unless-stopped
+    volumes:
+      - ./data:/data
+    # Publish only on the address your devices use: the LAN address, or a
+    # WireGuard / Tailscale one, e.g. "192.168.1.20:47100-47104:47100-47104".
+    ports:
+      - "47100-47104:47100-47104"
+    # The agent recurses deeply; the default 8 MB stack is not enough.
+    ulimits:
+      stack: -1

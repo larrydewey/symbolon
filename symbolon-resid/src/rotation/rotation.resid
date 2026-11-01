@@ -1,0 +1,413 @@
+// Symbolon credential rotation (SPEC Section 26): which items a trigger
+// rotates and in what order, password generation under a site's rules, the
+// two-phase change of a legacy password, sign-in rationing, leases, and
+// accounting. Pure: the browser-driven change itself runs a recipe
+// (src/recipe/), and the vault fields are sealed by src/vault/.
+//
+// A rotating item's plaintext fields:
+//   "current"    the password the site accepts
+//   "pending"    the new password, between Prepare and a verified sign-in
+//   "history.0" .. "history.N"  earlier passwords, newest first (at least 3 kept)
+//   "unresolved" present ("1") when neither password signed in
+
+import "../types.resid";
+import "../core/log.resid";
+import "../vault/vault.resid";
+import "word.resid";
+
+// ============================================================================
+// Triggers (SPEC 26.1)
+// ============================================================================
+
+// What the agent knows about an item for rotation (from its decrypted
+// fields and the principal's marks).
+pub type RotationItem = {
+    List(Int) id;
+    Str kind;                          // "password", "totp", "passkey", ...
+    Str domain;                        // the relying party's registrable domain
+    UInt(8) value;                     // 0 ordinary, 1 high, 2 email or identity provider, 3 financial
+    Option(List(Int)) resets_via;      // the email item that receives this site's resets
+    Bool in_duress_subset;
+    Bool readable_by_removed;          // existed when the removed device held the vault key
+};
+
+Bool is_secret_kind(Str k) { return k == "password" || k == "totp"; }
+
+Bool id_in(List(List(Int)) ids, List(Int) id, Int i) {
+    if (i >= ids.len()) { return false; }
+    if (bytes_eq(ids[i], id)) { return true; }
+    return id_in(ids, id, i + 1);
+}
+
+Bool covered(RotationTrigger t, RotationItem it) {
+    return match t {
+        TriggerDeviceRemoved(_) => is_secret_kind(it.kind) && it.readable_by_removed,
+        TriggerSuspectedCompromise(_) => (is_secret_kind(it.kind) && it.readable_by_removed) || it.kind == "passkey",
+        TriggerBreach(d) => it.domain == d,
+        TriggerWeakPassword(id) => bytes_eq(it.id, id),
+        TriggerDuressEnd => it.in_duress_subset,
+        TriggerPrincipalRequest(ids) => id_in(ids, it.id, 0),
+        TriggerPolicySchedule(ids) => it.value >= 1 && id_in(ids, it.id, 0)
+    };
+}
+
+List(RotationItem) select(RotationTrigger t, List(RotationItem) items, Int i, ListBuf(RotationItem) acc) {
+    if (i >= items.len()) { return acc.finish(); }
+    return select(t, items, i + 1, if (covered(t, items[i])) { acc.push(items[i]) } else { acc });
+}
+
+// Priority: financial, then email and identity providers, then high-value
+// marks, then the rest (SPEC 26.1).
+Int rank(RotationItem it) { return if (it.value == 3) { 0 } else { if (it.value == 2) { 1 } else { if (it.value == 1) { 2 } else { 3 } } }; }
+
+List(RotationItem) insert_ranked(List(RotationItem) xs, RotationItem x, Int i, ListBuf(RotationItem) acc) {
+    if (i >= xs.len()) { return acc.push(x).finish(); }
+    if (rank(x) < rank(xs[i])) { return rest_after(xs, i, acc.push(x)); }
+    return insert_ranked(xs, x, i + 1, acc.push(xs[i]));
+}
+
+List(RotationItem) rest_after(List(RotationItem) xs, Int i, ListBuf(RotationItem) acc) {
+    if (i >= xs.len()) { return acc.finish(); }
+    return rest_after(xs, i + 1, acc.push(xs[i]));
+}
+
+List(RotationItem) by_rank(List(RotationItem) xs, Int i, List(RotationItem) acc) {
+    if (i >= xs.len()) { return acc; }
+    return by_rank(xs, i + 1, insert_ranked(acc, xs[i], 0, ListBuf()));
+}
+
+Int pos_of(List(RotationItem) xs, List(Int) id, Int i) {
+    if (i >= xs.len()) { return -1; }
+    if (bytes_eq(xs[i].id, id)) { return i; }
+    return pos_of(xs, id, i + 1);
+}
+
+// Moves the item at `from` to just before `to` (from > to).
+List(RotationItem) move_before(List(RotationItem) xs, Int from, Int to, Int i, ListBuf(RotationItem) acc) {
+    if (i >= xs.len()) { return acc.finish(); }
+    if (i == from) { return move_before(xs, from, to, i + 1, acc); }
+    ListBuf(RotationItem) a = if (i == to) { acc.push(xs[from]) } else { acc };
+    return move_before(xs, from, to, i + 1, a.push(xs[i]));
+}
+
+// An email item that receives an item's resets goes before that item.
+// Each pass moves one email item up; `fuel` bounds the passes.
+List(RotationItem) resets_first(List(RotationItem) xs, Int fuel) {
+    if (fuel <= 0) { return xs; }
+    Int bad = first_violation(xs, 0);
+    if (bad < 0) { return xs; }
+    Option(List(Int)) via = xs[bad].resets_via;
+    Int e = match via { Some(v) => pos_of(xs, v, 0), None => -1 };
+    return resets_first(move_before(xs, e, bad, 0, ListBuf()), fuel - 1);
+}
+
+Int first_violation(List(RotationItem) xs, Int i) {
+    if (i >= xs.len()) { return -1; }
+    Option(List(Int)) via = xs[i].resets_via;
+    Int e = match via { Some(v) => pos_of(xs, v, 0), None => -1 };
+    return if (e > i) { i } else { first_violation(xs, i + 1) };
+}
+
+// The items `t` rotates, in the order to rotate them.
+pub List(RotationItem) rotation_plan(RotationTrigger t, List(RotationItem) items) {
+    List(RotationItem) chosen = select(t, items, 0, ListBuf());
+    List(RotationItem) ranked = by_rank(chosen, 0, []);
+    return resets_first(ranked, ranked.len() * ranked.len());
+}
+
+// ============================================================================
+// Password generation (SPEC 26.3 step 1)
+// ============================================================================
+
+Str lower_chars() { return "abcdefghijklmnopqrstuvwxyz"; }
+Str upper_chars() { return "ABCDEFGHIJKLMNOPQRSTUVWXYZ"; }
+Str digit_chars() { return "0123456789"; }
+Str symbol_chars() { return "!#$%&()*+,-./:;<=>?@[]^_{|}~"; }
+
+Bool has_char(Str s, Str c, Int i) {
+    if (i >= str_len(s)) { return false; }
+    if (str_slice(s, i, i + 1) == c) { return true; }
+    return has_char(s, c, i + 1);
+}
+
+Str allowed_from(Str set, Str forbidden, Int i, Str acc) {
+    if (i >= str_len(set)) { return acc; }
+    Str c = str_slice(set, i, i + 1);
+    return allowed_from(set, forbidden, i + 1, if (has_char(forbidden, c, 0)) { acc } else { acc + c });
+}
+
+pub type Alphabet = { List(Str) classes; Str all; };
+
+// The classes a password draws from: every class whose characters the site
+// allows (the required ones must be non-empty).
+pub Option(Alphabet) alphabet(PasswordRules r) {
+    List(Str) cs = [allowed_from(lower_chars(), r.forbidden_chars, 0, ""), allowed_from(upper_chars(), r.forbidden_chars, 0, ""),
+                    allowed_from(digit_chars(), r.forbidden_chars, 0, ""), allowed_from(symbol_chars(), r.forbidden_chars, 0, "")];
+    if (!required_present(cs, r.required_classes, 0)) { return None; }
+    List(Str) used = nonempty(cs, 0, []);
+    Str all = cat_all(used, 0, "");
+    if (str_len(all) < 2) { return None; }
+    return Some(Alphabet {.classes = used, .all = all});
+}
+
+Bool required_present(List(Str) cs, UInt(8) req, Int i) {
+    if (i >= 4) { return true; }
+    Bool need = ((req >> (UInt(8))i) & (UInt(8))1) == (UInt(8))1;
+    if (need && str_len(cs[i]) == 0) { return false; }
+    return required_present(cs, req, i + 1);
+}
+
+List(Str) nonempty(List(Str) cs, Int i, List(Str) acc) {
+    if (i >= cs.len()) { return acc; }
+    return nonempty(cs, i + 1, if (str_len(cs[i]) > 0) { acc.concat([cs[i]]) } else { acc });
+}
+
+Str cat_all(List(Str) cs, Int i, Str acc) {
+    if (i >= cs.len()) { return acc; }
+    return cat_all(cs, i + 1, acc + cs[i]);
+}
+
+// The length: 24 within the site's bounds.
+pub Int password_length(PasswordRules r) {
+    Int lo = if ((Int)r.min_length < 8) { 8 } else { (Int)r.min_length };
+    Int hi = if (r.max_length == 0) { 64 } else { (Int)r.max_length };
+    Int want = if (24 < lo) { lo } else { 24 };
+    return if (want > hi) { hi } else { want };
+}
+
+// Draws one index below n from `rnd` at `pos` by rejection (unbiased), each
+// candidate one byte; returns the index and the next position, or -1 when
+// the random bytes run out.
+type Draw = { Int value; Int pos; };
+
+Draw draw_below(List(Int) rnd, Int pos, Int n) {
+    Int limit = 256 - (256 % n);
+    if (pos >= rnd.len()) { return Draw {.value = -1, .pos = pos}; }
+    Int b = rnd[pos] & 255;
+    if (b < limit) { return Draw {.value = b % n, .pos = pos + 1}; }
+    return draw_below(rnd, pos + 1, n);
+}
+
+Bool covers(Str pw, List(Str) classes, Int i) {
+    if (i >= classes.len()) { return true; }
+    if (!any_in(pw, classes[i], 0)) { return false; }
+    return covers(pw, classes, i + 1);
+}
+
+Bool any_in(Str pw, Str set, Int i) {
+    if (i >= str_len(pw)) { return false; }
+    if (has_char(set, str_slice(pw, i, i + 1), 0)) { return true; }
+    return any_in(pw, set, i + 1);
+}
+
+Str build_pw(Alphabet a, List(Int) rnd, Int pos, Int left, StrBuf acc) {
+    if (left == 0) { return acc.finish(); }
+    Draw d = draw_below(rnd, pos, str_len(a.all));
+    if (d.value < 0) { _ = acc.finish(); return ""; }
+    return build_pw(a, rnd, d.pos, left - 1, acc.push(str_slice(a.all, d.value, d.value + 1)));
+}
+
+Int used_by(Alphabet a, List(Int) rnd, Int pos, Int left) {
+    if (left == 0) { return pos; }
+    Draw d = draw_below(rnd, pos, str_len(a.all));
+    if (d.value < 0) { return rnd.len() + 1; }
+    return used_by(a, rnd, d.pos, left - 1);
+}
+
+// A password under `r` from the random bytes `rnd`: uniform over the
+// allowed characters, redrawn until it has one character of every class it
+// draws from. None when the rules allow no password or `rnd` runs out
+// (pass at least 512 bytes).
+pub Option(Str) generate_password(PasswordRules r, List(Int) rnd) {
+    Option(Alphabet) oa = alphabet(r);
+    return match oa {
+        None => None,
+        Some(a) => gen_from(a, password_length(r), rnd, 0, 16)
+    };
+}
+
+Option(Str) gen_from(Alphabet a, Int n, List(Int) rnd, Int pos, Int tries) {
+    if (tries == 0 || pos >= rnd.len()) { return None; }
+    Str pw = build_pw(a, rnd, pos, n, StrBuf());
+    if (str_len(pw) != n) { return None; }
+    if (covers(pw, a.classes, 0)) { return Some(pw); }
+    return gen_from(a, n, rnd, used_by(a, rnd, pos, n), tries - 1);
+}
+
+// ============================================================================
+// The two-phase change (SPEC 26.3)
+// ============================================================================
+
+pub Option(List(Secret(UInt(8)))) field_value(List(FieldPlain) fs, Str name, Int i) {
+    if (i >= fs.len()) { return None; }
+    if (fs[i].name == name) { return Some(fs[i].value); }
+    return field_value(fs, name, i + 1);
+}
+
+Bool is_history(Str n) { return str_len(n) > 8 && str_slice(n, 0, 8) == "history."; }
+
+List(FieldPlain) without(List(FieldPlain) fs, Str name, Int i, ListBuf(FieldPlain) acc) {
+    if (i >= fs.len()) { return acc.finish(); }
+    return without(fs, name, i + 1, if (fs[i].name == name) { acc } else { acc.push(fs[i]) });
+}
+
+List(FieldPlain) others(List(FieldPlain) fs, Int i, ListBuf(FieldPlain) acc) {
+    if (i >= fs.len()) { return acc.finish(); }
+    Str n = fs[i].name;
+    Bool rotation_field = n == "current" || n == "pending" || n == "unresolved" || is_history(n);
+    return others(fs, i + 1, if (rotation_field) { acc } else { acc.push(fs[i]) });
+}
+
+List(List(Secret(UInt(8)))) history_of(List(FieldPlain) fs, Int k, List(List(Secret(UInt(8)))) acc) {
+    Option(List(Secret(UInt(8)))) h = field_value(fs, f"history.{k}", 0);
+    return match h { None => acc, Some(v) => history_of(fs, k + 1, acc.concat([v])) };
+}
+
+List(FieldPlain) history_fields(List(List(Secret(UInt(8)))) hs, Int i, ListBuf(FieldPlain) acc) {
+    if (i >= hs.len()) { return acc.finish(); }
+    return history_fields(hs, i + 1, acc.push(FieldPlain {.name = f"history.{i}", .value = hs[i]}));
+}
+
+pub Int history_kept() { return 3; }
+
+pub type Phase = Idle | Pending | Unresolved;
+
+pub Phase phase_of(List(FieldPlain) fs) {
+    if (has_field(fs, "unresolved", 0)) { return Unresolved; }
+    return if (has_field(fs, "pending", 0)) { Pending } else { Idle };
+}
+
+Bool has_field(List(FieldPlain) fs, Str n, Int i) {
+    if (i >= fs.len()) { return false; }
+    if (fs[i].name == n) { return true; }
+    return has_field(fs, n, i + 1);
+}
+
+// Step 1, Prepare: current stays, pending is the new password. The caller
+// seals this as a new item version and syncs it to another device before
+// step 2.
+pub Result(List(FieldPlain), SymbolonError) prepare(List(FieldPlain) fs, List(Secret(UInt(8))) new_pw) {
+    Phase p = phase_of(fs);
+    if (match p { Idle => false, _ => true }) { return Err(ErrRotationFailed("a change is already in progress")); }
+    if (!has_field(fs, "current", 0)) { return Err(ErrRotationFailed("no current password")); }
+    return Ok(fs.concat([FieldPlain {.name = "pending", .value = new_pw}]));
+}
+
+// What the fresh sign-in of step 3 found.
+pub type SignIn = NewWorks | OldWorks | NeitherWorks;
+
+// Step 3, Verify. The vault holds an accepted password in every outcome:
+// new works, it becomes current and the old one goes to history; old works,
+// pending is dropped; neither, both are kept and the item is unresolved.
+pub Result(List(FieldPlain), SymbolonError) verify(List(FieldPlain) fs, SignIn s) {
+    Option(List(Secret(UInt(8)))) cur = field_value(fs, "current", 0);
+    Option(List(Secret(UInt(8)))) pen = field_value(fs, "pending", 0);
+    return match cur {
+        None => Err(ErrRotationFailed("no current password")),
+        Some(c) => match pen {
+            None => Err(ErrRotationFailed("nothing pending")),
+            Some(n) => Ok(verified(fs, c, n, s))
+        }
+    };
+}
+
+List(FieldPlain) verified(List(FieldPlain) fs, List(Secret(UInt(8))) c, List(Secret(UInt(8))) n, SignIn s) {
+    List(FieldPlain) base = others(fs, 0, ListBuf());
+    List(List(Secret(UInt(8)))) hist = history_of(fs, 0, []);
+    return match s {
+        NewWorks => base.concat([FieldPlain {.name = "current", .value = n}]).concat(history_fields([c].concat(hist), 0, ListBuf())),
+        OldWorks => base.concat([FieldPlain {.name = "current", .value = c}]).concat(history_fields(hist, 0, ListBuf())),
+        NeitherWorks => base.concat([FieldPlain {.name = "current", .value = c}, FieldPlain {.name = "pending", .value = n},
+                                     FieldPlain {.name = "unresolved", .value = secret_bytes([49])}]).concat(history_fields(hist, 0, ListBuf()))
+    };
+}
+
+// A resolution of an unresolved item: the password from `candidates` (the
+// current, the pending and each history entry, in that order) that signed
+// in becomes current; nothing is deleted.
+pub Result(List(FieldPlain), SymbolonError) resolve(List(FieldPlain) fs, Int which) {
+    List(List(Secret(UInt(8)))) cands = candidates(fs);
+    if (which < 0 || which >= cands.len()) { return Err(ErrRotationFailed("no such candidate")); }
+    List(List(Secret(UInt(8)))) rest = drop_at(cands, which, 0, []);
+    return Ok(others(fs, 0, ListBuf()).concat([FieldPlain {.name = "current", .value = cands[which]}]).concat(history_fields(rest, 0, ListBuf())));
+}
+
+List(List(Secret(UInt(8)))) drop_at(List(List(Secret(UInt(8)))) xs, Int k, Int i, List(List(Secret(UInt(8)))) acc) {
+    if (i >= xs.len()) { return acc; }
+    return drop_at(xs, k, i + 1, if (i == k) { acc } else { acc.concat([xs[i]]) });
+}
+
+pub List(List(Secret(UInt(8)))) candidates(List(FieldPlain) fs) {
+    List(List(Secret(UInt(8)))) a = match field_value(fs, "current", 0) { Some(v) => [v], None => [] };
+    List(List(Secret(UInt(8)))) b = match field_value(fs, "pending", 0) { Some(v) => a.concat([v]), None => a };
+    return b.concat(history_of(fs, 0, []));
+}
+
+// ============================================================================
+// Sign-in rationing (SPEC 26.3, A-17)
+// ============================================================================
+
+// Failed sign-ins at one site, counted in the vault across devices.
+pub type Attempt = { Str domain; Int time; };
+
+Int fails_since(List(Attempt) xs, Str d, Int since, Int i, Int acc) {
+    if (i >= xs.len()) { return acc; }
+    return fails_since(xs, d, since, i + 1, acc + (if (xs[i].domain == d && xs[i].time > since) { 1 } else { 0 }));
+}
+
+Int last_fail(List(Attempt) xs, Str d, Int i, Int acc) {
+    if (i >= xs.len()) { return acc; }
+    return last_fail(xs, d, i + 1, if (xs[i].domain == d && xs[i].time > acc) { xs[i].time } else { acc });
+}
+
+// At most three failed attempts per site per day; after the k-th failure
+// in that day the next attempt waits 60 * 2^(k-1) seconds.
+pub Bool may_attempt(List(Attempt) fails, Str d, Int now) {
+    Int k = fails_since(fails, d, now - 86400, 0, 0);
+    if (k >= 3) { return false; }
+    if (k == 0) { return true; }
+    return now >= last_fail(fails, d, 0, 0) + 60 * (1 << (k - 1));
+}
+
+// ============================================================================
+// Leases (SPEC 26.1, A-17)
+// ============================================================================
+
+pub Result(List(RotationLease), SymbolonError) take_lease(List(RotationLease) ls, List(Int) item, List(Int) holder, Int now, Int ttl) {
+    if (held_by_other(ls, item, holder, now, 0)) { return Err(ErrRotationFailed("item leased by another device")); }
+    List(RotationLease) kept = drop_item(ls, item, 0, ListBuf());
+    return Ok(kept.concat([RotationLease {.item_id = item, .holder = holder, .expires_at = (UInt(64))(now + ttl)}]));
+}
+
+Bool held_by_other(List(RotationLease) ls, List(Int) item, List(Int) holder, Int now, Int i) {
+    if (i >= ls.len()) { return false; }
+    RotationLease l = ls[i];
+    if (bytes_eq(l.item_id, item) && !bytes_eq(l.holder, holder) && (Int)l.expires_at > now) { return true; }
+    return held_by_other(ls, item, holder, now, i + 1);
+}
+
+List(RotationLease) drop_item(List(RotationLease) ls, List(Int) item, Int i, ListBuf(RotationLease) acc) {
+    if (i >= ls.len()) { return acc.finish(); }
+    return drop_item(ls, item, i + 1, if (bytes_eq(ls[i].item_id, item)) { acc } else { acc.push(ls[i]) });
+}
+
+pub List(RotationLease) release_lease(List(RotationLease) ls, List(Int) item) { return drop_item(ls, item, 0, ListBuf()); }
+
+// ============================================================================
+// Accounting (SPEC 26.8)
+// ============================================================================
+
+pub type RotationRecord = { List(Int) item; Int time; Str why; Str result; };   // result: "rotated", "pending", "failed", "unresolved"
+
+pub type RotationStatus = { Int current; Int pending; Int need_principal; };
+
+pub RotationStatus status(List(Phase) phases, Int i, RotationStatus acc) {
+    if (i >= phases.len()) { return acc; }
+    Phase p = phases[i];
+    RotationStatus next = match p {
+        Idle => RotationStatus {.current = acc.current + 1, .pending = acc.pending, .need_principal = acc.need_principal},
+        Pending => RotationStatus {.current = acc.current, .pending = acc.pending + 1, .need_principal = acc.need_principal},
+        Unresolved => RotationStatus {.current = acc.current, .pending = acc.pending, .need_principal = acc.need_principal + 1}
+    };
+    return status(phases, i + 1, next);
+}

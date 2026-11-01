@@ -1,0 +1,302 @@
+// Event payloads from bytes (SPEC 8.1): the inverse of src/core/event.resid.
+//
+// Strict: definite lengths, shortest heads, map keys in the encoder's
+// order, and the result must re-encode to exactly the input, so one
+// payload has one accepted encoding and SignedEvent.encoded is always the
+// bytes `payload` was decoded from (the invariant src/core/log.resid
+// relies on).
+
+import "../types.resid";
+import "event.resid";
+import "log.resid";
+
+pub type Rd = { Int major; Int val; Int next; };
+
+Rd bad_rd() { return Rd {.major = -1, .val = 0, .next = -1}; }
+
+Int be_n(List(Int) b, Int p, Int n, Int acc) { return if (n == 0) { acc } else { be_n(b, p + 1, n - 1, acc * 256 + b[p]) }; }
+
+pub Rd rd(List(Int) b, Int p) {
+    if (p < 0 || p >= b.len()) { return bad_rd(); }
+    Int ib = b[p];
+    Int ai = ib & 31;
+    if (ai < 24) { return Rd {.major = ib >> 5, .val = ai, .next = p + 1}; }
+    Int n = if (ai == 24) { 1 } else { if (ai == 25) { 2 } else { if (ai == 26) { 4 } else { if (ai == 27) { 8 } else { 0 } } } };
+    if (n == 0 || p + 1 + n > b.len() || (n == 8 && b[p + 1] >= 128)) { return bad_rd(); }
+    Int v = be_n(b, p + 1, n, 0);
+    Bool shortest = (n == 1 && v >= 24) || (n == 2 && v > 255) || (n == 4 && v > 65535) || (n == 8 && v > 4294967295);
+    return if (shortest) { Rd {.major = ib >> 5, .val = v, .next = p + 1 + n} } else { bad_rd() };
+}
+
+type RU = { Int v; Int next; };
+type RB = { List(Int) v; Int next; };
+type RT = { Str v; Int next; };
+
+RU no_u() { return RU {.v = -1, .next = -1}; }
+
+RU r_uint(List(Int) b, Int p) { Rd h = rd(b, p); return if (h.major == 0) { RU {.v = h.val, .next = h.next} } else { no_u() }; }
+
+// A map key: k >= 0 major 0, k < 0 major 1.
+Int r_key(List(Int) b, Int p, Int k) {
+    Rd h = rd(b, p);
+    Bool ok = if (k >= 0) { h.major == 0 && h.val == k } else { h.major == 1 && h.val == 0 - 1 - k };
+    return if (ok) { h.next } else { -1 };
+}
+
+RB r_bytes(List(Int) b, Int p) {
+    Rd h = rd(b, p);
+    if (h.major != 2 || h.next + h.val > b.len()) { return RB {.v = [], .next = -1}; }
+    return RB {.v = b[h.next..h.next + h.val], .next = h.next + h.val};
+}
+
+RT r_text(List(Int) b, Int p) {
+    Rd h = rd(b, p);
+    if (h.major != 3 || h.next + h.val > b.len()) { return RT {.v = "", .next = -1}; }
+    return RT {.v = latin(b, h.next, h.next + h.val, StrBuf()), .next = h.next + h.val};
+}
+
+// Bytes as code points; a non-ASCII label then fails the re-encode check
+// (the encoder writes UTF-8) rather than passing altered.
+Str latin(List(Int) b, Int i, Int e, StrBuf acc) {
+    if (i >= e) { return acc.finish(); }
+    return latin(b, i + 1, e, acc.push(str_from_code(b[i])));
+}
+
+Bool is_null(List(Int) b, Int p) { return p >= 0 && p < b.len() && b[p] == 246; }
+
+Int arr_at(List(Int) b, Int p, Int n) { Rd h = rd(b, p); return if (h.major == 4 && h.val == n) { h.next } else { -1 }; }
+Int map_at(List(Int) b, Int p, Int n) { Rd h = rd(b, p); return if (h.major == 5 && h.val == n) { h.next } else { -1 }; }
+
+// COSE_Key EC2 P-256 back to SEC1 uncompressed.
+RB r_cose_key(List(Int) b, Int p) {
+    Int a = map_at(b, p, 4);
+    RU kty = r_uint(b, r_key(b, a, 1));
+    RU crv = r_uint(b, r_key(b, kty.next, -1));
+    RB x = r_bytes(b, r_key(b, crv.next, -2));
+    RB y = r_bytes(b, r_key(b, x.next, -3));
+    if (a < 0 || kty.v != 2 || crv.v != 1 || x.v.len() != 32 || y.next < 0 || y.v.len() != 32) { return RB {.v = [], .next = -1}; }
+    return RB {.v = [4].concat(x.v).concat(y.v), .next = y.next};
+}
+
+type RParty = { Party v; Int next; };
+
+Party no_party() { return Party {.id = [], .kind = 0, .auth_key = [], .hpke_key = [], .label = "", .attestation = NoAttestation}; }
+
+RParty r_party(List(Int) b, Int p) {
+    RParty bad = RParty {.v = no_party(), .next = -1};
+    Int a = map_at(b, p, 6);
+    RB id = r_bytes(b, r_key(b, a, 1));
+    RU kind = r_uint(b, r_key(b, id.next, 2));
+    RB ak = r_cose_key(b, r_key(b, kind.next, 3));
+    RB hk = r_cose_key(b, r_key(b, ak.next, 4));
+    RT label = r_text(b, r_key(b, hk.next, 5));
+    Int ap = r_key(b, label.next, 6);
+    if (a < 0 || label.next < 0 || ap < 0 || kind.v > 255) { return bad; }
+    if (is_null(b, ap)) {
+        return RParty {.v = Party {.id = id.v, .kind = (UInt(8))kind.v, .auth_key = ak.v, .hpke_key = hk.v, .label = label.v, .attestation = NoAttestation}, .next = ap + 1};
+    }
+    Int m = map_at(b, ap, 2);
+    RT fmt = r_text(b, r_key(b, m, 1));
+    RB dg = r_bytes(b, r_key(b, fmt.next, 2));
+    if (m < 0 || dg.next < 0) { return bad; }
+    return RParty {.v = Party {.id = id.v, .kind = (UInt(8))kind.v, .auth_key = ak.v, .hpke_key = hk.v, .label = label.v,
+                               .attestation = Attested(AttestationDigest {.format = fmt.v, .digest = dg.v})}, .next = dg.next};
+}
+
+type RParties = { List(Party) v; Int next; };
+
+RParties r_parties(List(Int) b, Int p) {
+    Rd h = rd(b, p);
+    if (h.major != 4 || h.val > 16) { return RParties {.v = [], .next = -1}; }
+    return r_parties_n(b, h.next, h.val, ListBuf());
+}
+
+RParties r_parties_n(List(Int) b, Int p, Int n, ListBuf(Party) acc) {
+    if (n == 0) { return RParties {.v = acc.finish(), .next = p}; }
+    RParty x = r_party(b, p);
+    if (x.next < 0) { _ = acc.finish(); return RParties {.v = [], .next = -1}; }
+    return r_parties_n(b, x.next, n - 1, acc.push(x.v));
+}
+
+type RQuorum = { Quorum v; Int next; };
+
+Quorum no_quorum() { return Quorum {.parties = [], .t = 0, .root_pubkey = [], .epoch = 0, .transcript_digest = []}; }
+
+RQuorum r_quorum(List(Int) b, Int p) {
+    Int a = map_at(b, p, 5);
+    RParties ps = r_parties(b, r_key(b, a, 1));
+    RU t = r_uint(b, r_key(b, ps.next, 2));
+    RB root = r_cose_key(b, r_key(b, t.next, 3));
+    RU ep = r_uint(b, r_key(b, root.next, 4));
+    RB td = r_bytes(b, r_key(b, ep.next, 5));
+    if (a < 0 || td.next < 0 || t.v > 255 || ep.v > 4294967295) { return RQuorum {.v = no_quorum(), .next = -1}; }
+    return RQuorum {.v = Quorum {.parties = ps.v, .t = (UInt(8))t.v, .root_pubkey = root.v, .epoch = (UInt(32))ep.v, .transcript_digest = td.v}, .next = td.next};
+}
+
+type RBl = { List(List(Int)) v; Int next; };
+
+RBl r_bytes_list(List(Int) b, Int p) {
+    Rd h = rd(b, p);
+    if (h.major != 4 || h.val > 64) { return RBl {.v = [], .next = -1}; }
+    return r_bl_n(b, h.next, h.val, []);
+}
+
+RBl r_bl_n(List(Int) b, Int p, Int n, List(List(Int)) acc) {
+    if (n == 0) { return RBl {.v = acc, .next = p}; }
+    RB x = r_bytes(b, p);
+    if (x.next < 0) { return RBl {.v = [], .next = -1}; }
+    return r_bl_n(b, x.next, n - 1, acc.concat([x.v]));
+}
+
+type RWs = { List(WitnessRef) v; Int next; };
+
+RWs r_witnesses(List(Int) b, Int p) {
+    Rd h = rd(b, p);
+    if (h.major != 4 || h.val > 32) { return RWs {.v = [], .next = -1}; }
+    return r_ws_n(b, h.next, h.val, []);
+}
+
+RWs r_ws_n(List(Int) b, Int p, Int n, List(WitnessRef) acc) {
+    if (n == 0) { return RWs {.v = acc, .next = p}; }
+    Int a = map_at(b, p, 2);
+    RT u = r_text(b, r_key(b, a, 1));
+    RB k = r_cose_key(b, r_key(b, u.next, 2));
+    if (a < 0 || k.next < 0) { return RWs {.v = [], .next = -1}; }
+    return r_ws_n(b, k.next, n - 1, acc.concat([WitnessRef {.url = u.v, .key = k.v}]));
+}
+
+type RPolicy = { Policy v; Int next; };
+
+Policy no_policy() {
+    return Policy {.device_sigs_for_authority = 0, .recovery_delay_sec = 0, .guardians = [], .guardian_threshold = 0, .witnesses = [], .duress_window_sec = 0, .cosigner_policy = NoCosignerPolicy};
+}
+
+RPolicy r_policy(List(Int) b, Int p) {
+    RPolicy bad = RPolicy {.v = no_policy(), .next = -1};
+    Int a = map_at(b, p, 7);
+    RU dev = r_uint(b, r_key(b, a, 1));
+    RU delay = r_uint(b, r_key(b, dev.next, 2));
+    RBl gs = r_bytes_list(b, r_key(b, delay.next, 3));
+    RU gt = r_uint(b, r_key(b, gs.next, 4));
+    RWs ws = r_witnesses(b, r_key(b, gt.next, 5));
+    RU dw = r_uint(b, r_key(b, ws.next, 6));
+    Int cp = r_key(b, dw.next, 7);
+    if (a < 0 || cp < 0 || dev.v > 255 || gt.v > 255) { return bad; }
+    if (is_null(b, cp)) {
+        return RPolicy {.v = Policy {.device_sigs_for_authority = (UInt(8))dev.v, .recovery_delay_sec = (UInt(64))delay.v, .guardians = gs.v,
+            .guardian_threshold = (UInt(8))gt.v, .witnesses = ws.v, .duress_window_sec = (UInt(64))dw.v, .cosigner_policy = NoCosignerPolicy}, .next = cp + 1};
+    }
+    Int m = map_at(b, cp, 2);
+    RU lim = r_uint(b, r_key(b, m, 1));
+    Int f = r_key(b, lim.next, 2);
+    if (m < 0 || f < 0 || f >= b.len() || b[f] != 244 || lim.v > 4294967295) { return bad; }
+    return RPolicy {.v = Policy {.device_sigs_for_authority = (UInt(8))dev.v, .recovery_delay_sec = (UInt(64))delay.v, .guardians = gs.v,
+        .guardian_threshold = (UInt(8))gt.v, .witnesses = ws.v, .duress_window_sec = (UInt(64))dw.v, .cosigner_policy = CosignerLimit((UInt(32))lim.v)}, .next = f + 1};
+}
+
+type RBody = { Option(EventBody) v; Int next; };
+
+RBody no_body() { return RBody {.v = None, .next = -1}; }
+
+// One CBOR data item's end, for the guardian approvals (opaque COSE_Sign1
+// items kept as their bytes). Definite lengths only, depth-bounded.
+Int item_end(List(Int) b, Int p, Int depth) {
+    if (depth <= 0) { return -1; }
+    Rd h = rd(b, p);
+    if (h.next < 0) { return -1; }
+    if (h.major == 0 || h.major == 1 || h.major == 7) { return if (h.major == 7 && h.val > 23) { -1 } else { h.next }; }
+    if (h.major == 2 || h.major == 3) { return if (h.next + h.val <= b.len()) { h.next + h.val } else { -1 }; }
+    if (h.major == 6) { return item_end(b, h.next, depth - 1); }
+    Int n = if (h.major == 4) { h.val } else { h.val * 2 };
+    return items_end(b, h.next, n, depth - 1);
+}
+
+Int items_end(List(Int) b, Int p, Int n, Int depth) {
+    if (n == 0 || p < 0) { return p; }
+    return items_end(b, item_end(b, p, depth), n - 1, depth);
+}
+
+type RRaw = { List(List(Int)) v; Int next; };
+
+RRaw r_raw_items(List(Int) b, Int p) {
+    Rd h = rd(b, p);
+    if (h.major != 4 || h.val > 32) { return RRaw {.v = [], .next = -1}; }
+    return r_raw_n(b, h.next, h.val, []);
+}
+
+RRaw r_raw_n(List(Int) b, Int p, Int n, List(List(Int)) acc) {
+    if (n == 0) { return RRaw {.v = acc, .next = p}; }
+    Int e = item_end(b, p, 16);
+    if (e < 0) { return RRaw {.v = [], .next = -1}; }
+    return r_raw_n(b, e, n - 1, acc.concat([b[p..e]]));
+}
+
+RBody r_recover(List(Int) b, Int p) {
+    Int a = arr_at(b, p, 4);
+    RU path = r_uint(b, a);
+    RParties ps = r_parties(b, path.next);
+    if (a < 0 || ps.next < 0 || path.v > 255) { return no_body(); }
+    Bool none = is_null(b, ps.next);
+    RB key = if (none) { RB {.v = [], .next = ps.next + 1} } else { r_cose_key(b, ps.next) };
+    RRaw ap = r_raw_items(b, key.next);
+    if (key.next < 0 || ap.next < 0) { return no_body(); }
+    Option(List(Int)) rk = if (none) { None } else { Some(key.v) };
+    return RBody {.v = Some(RecoverBody(RecoverBodyInner {.path = (UInt(8))path.v, .new_parties = ps.v, .revealed_recovery_key = rk, .guardian_approvals = ap.v})), .next = ap.next};
+}
+
+RBody r_body(List(Int) b, Int p) {
+    Rd h = rd(b, p);
+    if (h.major != 4 || h.val < 1 || h.val > 3) { return no_body(); }
+    RU k = r_uint(b, h.next);
+    Int n = h.val;
+    if (k.v == 0 && n == 3) {
+        RQuorum q = r_quorum(b, k.next);
+        RPolicy pl = r_policy(b, q.next);
+        return if (pl.next < 0) { no_body() } else { RBody {.v = Some(InceptionBody(q.v, pl.v)), .next = pl.next} };
+    }
+    if (k.v == 1 && n == 3) {
+        RParty pt = r_party(b, k.next);
+        RB t = r_bytes(b, pt.next);
+        return if (t.next < 0) { no_body() } else { RBody {.v = Some(ProposePartyBody(pt.v, t.v)), .next = t.next} };
+    }
+    if (k.v == 2 && n == 2) { RB id = r_bytes(b, k.next); return if (id.next < 0) { no_body() } else { RBody {.v = Some(RemovePartyBody(id.v)), .next = id.next} }; }
+    if (k.v == 3 && n == 2) { RQuorum q = r_quorum(b, k.next); return if (q.next < 0) { no_body() } else { RBody {.v = Some(ReshareBody(q.v)), .next = q.next} }; }
+    if (k.v == 4 && n == 2) { RPolicy pl = r_policy(b, k.next); return if (pl.next < 0) { no_body() } else { RBody {.v = Some(SetPolicyBody(pl.v)), .next = pl.next} }; }
+    if (k.v == 5 && n == 1) { return RBody {.v = Some(RotateRecoveryBody), .next = k.next}; }
+    if (k.v == 6 && n == 2) { return r_recover(b, k.next); }
+    if (k.v == 7 && n == 2) { RU s = r_uint(b, k.next); return if (s.next < 0) { no_body() } else { RBody {.v = Some(VetoBody((UInt(64))s.v)), .next = s.next} }; }
+    if (k.v == 10 && n == 2) { RU s = r_uint(b, k.next); return if (s.next < 0 || s.v > 255) { no_body() } else { RBody {.v = Some(MigrateBody((UInt(8))s.v)), .next = s.next} }; }
+    return no_body();
+}
+
+type ROpt = { Option(List(Int)) v; Int next; };
+
+ROpt r_opt_bytes(List(Int) b, Int p) {
+    if (is_null(b, p)) { return ROpt {.v = None, .next = p + 1}; }
+    RB x = r_bytes(b, p);
+    return ROpt {.v = if (x.next < 0) { None } else { Some(x.v) }, .next = x.next};
+}
+
+// The payload in `b`, which must be exactly its canonical encoding.
+pub Option(EventPayload) payload_decode(List(Int) b) {
+    Int a = map_at(b, 0, 7);
+    ROpt lid = r_opt_bytes(b, r_key(b, a, 1));
+    RU seq = r_uint(b, r_key(b, lid.next, 2));
+    ROpt pred = r_opt_bytes(b, r_key(b, seq.next, 3));
+    RU suite = r_uint(b, r_key(b, pred.next, 4));
+    RBody body = r_body(b, r_key(b, suite.next, 5));
+    RBl nd = r_bytes_list(b, r_key(b, body.next, 6));
+    RU t = r_uint(b, r_key(b, nd.next, 7));
+    if (a < 0 || t.next != b.len() || suite.v > 255) { return None; }
+    Option(EventBody) ob = body.v;
+    return match ob {
+        None => None,
+        Some(bd) => canonical(EventPayload {.log_id = lid.v, .sequence = (UInt(64))seq.v, .predecessor_digest = pred.v, .suite = (UInt(8))suite.v,
+                                            .body = bd, .next_recovery_key_digests = nd.v, .advisory_time = (UInt(64))t.v}, b)
+    };
+}
+
+Option(EventPayload) canonical(EventPayload p, List(Int) b) {
+    Option(List(Int)) e = payload_cbor(p);
+    return match e { None => None, Some(x) => if (bytes_eq(x, b)) { Some(p) } else { None } };
+}

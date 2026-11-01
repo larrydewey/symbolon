@@ -1,0 +1,48 @@
+// Shared collections (SPEC 19) as the relay stores them: a roster the
+// owner's device signs, the collection key wrapped to every member device,
+// and a person's card for others to find them by. The collection's items
+// are an ordinary VaultState under its own key ("coll-<id>").
+
+import "../types.resid";
+
+// A member other than the owner, with the name the owner gave them.
+//@ serial
+pub type Member = { List(Int) log_id; Str label; };
+
+// "roster-<id>": who is in the collection, signed by a device of the
+// owner's log. The version goes up on every change of members, name or
+// key; a device never accepts a lower one than it saw.
+//@ serial
+pub type Roster = {
+    List(Int) coll_id;                   // 16 random bytes
+    UInt(64) version;
+    List(Int) owner;                     // the owner's log id
+    Str owner_label;
+    List(Member) members;
+    List(Int) name_ct;                   // the collection's name, sealed under its key at this version
+    Bool deleted;
+    UInt(64) log_sequence;               // owner's log sequence at which the signer was a party
+    List(Int) signer;                    // party id of the signing device
+    List(Int) sig;
+};
+
+// The collection key for one device of a member: HPKE mode_auth from a
+// device of a member (from_log, from_party) to the device `to`.
+//@ serial
+pub type ShareWrap = { List(Int) to; List(Int) from_log; List(Int) from_party; List(Int) enc; List(Int) ct; };
+
+// "wrap-<member log>-<id>": the wraps for every device of one member, at
+// one roster version.
+//@ serial
+pub type WrapSet = { List(Int) coll_id; UInt(64) roster_version; List(Int) member; List(ShareWrap) wraps; };
+
+// "card-<log>": the name a person goes by, signed by one of their devices.
+//@ serial
+pub type Card = { List(Int) log_id; Str name; UInt(64) log_sequence; List(Int) signer; List(Int) sig; };
+
+// "leave-<id>-<log>": a member's word that they left the collection,
+// signed by one of their devices. The owner's device, when it next lists
+// its folders, removes them (a new key); the owner clears the record when
+// they are removed or added again.
+//@ serial
+pub type Leave = { List(Int) coll_id; List(Int) log_id; UInt(64) roster_version; UInt(64) log_sequence; List(Int) signer; List(Int) sig; };

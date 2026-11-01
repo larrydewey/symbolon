@@ -1,0 +1,428 @@
+// Symbolon threshold ECDSA P-256
+// SPEC Sections 6.2, 10, 11
+// Implements a t-of-n threshold ECDSA with:
+// - DKG (distributed key generation)
+// - Signing with additive tweak by designated party
+// - Proactive refresh
+// - Re-sharing to new parties
+
+@requires(device, network)
+import "../types.resid";
+import "crypto.resid";
+import "p256.resid";
+import "hpke.resid";
+import "cose.resid";
+import "cbor.resid";
+
+// ============================================================================
+// Configuration
+// ============================================================================
+
+
+// ============================================================================
+// Threshold key share
+// ============================================================================
+
+type ThresholdShare = {
+    party_id: PartyId,
+    epoch: Epoch,
+    x_i: SecretShare,      // Shamir share of root key x
+    public_poly: List(PubKey),  // commitment to polynomial coefficients
+    cc: SecretChainCode / Null,  // chain code (device + kit only)
+    hpke_key: PubKey,      // for receiving new shares
+};
+
+// ============================================================================
+// DKG (Distributed Key Generation)
+// SPEC Section 10.1
+// ============================================================================
+
+@requires(device, network)
+Result(ThresholdShare) dkg_participate(
+    PartyId my_id,
+    List(Party) participants,
+    UInt(8) t,
+    Epoch epoch
+) {
+    // Each party generates a random polynomial f_i(x) of degree t-1
+    // f_i(0) is their contribution to the secret x
+    // They broadcast commitments to coefficients: G * f_i(j) for j=0..t-1
+    // And send f_i(j) to party j (encrypted with HPKE)
+    
+    // This is a simplified sketch; real implementation needs:
+    // - Verifiable secret sharing (Feldman or Pedersen)
+    // - ZK proofs of correct sharing
+    // - Complaint and reconstruction phase
+    
+    Secret(Bytes(32)) my_secret = random_bytes(32);
+    List(SecretShare) shares = shamir_share(my_secret, t, participants.len());
+    
+    // Send shares to other parties
+    for (i in 0..participants.len()) {
+        if (participants[i].id == my_id) continue;
+        HpkeCiphertext ct = hpke_encrypt(
+            participants[i].hpke_key,
+            shares[i].to_bytes(),
+            "symbolon v1 dkg share || " || epoch.to_str()
+        );
+        // Send via sync service
+    }
+    
+    // Receive shares from others, verify against commitments
+    // Compute x_i = sum of received f_j(i)
+    SecretShare x_i = sum_received_shares();
+    
+    // Compute public polynomial coefficients
+    List(PubKey) public_poly = compute_public_poly(participants, t);
+    
+    // Generate chain code cc (device + kit only)
+    SecretChainCode cc = Null;
+    if (my_kind == PARTY_KIND_DEVICE || my_kind == PARTY_KIND_KIT) {
+        cc = generate_chain_code(participants);
+    }
+    
+    return Ok(ThresholdShare {
+        party_id: my_id,
+        epoch: epoch,
+        x_i: x_i,
+        public_poly: public_poly,
+        cc: cc,
+        hpke_key: my_hpke_key,
+    });
+}
+
+@requires()
+SecretChainCode generate_chain_code(List(Party) participants) {
+    // Each device/kit party contributes randomness
+    // cc = H(contribution_1 || contribution_2 || ...)
+    List(Secret(Bytes)) contributions = [];
+    for (p in participants) {
+        if (p.kind == PARTY_KIND_DEVICE || p.kind == PARTY_KIND_KIT) {
+            contributions.push(p.contribution);  // from DKG
+        }
+    }
+    return SecretChainCode(H(contributions));
+}
+
+// ============================================================================
+// Threshold signing with additive tweak
+// SPEC Sections 6.2, 10.3, 10.4
+// ============================================================================
+
+type SignRequest = {
+    session_id: Bytes(32),
+    message: Bytes(32),           // m = SHA-256(authData || clientDataHash)
+    epoch: Epoch,
+    rp_id: SecretRpId,            // only for designated party
+    nonce: Bytes(16),             // per-credential nonce
+    cc: SecretChainCode,          // only for designated party
+    requester_dk_sig: Es256Sig,   // signed by requester's DK over (m, epoch, session_id)
+};
+
+type SignResponse = {
+    session_id: Bytes(32),
+    party_id: PartyId,
+    partial_sig: Bytes,           // protocol-specific partial signature
+    proof: Bytes,                 // ZK proof of correct behavior
+};
+
+type ThresholdSignature = {
+    r: Bytes(32),
+    s: Bytes(32),                 // final ECDSA signature under P
+};
+
+@requires(device, network)
+Result(ThresholdSignature) threshold_sign(
+    ThresholdShare my_share,
+    SignRequest req,
+    List(Party) available_parties
+) {
+    // 1. Verify request: DK signature, epoch, session_id not reused
+    if (!verify_device_signature(req.requester_dk_sig, req)) {
+        return Err(ErrPolicyViolation { msg: "invalid request signature" });
+    }
+    if (req.epoch != my_share.epoch) {
+        return Err(ErrStaleEpoch { have: req.epoch, current: my_share.epoch });
+    }
+    if (session_id_seen(req.session_id)) {
+        return Err(ErrPolicyViolation { msg: "session id replay" });
+    }
+    mark_session_id_seen(req.session_id);
+
+    // 2. Designated party computes τ
+    Secret(Bytes(48)) tau = Null;
+    if (am_designated_party(req)) {
+        tau = compute_tau(my_share.cc, req.rp_id, req.nonce);
+    }
+
+    // 3. Run threshold protocol with t parties
+    // This is where the DKLs or CGGMP protocol runs
+    // The designated party adds τ to its share during signing
+    
+    Result(ThresholdSignature) result = run_threshold_protocol(
+        my_share.x_i,
+        req.message,
+        tau,
+        available_parties,
+        req.session_id
+    );
+
+    // 4. Verify result before returning
+    if (result.is_ok()) {
+        ThresholdSignature sig = result.unwrap();
+        if (!verify_es256(compute_pubkey(my_share, tau), req.message, sig)) {
+            return Err(ErrInternal { msg: "signature verification failed" });
+        }
+    }
+
+    return result;
+}
+
+@requires()
+Secret(Bytes(48)) compute_tau(SecretChainCode cc, SecretRpId rp_id, Bytes(16) nonce) {
+    // τ = HKDF(cc, nil, "symbolon v1 tweak" || rp_id || nonce, 48) mod q
+    Bytes info = "symbolon v1 tweak" + rp_id.inner + nonce;
+    Secret(Bytes(48)) hkdf_out = Secret(Bytes(48))(hkdf_sha256(cc.inner, Bytes(32)(0), info, 48));
+    // Reduce mod q (P-256 order)
+    return Secret(Bytes(48))(hkdf_out mod SECP256R1_ORDER);
+}
+
+@requires()
+PubKey compute_pubkey(ThresholdShare share, Secret(Bytes(48)) tau / Null) {
+    // P = X + τG
+    PubKey X = share.public_poly[0];  // X = f(0)G
+    if (tau.is_null()) {
+        return X;
+    }
+    // Add τG to X
+    Point tau_G = scalar_mul(SECP256R1_G, tau.inner);
+    return X + tau_G;
+}
+
+@requires()
+Result(ThresholdSignature) run_threshold_protocol(
+    SecretShare x_i,
+    Bytes(32) m,
+    Secret(Bytes(48)) tau,
+    List(Party) parties,
+    Bytes(32) session_id
+) {
+    // Placeholder for actual threshold ECDSA protocol
+    // Real implementation would use DKLs (OT-based) or CGGMP (Paillier-based)
+    // with all ZK proofs and parameter checks
+    
+    // This is where the cryptographic magic happens:
+    // - Each party computes their partial signature
+    // - Designated party adds τ to their share
+    // - Parties exchange messages
+    // - Combine into final (r, s)
+    
+    // For now, return error indicating not implemented
+    return Err(ErrInternal { msg: "threshold ECDSA not yet implemented" });
+}
+
+// ============================================================================
+// Proactive refresh (SPEC Section 11.3)
+// ============================================================================
+
+@requires(device, network)
+Result(ThresholdShare) proactive_refresh(
+    ThresholdShare old_share,
+    List(Party) same_parties,
+    Epoch new_epoch
+) {
+    // Same parties, new polynomial, same secret x
+    // Each party generates random polynomial g_i(x) of degree t-1 with g_i(0) = 0
+    // New share = old_share + sum g_j(i)
+    // Public polynomial = old + sum of g_j commitments
+    
+    SecretShare new_x_i = refresh_share(old_share.x_i, same_parties);
+    List(PubKey) new_public_poly = refresh_public_poly(old_share.public_poly, same_parties);
+    
+    return Ok(ThresholdShare {
+        party_id: old_share.party_id,
+        epoch: new_epoch,
+        x_i: new_x_i,
+        public_poly: new_public_poly,
+        cc: old_share.cc,  // chain code stays same
+        hpke_key: old_share.hpke_key,
+    });
+}
+
+// ============================================================================
+// Re-share (SPEC Section 11.3)
+// ============================================================================
+
+@requires(device, network)
+Result(ThresholdShare) reshare(
+    ThresholdShare old_share,
+    List(Party) old_parties,   // at least t
+    List(Party) new_parties,   // all new parties
+    UInt(8) new_t,
+    Epoch new_epoch
+) {
+    // Run DKG-style protocol between old and new parties
+    // Old parties use their shares to generate new shares for new parties
+    // Public key X stays the same
+    
+    // 1. Old parties compute new polynomial h(x) with h(0) = 0
+    // 2. For each new party j, compute h(j) and send encrypted
+    // 3. New parties combine with their DKG contributions
+    // 4. New public polynomial = old + h
+    
+    SecretShare new_x_i = reshare_compute_share(old_share, old_parties, new_parties, new_t);
+    List(PubKey) new_public_poly = reshare_public_poly(old_share.public_poly, old_parties);
+    
+    // Chain code rotation if device removed (SPEC 11.2)
+    SecretChainCode new_cc = old_share.cc;
+    if (device_removed(old_parties, new_parties)) {
+        new_cc = generate_chain_code(new_parties);
+    }
+    
+    return Ok(ThresholdShare {
+        party_id: old_share.party_id,
+        epoch: new_epoch,
+        x_i: new_x_i,
+        public_poly: new_public_poly,
+        cc: new_cc,
+        hpke_key: old_share.hpke_key,
+    });
+}
+
+// ============================================================================
+// Shamir secret sharing helpers
+// ============================================================================
+
+@requires()
+List(SecretShare) shamir_share(Secret(Bytes(32)) secret, UInt(8) t, UInt(8) n) {
+    // Generate random polynomial f(x) = a_0 + a_1*x + ... + a_{t-1}*x^{t-1}
+    // where a_0 = secret
+    // Return f(1), f(2), ..., f(n)
+    return [];
+}
+
+@requires()
+SecretShare sum_received_shares() {
+    return SecretShare(Bytes(32)(0));
+}
+
+@requires()
+List(PubKey) compute_public_poly(List(Party) participants, UInt(8) t) {
+    return [];
+}
+
+@requires()
+SecretShare refresh_share(SecretShare old, List(Party) parties) {
+    return old;
+}
+
+@requires()
+List(PubKey) refresh_public_poly(List(PubKey) old, List(Party) parties) {
+    return old;
+}
+
+@requires()
+SecretShare reshare_compute_share(ThresholdShare old, List(Party) old_p, List(Party) new_p, UInt(8) new_t) {
+    return old.x_i;
+}
+
+@requires()
+List(PubKey) reshare_public_poly(List(PubKey) old, List(Party) old_p) {
+    return old;
+}
+
+@requires()
+Bool device_removed(List(Party) old, List(Party) new) {
+    for (p in old) {
+        if (p.kind == PARTY_KIND_DEVICE) {
+            Bool found = false;
+            for (np in new) {
+                if (np.id == p.id) { found = true; break; }
+            }
+            if (!found) { return true; }
+        }
+    }
+    return false;
+}
+
+@requires()
+Bool am_designated_party(SignRequest req) {
+    // In real impl, check if we're the designated party for this session
+    return false;
+}
+
+@requires()
+Bool session_id_seen(Bytes(32) id) {
+    // Check replay cache
+    return false;
+}
+
+@requires()
+Void mark_session_id_seen(Bytes(32) id) {
+    // Record in replay cache
+}
+
+// ============================================================================
+// Credential ID and tweak (SPEC Section 10.3)
+// ============================================================================
+
+@requires()
+SecretCredentialId make_credential_id(SecretChainCode cc, SecretRpId rp_id, Bytes(16) nonce) {
+    // tag = HMAC-SHA256(k_cid, "symbolon v1 cid" || rp_id || nonce)[0..16]
+    // k_cid = HKDF(cc, nil, "symbolon v1 cid", 32)
+    SecretKey k_cid = hkdf_sha256(cc.inner, Bytes(32)(0), "symbolon v1 cid", 32);
+    Bytes tag = hmac_sha256(k_cid.inner, "symbolon v1 cid" + rp_id.inner + nonce);
+    tag = tag[0..16];
+    return SecretCredentialId(CredentialId(nonce + tag));
+}
+
+@requires()
+Bool verify_credential_id(SecretChainCode cc, SecretRpId rp_id, SecretCredentialId cid) {
+    Bytes(16) nonce = cid.inner[0..16];
+    Bytes(16) tag = cid.inner[16..32];
+    SecretKey k_cid = hkdf_sha256(cc.inner, Bytes(32)(0), "symbolon v1 cid", 32);
+    Bytes expected_tag = hmac_sha256(k_cid.inner, "symbolon v1 cid" + rp_id.inner + nonce)[0..16];
+    return ct_eq(tag, expected_tag);
+}
+
+@requires()
+Credential register_credential(
+    SecretChainCode cc,
+    SecretRpId rp_id,
+    PubKey root_pubkey
+) {
+    Bytes(16) nonce = random_bytes(16);
+    Secret(Bytes(48)) tau = compute_tau(cc, rp_id, nonce);
+    PubKey P = root_pubkey + scalar_mul(SECP256R1_G, tau.inner);
+    SecretCredentialId cid = make_credential_id(cc, rp_id, nonce);
+    
+    return Credential {
+        id: cid,
+        rp_id: rp_id,
+        public_key: P,
+        profile: Secret(UInt(8))(0),  // Threshold
+        tweak_tau: tau,
+        created_at: Secret(UInt(64))(current_timestamp()),
+        rotation_due: Null,
+    };
+}
+
+// ============================================================================
+// Exports
+// ============================================================================
+
+export {
+    ThresholdShare,
+    dkg_participate,
+    threshold_sign,
+    proactive_refresh,
+    reshare,
+    compute_tau,
+    make_credential_id,
+    verify_credential_id,
+    register_credential,
+    compute_pubkey,
+    ThresholdSignature,
+    SignRequest,
+    SignResponse,
+};

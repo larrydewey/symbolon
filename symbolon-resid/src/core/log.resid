@@ -1,0 +1,622 @@
+// Identity log verifier (SPEC Sections 8.2, 8.3, 13.4).
+//
+// Pure: no provider is touched, so nothing here needs a capability. The
+// caller supplies the events, their witness co-signatures, the current
+// witness time and (for guardian recoveries) the approval check; the
+// verifier never repairs a log, it returns Ok(VerifiedHead) or Err.
+//
+// Invariant the wire decoder MUST keep: SignedEvent.encoded is the exact
+// byte string that was signed and from which `payload` was decoded. The
+// verifier hashes and checks signatures over `encoded` and reads rules from
+// `payload`; it cannot tell the two apart.
+
+import "../types.resid";
+import "hash.resid";
+import "ecdsa.resid";
+import "crypto.resid";
+import "cose.resid";
+
+//@ serial
+pub type EventSig = { List(Int) signer; List(Int) sig; };
+
+pub type SignedEvent = {
+    EventPayload payload;
+    List(Int) encoded;
+    List(EventSig) sigs;
+    List(WitnessCosignature) cosigs;
+};
+
+// A delayed event, applied once its delay has run without a veto.
+type Pending = {
+    UInt(64) seq;
+    Int ready_at;
+    EventBody body;
+    List(Int) event_digest;
+    List(List(Int)) next_digests;
+};
+
+type LogState = {
+    Quorum quorum;
+    Policy policy;
+    List(List(Int)) recovery_digests;       // field 6 in force
+    List(Party) proposed;                // effective at the next reshare
+    List(List(Int)) removed;
+    List(Pending) pending;
+    Int vetoes;                          // consecutive vetoes of recoveries
+    List(Int) prev_digest;
+    UInt(64) next_seq;
+    Int last_time;                       // witness time of the last event
+    List(WitnessCosignature) last_cosigs;
+};
+
+// ============================================================================
+// Byte helpers
+// ============================================================================
+
+pub Bool bytes_eq(List(Int) a, List(Int) b) {
+    if (a.len() != b.len()) { return false; }
+    return bytes_eq_from(a, b, 0);
+}
+
+Bool bytes_eq_from(List(Int) a, List(Int) b, Int i) {
+    if (i >= a.len()) { return true; }
+    if (a[i] != b[i]) { return false; }
+    return bytes_eq_from(a, b, i + 1);
+}
+
+Eq(List(Int)) = bytes_eq;
+
+Bool has_bytes(List(List(Int)) xs, List(Int) x, Int i) {
+    if (i >= xs.len()) { return false; }
+    if (bytes_eq(xs[i], x)) { return true; }
+    return has_bytes(xs, x, i + 1);
+}
+
+Bool opt_bytes_is(Option(List(Int)) o, List(Int) want) {
+    return match o { Some(b) => bytes_eq(b, want), None => false };
+}
+
+Bool opt_present(Option(List(Int)) o) {
+    return match o { Some(_) => true, None => false };
+}
+
+Bool known_party(Option(Party) o) {
+    return match o { Some(_) => true, None => false };
+}
+
+Bool known_witness(Option(WitnessRef) o) {
+    return match o { Some(_) => true, None => false };
+}
+
+// ============================================================================
+// Quorum lookups
+// ============================================================================
+
+Option(Party) party_by_id(List(Party) ps, List(Int) id, Int i) {
+    if (i >= ps.len()) { return None; }
+    if (bytes_eq(ps[i].id, id)) { return Some(ps[i]); }
+    return party_by_id(ps, id, i + 1);
+}
+
+Int device_count(List(Party) ps, Int i, Int acc) {
+    if (i >= ps.len()) { return acc; }
+    Int add = if (ps[i].kind == party_kind_device()) { 1 } else { 0 };
+    return device_count(ps, i + 1, acc + add);
+}
+
+Bool ids_distinct(List(Party) ps, Int i) {
+    if (i >= ps.len()) { return true; }
+    List(List(Int)) rest = ids_of(ps, i + 1, ListBuf());
+    if (has_bytes(rest, ps[i].id, 0)) { return false; }
+    return ids_distinct(ps, i + 1);
+}
+
+List(List(Int)) ids_of(List(Party) ps, Int i, ListBuf(List(Int)) acc) {
+    if (i >= ps.len()) { return acc.finish(); }
+    return ids_of(ps, i + 1, acc.push(ps[i].id));
+}
+
+Bool key_ok(List(Int) k) { return ec_public_ok(P256, k); }
+
+Bool parties_ok(List(Party) ps, Int i) {
+    if (i >= ps.len()) { return true; }
+    Party p = ps[i];
+    if (!key_ok(p.auth_key)) { return false; }
+    if (p.id.len() != 32) { return false; }
+    return parties_ok(ps, i + 1);
+}
+
+// SPEC 7: 1 to 8 parties, 1 <= t <= parties, distinct ids, valid keys.
+Bool quorum_ok(Quorum q) {
+    Int n = q.parties.len();
+    if (n < 1 || n > 8) { return false; }
+    Int t = (Int)q.t;
+    if (t < 1 || t > n) { return false; }
+    if (!key_ok(q.root_pubkey)) { return false; }
+    if (!ids_distinct(q.parties, 0)) { return false; }
+    return parties_ok(q.parties, 0);
+}
+
+// Distinct witness keys (SPEC 20.3: at least three; independence of their
+// operators is a deployment matter the verifier cannot check).
+Int witness_keys_distinct(List(WitnessRef) ws, Int i) {
+    if (i >= ws.len()) { return 0; }
+    List(List(Int)) rest = witness_key_list(ws, i + 1, ListBuf());
+    return (if (has_bytes(rest, ws[i].key, 0)) { 0 } else { 1 }) + witness_keys_distinct(ws, i + 1);
+}
+
+List(List(Int)) witness_key_list(List(WitnessRef) ws, Int i, ListBuf(List(Int)) acc) {
+    if (i >= ws.len()) { return acc.finish(); }
+    return witness_key_list(ws, i + 1, acc.push(ws[i].key));
+}
+
+// SPEC 8.2 and 20.3: policy[1] >= 2 when the quorum holds two devices or more,
+// recovery delay at least 24 hours.
+Bool policy_ok(Policy p, Quorum q) {
+    Int floor = if (device_count(q.parties, 0, 0) >= 2) { 2 } else { 1 };
+    if ((Int)p.device_sigs_for_authority < floor) { return false; }
+    if (p.recovery_delay_sec < 86400) { return false; }
+    if (witness_keys_distinct(p.witnesses, 0) < 3) { return false; }
+    if ((Int)p.guardian_threshold > p.guardians.len()) { return false; }
+    return true;
+}
+
+// SPEC 8.2: a policy that shortens the delay or thins guardians or witnesses.
+Bool weakens(Policy old, Policy new) {
+    if (new.recovery_delay_sec < old.recovery_delay_sec) { return true; }
+    if (new.guardians.len() < old.guardians.len()) { return true; }
+    if (new.guardian_threshold < old.guardian_threshold) { return true; }
+    if (new.witnesses.len() < old.witnesses.len()) { return true; }
+    return false;
+}
+
+// ============================================================================
+// Signatures
+// ============================================================================
+
+Bool sig_ok(List(Int) key, List(Int) msg, List(Int) sig) {
+    return ecdsa_verify_raw(P256, Sha256, key, msg, sig);
+}
+
+// Distinct ids of parties in `ps` (filtered to devices when `devices_only`)
+// with a valid signature over the event's encoding.
+List(List(Int)) valid_signers(List(EventSig) sigs, List(Party) ps, Bool devices_only, List(Int) msg, Int i, List(List(Int)) acc) {
+    if (i >= sigs.len()) { return acc; }
+    EventSig s = sigs[i];
+    Option(Party) found = party_by_id(ps, s.signer, 0);
+    Bool counts = match found {
+        Some(p) => (!devices_only || p.kind == party_kind_device())
+                   && !has_bytes(acc, s.signer, 0)
+                   && sig_ok(p.auth_key, msg, s.sig),
+        None => false
+    };
+    List(List(Int)) next = if (counts) { acc.concat([s.signer]) } else { acc };
+    return valid_signers(sigs, ps, devices_only, msg, i + 1, next);
+}
+
+// Whether any signature verifies under `key` (for the kit's recovery key).
+Bool signed_by_key(List(EventSig) sigs, List(Int) key, List(Int) msg, Int i) {
+    if (i >= sigs.len()) { return false; }
+    if (sig_ok(key, msg, sigs[i].sig)) { return true; }
+    return signed_by_key(sigs, key, msg, i + 1);
+}
+
+Bool signed_by_any(List(EventSig) sigs, List(Party) ps, List(Int) msg, Int i) {
+    if (i >= ps.len()) { return false; }
+    if (signed_by_key(sigs, ps[i].auth_key, msg, 0)) { return true; }
+    return signed_by_any(sigs, ps, msg, i + 1);
+}
+
+// ============================================================================
+// Witness co-signatures and witness time (SPEC 8.3, A-07)
+// ============================================================================
+
+pub List(Int) witness_message(List(Int) l, UInt(64) seq, List(Int) d) {
+    List(Int) a = cbe_array(4, []);
+    List(Int) b = cbe_text("symbolon v1 witness", a);
+    List(Int) c = cbe_bytes(l, b);
+    List(Int) e = cbe_uint((Int)seq, c);
+    return cbe_bytes(d, e);
+}
+
+Option(WitnessRef) witness_by_key(List(WitnessRef) ws, List(Int) k, Int i) {
+    if (i >= ws.len()) { return None; }
+    if (bytes_eq(ws[i].key, k)) { return Some(ws[i]); }
+    return witness_by_key(ws, k, i + 1);
+}
+
+// Witness times of the distinct, valid co-signatures of one event.
+List(Int) cosig_times(List(WitnessCosignature) cs, List(WitnessRef) ws, List(Int) l, UInt(64) seq, List(Int) d, Int i, List(List(Int)) seen, List(Int) times) {
+    if (i >= cs.len()) { return times; }
+    WitnessCosignature c = cs[i];
+    Bool good = c.sequence == seq
+        && bytes_eq(c.log_id, l)
+        && bytes_eq(c.digest, d)
+        && !has_bytes(seen, c.witness_key, 0)
+        && known_witness(witness_by_key(ws, c.witness_key, 0))
+        && sig_ok(c.witness_key, witness_message(l, seq, d), c.signature);
+    List(List(Int)) seen2 = if (good) { seen.concat([c.witness_key]) } else { seen };
+    List(Int) times2 = if (good) { times.concat([(Int)c.witness_time]) } else { times };
+    return cosig_times(cs, ws, l, seq, d, i + 1, seen2, times2);
+}
+
+// Median witness time, provided a majority of the policy's witnesses signed.
+pub Result(Int, SymbolonError) witness_time(List(WitnessCosignature) cs, Policy pol, List(Int) l, UInt(64) seq, List(Int) d) {
+    List(Int) ts = cosig_times(cs, pol.witnesses, l, seq, d, 0, [], []);
+    Int need = pol.witnesses.len() / 2 + 1;
+    if (ts.len() < need) {
+        return Err(ErrInvalidLog("fewer than a majority of witnesses co-signed"));
+    }
+    List(Int) sorted = sort(ts);
+    return Ok(sorted[sorted.len() / 2]);
+}
+
+// ============================================================================
+// Applying effects
+// ============================================================================
+
+LogState apply_effect(LogState s, EventBody body, List(Int) event_digest, List(List(Int)) next_digests) {
+    return match body {
+        ProposePartyBody(party, _) => LogState {
+            .quorum = s.quorum, .policy = s.policy, .recovery_digests = s.recovery_digests,
+            .proposed = s.proposed.concat([party]), .removed = s.removed, .pending = s.pending,
+            .vetoes = s.vetoes, .prev_digest = s.prev_digest, .next_seq = s.next_seq,
+            .last_time = s.last_time, .last_cosigs = s.last_cosigs },
+        RemovePartyBody(id) => LogState {
+            .quorum = s.quorum, .policy = s.policy, .recovery_digests = s.recovery_digests,
+            .proposed = s.proposed, .removed = s.removed.concat([id]), .pending = s.pending,
+            .vetoes = s.vetoes, .prev_digest = s.prev_digest, .next_seq = s.next_seq,
+            .last_time = s.last_time, .last_cosigs = s.last_cosigs },
+        ReshareBody(nq) => LogState {
+            .quorum = nq, .policy = s.policy, .recovery_digests = s.recovery_digests,
+            .proposed = [], .removed = [], .pending = s.pending,
+            .vetoes = s.vetoes, .prev_digest = s.prev_digest, .next_seq = s.next_seq,
+            .last_time = s.last_time, .last_cosigs = s.last_cosigs },
+        SetPolicyBody(np) => LogState {
+            .quorum = s.quorum, .policy = np, .recovery_digests = s.recovery_digests,
+            .proposed = s.proposed, .removed = s.removed, .pending = s.pending,
+            .vetoes = s.vetoes, .prev_digest = s.prev_digest, .next_seq = s.next_seq,
+            .last_time = s.last_time, .last_cosigs = s.last_cosigs },
+        RotateRecoveryBody => LogState {
+            .quorum = s.quorum, .policy = s.policy, .recovery_digests = next_digests,
+            .proposed = s.proposed, .removed = s.removed, .pending = s.pending,
+            .vetoes = s.vetoes, .prev_digest = s.prev_digest, .next_seq = s.next_seq,
+            .last_time = s.last_time, .last_cosigs = s.last_cosigs },
+        RecoverBody(r) => LogState {
+            .quorum = Quorum {
+                .parties = r.new_parties, .t = s.quorum.t, .root_pubkey = s.quorum.root_pubkey,
+                .epoch = s.quorum.epoch + 1, .transcript_digest = event_digest },
+            .policy = s.policy, .recovery_digests = next_digests,
+            .proposed = [], .removed = [], .pending = s.pending,
+            .vetoes = 0, .prev_digest = s.prev_digest, .next_seq = s.next_seq,
+            .last_time = s.last_time, .last_cosigs = s.last_cosigs },
+        _ => s
+    };
+}
+
+LogState with_pending(LogState s, List(Pending) pending) {
+    return LogState {
+        .quorum = s.quorum, .policy = s.policy, .recovery_digests = s.recovery_digests,
+        .proposed = s.proposed, .removed = s.removed, .pending = pending,
+        .vetoes = s.vetoes, .prev_digest = s.prev_digest, .next_seq = s.next_seq,
+        .last_time = s.last_time, .last_cosigs = s.last_cosigs };
+}
+
+LogState with_vetoes(LogState s, Int vetoes) {
+    return LogState {
+        .quorum = s.quorum, .policy = s.policy, .recovery_digests = s.recovery_digests,
+        .proposed = s.proposed, .removed = s.removed, .pending = s.pending,
+        .vetoes = vetoes, .prev_digest = s.prev_digest, .next_seq = s.next_seq,
+        .last_time = s.last_time, .last_cosigs = s.last_cosigs };
+}
+
+LogState with_time(LogState s, Int time) {
+    return LogState {
+        .quorum = s.quorum, .policy = s.policy, .recovery_digests = s.recovery_digests,
+        .proposed = s.proposed, .removed = s.removed, .pending = s.pending,
+        .vetoes = s.vetoes, .prev_digest = s.prev_digest, .next_seq = s.next_seq,
+        .last_time = time, .last_cosigs = s.last_cosigs };
+}
+
+LogState advance(LogState s, List(Int) digest, Int time, List(WitnessCosignature) cosigs) {
+    return LogState {
+        .quorum = s.quorum, .policy = s.policy, .recovery_digests = s.recovery_digests,
+        .proposed = s.proposed, .removed = s.removed, .pending = s.pending,
+        .vetoes = s.vetoes, .prev_digest = digest, .next_seq = s.next_seq + 1,
+        .last_time = time, .last_cosigs = cosigs };
+}
+
+// Applies every pending event whose delay has run by `now`, oldest first.
+LogState settle(LogState s, Int now) {
+    return settle_from(s, now, 0, ListBuf());
+}
+
+LogState settle_from(LogState s, Int now, Int i, ListBuf(Pending) kept) {
+    if (i >= s.pending.len()) { return with_pending(s, kept.finish()); }
+    Pending p = s.pending[i];
+    if (p.ready_at <= now) {
+        LogState applied = apply_effect(s, p.body, p.event_digest, p.next_digests);
+        return settle_from(applied, now, i + 1, kept);
+    }
+    return settle_from(s, now, i + 1, kept.push(p));
+}
+
+Option(Pending) pending_by_seq(List(Pending) ps, UInt(64) seq, Int i) {
+    if (i >= ps.len()) { return None; }
+    if (ps[i].seq == seq) { return Some(ps[i]); }
+    return pending_by_seq(ps, seq, i + 1);
+}
+
+List(Pending) pending_without(List(Pending) ps, UInt(64) seq, Int i, ListBuf(Pending) acc) {
+    if (i >= ps.len()) { return acc.finish(); }
+    ListBuf(Pending) next = if (ps[i].seq == seq) { acc } else { acc.push(ps[i]) };
+    return pending_without(ps, seq, i + 1, next);
+}
+
+Bool is_recover_body(EventBody b) {
+    return match b { RecoverBody(_) => true, _ => false };
+}
+
+// ============================================================================
+// Reshare checks (SPEC 8.2, 11.3)
+// ============================================================================
+
+// Every party of the new quorum is a surviving member of the old quorum or a
+// proposed party, and no removed party remains.
+Bool reshare_parties_ok(LogState s, List(Party) np, Int i) {
+    if (i >= np.len()) { return true; }
+    Party p = np[i];
+    Bool in_old = known_party(party_by_id(s.quorum.parties, p.id, 0));
+    Bool in_proposed = known_party(party_by_id(s.proposed, p.id, 0));
+    if (!in_old && !in_proposed) { return false; }
+    if (has_bytes(s.removed, p.id, 0)) { return false; }
+    return reshare_parties_ok(s, np, i + 1);
+}
+
+List(Party) online_parties(List(Party) ps, Int i, List(Party) acc) {
+    if (i >= ps.len()) { return acc; }
+    Bool offline = ps[i].kind == party_kind_kit() || ps[i].kind == party_kind_guardian();
+    return online_parties(ps, i + 1, if (offline) { acc } else { acc.concat([ps[i]]) });
+}
+
+// Signers from the union of old and new parties.
+Int signers_in(List(List(Int)) ids, List(Party) ps, Int i, Int acc) {
+    if (i >= ids.len()) { return acc; }
+    Int add = if (known_party(party_by_id(ps, ids[i], 0))) { 1 } else { 0 };
+    return signers_in(ids, ps, i + 1, acc + add);
+}
+
+// ============================================================================
+// One event
+// ============================================================================
+
+Result(LogState, SymbolonError) refuse(Str why) { return Err(ErrInvalidLog(why)); }
+
+// Authority events: immediate when signed by policy[1] devices, otherwise
+// delayed by the recovery delay (A-04).
+Result(LogState, SymbolonError) authority(LogState s, SignedEvent e, List(Int) dig, Bool force_delay, Int dev_sigs) {
+    if (dev_sigs < 1) { return refuse("authority event without a device signature"); }
+    EventPayload ep = e.payload;
+    Bool immediate = !force_delay && dev_sigs >= (Int)s.policy.device_sigs_for_authority;
+    if (immediate) {
+        return Ok(apply_effect(s, ep.body, dig, ep.next_recovery_key_digests));
+    }
+    Pending p = Pending {
+        .seq = ep.sequence, .ready_at = s.last_time + (Int)s.policy.recovery_delay_sec,
+        .body = ep.body, .event_digest = dig, .next_digests = ep.next_recovery_key_digests };
+    return Ok(with_pending(s, s.pending.concat([p])));
+}
+
+Result(LogState, SymbolonError) do_propose(LogState s, SignedEvent e, List(Int) dig, Int dev_sigs, Party party) {
+    if (known_party(party_by_id(s.quorum.parties, party.id, 0)) || known_party(party_by_id(s.proposed, party.id, 0))) {
+        return refuse("party already known");
+    }
+    if (!key_ok(party.auth_key)) { return refuse("bad party key"); }
+    return authority(s, e, dig, false, dev_sigs);
+}
+
+Result(LogState, SymbolonError) do_remove(LogState s, SignedEvent e, List(Int) dig, Int dev_sigs, List(Int) id) {
+    if (!known_party(party_by_id(s.quorum.parties, id, 0))) { return refuse("removing an unknown party"); }
+    return authority(s, e, dig, false, dev_sigs);
+}
+
+Result(LogState, SymbolonError) do_set_policy(LogState s, SignedEvent e, List(Int) dig, Int dev_sigs, Policy np) {
+    if (!policy_ok(np, s.quorum)) { return refuse("policy below the SPEC 8.2 floor"); }
+    return authority(s, e, dig, weakens(s.policy, np), dev_sigs);
+}
+
+Result(LogState, SymbolonError) do_rotate(LogState s, SignedEvent e, List(Int) dig, Int dev_sigs) {
+    if (e.payload.next_recovery_key_digests.len() < 1) { return refuse("rotate-recovery without digests"); }
+    return authority(s, e, dig, false, dev_sigs);
+}
+
+Result(LogState, SymbolonError) do_reshare(LogState s, SignedEvent e, List(Int) dig, Quorum nq) {
+    if (!quorum_ok(nq)) { return refuse("malformed quorum"); }
+    if (!bytes_eq(nq.root_pubkey, s.quorum.root_pubkey)) { return refuse("reshare changed the root key"); }
+    if (nq.epoch != s.quorum.epoch + 1) { return refuse("reshare epoch is not the next epoch"); }
+    if (!reshare_parties_ok(s, nq.parties, 0)) { return refuse("reshare party set"); }
+    List(Party) everyone = s.quorum.parties.concat(nq.parties);
+    List(List(Int)) all_signers = valid_signers(e.sigs, everyone, false, e.encoded, 0, []);
+    // At least t of the old quorum, and every party that took part (SPEC
+    // 8.2): every new party but the offline ones, the kit and guardians,
+    // whose material the online parties compute and wrap (SPEC 10.6).
+    if (signers_in(all_signers, s.quorum.parties, 0, 0) < (Int)s.quorum.t) {
+        return refuse("reshare signed by fewer than t of the old quorum");
+    }
+    List(Party) online = online_parties(nq.parties, 0, []);
+    if (signers_in(all_signers, online, 0, 0) < online.len()) {
+        return refuse("reshare not signed by every online new party");
+    }
+    return Ok(apply_effect(s, e.payload.body, dig, e.payload.next_recovery_key_digests));
+}
+
+Bool kit_authorized(LogState s, SignedEvent e, List(List(Int)) next_digests, Option(List(Int)) revealed) {
+    return match revealed {
+        Some(k) => key_ok(k)
+                   && has_bytes(s.recovery_digests, sha256_bytes(k), 0)
+                   && !has_bytes(next_digests, sha256_bytes(k), 0)
+                   && signed_by_key(e.sigs, k, e.encoded, 0),
+        None => false
+    };
+}
+
+Bool guardians_authorized(SignedEvent e, RecoverBodyInner r, Bool closure(EventPayload) approvals_ok) {
+    return !opt_present(r.revealed_recovery_key)
+        && signed_by_any(e.sigs, r.new_parties, e.encoded, 0)
+        && approvals_ok(e.payload);
+}
+
+Result(LogState, SymbolonError) do_recover(LogState s, SignedEvent e, List(Int) dig, RecoverBodyInner r, Bool closure(EventPayload) approvals_ok) {
+    EventPayload ep = e.payload;
+    if (r.new_parties.len() < 1 || r.new_parties.len() > 8) { return refuse("recover party count"); }
+    if (!ids_distinct(r.new_parties, 0) || !parties_ok(r.new_parties, 0)) { return refuse("recover parties"); }
+    if (device_count(r.new_parties, 0, 0) < 1) { return refuse("recover without a device"); }
+    if (ep.next_recovery_key_digests.len() < 1) { return refuse("recover without new digests"); }
+    Bool authorized = if (r.path == recover_path_kit()) {
+        kit_authorized(s, e, ep.next_recovery_key_digests, r.revealed_recovery_key)
+    } else {
+        r.path == recover_path_guardians() && guardians_authorized(e, r, approvals_ok)
+    };
+    if (!authorized) { return refuse("recover not authorized"); }
+    Int mult = if (s.vetoes >= 2) { 4 } else { 1 };
+    Pending p = Pending {
+        .seq = ep.sequence,
+        .ready_at = s.last_time + (Int)s.policy.recovery_delay_sec * mult,
+        .body = ep.body, .event_digest = dig, .next_digests = ep.next_recovery_key_digests };
+    return Ok(with_pending(s, s.pending.concat([p])));
+}
+
+Result(LogState, SymbolonError) do_veto_found(LogState s, Int dev_sigs, UInt(64) target, Pending p) {
+    // A contested recovery needs two devices to veto again (13.4).
+    Int need = if (is_recover_body(p.body) && s.vetoes >= 2) { 2 } else { 1 };
+    if (dev_sigs < need) { return refuse("veto without enough device signatures"); }
+    LogState removed_p = with_pending(s, pending_without(s.pending, target, 0, ListBuf()));
+    return Ok(if (is_recover_body(p.body)) { with_vetoes(removed_p, s.vetoes + 1) } else { removed_p });
+}
+
+Result(LogState, SymbolonError) do_veto(LogState s, Int dev_sigs, UInt(64) target) {
+    Option(Pending) found = pending_by_seq(s.pending, target, 0);
+    return match found {
+        None => refuse("veto of an event that is not pending"),
+        Some(p) => do_veto_found(s, dev_sigs, target, p)
+    };
+}
+
+Result(LogState, SymbolonError) apply_body(LogState s, SignedEvent e, List(Int) dig, Bool closure(EventPayload) approvals_ok) {
+    EventBody body = e.payload.body;
+    Int dev_sigs = valid_signers(e.sigs, s.quorum.parties, true, e.encoded, 0, []).len();
+    return match body {
+        InceptionBody(_, _) => refuse("inception only as event 0"),
+        ProposePartyBody(party, _) => do_propose(s, e, dig, dev_sigs, party),
+        RemovePartyBody(id) => do_remove(s, e, dig, dev_sigs, id),
+        SetPolicyBody(np) => do_set_policy(s, e, dig, dev_sigs, np),
+        RotateRecoveryBody => do_rotate(s, e, dig, dev_sigs),
+        MigrateBody(_) => refuse("unsupported suite"),
+        ReshareBody(nq) => do_reshare(s, e, dig, nq),
+        RecoverBody(r) => do_recover(s, e, dig, r, approvals_ok),
+        VetoBody(target) => do_veto(s, dev_sigs, target)
+    };
+}
+
+// Digests in field 6 must not change except through rotate-recovery or recover.
+Bool field6_stable(LogState s, EventPayload ep) {
+    EventBody body = ep.body;
+    return match body {
+        RotateRecoveryBody => true,
+        RecoverBody(_) => true,
+        _ => digests_eq(s.recovery_digests, ep.next_recovery_key_digests, 0)
+    };
+}
+
+Bool digests_eq(List(List(Int)) a, List(List(Int)) b, Int i) {
+    if (a.len() != b.len()) { return false; }
+    if (i >= a.len()) { return true; }
+    if (!bytes_eq(a[i], b[i])) { return false; }
+    return digests_eq(a, b, i + 1);
+}
+
+Result(LogState, SymbolonError) step(LogState s, SignedEvent e, List(Int) l, Bool closure(EventPayload) approvals_ok) {
+    EventPayload ep = e.payload;
+    List(Int) dig = sha256_bytes(e.encoded);
+    Int t = witness_time(e.cosigs, s.policy, l, ep.sequence, dig)?;
+    if (t < s.last_time) { return refuse("witness time went backwards"); }
+    LogState settled = settle(s, t);
+    if (ep.sequence != settled.next_seq) { return refuse("sequence"); }
+    if (ep.suite != 1) { return refuse("suite"); }
+    if (!opt_bytes_is(ep.log_id, l)) { return refuse("log id"); }
+    if (!opt_bytes_is(ep.predecessor_digest, settled.prev_digest)) { return refuse("predecessor digest"); }
+    if (!field6_stable(settled, ep)) { return refuse("recovery-key digests changed without rotate or recover"); }
+    // Delays run from this event's own witness time (A-07).
+    LogState applied = apply_body(with_time(settled, t), e, dig, approvals_ok)?;
+    return Ok(advance(applied, dig, t, e.cosigs));
+}
+
+// ============================================================================
+// Whole log
+// ============================================================================
+
+Result(LogState, SymbolonError) start(SignedEvent e0, List(Int) l) {
+    EventPayload ep = e0.payload;
+    List(Int) dig = sha256_bytes(e0.encoded);
+    if (!bytes_eq(dig, l)) { return refuse("H(E0) is not the log id"); }
+    if (ep.sequence != 0 || ep.suite != 1) { return refuse("E0 sequence or suite"); }
+    if (opt_present(ep.log_id) || opt_present(ep.predecessor_digest)) { return refuse("E0 carries a log id or predecessor"); }
+    if (ep.next_recovery_key_digests.len() < 1) { return refuse("E0 without recovery digests"); }
+    EventBody e0_body = ep.body;
+    return match e0_body {
+        InceptionBody(q, pol) => start_inception(e0, l, dig, q, pol),
+        _ => refuse("E0 is not an inception")
+    };
+}
+
+Result(LogState, SymbolonError) start_inception(SignedEvent e0, List(Int) l, List(Int) dig, Quorum q, Policy pol) {
+    EventPayload ep = e0.payload;
+    if (!quorum_ok(q) || !policy_ok(pol, q)) { return refuse("E0 quorum or policy"); }
+    Int t = witness_time(e0.cosigs, pol, l, 0, dig)?;
+    // E0 is signed by every party of its own quorum.
+    List(List(Int)) signers = valid_signers(e0.sigs, q.parties, false, e0.encoded, 0, []);
+    if (signers.len() < q.parties.len()) { return refuse("E0 not signed by every party"); }
+    return Ok(LogState {
+        .quorum = q, .policy = pol, .recovery_digests = ep.next_recovery_key_digests,
+        .proposed = [], .removed = [], .pending = [], .vetoes = 0,
+        .prev_digest = dig, .next_seq = 1, .last_time = t, .last_cosigs = e0.cosigs });
+}
+
+Result(LogState, SymbolonError) run(LogState s, List(SignedEvent) events, List(Int) l, Bool closure(EventPayload) approvals_ok, Int i) {
+    if (i >= events.len()) { return Ok(s); }
+    LogState next = step(s, events[i], l, approvals_ok)?;
+    return run(next, events, l, approvals_ok, i + 1);
+}
+
+// SPEC 8.3. `now` is a witness time at or after the last event's: events
+// pending at the head whose delay has run by `now` are applied, the rest are
+// reported in `pending`. `approvals_ok` checks a guardian recovery's
+// approvals against the guardians' own logs (SPEC 13.3).
+pub Result(VerifiedHead, SymbolonError) il_verify(List(Int) l, List(SignedEvent) events, Int now, Bool closure(EventPayload) approvals_ok) {
+    if (events.len() < 1) { return Err(ErrInvalidLog("empty log")); }
+    LogState s0 = start(events[0], l)?;
+    LogState s1 = run(s0, events, l, approvals_ok, 1)?;
+    if (now < s1.last_time) { return Err(ErrInvalidLog("now precedes the last event")); }
+    LogState fin = settle(s1, now);
+    return Ok(VerifiedHead {
+        .head = LogHead {
+            .log_id = l, .sequence = fin.next_seq - 1, .digest = fin.prev_digest,
+            .quorum = fin.quorum, .policy = fin.policy },
+        .witness_cosigs = fin.last_cosigs,
+        .pending = pending_seqs(fin.pending, 0, ListBuf()) });
+}
+
+List(UInt(64)) pending_seqs(List(Pending) ps, Int i, ListBuf(UInt(64)) acc) {
+    if (i >= ps.len()) { return acc.finish(); }
+    return pending_seqs(ps, i + 1, acc.push(ps[i].seq));
+}
+
+// SPEC 8.4 / 20.4: two heads of one log at one sequence with different
+// digests are a fork; a lower sequence than one already seen is a rollback.
+pub Bool is_fork(LogHead a, LogHead b) {
+    return bytes_eq(a.log_id, b.log_id) && a.sequence == b.sequence && !bytes_eq(a.digest, b.digest);
+}
+
+pub Bool is_rollback(LogHead seen, LogHead offered) {
+    return bytes_eq(seen.log_id, offered.log_id) && offered.sequence < seen.sequence;
+}

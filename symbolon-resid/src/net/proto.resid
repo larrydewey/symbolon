@@ -1,0 +1,91 @@
+// Messages between Symbolon parties, carried inside HPKE envelopes through
+// the relay (SPEC 20.2). Encoded with the instances resid-derive generates
+// into proto_serial.resid.
+
+import "../threshold/threshold.resid";
+import "../cosigner/cosigner.resid";
+import "../types.resid";
+import "crypto.resid";
+
+// An invitation to key generation at inception: the session, the parties in
+// CGGMP id order (id i + 1 is parties[i]) with their keys, and the
+// polynomial degree (t - 1).
+//@ serial
+pub type KeygenInvite = { List(Int) session_id; List(PartyKeys) parties; Int threshold; };
+
+// A party's public keys, sent with its first message to a peer it has not
+// met: authentication key (DK) and HPKE key, SEC1 points.
+//@ serial
+pub type PartyKeys = { List(Int) party; List(Int) auth_key; List(Int) hpke_key; };
+
+// A request to co-sign (SPEC 10.4 step 3): the signed request and the
+// signer set, then protocol messages under its session id.
+//@ serial
+pub type SignInvite = {
+    List(Int) session_id; List(Int) message; Int epoch; List(Int) requester; Int kind; List(Int) sig;
+    List(List(Int)) signers;
+};
+
+// One round's protocol messages from one sender: a receiver runs round
+// `round` once it holds that round's batch from every other party. A
+// designated signer ends a session with a round-7 batch, [ThAbortReq] or
+// empty, so peers waiting for an abort request can close.
+//@ serial
+pub type SessionMsg = { List(Int) session_id; Int round; List(ThMsg) msgs; };
+
+// The cosigner's half of the kit's material for a recovered device, and
+// any other offline wrapping: HPKE base mode enc and ciphertext.
+//@ serial
+pub type WrappedBlob = { List(Int) enc; List(Int) ct; };
+
+// An invitation to re-share (SPEC 11.3): the new quorum's parties in
+// CGGMP id order (id i + 1 is new_parties[i]), who deals (old ids), who
+// receives (new ids), who is offline (new ids), the new polynomial degree
+// and epoch, and the requester's DK signature over request_tbs(session id,
+// reshare_message(...), old epoch, requester, request_reshare).
+//@ serial
+pub type ReshareInvite = {
+    List(Int) session_id; List(Int) log_id; List(Party) new_parties;
+    List(Int) dealers; List(Int) receivers; List(Int) offline; Int degree; Int epoch;
+    List(Int) requester; List(Int) sig;
+};
+
+// What an enrolled device receives from the device that enrolled it (SPEC
+// 11.1 step 4): the chain code and the vault key.
+//@ serial
+pub type EnrollSecrets = { List(Int) cc; List(Int) vault_key; };
+
+//@ serial
+pub type Packet =
+    WKeygen(KeygenInvite)
+  | WSign(SignInvite)
+  | WSession(SessionMsg)
+  | WRefused(List(Int))                  // a session id the receiver will not run
+  | WKitHalf(WrappedBlob)
+  | WSignEvent(List(Int))                 // event payload bytes the receiver is asked to sign
+  | WEventSig(List(Int))                  // its signature r || s
+  | WReshare(ReshareInvite)
+  | WEnrollSecrets(EnrollSecrets)
+  | WKitKey(List(Int))                    // the cosigner's half k_b of the kit key for a new epoch
+  | WKitRelease(List(Int))                // a recovered device asks for the cosigner's half (log id)
+  | WDuressKey(List(Int));                // the sender's duress DK sub-key (SPEC 14.2); every device sends one
+
+// What the relay carries: sender and recipient party ids, and the HPKE
+// mode_auth encapsulation and ciphertext of one Packet value.
+//@ serial
+pub type Envelope = { List(Int) from; List(Int) to; List(Int) enc; List(Int) ct; };
+
+// What a re-share request signs as its message m: SHA-256 of the log id,
+// the session id, the new parties' ids, the dealers, receivers, offline
+// ids, degree and epoch.
+pub List(Int) reshare_message(ReshareInvite r) {
+    return sha256_bytes(r.log_id.concat(r.session_id).concat(ids_bytes(r.new_parties, 0, [])).concat(small(r.dealers)).concat(small(r.receivers))
+        .concat(small(r.offline)).concat([r.degree & 255, (r.epoch >> 24) & 255, (r.epoch >> 16) & 255, (r.epoch >> 8) & 255, r.epoch & 255]));
+}
+
+List(Int) ids_bytes(List(Party) ps, Int i, List(Int) acc) {
+    if (i >= ps.len()) { return acc; }
+    return ids_bytes(ps, i + 1, acc.concat(ps[i].id));
+}
+
+List(Int) small(List(Int) xs) { return [xs.len() & 255].concat(xs); }

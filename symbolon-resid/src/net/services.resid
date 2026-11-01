@@ -1,0 +1,346 @@
+// The relay (sync service, SPEC 20.1) and a witness (SPEC 20.3) as HTTP
+// handlers over a data directory, and their clients.
+//
+// The relay is untrusted and dumb: it stores what it is given and returns
+// it. Every object it holds is verified by its recipient (envelopes are
+// HPKE mode_auth, log events are signed and witnessed, vault items are
+// AEAD-sealed under a signed head).
+//
+//   POST /mbox/<to>            an envelope for party <to>; answers its index
+//   GET  /mbox/<to>/<n>        envelope n for <to>, 404 when there is none
+//   POST /log/<log>/<seq>      an event; refused (409) when <seq> is taken
+//   GET  /log/<log>/<seq>      the event
+//   PUT  /blob/<name>          an object (vault state, wrapped keys, ...)
+//   GET  /blob/<name>
+//   GET  /list/<prefix>        the names of the blobs that start with <prefix>, one per
+//                              line, sorted, at most max_listed() (people's cards, the
+//                              shared collections a person's devices have keys for)
+//
+// A witness co-signs (log, seq, digest) once: a second digest for the same
+// (log, seq) is refused (409), the first is re-signed on request.
+//
+//   POST /cosign               CBOR [log, seq, digest]; answers CBOR [time, r || s]
+//   POST /time                 a 32-byte nonce; answers CBOR [time, r || s] over
+//                              ["symbolon v1 witness time", nonce, time]: the witness
+//                              time devices and the cosigner measure delays by (SPEC 13.4)
+//
+// <to>, <log> are lower-case hex; <seq>, <n> decimal; <name> is
+// [a-z0-9._-], at most 128 characters.
+
+import "../core/log.resid";
+import "httpserv.resid";
+import "cose.resid";
+import "cosesig.resid";
+import "ecdsa.resid";
+import "crypto.resid";
+import "clock.resid";
+import "wire.resid";
+import "tlsclient.resid";
+import "tlswire.resid";
+import "tlskey.resid";
+import "chain.resid";
+
+Bool hex_name(Str s, Int i) {
+    if (str_len(s) == 0 || str_len(s) > 128) { return false; }
+    if (i >= str_len(s)) { return true; }
+    Int c = str_char_at(s, i);
+    return ((c >= 48 && c <= 57) || (c >= 97 && c <= 102)) && hex_name(s, i + 1);
+}
+
+Bool blob_name(Str s, Int i) {
+    if (str_len(s) == 0 || str_len(s) > 128) { return false; }
+    if (i >= str_len(s)) { return true; }
+    Int c = str_char_at(s, i);
+    Bool ok = (c >= 48 && c <= 57) || (c >= 97 && c <= 122) || c == 46 || c == 95 || c == 45;
+    return ok && !(i == 0 && c == 46) && blob_name(s, i + 1);
+}
+
+Bool dec_name(Str s, Int i) {
+    if (str_len(s) == 0 || str_len(s) > 19) { return false; }
+    if (i >= str_len(s)) { return true; }
+    Int c = str_char_at(s, i);
+    return c >= 48 && c <= 57 && dec_name(s, i + 1);
+}
+
+Str seg(List(Str) parts, Int i) { return if (i < parts.len()) { parts[i] } else { "" }; }
+
+@requires(filesystem)
+Int next_index(Str dir, Int i) {
+    if (!filesystem.exists(dir + "/" + f"{i}")) { return i; }
+    return next_index(dir, i + 1);
+}
+
+// ============================================================================
+// The relay
+// ============================================================================
+
+@requires(filesystem)
+pub HttpReply relay_handle(Str root, HttpRequest r) {
+    List(Str) p = str_split(r.path, "/");
+    // p[0] is "" (the path starts with "/").
+    Str kind = seg(p, 1);
+    if (kind == "mbox" && r.method == "POST" && p.len() == 3 && hex_name(seg(p, 2), 0)) {
+        Str d = root + "/mbox/" + seg(p, 2);
+        _ = filesystem.create_dir(d);
+        Int n = next_index(d, 0);
+        if (r.body.len() == 0 || r.body.len() > 16781312) { return http_reply_status(413); }
+        return if (filesystem.write_bytes(d + "/" + f"{n}", r.body)) { http_reply_text(200, "text/plain", f"{n}") } else { http_reply_status(500) };
+    }
+    if (kind == "mbox" && r.method == "GET" && p.len() == 4 && hex_name(seg(p, 2), 0) && dec_name(seg(p, 3), 0)) {
+        return file_reply(root + "/mbox/" + seg(p, 2) + "/" + seg(p, 3));
+    }
+    if (kind == "log" && p.len() == 4 && hex_name(seg(p, 2), 0) && dec_name(seg(p, 3), 0)) {
+        Str f = root + "/log/" + seg(p, 2) + "/" + seg(p, 3);
+        if (r.method == "GET") { return file_reply(f); }
+        if (r.method == "POST") {
+            if (filesystem.exists(f)) { return http_reply_status(409); }
+            _ = filesystem.create_dir(root + "/log/" + seg(p, 2));
+            return if (filesystem.write_bytes(f, r.body)) { http_reply_status(200) } else { http_reply_status(500) };
+        }
+    }
+    if (kind == "blob" && p.len() == 3 && blob_name(seg(p, 2), 0)) {
+        Str f = root + "/blob/" + seg(p, 2);
+        if (r.method == "GET") { return file_reply(f); }
+        if (r.method == "PUT") {
+            _ = filesystem.create_dir(root + "/blob");
+            return if (filesystem.write_bytes(f, r.body)) { http_reply_status(200) } else { http_reply_status(500) };
+        }
+    }
+    if (kind == "list" && r.method == "GET" && p.len() == 3 && blob_name(seg(p, 2), 0)) {
+        List(Str) names = sort(starting_with(filesystem.list_dir(root + "/blob"), seg(p, 2), 0, ListBuf()));
+        return http_reply_text(200, "text/plain", str_join(if (names.len() > max_listed()) { names[0..max_listed()] } else { names }, "\n"));
+    }
+    return http_reply_status(404);
+}
+
+pub Int max_listed() { return 4096; }
+
+List(Str) starting_with(List(Str) xs, Str prefix, Int i, ListBuf(Str) acc) {
+    if (i >= xs.len()) { return acc.finish(); }
+    return starting_with(xs, prefix, i + 1, if (str_starts_with(xs[i], prefix) && blob_name(xs[i], 0)) { acc.push(xs[i]) } else { acc });
+}
+
+@requires(filesystem)
+HttpReply file_reply(Str f) {
+    if (!filesystem.exists(f)) { return http_reply_status(404); }
+    return http_reply_bytes(200, "application/octet-stream", filesystem.read_bytes(f));
+}
+
+// ============================================================================
+// A witness
+// ============================================================================
+
+// The witness's request: CBOR [log id, sequence, digest].
+pub List(Int) cosign_request(List(Int) l, UInt(64) seq, List(Int) d) {
+    return cbe_bytes(d, cbe_uint((Int)seq, cbe_bytes(l, cbe_array(3, []))));
+}
+
+type CoReq = { List(Int) l; Int seq; List(Int) d; };
+
+Option(CoReq) parse_cosign(List(Int) b) {
+    if (b.len() < 3 || b[0] != 131) { return None; }
+    Int at = 1;
+    if (b[at] != 88 || at + 2 + 32 > b.len() || b[at + 1] != 32) { return None; }
+    List(Int) l = b[at + 2..at + 34];
+    Int sp = at + 34;
+    if (sp >= b.len()) { return None; }
+    Int ib = b[sp];
+    Int ai = ib & 31;
+    if ((ib >> 5) != 0) { return None; }
+    Int n = if (ai < 24) { 0 } else { if (ai == 24) { 1 } else { if (ai == 25) { 2 } else { if (ai == 26) { 4 } else { if (ai == 27) { 8 } else { -1 } } } } };
+    if (n < 0 || sp + 1 + n + 34 != b.len()) { return None; }
+    Int seq = if (n == 0) { ai } else { be_at(b, sp + 1, n, 0) };
+    Int dp = sp + 1 + n;
+    if (b[dp] != 88 || b[dp + 1] != 32) { return None; }
+    List(Int) d = b[dp + 2..dp + 34];
+    // Canonical only: the bytes must be what cosign_request writes.
+    if (!bytes_eq(cosign_request(l, (UInt(64))seq, d), b)) { return None; }
+    return Some(CoReq {.l = l, .seq = seq, .d = d});
+}
+
+Int be_at(List(Int) b, Int p, Int n, Int acc) { return if (n == 0) { acc } else { be_at(b, p + 1, n - 1, acc * 256 + b[p]) }; }
+
+// The answer: CBOR [witness time, r || s over witness_message].
+// What a witness signs for a time query.
+pub List(Int) time_message(List(Int) nonce, Int t) {
+    return cbe_uint(t, cbe_bytes(nonce, cbe_text("symbolon v1 witness time", cbe_array(3, []))));
+}
+
+// `offset` (seconds) is added to the witness's clock: a test witness that
+// claims later times stands for the time passing (a witness majority is
+// trusted for time by design, SPEC 20.3).
+@requires(filesystem, clock(readonly), declassify)
+pub HttpReply witness_handle(Str root, List(Secret(UInt(8))) wpriv, Int offset, HttpRequest r) {
+    if (r.method == "POST" && r.path == "/time") {
+        if (r.body.len() != 32) { return http_reply_status(400); }
+        Int t = clock_now_seconds() + offset;
+        return http_reply_bytes(200, "application/cbor", cbe_bytes(ecdsag_sign_raw(P256, Sha256, wpriv, time_message(r.body, t)), cbe_uint(t, cbe_array(2, []))));
+    }
+    if (r.method != "POST" || r.path != "/cosign") { return http_reply_status(404); }
+    Option(CoReq) oq = parse_cosign(r.body);
+    return match oq {
+        None => http_reply_status(400),
+        Some(q) => witness_sign(root, wpriv, offset, q)
+    };
+}
+
+@requires(filesystem, clock(readonly), declassify)
+HttpReply witness_sign(Str root, List(Secret(UInt(8))) wpriv, Int offset, CoReq q) {
+    Str dir = root + "/seen/" + hex_encode(q.l);
+    Str f = dir + "/" + f"{q.seq}";
+    if (filesystem.exists(f)) {
+        List(Int) held = filesystem.read_bytes(f);
+        if (!bytes_eq(held[0..32], q.d)) { return http_reply_status(409); }
+        return http_reply_bytes(200, "application/cbor", held[32..held.len()]);
+    }
+    Int t = clock_now_seconds() + offset;
+    List(Int) sig = ecdsag_sign_raw(P256, Sha256, wpriv, witness_message(q.l, (UInt(64))q.seq, q.d));
+    List(Int) answer = cbe_bytes(sig, cbe_uint(t, cbe_array(2, [])));
+    _ = filesystem.create_dir(dir);
+    if (!filesystem.write_bytes(f, q.d.concat(answer))) { return http_reply_status(500); }
+    return http_reply_bytes(200, "application/cbor", answer);
+}
+
+// ============================================================================
+// Clients
+// ============================================================================
+
+pub type HttpOut = { Int status; List(Int) body; };
+
+List(Int) ascii(Str s) { return http_bytes(s); }
+
+Int find_crlf2(List(Int) b, Int i) {
+    if (i + 3 >= b.len()) { return -1; }
+    if (b[i] == 13 && b[i + 1] == 10 && b[i + 2] == 13 && b[i + 3] == 10) { return i; }
+    return find_crlf2(b, i + 1);
+}
+
+// One request on a fresh connection to host:port (loopback or a pinned
+// address), Connection: close; the status and the body.
+@requires(network)
+pub HttpOut http_call_bytes(Str host, Int port, Str method, Str path, List(Int) body) {
+    Int fd = resid_tcp_connect(host, port);
+    if (fd < 0) { return HttpOut {.status = 0, .body = []}; }
+    Str head = method + " " + path + " HTTP/1.1\r\nHost: " + host + "\r\nConnection: close\r\nContent-Length: " + f"{body.len()}" + "\r\n\r\n";
+    _ = resid_tcp_send_bin(fd, ascii(head).concat(body));
+    _ = resid_tcp_deadline(fd, 30000);
+    List(Int) raw = recv_all(fd, 0, ListBuf());
+    _ = resid_tcp_close(fd);
+    Int at = find_crlf2(raw, 0);
+    if (at < 12) { return HttpOut {.status = 0, .body = []}; }
+    Int status = str_parse_int(http_text(raw, 9, 12));
+    return HttpOut {.status = status, .body = raw[at + 4..raw.len()]};
+}
+
+// The whole response, until the server closes; at most max_response()
+// bytes (more is cut off, and the reply then fails to parse).
+pub Int max_response() { return 16781312 + 65536; }
+
+@requires(network)
+List(Int) recv_all(Int fd, Int got, ListBuf(Int) acc) {
+    if (got >= max_response()) { return acc.finish(); }
+    List(Int) chunk = resid_tcp_recv_some(fd, 65536);
+    if (chunk.len() == 0) { return acc.finish(); }
+    return recv_all(fd, got + chunk.len(), push_all(acc, chunk, 0));
+}
+
+ListBuf(Int) push_all(ListBuf(Int) acc, List(Int) xs, Int i) {
+    if (i >= xs.len()) { return acc; }
+    return push_all(acc.push(xs[i]), xs, i + 1);
+}
+
+// `ca`: the PEM trust anchor for TLS to this endpoint; "" speaks plain HTTP
+// (loopback tests). Every message is end-to-end protected anyway (HPKE
+// envelopes, signed log events and witness signatures); TLS hides the
+// traffic's metadata from the network and keeps a path attacker from
+// posing as the relay or a witness.
+pub type Endpoint = { Str host; Int port; Str ca; };
+
+// One request to `e`: HTTPS under e.ca when it is set, else plain HTTP.
+@requires(network, clock(readonly), declassify)
+pub HttpOut http_call_ep(Endpoint e, Str method, Str path, List(Int) body) {
+    if (str_len(e.ca) == 0) { return http_call_bytes(e.host, e.port, method, path, body); }
+    TrustStore store = trust_store_add_pem(trust_store_empty(), e.ca);
+    HttpsGet g = tls_https_request("https://" + e.host + ":" + f"{e.port}" + path, "", store, ["http/1.1"], 30000, method, "", body);
+    return HttpOut {.status = g.status, .body = g.bytes};
+}
+
+@requires(network, clock(readonly), declassify)
+pub Int mbox_put(Endpoint e, List(Int) to, List(Int) envelope) {
+    HttpOut o = http_call_ep(e, "POST", "/mbox/" + hex_encode(to), envelope);
+    return if (o.status == 200) { str_parse_int(http_text(o.body, 0, o.body.len())) } else { -1 };
+}
+
+@requires(network, clock(readonly), declassify)
+pub Option(List(Int)) mbox_get(Endpoint e, List(Int) to, Int n) {
+    HttpOut o = http_call_ep(e, "GET", "/mbox/" + hex_encode(to) + "/" + f"{n}", []);
+    return if (o.status == 200) { Some(o.body) } else { None };
+}
+
+@requires(network, clock(readonly), declassify)
+pub Bool log_put(Endpoint e, List(Int) l, UInt(64) seq, List(Int) event) {
+    return http_call_ep(e, "POST", "/log/" + hex_encode(l) + "/" + f"{seq}", event).status == 200;
+}
+
+@requires(network, clock(readonly), declassify)
+pub Option(List(Int)) log_get(Endpoint e, List(Int) l, UInt(64) seq) {
+    HttpOut o = http_call_ep(e, "GET", "/log/" + hex_encode(l) + "/" + f"{seq}", []);
+    return if (o.status == 200) { Some(o.body) } else { None };
+}
+
+@requires(network, clock(readonly), declassify)
+pub Bool blob_put(Endpoint e, Str name, List(Int) b) { return http_call_ep(e, "PUT", "/blob/" + name, b).status == 200; }
+
+@requires(network, clock(readonly), declassify)
+pub Option(List(Int)) blob_get(Endpoint e, Str name) {
+    HttpOut o = http_call_ep(e, "GET", "/blob/" + name, []);
+    return if (o.status == 200) { Some(o.body) } else { None };
+}
+
+// The names of the relay's blobs that start with `prefix`.
+@requires(network, clock(readonly), declassify)
+pub List(Str) blob_list(Endpoint e, Str prefix) {
+    HttpOut o = http_call_ep(e, "GET", "/list/" + prefix, []);
+    if (o.status != 200 || o.body.len() == 0) { return []; }
+    return str_split(text_of_body(o.body, 0, StrBuf()), "\n");
+}
+
+Str text_of_body(List(Int) b, Int i, StrBuf acc) {
+    if (i >= b.len()) { return acc.finish(); }
+    return text_of_body(b, i + 1, acc.push(str_from_code(b[i])));
+}
+
+// A witness's co-signature on (l, seq, d), checked here under its key.
+@requires(network, clock(readonly), declassify)
+pub Option(WitnessCosignature) cosign_from(Endpoint e, List(Int) wkey, List(Int) l, UInt(64) seq, List(Int) d) {
+    HttpOut o = http_call_ep(e, "POST", "/cosign", cosign_request(l, seq, d));
+    if (o.status != 200) { return None; }
+    List(Int) b = o.body;
+    // [uint time, bytes(64)]
+    if (b.len() < 3 || b[0] != 130) { return None; }
+    Int ib = b[1];
+    Int ai = ib & 31;
+    Int n = if (ai < 24) { 0 } else { if (ai == 24) { 1 } else { if (ai == 25) { 2 } else { if (ai == 26) { 4 } else { if (ai == 27) { 8 } else { -1 } } } } };
+    if ((ib >> 5) != 0 || n < 0 || 2 + n + 2 + 64 != b.len()) { return None; }
+    Int t = if (n == 0) { ai } else { be_at(b, 2, n, 0) };
+    if (b[2 + n] != 88 || b[3 + n] != 64) { return None; }
+    List(Int) sig = b[4 + n..b.len()];
+    if (!ecdsa_verify_raw(P256, Sha256, wkey, witness_message(l, seq, d), sig)) { return None; }
+    return Some(WitnessCosignature {.log_id = l, .sequence = seq, .digest = d, .witness_key = wkey, .signature = sig, .witness_time = (UInt(64))t});
+}
+
+// A witness's current time, checked under its key and bound to `nonce`.
+@requires(network, clock(readonly), declassify)
+pub Option(Int) time_from(Endpoint e, List(Int) wkey, List(Int) nonce) {
+    HttpOut o = http_call_ep(e, "POST", "/time", nonce);
+    if (o.status != 200) { return None; }
+    List(Int) b = o.body;
+    if (b.len() < 3 || b[0] != 130) { return None; }
+    Int ib = b[1];
+    Int ai = ib & 31;
+    Int n = if (ai < 24) { 0 } else { if (ai == 24) { 1 } else { if (ai == 25) { 2 } else { if (ai == 26) { 4 } else { if (ai == 27) { 8 } else { -1 } } } } };
+    if ((ib >> 5) != 0 || n < 0 || 2 + n + 2 + 64 != b.len()) { return None; }
+    Int t = if (n == 0) { ai } else { be_at(b, 2, n, 0) };
+    if (b[2 + n] != 88 || b[3 + n] != 64) { return None; }
+    return if (ecdsa_verify_raw(P256, Sha256, wkey, time_message(nonce, t), b[4 + n..b.len()])) { Some(t) } else { None };
+}

@@ -1,0 +1,129 @@
+// Synchronization checks (SPEC Section 20). The sync service is untrusted
+// storage and relay, so everything here runs on the recipient: it decides
+// from verified objects whether a head is new, stale or a fork, whether a
+// head carries enough witness evidence to act on, whether a log looks
+// frozen, and whether a device's authentication is genuine. Nothing here
+// talks to the network.
+
+import "../types.resid";
+import "../core/log.resid";
+import "cose.resid";
+import "ecdsa.resid";
+import "hash.resid";
+
+// ============================================================================
+// Heads seen (SPEC 8.4, 20.4)
+// ============================================================================
+
+// What a party learns on seeing a head of a log it already follows.
+pub type HeadObservation =
+    FirstSeen            // no head of this log held yet
+  | Unchanged            // same sequence, same digest
+  | Advanced             // a higher sequence: the new head replaces the old
+  | Rollback             // a lower sequence than one already verified
+  | Fork                 // the same sequence with another digest
+  | OtherLog;            // not the log this observation is about
+
+pub HeadObservation observe_head(Option(LogHead) seen, LogHead offered) {
+    return match seen {
+        None => FirstSeen,
+        Some(h) => observe_known(h, offered)
+    };
+}
+
+HeadObservation observe_known(LogHead held, LogHead offered) {
+    if (!bytes_eq(held.log_id, offered.log_id)) { return OtherLog; }
+    if (is_fork(held, offered)) { return Fork; }
+    if (is_rollback(held, offered)) { return Rollback; }
+    if (offered.sequence == held.sequence) { return Unchanged; }
+    return Advanced;
+}
+
+// The head to hold after seeing `offered`: it replaces `seen` only when it is
+// first or higher. A rollback or a fork never lowers or replaces a head.
+pub Option(LogHead) next_seen(Option(LogHead) seen, LogHead offered) {
+    return match observe_head(seen, offered) {
+        FirstSeen => Some(offered),
+        Advanced => Some(offered),
+        _ => seen
+    };
+}
+
+// Whether an observation is an alarm the principal must see.
+pub Bool is_alarm(HeadObservation o) {
+    return match o { Rollback => true, Fork => true, _ => false };
+}
+
+// Parties exchange their highest verified heads at every contact (SPEC 20.4).
+// The alarms raised by comparing each head a peer offers with the one held
+// for the same log, in the order the peer offered them.
+pub List(HeadObservation) compare_contact(List(LogHead) held, List(LogHead) offered) {
+    return compare_each(held, offered, 0, ListBuf());
+}
+
+List(HeadObservation) compare_each(List(LogHead) held, List(LogHead) offered, Int i, ListBuf(HeadObservation) acc) {
+    if (i >= offered.len()) { return acc.finish(); }
+    return compare_each(held, offered, i + 1, acc.push(observe_head(held_for(held, offered[i].log_id, 0), offered[i])));
+}
+
+Option(LogHead) held_for(List(LogHead) held, List(Int) log_id, Int i) {
+    if (i >= held.len()) { return None; }
+    if (bytes_eq(held[i].log_id, log_id)) { return Some(held[i]); }
+    return held_for(held, log_id, i + 1);
+}
+
+// ============================================================================
+// Freeze detection (SPEC 20.4)
+// ============================================================================
+
+// A party that sees no newer witnessed head within `interval` seconds of the
+// last one warns that the log may be frozen. Times are witness times.
+pub Bool may_be_frozen(Int last_witnessed_time, Int now, Int interval) {
+    return now - last_witnessed_time > interval;
+}
+
+// ============================================================================
+// Witness evidence (SPEC 8.3, 13.4, 20.3)
+// ============================================================================
+
+// A head an agent or the cosigner acts on must carry co-signatures from a
+// majority of the policy's witnesses; the result is its witness time.
+pub Result(Int, SymbolonError) require_witnessed(List(WitnessCosignature) cosigs, LogHead head) {
+    return witness_time(cosigs, head.policy, head.log_id, head.sequence, head.digest);
+}
+
+// SPEC 13.4 release rule: the cosigner takes part in nothing until the event's
+// witness time is at least the recovery delay in the past.
+pub Bool delay_elapsed(Int event_witness_time, Int now, Int delay) {
+    return now - event_witness_time >= delay;
+}
+
+// ============================================================================
+// Device authentication (SPEC 20.1)
+// ============================================================================
+
+// Devices authenticate to the service with a DK signature over a fresh
+// challenge: ["symbolon v1 auth", challenge, device_id, audience]. The
+// audience names the service, so a signature made for one service cannot be
+// replayed to another.
+pub List(Int) auth_tbs(List(Int) challenge, List(Int) device_id, Str audience) {
+    List(Int) a = cbe_text("symbolon v1 auth", cbe_array(4, []));
+    List(Int) b = cbe_bytes(challenge, a);
+    List(Int) c = cbe_bytes(device_id, b);
+    return cbe_text(audience, c);
+}
+
+Option(List(Int)) device_dk(List(Party) ps, List(Int) id, Int i) {
+    if (i >= ps.len()) { return None; }
+    if (bytes_eq(ps[i].id, id) && ps[i].kind == party_kind_device()) { return Some(ps[i].auth_key); }
+    return device_dk(ps, id, i + 1);
+}
+
+// Whether `sig` (r || s) is the DK signature of device `device_id`, a device
+// of `q`, over the challenge for `audience`.
+pub Bool verify_device_auth(Quorum q, List(Int) device_id, List(Int) challenge, Str audience, List(Int) sig) {
+    return match device_dk(q.parties, device_id, 0) {
+        None => false,
+        Some(key) => ecdsa_verify_raw(P256, Sha256, key, auth_tbs(challenge, device_id, audience), sig)
+    };
+}

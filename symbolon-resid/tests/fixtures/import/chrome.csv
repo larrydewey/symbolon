@@ -1,0 +1,3 @@
+name,url,username,password,note
+example.com,https://example.com/login,alice,pw1,
+android,android://abc@com.example.app/,alice,pw2,app

@@ -1,0 +1,316 @@
+// Symbolon shared types (SPEC Section 7 and following).
+//
+// Resid has no globals, so constants are zero-argument functions, and a sum
+// type carries positional payloads. Byte strings are List(Int), as in the stdlib.
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+pub UInt(8) format_version() { return 1; }
+
+pub UInt(8) party_kind_device() { return 0; }
+pub UInt(8) party_kind_kit() { return 1; }
+pub UInt(8) party_kind_cosigner() { return 2; }
+pub UInt(8) party_kind_guardian() { return 3; }
+
+pub UInt(8) recover_path_kit() { return 1; }
+pub UInt(8) recover_path_guardians() { return 2; }
+
+// ============================================================================
+// Basic types
+// ============================================================================
+
+// Byte strings are List(Int), because an alias is a distinct type in Resid:
+// Digest, log ids and party ids are 32 bytes; a public key is a SEC1
+// uncompressed P-256 point (0x04 || X || Y, 65 bytes); an ECDSA signature
+// is r || s (64 bytes). Epoch is UInt(32); sequence numbers and timestamps
+// are UInt(64).
+
+// ============================================================================
+// Parties and quorum (SPEC Section 7)
+// ============================================================================
+
+//@ serial
+type AttestationRef = NoAttestation | Attested(AttestationDigest);
+//@ serial
+type AttestationDigest = { Str format; List(Int) digest; };
+
+//@ serial
+type WitnessRef = { Str url; List(Int) key; };
+
+//@ serial
+type Party = {
+    List(Int) id;
+    UInt(8) kind;
+    List(Int) auth_key;       // DK, kit key, cosigner key, or guardian's DK
+    List(Int) hpke_key;       // share transport
+    Str label;
+    AttestationRef attestation;
+};
+
+//@ serial
+type Quorum = {
+    List(Party) parties;
+    UInt(8) t;
+    List(Int) root_pubkey;
+    UInt(32) epoch;
+    List(Int) transcript_digest;
+};
+
+//@ serial
+type CosignerPolicy = NoCosignerPolicy | CosignerLimit(UInt(32));
+
+//@ serial
+type Policy = {
+    UInt(8) device_sigs_for_authority;   // policy[1], at least 2
+    UInt(64) recovery_delay_sec;         // policy[2], at least 86400
+    List(List(Int)) guardians;
+    UInt(8) guardian_threshold;
+    List(WitnessRef) witnesses;
+    UInt(64) duress_window_sec;
+    CosignerPolicy cosigner_policy;
+};
+
+// A recovery's payload (SPEC 13.2).
+type RecoverBodyInner = {
+    UInt(8) path;                        // 1 kit, 2 guardians
+    List(Party) new_parties;
+    Option(List(Int)) revealed_recovery_key;
+    List(List(Int)) guardian_approvals;      // COSE_Sign1 encodings
+};
+
+type EventBody =
+    InceptionBody(Quorum, Policy)
+  | ProposePartyBody(Party, List(Int))
+  | RemovePartyBody(List(Int))
+  | ReshareBody(Quorum)
+  | SetPolicyBody(Policy)
+  | RotateRecoveryBody
+  | RecoverBody(RecoverBodyInner)
+  | VetoBody(UInt(64))
+  | MigrateBody(UInt(8));
+
+type EventPayload = {
+    Option(List(Int)) log_id;                // None only in event 0
+    UInt(64) sequence;
+    Option(List(Int)) predecessor_digest;
+    UInt(8) suite;
+    EventBody body;
+    List(List(Int)) next_recovery_key_digests;
+    UInt(64) advisory_time;
+};
+
+// ============================================================================
+// Secret types (SPEC Section 23.3)
+// ============================================================================
+
+type SecretShare = List(Secret(UInt(8)));    // Shamir share x_i
+type SecretChainCode = List(Secret(UInt(8)));
+type SecretNonce = List(Secret(UInt(8)));
+type SecretKey = List(Secret(UInt(8)));      // vault key, item key, field key
+type SecretTweak = List(Secret(UInt(8)));    // credential tweak tau
+type SecretPin = List(Secret(UInt(8)));
+type SecretCredentialId = List(Secret(UInt(8)));
+type SecretRpId = Secret(Str);
+
+// ============================================================================
+// Identity log (SPEC Section 8)
+// ============================================================================
+
+//@ serial
+type LogHead = {
+    List(Int) log_id;
+    UInt(64) sequence;
+    List(Int) digest;
+    Quorum quorum;
+    Policy policy;
+};
+
+//@ serial
+type WitnessCosignature = {
+    List(Int) log_id;
+    UInt(64) sequence;
+    List(Int) digest;
+    List(Int) witness_key;
+    List(Int) signature;
+    UInt(64) witness_time;
+};
+
+// Constructed only by the log verifier (SPEC 23.2).
+//@ serial
+type VerifiedHead = { LogHead head; List(WitnessCosignature) witness_cosigs; List(UInt(64)) pending; };
+
+// ============================================================================
+// Vault (SPEC Section 18)
+// ============================================================================
+
+
+//@ serial
+type Item = {
+    List(Int) id;
+    UInt(64) version;
+    Str kind;
+    Map(Str, List(Int)) fields;          // ciphertext by field name
+    Bool in_duress_subset;
+    Option(Str) handling_policy;
+};
+
+// Vault head (SPEC 18.4): a COSE_Sign1 (ES256) over the payload
+// {1: vault_id, 2: version, 3: merkle_root, 4: log_id, 5: log_sequence,
+// 6: suite}. The payload is rebuilt from these fields, never decoded.
+//@ serial
+type VaultHead = {
+    List(Int) vault_id;
+    UInt(64) version;
+    List(Int) merkle_root;
+    List(Int) log_id;
+    UInt(64) log_sequence;
+    UInt(8) suite;
+    List(Int) signer;                    // party id of the signing device
+    List(Int) sig;
+};
+
+//@ serial
+type VaultState = { VaultHead head; List(Item) items; };
+
+// ============================================================================
+// Threshold credentials (SPEC Section 10)
+// ============================================================================
+
+
+type Credential = {
+    SecretCredentialId id;
+    SecretRpId rp_id;
+    List(Int) public_key;                   // P = X + tau G
+    Secret(UInt(8)) profile;              // 0 threshold, 1 bound, 2 synced
+    Secret(UInt(64)) created_at;
+    Option(Secret(UInt(64))) rotation_due;
+};
+
+type ThresholdSession = {
+    List(Int) session_id;
+    List(Int) message;                   // SHA-256(authData || clientDataHash)
+    UInt(32) epoch;
+    List(List(Int)) parties;
+    List(Int) designated_party;            // applies tau
+    UInt(8) status;                      // 0 pending, 1 signing, 2 complete, 3 aborted
+};
+
+// ============================================================================
+// Sync (SPEC Section 20)
+// ============================================================================
+
+type SyncObject =
+    SyncLogHead(LogHead)
+  | SyncVaultHead(VaultHead)
+  | SyncItem(Item)
+  | SyncWrappedKey(List(Int), List(Int))
+  | SyncProtocolMessage(List(Int), List(Int), UInt(32), List(Int))
+  | SyncRecoveryNotification(EventPayload);
+
+// ============================================================================
+// Rotation (SPEC Section 26)
+// ============================================================================
+
+type RotationTrigger =
+    TriggerDeviceRemoved(List(Int))
+  | TriggerSuspectedCompromise(List(Int))
+  | TriggerBreach(Str)
+  | TriggerWeakPassword(List(Int))
+  | TriggerDuressEnd
+  | TriggerPrincipalRequest(List(List(Int)))
+  | TriggerPolicySchedule(List(List(Int)));
+
+type RotationLease = { List(Int) item_id; List(Int) holder; UInt(64) expires_at; };
+
+type PasswordRules = {
+    UInt(8) min_length;
+    UInt(8) max_length;
+    UInt(8) required_classes;            // 1 lower, 2 upper, 4 digit, 8 symbol
+    Str forbidden_chars;
+};
+
+type ExpectCondition =
+    ExpectUrl(Str)
+  | ExpectElement(Str)
+  | ExpectText(Str)
+  | ExpectAbsent(Str);
+
+type RecipeStep =
+    StepNavigate(Str)
+  | StepFill(Str, Str)                   // selector, slot: username | old | new | totp
+  | StepClick(Str)
+  | StepExpect(ExpectCondition)
+  | StepPasskeyRegister;
+
+type RecipePayload = {
+    Str domain;
+    UInt(32) version;
+    PasswordRules password_rules;
+    List(RecipeStep) steps;
+    List(Str) allowed_origins;
+    List(RecipeStep) sign_in;            // field 6: the sign-in procedure (slot "password"), empty when absent
+};
+
+// ============================================================================
+// Attestation (SPEC Section 21)
+// ============================================================================
+
+type CompilerInfo = { Str name; Str version; Bool reproducible; };
+
+type CacheProvenance = { Str key; List(Int) hash; List(Str) capabilities; };
+
+type ProvenanceRecord = {
+    Str package_name;
+    Str package_version;
+    List(Int) source_hash;
+    List(List(Int)) dependency_hashes;
+    List(Str) capability_requirements;
+    CompilerInfo compiler_info;
+    List(CacheProvenance) cache_entry_provenance;
+    List(Int) signature;
+};
+
+type AttestationEvidence = {
+    List(Int) tpm_certify;
+    List(List(Int)) ak_cert_chain;
+    ProvenanceRecord agent_provenance;
+};
+
+// ============================================================================
+// Duress (SPEC Section 14)
+// ============================================================================
+
+// Subset tweaks only: never the chain code, never the full vault key.
+type DuressProfile = {
+    Map(List(Int), SecretTweak) subset_tweaks;
+    SecretKey subset_vault_key;
+};
+
+type DuressWindow = {
+    Secret(UInt(64)) started_at;
+    List(Secret(UInt(8))) duress_device;
+    List(Secret(UInt(8))) duress_subkey;  // SEC1 point; which key it is stays secret
+};
+
+// ============================================================================
+// Errors
+// ============================================================================
+
+type SymbolonError =
+    ErrInvalidLog(Str)
+  | ErrInvalidSignature(Str)
+  | ErrQuorumNotMet(UInt(8), UInt(8))    // have, need
+  | ErrStaleEpoch(UInt(32), UInt(32))          // have, current
+  | ErrVaultIntegrity(Str)
+  | ErrPolicyViolation(Str)
+  | ErrDuressContainment(Str)
+  | ErrRecoveryFailed(Str)
+  | ErrRotationFailed(Str)
+  | ErrAttestationFailed(Str)
+  | ErrCapabilityDenied(Str)
+  | ErrNetwork(Str)
+  | ErrStorage(Str)
+  | ErrHardware(Str)
+  | ErrInternal(Str);

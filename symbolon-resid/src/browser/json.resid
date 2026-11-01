@@ -1,0 +1,215 @@
+// JSON (RFC 8259), as much as the Chrome DevTools Protocol needs: a value
+// type, a strict parser over UTF-8 bytes, and string quoting for building
+// requests. Numbers are kept as their text; the protocol's ids and the
+// values this agent reads are integers or strings.
+
+import "httpserv.resid";
+
+pub type Jv = JNull | JBool(Bool) | JNum(Str) | JStr(Str) | JArr(List(Jv)) | JObj(List(JField));
+pub type JField = { Str key; Jv value; };
+
+// ============================================================================
+// Quoting
+// ============================================================================
+
+Str hex4(Int c) {
+    List(Str) d = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "a", "b", "c", "d", "e", "f"];
+    return "\\u00" + d[(c >> 4) & 15] + d[c & 15];
+}
+
+StrBuf quote_at(Str s, Int i, StrBuf acc) {
+    if (i >= str_len(s)) { return acc; }
+    Int c = str_char_at(s, i);
+    StrBuf next = if (c == 34) { acc.push("\\\"") } else { if (c == 92) { acc.push("\\\\") } else {
+        if (c == 10) { acc.push("\\n") } else { if (c == 13) { acc.push("\\r") } else { if (c == 9) { acc.push("\\t") } else {
+        if (c == 8) { acc.push("\\b") } else { if (c == 12) { acc.push("\\f") } else {
+        if (c < 32) { acc.push(hex4(c)) } else { acc.push_char(c) } } } } } } } };
+    return quote_at(s, i + 1, next);
+}
+
+// `s` as a JSON string literal, control characters escaped.
+pub Str json_quote(Str s) { return quote_at(s, 0, StrBuf().push("\"")).push("\"").finish(); }
+
+// The UTF-8 bytes of `s`.
+pub List(Int) json_utf8(Str s) { return enc_at(s, 0, ListBuf()); }
+
+List(Int) enc_at(Str s, Int i, ListBuf(Int) acc) {
+    if (i >= str_len(s)) { return acc.finish(); }
+    Int c = str_char_at(s, i);
+    ListBuf(Int) a = if (c < 128) { acc.push(c) } else { if (c < 2048) { acc.push(192 | (c >> 6)).push(128 | (c & 63)) } else {
+        if (c < 65536) { acc.push(224 | (c >> 12)).push(128 | ((c >> 6) & 63)).push(128 | (c & 63)) } else {
+            acc.push(240 | (c >> 18)).push(128 | ((c >> 12) & 63)).push(128 | ((c >> 6) & 63)).push(128 | (c & 63)) } } };
+    return enc_at(s, i + 1, a);
+}
+
+Bool same_at(List(Int) b, Int i, List(Int) w, Int j) {
+    if (j >= w.len()) { return true; }
+    if (b[i + j] != w[j]) { return false; }
+    return same_at(b, i, w, j + 1);
+}
+
+// ============================================================================
+// Parsing
+// ============================================================================
+
+type Pj = { Jv v; Int next; };   // next < 0: malformed
+
+Pj bad() { return Pj {.v = JNull, .next = -1}; }
+Pj bad_s(StrBuf a) { _ = a.discard(); return bad(); }
+Pj bad_a(ListBuf(Jv) a) { _ = a.discard(); return bad(); }
+Pj bad_o(ListBuf(JField) a) { _ = a.discard(); return bad(); }
+
+Int skip_ws(List(Int) b, Int i) {
+    if (i < b.len() && (b[i] == 32 || b[i] == 9 || b[i] == 10 || b[i] == 13)) { return skip_ws(b, i + 1); }
+    return i;
+}
+
+Bool lit_at(List(Int) b, Int i, List(Int) w) {
+    if (i + w.len() > b.len()) { return false; }
+    return same_at(b, i, w, 0);
+}
+
+Pj value_at(List(Int) b, Int i0, Int depth) {
+    Int i = skip_ws(b, i0);
+    if (i >= b.len() || depth > 64) { return bad(); }
+    Int c = b[i];
+    if (c == 123) { return obj_at(b, skip_ws(b, i + 1), depth + 1, ListBuf(), true); }
+    if (c == 91) { return arr_at(b, skip_ws(b, i + 1), depth + 1, ListBuf(), true); }
+    if (c == 34) { return str_at(b, i + 1, StrBuf()); }
+    if (lit_at(b, i, json_utf8("true"))) { return Pj {.v = JBool(true), .next = i + 4}; }
+    if (lit_at(b, i, json_utf8("false"))) { return Pj {.v = JBool(false), .next = i + 5}; }
+    if (lit_at(b, i, json_utf8("null"))) { return Pj {.v = JNull, .next = i + 4}; }
+    if (c == 45 || (c >= 48 && c <= 57)) { return num_at(b, i, i); }
+    return bad();
+}
+
+Bool num_char(Int c) { return (c >= 48 && c <= 57) || c == 45 || c == 43 || c == 46 || c == 101 || c == 69; }
+
+Pj num_at(List(Int) b, Int start, Int i) {
+    if (i < b.len() && num_char(b[i])) { return num_at(b, start, i + 1); }
+    return Pj {.v = JNum(http_text(b, start, i)), .next = i};
+}
+
+Int hexval(Int c) {
+    if (c >= 48 && c <= 57) { return c - 48; }
+    if (c >= 97 && c <= 102) { return c - 87; }
+    if (c >= 65 && c <= 70) { return c - 55; }
+    return -1;
+}
+
+Int u4(List(Int) b, Int i) {
+    if (i + 4 > b.len()) { return -1; }
+    Int a = hexval(b[i]); Int c = hexval(b[i + 1]); Int d = hexval(b[i + 2]); Int e = hexval(b[i + 3]);
+    if (a < 0 || c < 0 || d < 0 || e < 0) { return -1; }
+    return (a << 12) | (c << 8) | (d << 4) | e;
+}
+
+// The UTF-8 sequence starting at b[i] (already valid when Chrome sent it):
+// its length, or -1.
+Int seq_len(Int c) {
+    if (c < 128) { return 1; }
+    if (c >= 192 && c < 224) { return 2; }
+    if (c >= 224 && c < 240) { return 3; }
+    if (c >= 240 && c < 248) { return 4; }
+    return -1;
+}
+
+Pj str_at(List(Int) b, Int i, StrBuf acc) {
+    if (i >= b.len()) { return bad_s(acc); }
+    Int c = b[i];
+    if (c == 34) { return Pj {.v = JStr(acc.finish()), .next = i + 1}; }
+    if (c < 32) { return bad_s(acc); }
+    if (c != 92) {
+        Int n = seq_len(c);
+        if (n < 0 || i + n > b.len()) { return bad_s(acc); }
+        return str_at(b, i + n, acc.push(http_text(b, i, i + n)));
+    }
+    if (i + 1 >= b.len()) { return bad_s(acc); }
+    Int e = b[i + 1];
+    if (e == 117) { return esc_u(b, i + 2, acc); }
+    Int ch = if (e == 34) { 34 } else { if (e == 92) { 92 } else { if (e == 47) { 47 } else { if (e == 98) { 8 } else {
+             if (e == 102) { 12 } else { if (e == 110) { 10 } else { if (e == 114) { 13 } else { if (e == 116) { 9 } else { -1 } } } } } } } };
+    if (ch < 0) { return bad_s(acc); }
+    return str_at(b, i + 2, acc.push_char(ch));
+}
+
+Pj esc_u(List(Int) b, Int i, StrBuf acc) {
+    Int hi = u4(b, i);
+    if (hi < 0) { return bad_s(acc); }
+    if (hi >= 55296 && hi < 56320) {
+        Bool pair = i + 10 <= b.len() && b[i + 4] == 92 && b[i + 5] == 117;
+        Int lo = if (pair) { u4(b, i + 6) } else { -1 };
+        if (lo < 56320 || lo >= 57344) { return str_at(b, i + 4, acc.push_char(65533)); }
+        return str_at(b, i + 10, acc.push_char(65536 + ((hi - 55296) << 10) + (lo - 56320)));
+    }
+    return str_at(b, i + 4, acc.push_char(if (hi >= 56320 && hi < 57344) { 65533 } else { hi }));
+}
+
+Pj arr_at(List(Int) b, Int i, Int depth, ListBuf(Jv) acc, Bool first) {
+    if (i >= b.len()) { return bad_a(acc); }
+    if (b[i] == 93 && first) { return Pj {.v = JArr(acc.finish()), .next = i + 1}; }
+    Pj v = value_at(b, i, depth);
+    if (v.next < 0) { return bad_a(acc); }
+    Int j = skip_ws(b, v.next);
+    if (j >= b.len()) { return bad_a(acc); }
+    if (b[j] == 44) { return arr_at(b, skip_ws(b, j + 1), depth, acc.push(v.v), false); }
+    if (b[j] == 93) { return Pj {.v = JArr(acc.push(v.v).finish()), .next = j + 1}; }
+    return bad_a(acc);
+}
+
+Pj obj_at(List(Int) b, Int i, Int depth, ListBuf(JField) acc, Bool first) {
+    if (i >= b.len()) { return bad_o(acc); }
+    if (b[i] == 125 && first) { return Pj {.v = JObj(acc.finish()), .next = i + 1}; }
+    if (b[i] != 34) { return bad_o(acc); }
+    Pj k = str_at(b, i + 1, StrBuf());
+    Int colon = skip_ws(b, k.next);
+    if (k.next < 0 || colon >= b.len() || b[colon] != 58) { return bad_o(acc); }
+    Pj v = value_at(b, colon + 1, depth);
+    if (v.next < 0) { return bad_o(acc); }
+    Jv kv = k.v;
+    Str key = match kv { JStr(s) => s, _ => "" };
+    ListBuf(JField) more = acc.push(JField {.key = key, .value = v.v});
+    Int j = skip_ws(b, v.next);
+    if (j >= b.len()) { return bad_o(more); }
+    if (b[j] == 44) { return obj_at(b, skip_ws(b, j + 1), depth, more, false); }
+    if (b[j] == 125) { return Pj {.v = JObj(more.finish()), .next = j + 1}; }
+    return bad_o(more);
+}
+
+// The one JSON value in `b` (surrounding white space allowed).
+pub Option(Jv) json_parse(List(Int) b) {
+    Pj p = value_at(b, 0, 0);
+    if (p.next < 0 || skip_ws(b, p.next) != b.len()) { return None; }
+    return Some(p.v);
+}
+
+// ============================================================================
+// Access
+// ============================================================================
+
+Option(Jv) field_in(List(JField) fs, Str k, Int i) {
+    if (i >= fs.len()) { return None; }
+    if (fs[i].key == k) { return Some(fs[i].value); }
+    return field_in(fs, k, i + 1);
+}
+
+// Member `k` of an object; None for anything else.
+pub Option(Jv) jget(Jv v, Str k) {
+    return match v { JObj(fs) => field_in(fs, k, 0), _ => None };
+}
+
+// The value at a path of member names.
+pub Option(Jv) jpath(Jv v, List(Str) ks, Int i) {
+    if (i >= ks.len()) { return Some(v); }
+    Option(Jv) n = jget(v, ks[i]);
+    return match n { None => None, Some(x) => jpath(x, ks, i + 1) };
+}
+
+pub Str jstr(Option(Jv) v) { return match v { Some(x) => str_of(x), None => "" }; }
+Str str_of(Jv v) { return match v { JStr(s) => s, _ => "" }; }
+
+pub Int jint(Option(Jv) v) { return match v { Some(x) => int_of(x), None => -1 }; }
+Int int_of(Jv v) { return match v { JNum(s) => str_parse_int(s), _ => -1 }; }
+
+pub Bool jbool(Option(Jv) v) { return match v { Some(x) => bool_of(x), None => false }; }
+Bool bool_of(Jv v) { return match v { JBool(b) => b, _ => false }; }

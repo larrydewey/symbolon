@@ -1,0 +1,104 @@
+// The duress PIN from the command line (SPEC 9.2, 14).
+//
+// Every device has, whether or not a duress PIN exists:
+//   duress.pub   the duress DK sub-key's public key, registered with the
+//                cosigner (a device without a duress PIN registers a key no
+//                one holds);
+//   dshare       its CGGMP21 configuration for the duress profile, HPKE-
+//                sealed to the duress profile's key by the real profile, which
+//                cannot read it back (random bytes of the same length
+//                without a duress PIN);
+//   slot         the duress profile's update: the subset's tweaks
+//                (src/duress/, written on every `register`, decoy or not);
+//   subset.enc   the subset, as the real profile keeps it (under the DEK).
+// Nothing differs at the relay, the log or the witnesses (A-05).
+
+import "../types.resid";
+import "../core/log.resid";
+import "../duress/duress.resid";
+import "../threshold/threshold.resid";
+import "../net/proto.resid";
+import "../net/services.resid";
+import "state.resid";
+import "common.resid";
+import "session.resid";
+import "cggmp_store.resid";
+import "hpke.resid";
+import "hpkeg.resid";
+import "word.resid";
+import "crypto.resid";
+
+List(Secret(UInt(8))) zeros32() { return secret_bytes([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]); }
+
+List(Int) dshare_info() { return utf8("symbolon v1 duress share"); }
+
+// The duress configuration, written whenever the real profile stores a new
+// configuration.
+@requires(filesystem, declassify)
+pub Bool store_dshare(Str dir, RealProfile real, CgConfig cfg) {
+    List(Int) pt = cg_cfg_encode(cfg);
+    if (real.duress_hpke_pub.len() == 65) {
+        HpkeMessage m = hpke_seal_to(slot_suite(), real.duress_hpke_pub, dshare_info(), [], pt);
+        return m.ok && filesystem.write_bytes(dir + "/dshare", m.enc.concat(m.ct));
+    }
+    return filesystem.write_bytes(dir + "/dshare", random_bytes(65 + pt.len() + 16));
+}
+
+@requires(filesystem, declassify)
+pub Option(CgConfig) load_dshare(Str dir, List(Secret(UInt(8))) hpke_priv) {
+    List(Int) b = get_file(dir + "/dshare");
+    if (b.len() < 81) { return None; }
+    Option(List(Int)) pt = hpke_open_with(slot_suite(), b[0..65], reveal(hpke_priv), dshare_info(), [], b[65..b.len()]);
+    return match pt { None => None, Some(p) => cg_cfg_decode(p) };
+}
+
+// ─── The subset ─────────────────────────────────────────────────
+
+List(Int) subset_aad() { return utf8("symbolon v1 duress subset"); }
+
+@requires(filesystem, declassify)
+List(Int) load_subset(Str dir, List(Secret(UInt(8))) dek) {
+    List(Int) b = get_file(dir + "/subset.enc");
+    if (b.len() < 28) { return []; }
+    Option(List(Secret(UInt(8)))) pt = aes_gcmg_decrypt(dek, b[0..12], b[12..b.len()], subset_aad());
+    return match pt { None => [], Some(p) => reveal(p) };
+}
+
+List(SubsetTweak) tweaks_of(List(Int) b, Int i, List(SubsetTweak) acc) {
+    if (i + 64 > b.len()) { return acc; }
+    return tweaks_of(b, i + 64, acc.concat([SubsetTweak {.cid = b[i..i + 32], .tau = secret_bytes(b[i + 32..i + 64])}]));
+}
+
+// Adds (cid, tau) to the subset when `add` (a credential registered with
+// --duress), and rewrites the update slot either way, so a register with
+// and without --duress, and a device with and without a duress PIN, write
+// the same files.
+@requires(filesystem, declassify)
+pub Bool update_duress(Str dir, RealProfile real, List(Int) cid, List(Int) tau32, Bool add) {
+    List(Int) old = load_subset(dir, real.dek);
+    List(Int) all = if (add) { old.concat(cid).concat(tau32) } else { old };
+    List(Int) iv = random_bytes(12);
+    Bool saved = put_secret_file(dir + "/subset.enc", iv.concat(reveal(aes_gcmg_seal(real.dek, iv, secret_bytes(all), subset_aad()))));
+    List(Int) slot = if (real.duress_hpke_pub.len() == 65) {
+        seal_slot(real.duress_hpke_pub, 0, DuressFull {.share = zeros32(), .subkey = zeros32(), .vault_key = zeros32(), .hpke_priv = zeros32(), .tweaks = tweaks_of(all, 0, [])}, random_secret(32)) else { [] }
+    } else { decoy_slot(random_bytes(slot_len())) };
+    return saved && slot.len() > 0 && filesystem.write_bytes(dir + "/slot", slot);
+}
+
+// The duress profile's tweaks, from the slot.
+@requires(filesystem, declassify, provision)
+pub List(SubsetTweak) duress_tweaks(Str dir, DuressFull d) {
+    Option(DuressFull) up = open_slot(d.hpke_priv, 0, get_file(dir + "/slot"));
+    return match up { None => [], Some(x) => x.tweaks };
+}
+
+// ─── Registration with the cosigner ─────────────────────────────
+
+@requires(filesystem)
+pub List(Int) duress_pub(Str dir) { return get_file(dir + "/duress.pub"); }
+
+@requires(filesystem, network, declassify, clock(readonly))
+pub Bool send_duress_key(Str dir, Endpoint relay, Local me, Remote cos) {
+    List(Int) k = duress_pub(dir);
+    return k.len() == 65 && send_to(relay, me, cos, WDuressKey(k));
+}

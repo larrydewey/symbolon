@@ -1,0 +1,415 @@
+// Symbolon threshold glue (SPEC Sections 6.2, 10, 11.3, 12.2): per-credential
+// keys, one party's side of a blind-tweak CGGMP21 signing session, the epoch
+// rule, abort bookkeeping and the kit's split offline material.
+//
+// The cryptography is the Resid standard library (lib/cggmp*.resid). The
+// tweak is applied with lib/cggmp_blind.resid: no party but the designated
+// one (the initiating device) learns tau, tau*G or P, and only it receives
+// the S points and the signature shares (SPEC 12.2).
+//
+// Layer 8 of PLAN-CGGMP.md is open: CGGMP21 holds key shares and nonces as
+// public List(UInt(64)). The tweak is derived as a secret and crosses into
+// the protocol at one named point, `tweak_scalar` ("tweak into CGGMP
+// reference implementation"); that declassify is a release blocker and goes
+// away with layer 8.
+
+import "../types.resid";
+import "../core/log.resid";
+import "../vault/vault.resid";
+import "cggmp_blind.resid";
+import "rsmsg.resid";
+import "cggmp_curve.resid";
+import "sha256g.resid";
+import "word.resid";
+import "hpke.resid";
+import "cose.resid";
+import "crypto.resid";
+
+// ============================================================================
+// Per-credential keys (SPEC 10.3)
+// ============================================================================
+
+List(Secret(UInt(8))) hkdf_nil(List(Secret(UInt(8))) ikm, List(Int) info, Int n) {
+    List(Secret(UInt(8))) nil = [];
+    return hkdf256g_expand(hkdf256g_extract(nil, ikm), secret_bytes(info), n);
+}
+
+List(Int) ints_of(List(UInt(8)) bs, Int i, ListBuf(Int) acc) {
+    if (i >= bs.len()) { return acc.finish(); }
+    return ints_of(bs, i + 1, acc.push((Int)bs[i]));
+}
+
+// k_cid = HKDF(cc, nil, "symbolon v1 cid", 32)
+List(Secret(UInt(8))) cid_key(List(Secret(UInt(8))) cc) { return hkdf_nil(cc, utf8("symbolon v1 cid"), 32); }
+
+// tag = HMAC-SHA256(k_cid, "symbolon v1 cid" || rp_id || nonce)[0..16]. The
+// tag goes into the credential ID, which the relying party holds.
+@requires(declassify)
+pub List(Int) credential_tag(List(Secret(UInt(8))) cc, Str rp_id, List(Int) nonce) {
+    List(Secret(UInt(8))) mac = hmac256g(cid_key(cc), secret_bytes(utf8("symbolon v1 cid").concat(utf8(rp_id)).concat(nonce)));
+    return ints_of(declassify(secret_join(mac[0..16]), "credential id tag goes to the relying party"), 0, ListBuf());
+}
+
+// cid = nonce || tag, 32 bytes.
+@requires(declassify)
+pub List(Int) credential_id(List(Secret(UInt(8))) cc, Str rp_id, List(Int) nonce) {
+    return nonce.concat(credential_tag(cc, rp_id, nonce));
+}
+
+// The nonce of a credential ID presented with the request's RP ID, or None
+// when the tag does not match that RP ID (A-12).
+@requires(declassify)
+pub Option(List(Int)) credential_nonce(List(Secret(UInt(8))) cc, Str rp_id, List(Int) cid) {
+    if (cid.len() != 32) { return None; }
+    List(Int) nonce = cid[0..16];
+    return if (ct_equal(credential_tag(cc, rp_id, nonce), cid[16..32])) { Some(nonce) } else { None };
+}
+
+// The 48 tweak bytes, HKDF(cc, nil, "symbolon v1 tweak" || rp_id || nonce, 48).
+pub List(Secret(UInt(8))) tweak_bytes(List(Secret(UInt(8))) cc, Str rp_id, List(Int) nonce) {
+    return hkdf_nil(cc, utf8("symbolon v1 tweak").concat(utf8(rp_id)).concat(nonce), 48);
+}
+
+// tau = tweak_bytes mod q, as the protocol's scalar. See the header: this is
+// the one declassification of the threshold layer.
+@requires(declassify)
+pub List(UInt(64)) tweak_scalar(List(Secret(UInt(8))) cc, Str rp_id, List(Int) nonce) {
+    List(Int) b = ints_of(declassify(secret_join(tweak_bytes(cc, rp_id, nonce)), "tweak into CGGMP reference implementation"), 0, ListBuf());
+    return sc_of_bytes(b);
+}
+
+// P = X + tau*G as a SEC1 uncompressed point (65 bytes), or [] when X is not
+// a point.
+pub List(Int) credential_pubkey(List(Int) root_pubkey, List(UInt(64)) tau) {
+    Option(CvPt) ox = sec1_point(root_pubkey);
+    return match ox {
+        None => [],
+        Some(x) => sec1_uncompressed(cv_add(x, cv_mul_base(tau)))
+    };
+}
+
+// The point of a SEC1 uncompressed encoding (0x04 || X || Y), checked to be
+// on the curve: it is decoded from its compressed form and Y must agree.
+pub Option(CvPt) sec1_point(List(Int) b) {
+    if (b.len() != 65 || b[0] != 4) { return None; }
+    List(UInt(64)) y = bn_from_be(b[33..65]);
+    Option(CvPt) op = cv_dec([2 + bn_bit(y, 0)].concat(b[1..33]));
+    return match op {
+        None => None,
+        Some(p) => if (bn_cmp(p.y, y) == 0) { Some(p) } else { None }
+    };
+}
+
+pub List(Int) sec1_uncompressed(CvPt p) {
+    if (p.inf) { return []; }
+    return [4].concat(bn_to_be(p.x, 32)).concat(bn_to_be(p.y, 32));
+}
+
+// ============================================================================
+// Parties as protocol ids (SPEC 7)
+// ============================================================================
+
+// A party's CGGMP id: its position in the quorum's party list, from 1.
+pub Int cg_id_of(Quorum q, List(Int) party, Int i) {
+    if (i >= q.parties.len()) { return 0; }
+    if (bytes_eq(q.parties[i].id, party)) { return i + 1; }
+    return cg_id_of(q, party, i + 1);
+}
+
+List(Int) insert_sorted(List(Int) xs, Int v, Int i, ListBuf(Int) acc) {
+    if (i >= xs.len()) { return acc.push(v).finish(); }
+    if (v < xs[i]) { return copy_rest(xs, i, acc.push(v)); }
+    return insert_sorted(xs, v, i + 1, acc.push(xs[i]));
+}
+
+List(Int) copy_rest(List(Int) xs, Int i, ListBuf(Int) acc) {
+    if (i >= xs.len()) { return acc.finish(); }
+    return copy_rest(xs, i + 1, acc.push(xs[i]));
+}
+
+// The signers' CGGMP ids in ascending order, or [] when one is not in the
+// quorum or appears twice.
+pub List(Int) cg_ids(Quorum q, List(List(Int)) signers, Int i, List(Int) acc) {
+    if (i >= signers.len()) { return acc; }
+    Int id = cg_id_of(q, signers[i], 0);
+    if (id == 0 || cg_index(acc, id, 0) >= 0) { return []; }
+    return cg_ids(q, signers, i + 1, insert_sorted(acc, id, 0, ListBuf()));
+}
+
+// ============================================================================
+// Epochs (SPEC 11.3)
+// ============================================================================
+
+// A party signs only with shares of the log's current epoch.
+pub Result(Int, SymbolonError) epoch_ok(UInt(32) share_epoch, LogHead h) {
+    if (share_epoch < h.quorum.epoch) { return Err(ErrStaleEpoch(share_epoch, h.quorum.epoch)); }
+    if (share_epoch > h.quorum.epoch) { return Err(ErrInvalidLog("share epoch ahead of the verified log")); }
+    return Ok(0);
+}
+
+// ============================================================================
+// One party's side of a signing session (SPEC 10.4)
+// ============================================================================
+
+//@ serial
+pub type ThMsg = ThCg(CgMsg) | ThTw(BlTwMsg) | ThAbortReq(Int) | ThRs(RsMsg);
+
+pub type ThState =
+    ThR1(Ps1, BlRole)
+  | ThR2(BlR2)
+  | ThR3(Ps3, BlR2)
+  | ThR4(Ps4, BlR2)
+  | ThR5(Ps5, BlR2)
+  | ThR6(Ps6, BlR2)
+  | ThPeerSent(Ps6, BlR2)                // a peer that has sent its share; it answers an abort request
+  | ThAwaitAbort(PsAb2, BlR2)            // the designated party, waiting for abort-2 openings
+  | ThSigned(CgSig)
+  | ThClosed;
+
+pub type ThStep = { ThState state; List(ThMsg) out; };
+
+// The session context for party `self_party`. The designated party is the
+// initiating device: it alone holds tau and ends with the signature.
+pub Option(CgCtx) th_ctx(CgConfig cfg, Quorum q, List(List(Int)) signers, List(Int) initiator, List(UInt(64)) tau, List(Int) session_id, List(Int) digest, List(Int) seed) {
+    List(Int) ids = cg_ids(q, signers, 0, []);
+    Int d = cg_id_of(q, initiator, 0);
+    if (ids.len() == 0 || d == 0) { return None; }
+    return bl_ctx(cfg, ids, BlRole {.designated = d, .tau = if (cfg.id == d) { tau } else { [] }}, session_id, digest, seed);
+}
+
+pub BlRole th_role(CgCtx c, Quorum q, List(Int) initiator, List(UInt(64)) tau) {
+    Int d = cg_id_of(q, initiator, 0);
+    return BlRole {.designated = d, .tau = if (c.self == d) { tau } else { [] }};
+}
+
+List(ThMsg) wrap_cg(List(CgMsg) ms, Int i, ListBuf(ThMsg) acc) {
+    if (i >= ms.len()) { return acc.finish(); }
+    return wrap_cg(ms, i + 1, acc.push(ThCg(ms[i])));
+}
+
+List(ThMsg) wrap_tw(List(BlTwMsg) ms, Int i, ListBuf(ThMsg) acc) {
+    if (i >= ms.len()) { return acc.finish(); }
+    return wrap_tw(ms, i + 1, acc.push(ThTw(ms[i])));
+}
+
+List(CgMsg) cg_of(List(ThMsg) ms, Int i, ListBuf(CgMsg) acc) {
+    if (i >= ms.len()) { return acc.finish(); }
+    ThMsg m = ms[i];
+    return cg_of(ms, i + 1, match m { ThCg(x) => acc.push(x), _ => acc });
+}
+
+List(BlTwMsg) tw_of(List(ThMsg) ms, Int i, ListBuf(BlTwMsg) acc) {
+    if (i >= ms.len()) { return acc.finish(); }
+    ThMsg m = ms[i];
+    return tw_of(ms, i + 1, match m { ThTw(x) => acc.push(x), _ => acc });
+}
+
+Bool abort_asked(List(ThMsg) ms, Int from, Int i) {
+    if (i >= ms.len()) { return false; }
+    ThMsg m = ms[i];
+    Bool hit = match m { ThAbortReq(f) => f == from, _ => false };
+    return hit || abort_asked(ms, from, i + 1);
+}
+
+pub ThStep th_start(CgCtx c, BlRole role) {
+    Ps1 s = ps_start(c);
+    return ThStep {.state = ThR1(s, role), .out = wrap_cg(s.out, 0, ListBuf())};
+}
+
+CgCtx ctx_of6(Ps6 s) { return s.prev.prev.prev.prev.prev.ctx; }
+
+// Advances the session by one round on `in`, everything addressed to this
+// party in the last round. A failure names the parties to blame, if any.
+pub Result(ThStep, CgFail) th_step(ThState st, List(ThMsg) in) {
+    List(CgMsg) cin = cg_of(in, 0, ListBuf());
+    return match st {
+        ThR1(s, role) => th_r2(s, role, cin),
+        ThR2(b) => th_r3(b, cin, tw_of(in, 0, ListBuf())),
+        ThR3(s, b) => th_r4(s, b, cin),
+        ThR4(s, b) => th_r5(s, b, cin),
+        ThR5(s, b) => th_r6(s, b, cin),
+        ThR6(s, b) => th_r7(s, b, cin),
+        ThPeerSent(s, b) => th_peer_after(s, b, in),
+        ThAwaitAbort(a, b) => Err(bl_abort2_blame(a, cin, b)),
+        ThSigned(sig) => Ok(ThStep {.state = ThSigned(sig), .out = []}),
+        ThClosed => Err(cg_fail("session closed", []))
+    };
+}
+
+Result(ThStep, CgFail) th_r2(Ps1 s, BlRole role, List(CgMsg) in) {
+    Ps2 s2 = ps_r2(s, in)?;
+    BlR2 b = bl_r2(s2, role);
+    return Ok(ThStep {.state = ThR2(b), .out = wrap_cg(s2.out, 0, ListBuf()).concat(wrap_tw(b.out, 0, ListBuf()))});
+}
+
+Result(ThStep, CgFail) th_r3(BlR2 b, List(CgMsg) in, List(BlTwMsg) tw) {
+    Ps3 s = bl_r3(b, in, tw)?;
+    return Ok(ThStep {.state = ThR3(s, b), .out = wrap_cg(s.out, 0, ListBuf())});
+}
+
+Result(ThStep, CgFail) th_r4(Ps3 s3, BlR2 b, List(CgMsg) in) {
+    Ps4 s = ps_r4(s3, in)?;
+    return Ok(ThStep {.state = ThR4(s, b), .out = wrap_cg(s.out, 0, ListBuf())});
+}
+
+Result(ThStep, CgFail) th_r5(Ps4 s4, BlR2 b, List(CgMsg) in) {
+    Ps5 s = ps_r5(s4, in)?;
+    return Ok(ThStep {.state = ThR5(s, b), .out = wrap_cg(s.out, 0, ListBuf())});
+}
+
+Result(ThStep, CgFail) th_r6(Ps5 s5, BlR2 b, List(CgMsg) in) {
+    Ps6 s = bl_r6(ps_r6(s5, in)?, b.role);
+    CgCtx c = ctx_of6(s);
+    if (c.self == b.role.designated) { return Ok(ThStep {.state = ThR6(s, b), .out = []}); }
+    // A peer sends its S point and its signature share in one go, both to
+    // the designated party only.
+    PsDone done = bl_r7_peer(s, b.role);
+    return Ok(ThStep {.state = ThPeerSent(s, b), .out = wrap_cg(s.out.concat(done.out), 0, ListBuf())});
+}
+
+// The designated party: the S points must add up to P; then the signature
+// shares make the signature, checked under P.
+Result(ThStep, CgFail) th_r7(Ps6 s, BlR2 b, List(CgMsg) in) {
+    CgCtx c = ctx_of6(s);
+    return match bl_r7_designated(s, in) {
+        Err(e) => th_start_abort(s, b, e),
+        Ok(done) => match bl_finish(c, done.presig, in, b.role) {
+            Err(e) => Err(e),
+            Ok(sig) => Ok(ThStep {.state = ThSigned(sig), .out = []})
+        }
+    };
+}
+
+Result(ThStep, CgFail) th_start_abort(Ps6 s, BlR2 b, CgFail e) {
+    if (e.culprits.len() > 0 || e.why != "the S shares do not add up to the public key") { return Err(e); }
+    PsAb2 a = bl_abort2(s, b.role)?;
+    return Ok(ThStep {.state = ThAwaitAbort(a, b), .out = [ThAbortReq(b.role.designated)]});
+}
+
+// A peer that has sent its share answers the designated party's abort
+// request with its openings (to that party only), and is then done.
+Result(ThStep, CgFail) th_peer_after(Ps6 s, BlR2 b, List(ThMsg) in) {
+    if (!abort_asked(in, b.role.designated, 0)) { return Ok(ThStep {.state = ThClosed, .out = []}); }
+    PsAb2 a = bl_abort2(s, b.role)?;
+    return Ok(ThStep {.state = ThClosed, .out = wrap_cg(a.out, 0, ListBuf())});
+}
+
+// The ECDSA signature r || s (64 bytes) of a finished session.
+pub List(Int) th_sig_raw(CgSig sig) { return cg_sig_raw(sig.r, sig.s); }
+
+// ============================================================================
+// Aborts (SPEC 6.2)
+// ============================================================================
+
+// Parties named by an abort, and the count of aborts that named no one.
+pub type AbortBook = { List(List(Int)) banned; Int unidentified; };
+
+pub AbortBook abort_book() { return AbortBook {.banned = [], .unidentified = 0}; }
+
+// After this many consecutive aborts that identify no one, the parties stop
+// and alert instead of trying again.
+pub Int unidentified_limit() { return 3; }
+
+List(List(Int)) party_ids_of(Quorum q, List(Int) cg_ids_named, Int i, List(List(Int)) acc) {
+    if (i >= cg_ids_named.len()) { return acc; }
+    Int k = cg_ids_named[i] - 1;
+    List(List(Int)) next = if (k >= 0 && k < q.parties.len()) { acc.concat([q.parties[k].id]) } else { acc };
+    return party_ids_of(q, cg_ids_named, i + 1, next);
+}
+
+Bool held(List(List(Int)) xs, List(Int) x, Int i) {
+    if (i >= xs.len()) { return false; }
+    if (bytes_eq(xs[i], x)) { return true; }
+    return held(xs, x, i + 1);
+}
+
+List(List(Int)) union_ids(List(List(Int)) a, List(List(Int)) b, Int i) {
+    if (i >= b.len()) { return a; }
+    return union_ids(if (held(a, b[i], 0)) { a } else { a.concat([b[i]]) }, b, i + 1);
+}
+
+pub AbortBook record_abort(AbortBook book, Quorum q, CgFail f) {
+    if (f.culprits.len() == 0) { return AbortBook {.banned = book.banned, .unidentified = book.unidentified + 1}; }
+    return AbortBook {.banned = union_ids(book.banned, party_ids_of(q, f.culprits, 0, []), 0), .unidentified = 0};
+}
+
+pub AbortBook record_success(AbortBook book) { return AbortBook {.banned = book.banned, .unidentified = 0}; }
+
+// Whether a session with these signers may run: none is banned, and the
+// aborts that named no one have not reached the limit.
+pub Result(Int, SymbolonError) may_run(AbortBook book, List(List(Int)) signers) {
+    if (book.unidentified >= unidentified_limit()) { return Err(ErrPolicyViolation("repeated unidentified aborts: stop and alert")); }
+    return may_run_from(book, signers, 0);
+}
+
+Result(Int, SymbolonError) may_run_from(AbortBook book, List(List(Int)) signers, Int i) {
+    if (i >= signers.len()) { return Ok(0); }
+    if (held(book.banned, signers[i], 0)) { return Err(ErrPolicyViolation("a signer was identified in an abort")); }
+    return may_run_from(book, signers, i + 1);
+}
+
+List(List(Int)) still_present(List(List(Int)) banned, Quorum q, Int i, List(List(Int)) acc) {
+    if (i >= banned.len()) { return acc; }
+    Bool present = cg_id_of(q, banned[i], 0) != 0;
+    return still_present(banned, q, i + 1, if (present) { acc.concat([banned[i]]) } else { acc });
+}
+
+// After a refresh or re-share to `q`: a banned party that `q` excludes is
+// forgotten; one still in `q` stays banned (only a refresh that excludes it
+// lifts the rule).
+pub AbortBook after_reshare(AbortBook book, Quorum q) {
+    return AbortBook {.banned = still_present(book.banned, q, 0, []), .unidentified = 0};
+}
+
+// ============================================================================
+// The kit's offline material (SPEC 10.6)
+// ============================================================================
+
+// With a cosigner in the quorum the kit's share is x_K = a + b and its key
+// k_K = k_a XOR k_b; a, k_a are wrapped to the kit, b, k_b to the cosigner.
+pub type KitHalves = { List(UInt(64)) a; List(UInt(64)) b; List(Int) ka; List(Int) kb; };
+
+List(Int) xor_bytes(List(Int) x, List(Int) y, Int i, ListBuf(Int) acc) {
+    if (i >= x.len()) { return acc.finish(); }
+    return xor_bytes(x, y, i + 1, acc.push(x[i] ^ y[i]));
+}
+
+// `ra` (32 bytes) and `rkb` (as long as k_K) are fresh random bytes.
+pub KitHalves kit_split(List(UInt(64)) xk, List(Int) kk, List(Int) ra, List(Int) rkb) {
+    List(UInt(64)) a = sc_of_bytes(ra);
+    return KitHalves {.a = a, .b = sc_nat_sub(xk, a), .ka = xor_bytes(kk, rkb, 0, ListBuf()), .kb = rkb};
+}
+
+pub List(UInt(64)) kit_share(List(UInt(64)) a, List(UInt(64)) b) { return sc_nat_add(a, b); }
+
+pub List(Int) kit_key(List(Int) ka, List(Int) kb) {
+    if (ka.len() != kb.len()) { return []; }
+    return xor_bytes(ka, kb, 0, ListBuf());
+}
+
+// HPKE base mode, DHKEM(P-256), HKDF-SHA256, AES-256-GCM (SPEC 6.1).
+pub HpkeSuite offline_suite() { return hpke_suite(16, 1, 2); }
+
+// info = CBOR ["symbolon v1 offline", log_id, epoch, party_id]
+pub List(Int) offline_info(List(Int) log_id, UInt(32) epoch, List(Int) party) {
+    List(Int) a = cbe_text("symbolon v1 offline", cbe_array(4, []));
+    List(Int) b = cbe_bytes(log_id, a);
+    List(Int) c = cbe_uint((Int)epoch, b);
+    return cbe_bytes(party, c);
+}
+
+pub type Wrapped = { List(Int) enc; List(Int) ct; };
+
+// Wraps `pt` to `hpke_pub` for party `party` at this epoch. `ikm_e` is the
+// fresh ephemeral key material.
+pub Option(Wrapped) offline_wrap(List(Int) hpke_pub, List(Int) log_id, UInt(32) epoch, List(Int) party, List(Int) pt, List(Int) ikm_e) {
+    HpkeSender s = hpke_setup_sender_full(offline_suite(), hpke_pub, offline_info(log_id, epoch, party), [], [], [], ikm_e);
+    if (!s.ctx.ok) { return None; }
+    HpkeSealed sealed = hpke_seal(s.ctx, [], pt);
+    if (sealed.ct.len() == 0) { return None; }
+    return Some(Wrapped {.enc = s.enc, .ct = sealed.ct});
+}
+
+pub Option(List(Int)) offline_unwrap(List(Int) hpke_priv, List(Int) log_id, UInt(32) epoch, List(Int) party, Wrapped w) {
+    return hpke_open_with(offline_suite(), w.enc, hpke_priv, offline_info(log_id, epoch, party), [], w.ct);
+}

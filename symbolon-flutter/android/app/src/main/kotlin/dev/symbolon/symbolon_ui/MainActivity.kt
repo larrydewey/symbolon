@@ -1,0 +1,70 @@
+package dev.symbolon.symbolon_ui
+
+import android.content.ComponentName
+import android.os.Build
+import android.os.CancellationSignal
+import androidx.credentials.CreateCredentialResponse
+import androidx.credentials.CreatePublicKeyCredentialRequest
+import androidx.credentials.CreatePublicKeyCredentialResponse
+import androidx.credentials.CredentialManager
+import androidx.credentials.CredentialManagerCallback
+import androidx.credentials.GetCredentialRequest
+import androidx.credentials.GetCredentialResponse
+import androidx.credentials.GetPublicKeyCredentialOption
+import androidx.credentials.PublicKeyCredential
+import androidx.credentials.exceptions.CreateCredentialException
+import androidx.credentials.exceptions.GetCredentialException
+import io.flutter.embedding.android.FlutterFragmentActivity
+import io.flutter.embedding.engine.FlutterEngine
+import io.flutter.plugin.common.MethodChannel
+
+// The agent ships as lib/<abi>/libsymbolon.so: Android extracts native
+// libraries to a directory it lets the app execute from (the app's data
+// directory is not executable). The Dart side runs it as a subprocess.
+class MainActivity : FlutterFragmentActivity() {
+    override fun onResume() {
+        super.onResume()
+        KeystoreServer.inFront(this)
+    }
+
+    override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
+        super.configureFlutterEngine(flutterEngine)
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "symbolon/platform").setMethodCallHandler { call, result ->
+            if (Biometric.handle(this, call, result)) return@setMethodCallHandler
+            when (call.method) {
+                "paths" -> result.success(platformPaths(this))
+                "keystore" -> result.success(KeystoreServer.info(this))
+                // Android 14+: whether passkey providers can be chosen, and
+                // the system page where the user turns Symbolon on.
+                "providerSupported" -> result.success(Build.VERSION.SDK_INT >= 34)
+                "providerEnabled" -> result.success(Build.VERSION.SDK_INT >= 34 &&
+                    getSystemService(android.credentials.CredentialManager::class.java)
+                        .isEnabledCredentialProviderService(ComponentName(this, SymbolonCredentialService::class.java)))
+                "openProviderSettings" -> {
+                    if (Build.VERSION.SDK_INT >= 34) {
+                        CredentialManager.create(this).createSettingsPendingIntent().send()
+                        result.success(true)
+                    } else result.success(false)
+                }
+                // Debug builds: this app asks the system for a passkey, as a
+                // site's app would, to try the provider end to end.
+                "testCreate" -> CredentialManager.create(this).createCredentialAsync(this, CreatePublicKeyCredentialRequest(call.arguments as String),
+                    CancellationSignal(), mainExecutor, object : CredentialManagerCallback<CreateCredentialResponse, CreateCredentialException> {
+                        override fun onResult(r: CreateCredentialResponse) = result.success((r as CreatePublicKeyCredentialResponse).registrationResponseJson)
+                        override fun onError(e: CreateCredentialException) = result.error(e.type, e.message, null)
+                    })
+                "testGet" -> CredentialManager.create(this).getCredentialAsync(this, GetCredentialRequest(listOf(GetPublicKeyCredentialOption(call.arguments as String))),
+                    CancellationSignal(), mainExecutor, object : CredentialManagerCallback<GetCredentialResponse, GetCredentialException> {
+                        override fun onResult(r: GetCredentialResponse) = result.success((r.credential as PublicKeyCredential).authenticationResponseJson)
+                        override fun onError(e: GetCredentialException) = result.error(e.type, e.message, null)
+                    })
+                else -> result.notImplemented()
+            }
+        }
+    }
+}
+
+fun platformPaths(a: android.content.Context) = mapOf(
+    "nativeLibraryDir" to a.applicationInfo.nativeLibraryDir,
+    "filesDir" to a.filesDir.absolutePath,
+)

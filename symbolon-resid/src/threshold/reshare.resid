@@ -1,0 +1,324 @@
+// One party's side of a re-share to a new party set (SPEC 11.3), keeping the
+// root key X: lib/cggmp_reshare.resid's dealing and assembly, with the new
+// parties' auxiliary keys announced and proven as CGGMP21 key generation
+// proves them (mod, prm, fac; and a Schnorr proof for the ElGamal key).
+//
+// Dealers are the old quorum's online parties taking part (at least t);
+// receivers are the new quorum's online parties; the offline parties (the
+// kit) receive nothing here: each dealer returns its contribution to them,
+// which the agent wraps (SPEC 10.6). A party can be both dealer and receiver.
+//
+// Rounds, over ThRs messages:
+//   1. receivers announce;
+//   2. dealers check the announcements and deal; receivers send fac proofs;
+//   3. receivers check the deals and proofs and assemble their configuration;
+//      everyone computes the transcript digest the reshare event carries.
+
+import "../types.resid";
+import "threshold.resid";
+import "rsmsg.resid";
+import "cggmp_reshare.resid";
+import "cggmp_keygen.resid";
+import "cggmp_zk.resid";
+import "cggmp_proofs.resid";
+import "cggmp_hash.resid";
+import "crypto.resid";
+
+pub type RsCtx = {
+    Int self;                            // new id when a receiver, else 0
+    Int old_self;                        // old id when a dealer, else 0
+    List(Int) dealers;                   // old ids of the dealers
+    List(Int) receivers;                 // new ids of the online new parties
+    List(Int) offline;                   // new ids of the offline new parties
+    Int degree;                          // new polynomial degree (t - 1)
+    List(CgConfig) old;                  // the dealer's configuration (one), or empty
+    List(Int) root;                      // X, SEC1
+    List(Int) session_id; List(Int) seed;
+    List(List(UInt(64))) primes;         // receiver's Paillier primes, or empty to generate them
+};
+
+// What a party keeps between rounds.
+pub type RsMine = {
+    List(UInt(64)) p; List(UInt(64)) q; PaillierSec psec; PaillierPub ppub; PedersenKey ped;
+    List(UInt(64)) elg;
+};
+
+pub type RsResult = {
+    Option(CgConfig) cfg;                // a receiver's new configuration
+    List(RsOffline) offline;             // a dealer's contributions to the offline parties
+    List(Int) transcript;                // what the reshare event's quorum carries as field 5
+};
+
+pub type RsOffline = { Int id; List(UInt(64)) share; };
+
+pub type RsState =
+    RS1(RsCtx, List(RsMine))             // announced (receivers hold RsMine)
+  | RS2(RsCtx, List(RsMine), List(RsAnnMsg), List(RsOffline), List(RsDealMsg))   // the last: our own deal, if a dealer
+  | RSDone(RsResult);
+
+pub type RsStep = { RsState state; List(ThMsg) out; };
+
+Transcript rs_tr(RsCtx c, Int id) { return tr_item(tr_item(tr_item(tr_new(), "Session ID", c.session_id), "Protocol ID", bytes_of("symbolon/reshare")), "ID", bytes_of(f"{id}")); }
+
+Bool in_ids(List(Int) xs, Int x, Int i) {
+    if (i >= xs.len()) { return false; }
+    if (xs[i] == x) { return true; }
+    return in_ids(xs, x, i + 1);
+}
+
+// ─── Round 1 ────────────────────────────────────────────────────
+
+pub Result(RsStep, CgFail) rs_start(RsCtx c) {
+    if (c.self == 0) { return Ok(RsStep {.state = RS1(c, []), .out = []}); }
+    List(List(UInt(64))) pq = if (c.primes.len() == 2) { c.primes } else { kg_primes(KgCtx {.self = c.self, .ids = c.receivers, .threshold = c.degree, .prev = [], .session_id = c.session_id, .seed = c.seed, .primes = []}) };
+    if (pq.len() != 2) { return Err(cg_fail("no Paillier primes", [])); }
+    Option(PaillierSec) os = paillier_sec(pq[0], pq[1]);
+    Option(PedersenKey) opk = pedersen_generate(pq[0], pq[1], cg_rng(c.seed, "rs/ped", 2048));
+    return match os {
+        None => Err(cg_fail("bad Paillier primes", [])),
+        Some(sec) => match opk {
+            None => Err(cg_fail("randomness exhausted", [])),
+            Some(pk) => announce(c, RsMine {.p = pq[0], .q = pq[1], .psec = sec, .ppub = paillier_pub(bn_mul(pq[0], pq[1])), .ped = pk, .elg = cg_scalar(c.seed, "rs/elg")})
+        }
+    };
+}
+
+Result(RsStep, CgFail) announce(RsCtx c, RsMine m) {
+    Transcript tr = rs_tr(c, c.self);
+    Option(RshAnn) oa = rsh_announce(c.self, m.psec, m.ped.ped, m.ped.lam, tr, cg_rng(c.seed, "rs/ann", 32));
+    CvPt e = cv_mul_base(m.elg);
+    Option(SchProof) closure(List(Int)) sp = lambda(r) { sch_prove(e, cv_g(), m.elg, tr, r) };
+    Option(SchProof) os = cg_retry(sp, c.seed, "rs/sch", 256, 0);
+    return match oa {
+        None => Err(cg_fail("cannot prove the Paillier key", [])),
+        Some(a) => match os {
+            None => Err(cg_fail("cannot prove the ElGamal key", [])),
+            Some(s) => Ok(RsStep {.state = RS1(c, [m]), .out = [ThRs(RsMsg {.from = c.self, .to = 0, .body = RsAnn(RsAnnMsg {.id = c.self, .n = a.pail.n, .ped = a.ped, .modp = a.modp, .prm = a.prm, .elgamal = e, .elg_proof = s})})]})
+        }
+    };
+}
+
+List(RsAnnMsg) anns_of(List(ThMsg) in, Int i, List(RsAnnMsg) acc) {
+    if (i >= in.len()) { return acc; }
+    ThMsg m = in[i];
+    List(RsAnnMsg) next = match m { ThRs(r) => ann_in(r, acc), _ => acc };
+    return anns_of(in, i + 1, next);
+}
+
+List(RsAnnMsg) ann_in(RsMsg r, List(RsAnnMsg) acc) {
+    RsBody b = r.body;
+    return match b { RsAnn(a) => if (a.id == r.from) { acc.concat([a]) } else { acc }, _ => acc };
+}
+
+List(RsDealMsg) deal_in(RsMsg r, List(RsDealMsg) acc) {
+    RsBody b = r.body;
+    return match b { RsDeal(d) => acc.concat([d]), _ => acc };
+}
+
+Option(FacProof) fac_in(RsMsg r, Int from, Int me) {
+    if (r.from != from || r.to != me) { return None; }
+    RsBody b = r.body;
+    return match b { RsFac(x) => Some(x.fac), _ => None };
+}
+
+Option(RsAnnMsg) ann_for(List(RsAnnMsg) as, Int id, Int i) {
+    if (i >= as.len()) { return None; }
+    if (as[i].id == id) { return Some(as[i]); }
+    return ann_for(as, id, i + 1);
+}
+
+RshAnn rsh_of(RsAnnMsg a) { return RshAnn {.id = a.id, .pail = paillier_pub(a.n), .ped = a.ped, .modp = a.modp, .prm = a.prm}; }
+
+// Every receiver's announcement, in id order, checked; the culprit otherwise.
+Result(List(RsAnnMsg), CgFail) check_anns(RsCtx c, List(RsAnnMsg) got, List(RsMine) mine, Int i, List(RsAnnMsg) acc) {
+    if (i >= c.receivers.len()) { return Ok(acc); }
+    Int id = c.receivers[i];
+    Option(RsAnnMsg) oa = if (id == c.self) { None } else { ann_for(got, id, 0) };
+    if (id == c.self) { return check_anns(c, got, mine, i + 1, acc.concat([own_ann(c, mine[0])])); }
+    return match oa {
+        None => Err(cg_fail("missing announcement", [id])),
+        Some(a) => if (rsh_announce_ok(rsh_of(a), rs_tr(c, id)) && pedersen_valid(a.ped) && sch_verify(a.elgamal, cv_g(), a.elg_proof, rs_tr(c, id))) {
+            check_anns(c, got, mine, i + 1, acc.concat([a]))
+        } else { Err(cg_fail("announcement proofs failed", [id])) }
+    };
+}
+
+// Our own announcement as the others will see it (proofs are not rechecked).
+RsAnnMsg own_ann(RsCtx c, RsMine m) {
+    List(UInt(64)) none = [];
+    return RsAnnMsg {.id = c.self, .n = m.ppub.n, .ped = m.ped.ped, .modp = ModProof {.w = none, .responses = []}, .prm = PrmProof {.as = [], .zs = []},
+                     .elgamal = cv_mul_base(m.elg), .elg_proof = SchProof {.c = cv_inf(), .z = none}};
+}
+
+// ─── Round 2 ────────────────────────────────────────────────────
+
+List(List(UInt(64))) zero_poly(RsCtx c, Int k, List(List(UInt(64))) acc) {
+    if (k > c.degree) { return acc; }
+    List(UInt(64)) v = if (k == 0) { [] } else { cg_scalar(c.seed, f"rs/h/{k}") };
+    return zero_poly(c, k + 1, acc.concat([v]));
+}
+
+List(RshNewPeer) peers_of(List(RsAnnMsg) as, Int i, List(RshNewPeer) acc) {
+    if (i >= as.len()) { return acc; }
+    return peers_of(as, i + 1, acc.concat([RshNewPeer {.id = as[i].id, .pail = paillier_pub(as[i].n)}]));
+}
+
+List(RsPartMsg) parts_msg(List(RshPart) ps, Int i, List(RsPartMsg) acc) {
+    if (i >= ps.len()) { return acc; }
+    return parts_msg(ps, i + 1, acc.concat([RsPartMsg {.to = ps[i].to, .ct = ps[i].ct}]));
+}
+
+List(RsOffline) offline_of(RsCtx c, List(List(UInt(64))) poly, Int i, List(RsOffline) acc) {
+    if (i >= c.offline.len()) { return acc; }
+    return offline_of(c, poly, i + 1, acc.concat([RsOffline {.id = c.offline[i], .share = rsh_eval_poly(poly, c.offline[i])}]));
+}
+
+List(ThMsg) facs(RsCtx c, RsMine m, List(RsAnnMsg) as, Int i, List(ThMsg) acc) {
+    if (i >= as.len()) { return acc; }
+    RsAnnMsg a = as[i];
+    if (a.id == c.self) { return facs(c, m, as, i + 1, acc); }
+    Option(FacProof) closure(List(Int)) fp = lambda(r) { fac_prove(m.p, m.q, a.ped, rs_tr(c, c.self), r) };
+    Option(FacProof) f = cg_retry(fp, c.seed, f"rs/fac/{a.id}", 4 * 4300, 0);
+    return facs(c, m, as, i + 1, match f { None => acc, Some(x) => acc.concat([ThRs(RsMsg {.from = c.self, .to = a.id, .body = RsFac(RsFacMsg {.to = a.id, .fac = x})})]) });
+}
+
+Result(RsStep, CgFail) rs_round2(RsCtx c, List(RsMine) mine, List(ThMsg) in) {
+    List(RsAnnMsg) as = check_anns(c, anns_of(in, 0, []), mine, 0, [])?;
+    List(ThMsg) fac_out = if (c.self != 0) { facs(c, mine[0], as, 0, []) } else { [] };
+    if (c.old_self == 0 || c.old.len() == 0) { return Ok(RsStep {.state = RS2(c, mine, as, [], []), .out = fac_out}); }
+    List(List(UInt(64))) poly = rsh_dealer_poly(c.old[0].ecdsa, c.dealers, c.old_self, zero_poly(c, 0, []));
+    RshD1 d = rsh_d1(c.old_self, c.dealers, c.old[0].ecdsa, zero_poly(c, 0, []), peers_of(as, 0, []), c.seed);
+    RsDealMsg dm = RsDealMsg {.dealer = c.old_self, .commits = d.commits, .parts = parts_msg(d.parts, 0, [])};
+    ThMsg deal = ThRs(RsMsg {.from = c.self, .to = 0, .body = RsDeal(dm)});
+    return Ok(RsStep {.state = RS2(c, mine, as, offline_of(c, poly, 0, []), [dm]), .out = [deal].concat(fac_out)});
+}
+
+// ─── Round 3 ────────────────────────────────────────────────────
+
+List(RsDealMsg) deals_of(List(ThMsg) in, Int i, List(RsDealMsg) acc) {
+    if (i >= in.len()) { return acc; }
+    ThMsg m = in[i];
+    List(RsDealMsg) next = match m { ThRs(r) => deal_in(r, acc), _ => acc };
+    return deals_of(in, i + 1, next);
+}
+
+Option(RsDealMsg) deal_by(List(RsDealMsg) ds, Int dealer, Int i) {
+    if (i >= ds.len()) { return None; }
+    if (ds[i].dealer == dealer) { return Some(ds[i]); }
+    return deal_by(ds, dealer, i + 1);
+}
+
+// Every dealer's deal once, in dealer order (a party's own broadcast is not
+// delivered back to it; RS2 keeps a dealer's own deal).
+Result(List(RsDealMsg), CgFail) ordered_deals(RsCtx c, List(RsDealMsg) ds, Int i, List(RsDealMsg) acc) {
+    if (i >= c.dealers.len()) { return Ok(acc); }
+    Option(RsDealMsg) d = deal_by(ds, c.dealers[i], 0);
+    return match d {
+        None => Err(cg_fail("missing deal", [c.dealers[i]])),
+        Some(x) => if (x.commits.len() != c.degree + 1) { Err(cg_fail("deal of the wrong degree", [c.dealers[i]])) } else { ordered_deals(c, ds, i + 1, acc.concat([x])) }
+    };
+}
+
+List(RshD1) d1s(List(RsDealMsg) ds, Int i, List(RshD1) acc) {
+    if (i >= ds.len()) { return acc; }
+    return d1s(ds, i + 1, acc.concat([RshD1 {.dealer = ds[i].dealer, .commits = ds[i].commits, .parts = rparts(ds[i].parts, 0, [])}]));
+}
+
+List(RshPart) rparts(List(RsPartMsg) ps, Int i, List(RshPart) acc) {
+    if (i >= ps.len()) { return acc; }
+    return rparts(ps, i + 1, acc.concat([RshPart {.to = ps[i].to, .ct = ps[i].ct}]));
+}
+
+CvPt public_share(List(RsDealMsg) ds, Int id, Int i, CvPt acc) {
+    if (i >= ds.len()) { return acc; }
+    return public_share(ds, id, i + 1, cv_add(acc, rsh_commit_eval_at(ds[i].commits, id)));
+}
+
+CvPt constant_sum(List(RsDealMsg) ds, Int i, CvPt acc) {
+    if (i >= ds.len()) { return acc; }
+    return constant_sum(ds, i + 1, cv_add(acc, ds[i].commits[0]));
+}
+
+// The transcript digest: SHA-256 over the session id, each receiver's
+// Paillier modulus, Pedersen parameters and ElGamal key, and each dealer's
+// commitments, in id order.
+List(Int) transcript_of(RsCtx c, List(RsAnnMsg) as, List(RsDealMsg) ds) {
+    return sha256_bytes(c.session_id.concat(t_anns(as, 0, [])).concat(t_deals(ds, 0, [])));
+}
+
+List(Int) t_anns(List(RsAnnMsg) as, Int i, List(Int) acc) {
+    if (i >= as.len()) { return acc; }
+    RsAnnMsg a = as[i];
+    List(Int) one = bn_to_be(bn_from_u64(u64(a.id)), 4).concat(bn_to_be(a.n, 256)).concat(bn_to_be(a.ped.s, 256)).concat(bn_to_be(a.ped.t, 256)).concat(cv_enc(a.elgamal));
+    return t_anns(as, i + 1, acc.concat(one));
+}
+
+List(Int) t_deals(List(RsDealMsg) ds, Int i, List(Int) acc) {
+    if (i >= ds.len()) { return acc; }
+    return t_deals(ds, i + 1, acc.concat(bn_to_be(bn_from_u64(u64(ds[i].dealer)), 4)).concat(t_pts(ds[i].commits, 0, [])));
+}
+
+List(Int) t_pts(List(CvPt) ps, Int i, List(Int) acc) {
+    if (i >= ps.len()) { return acc; }
+    return t_pts(ps, i + 1, acc.concat(cv_enc(ps[i])));
+}
+
+Option(FacProof) fac_from(List(ThMsg) in, Int from, Int me, Int i) {
+    if (i >= in.len()) { return None; }
+    ThMsg m = in[i];
+    Option(FacProof) f = match m { ThRs(r) => fac_in(r, from, me), _ => None };
+    return match f { Some(x) => Some(x), None => fac_from(in, from, me, i + 1) };
+}
+
+Result(Int, CgFail) check_facs(RsCtx c, RsMine m, List(RsAnnMsg) as, List(ThMsg) in, Int i) {
+    if (i >= as.len()) { return Ok(0); }
+    RsAnnMsg a = as[i];
+    if (a.id == c.self) { return check_facs(c, m, as, in, i + 1); }
+    Option(FacProof) f = fac_from(in, a.id, c.self, 0);
+    return match f {
+        None => Err(cg_fail("missing fac proof", [a.id])),
+        Some(x) => if (fac_verify(a.n, m.ped.ped, x, rs_tr(c, a.id))) { check_facs(c, m, as, in, i + 1) } else { Err(cg_fail("fac proof failed", [a.id])) }
+    };
+}
+
+List(CgPublicCfg) publics(List(RsAnnMsg) as, List(RsDealMsg) ds, Int i, List(CgPublicCfg) acc) {
+    if (i >= as.len()) { return acc; }
+    RsAnnMsg a = as[i];
+    return publics(as, ds, i + 1, acc.concat([CgPublicCfg {.id = a.id, .ecdsa = public_share(ds, a.id, 0, cv_inf()), .elgamal = a.elgamal, .n = a.n, .ped = a.ped}]));
+}
+
+Result(RsStep, CgFail) rs_round3(RsCtx c, List(RsMine) mine, List(RsAnnMsg) as, List(RsOffline) off, List(ThMsg) in, List(RsDealMsg) own_deal) {
+    List(RsDealMsg) ds = ordered_deals(c, deals_of(in, 0, []).concat(own_deal), 0, [])?;
+    // The deals must keep X: the constant terms add up to the root key.
+    Option(CvPt) ox = cv_dec(compress(c.root));
+    CvPt x = ox else { cv_inf() };
+    if (!cv_eq(constant_sum(ds, 0, cv_inf()), x)) { return Err(cg_fail("the deals do not keep the root key", [])); }
+    List(Int) tr = transcript_of(c, as, ds);
+    if (c.self == 0) { return Ok(RsStep {.state = RSDone(RsResult {.cfg = None, .offline = off, .transcript = tr}), .out = []}); }
+    RsMine m = mine[0];
+    _ = check_facs(c, m, as, in, 0)?;
+    Result(List(UInt(64)), Int) rs = rsh_assemble_of(d1s(ds, 0, []), c.self, m.psec, m.ppub);
+    return match rs {
+        Err(culprit) => Err(cg_fail("a dealt share does not match its commitments", [culprit])),
+        Ok(share) => Ok(RsStep {.state = RSDone(RsResult {.cfg = Some(CgConfig {.id = c.self, .threshold = c.degree, .ecdsa = share, .elgamal = m.elg,
+                                    .p = m.p, .q = m.q, .rid = c.session_id, .chain_key = [], .public = publics(as, ds, 0, [])}), .offline = off, .transcript = tr}), .out = []})
+    };
+}
+
+// SEC1 uncompressed to compressed (cv_dec takes the compressed form).
+List(Int) compress(List(Int) p) {
+    if (p.len() != 65) { return []; }
+    return [2 + (p[64] & 1)].concat(p[1..33]);
+}
+
+// ─── Stepping ───────────────────────────────────────────────────
+
+pub Result(RsStep, CgFail) rs_step(RsState st, List(ThMsg) in) {
+    return match st {
+        RS1(c, mine) => rs_round2(c, mine, in),
+        RS2(c, mine, as, off, own) => rs_round3(c, mine, as, off, in, own),
+        RSDone(r) => Ok(RsStep {.state = RSDone(r), .out = []})
+    };
+}
+
+pub Option(RsResult) rs_result(RsState st) { return match st { RSDone(r) => Some(r), _ => None }; }

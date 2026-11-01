@@ -1,0 +1,320 @@
+// Recovery from the command line (SPEC 13): `symbolon device recover` (R2,
+// the kit), `symbolon device veto` (SPEC 13.4) and `symbolon device
+// recover-release` (asking the cosigner for its half of the kit's material,
+// which it gives only after the delay and never after a veto).
+//
+// The release and the re-share that follows it run only after the
+// recovery delay (at least 24 hours of witness time); tests/cli_e2e.sh
+// covers everything before that point, and src/recovery/recovery_ref_test
+// the release rules themselves.
+
+import "../types.resid";
+import "../core/log.resid";
+import "../core/event.resid";
+import "../recovery/recovery.resid";
+import "../net/proto.resid";
+import "../net/services.resid";
+import "state.resid";
+import "common.resid";
+import "session.resid";
+import "device.resid";
+import "enroll.resid";
+import "serials.resid";
+import "../threshold/threshold.resid";
+import "../threshold/reshare.resid";
+import "../duress/duress.resid";
+import "cosignerd.resid";
+import "vaultcli.resid";
+import "duresscli.resid";
+import "word.resid";
+import "crypto.resid";
+import "clock.resid";
+
+// `symbolon device recover DIR KIT_SEED LOG_ID`, on a device made with
+// `device new`: reveals the kit's key in a recover event naming this
+// device, the cosigner and a new kit, which it prints.
+@requires(filesystem, network, device, declassify, clock)
+pub Int device_recover(Str dir, Str seed_hex, Str log_hex) {
+    Option(DeviceConfig) oc = load_config(dir);
+    Option(KitKeys) ok = kit_keys(cose_hex_decode(seed_hex));
+    List(Int) l = cose_hex_decode(log_hex);
+    return match oc {
+        None => dfail("run `symbolon device new` first"),
+        Some(c) => match ok {
+            None => dfail("that is not a kit seed"),
+            Some(kit) => if (l.len() != 32) { dfail("a 32-byte log id") } else { recover_with(dir, c, kit, l) }
+        }
+    };
+}
+
+@requires(filesystem, network, device, declassify, clock)
+Int recover_with(Str dir, DeviceConfig c0, KitKeys kit, List(Int) l) {
+    Result(VerifiedHead, SymbolonError) rv = verified_log(relay_ep(c0), l);
+    return match rv {
+        Err(e) => dfail(err_text(e)),
+        Ok(vh) => recover_event(dir, with_log(c0, eps_of(vh.head.policy.witnesses, 0, []), l, c0.mbox_next, []), kit, vh)
+    };
+}
+
+@requires(filesystem, network, device, declassify, clock)
+Int recover_event(Str dir, DeviceConfig c, KitKeys kit, VerifiedHead vh) {
+    Quorum q = vh.head.quorum;
+    Party cos = cosigner_of(q.parties, 0) else { none_party() };
+    List(Int) new_seed = random_bytes(32);
+    KitKeys nk = kit_keys(new_seed) else { kit };
+    Party me = Party {.id = c.party, .kind = party_kind_device(), .auth_key = c.dk_pub, .hpke_key = c.hpke_pub, .label = "recovered device", .attestation = NoAttestation};
+    Party nkp = Party {.id = recovery_key_digest(nk.sign_pub), .kind = party_kind_kit(), .auth_key = nk.sign_pub, .hpke_key = nk.hpke_pub, .label = "recovery kit", .attestation = NoAttestation};
+    List(Party) np = if (cos.id.len() > 0) { [me, nkp, cos] } else { [me, nkp] };
+    Result(SignedEvent, SymbolonError) re = recover_by_kit(vh.head, kit, np, [recovery_key_digest(nk.sign_pub)], (UInt(64))clock_now_seconds());
+    return match re {
+        Err(e) => dfail(err_text(e)),
+        Ok(se) => match publish_event(c, se.payload, se.encoded, se.sigs) {
+            Err(m) => dfail("recover: " + m),
+            Ok(vh2) => recover_posted(dir, c, vh2, new_seed)
+        }
+    };
+}
+
+@requires(filesystem)
+Int recover_posted(Str dir, DeviceConfig c, VerifiedHead vh, List(Int) new_seed) {
+    if (!save_config(dir, c)) { return dfail("cannot store the configuration"); }
+    println(f"recovery pending: {vh.pending.len()} delayed event(s); it takes effect after {vh.head.policy.recovery_delay_sec} s of witness time unless a device vetoes");
+    println("NEW RECOVERY KIT (write it down; it is shown once): " + hex_encode(new_seed));
+    return 0;
+}
+
+// `symbolon device veto DIR`: vetoes the most recent pending event.
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+pub Int device_veto(Str dir) {
+    Option(DeviceConfig) oc = load_config(dir);
+    return match oc {
+        None => dfail("not set up"),
+        Some(c) => veto_with(dir, c, read_pin())
+    };
+}
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+Int veto_with(Str dir, DeviceConfig c, Str pin) {
+    Unlocked u = unlock_dir(dir, c, pin);
+    if (u.kind != 1) { return dfail("wrong PIN"); }
+    Result(VerifiedHead, SymbolonError) rv = verified_log(relay_ep(c), c.log_id);
+    return match rv {
+        Err(e) => dfail(err_text(e)),
+        Ok(vh) => if (vh.pending.len() == 0) { dfail("nothing is pending") } else { veto_target(c, u, vh, vh.pending[vh.pending.len() - 1], pin) }
+    };
+}
+
+@requires(filesystem, network, device, declassify, clock, environment)
+Int veto_target(DeviceConfig c, Unlocked u, VerifiedHead vh, UInt(64) target, Str pin) {
+    List(SignedEvent) es = fetch_log(relay_ep(c), c.log_id, 0, []);
+    EventPayload p = EventPayload {.log_id = Some(vh.head.log_id), .sequence = vh.head.sequence + 1, .predecessor_digest = Some(vh.head.digest),
+                                   .suite = 1, .body = VetoBody(target), .next_recovery_key_digests = field6_in_force(es, vh.pending, es.len() - 1), .advisory_time = (UInt(64))clock_now_seconds()};
+    List(Int) enc = payload_cbor(p) else { [] };
+    Result(List(Int), Str) s = dk_sign(c, u.real, u.st, enc);
+    return match s {
+        Err(m) => dfail(m),
+        Ok(sig) => match publish_event(c, p, enc, [EventSig {.signer = c.party, .sig = sig}]) {
+            Err(m) => dfail("veto: " + m),
+            Ok(vh2) => veto_done(target, vh2)
+        }
+    };
+}
+
+Int veto_done(UInt(64) target, VerifiedHead vh) {
+    println(f"vetoed event {target}; pending now {vh.pending.len()}");
+    return 0;
+}
+
+// `symbolon device recover-release DIR`: asks the cosigner for its half of
+// the kit's material. Before the recovery has taken effect, or after a
+// veto, the cosigner refuses.
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+pub Int device_recover_release(Str dir) {
+    Option(DeviceConfig) oc = load_config(dir);
+    return match oc {
+        None => dfail("not set up"),
+        Some(c) => release_with(dir, c, read_pin())
+    };
+}
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+Int release_with(Str dir, DeviceConfig c, Str pin) {
+    Unlocked u = unlock_dir(dir, c, pin);
+    if (u.kind != 1) { return dfail("wrong PIN"); }
+    Endpoint relay = relay_ep(c);
+    List(SignedEvent) es = fetch_log(relay, c.log_id, 0, []);
+    Party cos = cosigner_of(quorum_before(es), 0) else { none_party() };
+    if (cos.id.len() == 0) { return dfail("no cosigner"); }
+    Local me = Local {.party = c.party, .cg = 0, .hpke_sk = device_hpke(u.real.dek).sk};
+    Remote cr = Remote {.party = cos.id, .cg = 0, .hpke_pub = cos.hpke_key};
+    Int start = mailbox_end(relay, c.party, c.mbox_next);
+    if (!send_to(relay, me, cr, WKitRelease(c.log_id))) { return dfail("cannot reach the relay"); }
+    Waited w = wait_release(relay, me, cr, Cursor {.party = c.party, .next = start}, clock_now_seconds());
+    Option(Packet) ow = w.w;
+    return match ow {
+        None => dfail("no answer from the cosigner"),
+        Some(x) => match x {
+            WKitHalf(_) => released(),
+            _ => dfail("the cosigner refused to release its half (the recovery has not taken effect)")
+        }
+    };
+}
+
+Int released() { println("the cosigner released its half of the kit's material"); return 0; }
+
+// The quorum of the inception (the cosigner named there).
+List(Party) quorum_before(List(SignedEvent) es) {
+    if (es.len() == 0) { return []; }
+    EventBody b = es[0].payload.body;
+    return match b { InceptionBody(q, _) => q.parties, _ => [] };
+}
+
+Int answer_kind(Packet w) { return match w { WKitHalf(_) => 1, WRefused(_) => 1, _ => 0 }; }
+
+Option(Packet) first_answer(List(Got) gs, Int i) {
+    if (i >= gs.len()) { return None; }
+    if (answer_kind(gs[i].w) == 1) { return Some(gs[i].w); }
+    return first_answer(gs, i + 1);
+}
+
+@requires(network, declassify, clock)
+Waited wait_release(Endpoint relay, Local me, Remote from, Cursor cur, Int since) {
+    Drained d = drain(relay, me, [from], cur, ListBuf());
+    Option(Packet) w = first_answer(d.got, 0);
+    if (match w { Some(_) => true, None => false } || clock_now_seconds() - since > 60) { return Waited {.w = w, .all = d.got, .cur = d.cur}; }
+    _ = clock_sleep_ms(200);
+    return wait_release(relay, me, from, d.cur, since);
+}
+
+// ─── `device recover-finish DIR KIT_SEED [PRIMES]` (SPEC 13.2 step 4) ──
+// After the delay: the cosigner's half and the kit's half give the kit's
+// share x_K and key k_K; k_K opens the chain code and vault key; this
+// device, holding x_K at the kit's x-coordinate, re-shares with the
+// cosigner to the recovered quorum, and the new kit gets fresh material.
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+pub Int device_recover_finish(Str dir, Str seed_hex, Str primes_file) {
+    Option(DeviceConfig) oc = load_config(dir);
+    Option(KitKeys) ok = kit_keys(cose_hex_decode(seed_hex));
+    return match oc {
+        None => dfail("not set up"),
+        Some(c) => match ok {
+            None => dfail("that is not a kit seed"),
+            Some(kit) => finish_with(dir, c, kit, read_pin(), primes_file)
+        }
+    };
+}
+
+// The quorum in force just before the latest recover that names `me`.
+@requires(network, clock(readonly))
+Option(Quorum) quorum_before_recover(List(SignedEvent) es, List(Int) l, List(Int) me) {
+    Int k = last_recover_for(es, me, 0, -1);
+    if (k < 1) { return None; }
+    List(SignedEvent) prefix = es[0..k];
+    return match il_verify(l, prefix, last_time(prefix, policy_of_e0(prefix)), lambda(p) { false }) { Ok(v) => Some(v.head.quorum), Err(_) => None };
+}
+
+Int last_recover_for(List(SignedEvent) es, List(Int) me, Int i, Int acc) {
+    if (i >= es.len()) { return acc; }
+    EventBody b = es[i].payload.body;
+    Bool hit = match b { RecoverBody(r) => pos1(r.new_parties, me, 0) > 0, _ => false };
+    return last_recover_for(es, me, i + 1, if (hit) { i } else { acc });
+}
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+Int finish_with(Str dir, DeviceConfig c, KitKeys kit, Str pin, Str primes_file) {
+    Unlocked u = unlock_dir(dir, c, pin);
+    if (u.kind != 1) { return dfail("wrong PIN"); }
+    Endpoint relay = relay_ep(c);
+    Result(VerifiedHead, SymbolonError) rv = verified_log(relay, c.log_id);
+    List(SignedEvent) es = fetch_log(relay, c.log_id, 0, []);
+    Option(Quorum) opre = quorum_before_recover(es, c.log_id, c.party);
+    return match rv {
+        Err(e) => dfail(err_text(e)),
+        Ok(vh) => match opre {
+            None => dfail("no recovery names this device"),
+            Some(pre) => if (pos1(vh.head.quorum.parties, c.party, 0) == 0) { dfail("the recovery has not taken effect (delay, or vetoed)") } else { release_then(dir, c, u, kit, vh, pre, pin, primes_file) }
+        }
+    };
+}
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+Int release_then(Str dir, DeviceConfig c, Unlocked u, KitKeys kit, VerifiedHead vh, Quorum pre, Str pin, Str primes_file) {
+    Endpoint relay = relay_ep(c);
+    Party cos = cosigner_of(vh.head.quorum.parties, 0) else { none_party() };
+    Party oldkit = kit_of(pre.parties, 0) else { none_party() };
+    Local me = Local {.party = c.party, .cg = 0, .hpke_sk = device_hpke(u.real.dek).sk};
+    Remote cr = Remote {.party = cos.id, .cg = 0, .hpke_pub = cos.hpke_key};
+    Int start = mailbox_end(relay, c.party, c.mbox_next);
+    if (!send_to(relay, me, cr, WKitRelease(c.log_id))) { return dfail("cannot reach the relay"); }
+    Waited w = wait_release(relay, me, cr, Cursor {.party = c.party, .next = start}, clock_now_seconds());
+    Option(Packet) ow = w.w;
+    List(Int) theirs = match ow {
+        Some(x) => match x { WKitHalf(b) => offline_unwrap(reveal(device_hpke(u.real.dek).sk), c.log_id, vh.head.quorum.epoch, c.party, Wrapped {.enc = b.enc, .ct = b.ct}) else { [] }, _ => [] },
+        None => []
+    };
+    if (theirs.len() != 64) { return dfail("the cosigner did not release its half"); }
+    Option(WrappedBlob) oa = blob_of_cbor(blob_get(relay, "kit-" + hex_encode(c.log_id) + "-a") else { [] });
+    List(Int) mine = match oa { Some(b) => offline_unwrap(kit.hpke_priv, c.log_id, pre.epoch, oldkit.id, Wrapped {.enc = b.enc, .ct = b.ct}) else { [] }, None => [] };
+    Half hb = half_of(theirs) else { Half {.share = [], .key = []} };
+    Half ha = half_of(mine) else { Half {.share = [], .key = []} };
+    Half full = kit_assemble(ha, hb) else { Half {.share = [], .key = []} };
+    if (full.key.len() != 32) { return dfail("the kit's halves do not assemble"); }
+    Result(KitSecrets, SymbolonError) ks = kit_secrets_open(secret_bytes(full.key), c.log_id, pre.epoch, blob_get(relay, "kit-" + hex_encode(c.log_id) + "-secrets") else { [] });
+    return match ks {
+        Err(e) => dfail(err_text(e)),
+        Ok(s) => reshare_as_kit(dir, c, u, s, full.share, vh, pre, oldkit, cos, pin, primes_file, w.cur)
+    };
+}
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+Int reshare_as_kit(Str dir, DeviceConfig c, Unlocked u0, KitSecrets s, List(UInt(64)) xk, VerifiedHead vh, Quorum pre, Party oldkit, Party cos, Str pin, Str primes_file, Cursor cur) {
+    // The recovered chain code and vault key replace this device's own.
+    Unlocked u = Unlocked {.kind = 1, .duress = u0.duress, .st = u0.st, .real = RealProfile {.share = u0.real.share, .cc = s.cc, .vault_key = s.vault_rk, .dek = u0.real.dek, .duress_hpke_pub = u0.real.duress_hpke_pub}};
+    Quorum q = vh.head.quorum;
+    List(Party) np = q.parties;
+    Int kit_old = pos1(pre.parties, oldkit.id, 0);
+    List(Int) sid = random_bytes(32);
+    ReshareInvite inv0 = ReshareInvite {.session_id = sid, .log_id = c.log_id, .new_parties = np, .dealers = [kit_old, pos1(pre.parties, cos.id, 0)],
+        .receivers = receivers_of(np, 0, []), .offline = offline_of(np, 0, []), .degree = (Int)q.t - 1, .epoch = (Int)q.epoch + 1, .requester = c.party, .sig = []};
+    Result(List(Int), Str) rs = dk_sign(c, u.real, u.st, request_tbs(sid, reshare_message(inv0), q.epoch, c.party, request_reshare()));
+    List(Int) rsig = match rs { Ok(x) => x, Err(_) => [] };
+    ReshareInvite inv = ReshareInvite {.session_id = sid, .log_id = c.log_id, .new_parties = np, .dealers = inv0.dealers, .receivers = inv0.receivers,
+        .offline = inv0.offline, .degree = inv0.degree, .epoch = inv0.epoch, .requester = c.party, .sig = rsig};
+    Endpoint relay = relay_ep(c);
+    Int me_new = pos1(np, c.party, 0);
+    Local me = Local {.party = c.party, .cg = me_new, .hpke_sk = device_hpke(u.real.dek).sk};
+    List(Remote) rem = session_remotes(np, inv.receivers, c.party, 0, []);
+    if (rsig.len() != 64 || !send_all_invites(relay, me, rem, WReshare(inv), 0)) { return dfail("cannot send the re-share request"); }
+    println("device: re-sharing to the recovered quorum...");
+    CgConfig kitcfg = CgConfig {.id = kit_old, .threshold = (Int)q.t - 1, .ecdsa = xk, .elgamal = [], .p = [], .q = [], .rid = [], .chain_key = [], .public = []};
+    RsCtx rc = RsCtx {.self = me_new, .old_self = kit_old, .dealers = inv.dealers, .receivers = inv.receivers, .offline = inv.offline, .degree = inv.degree,
+        .old = [kitcfg], .root = q.root_pubkey, .session_id = sid, .seed = random_bytes(32), .primes = primes_of(primes_file)};
+    return match rs_start(rc) {
+        Err(e) => dfail("re-share: " + e.why),
+        Ok(s0) => sealed_after(dir, c, u, pin, pre, after_session(dir, c, u, vh, np, inv, rem, pin,
+            run_session(relay, sid, [Seat {.me = me, .st = s0.state, .round = 1, .out = s0.out, .done = false}], rem, [cur], [],
+                        lambda(t, msgs) { rs_adapt(t, msgs) }, 1800)))
+    };
+}
+
+// The recovered device's profile, resealed with the recovered secrets.
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+Int sealed_after(Str dir, DeviceConfig c, Unlocked u, Str pin, Quorum pre, Int r) {
+    if (r != 0) { return r; }
+    List(Secret(UInt(8))) k = unlock_key_for(c, u.st, true);
+    List(Secret(UInt(8))) rp = encode_real(u.real) else { [] };
+    Bool a_real = unlock(k, get_file(dir + "/blob_a"), []).kind == 1;
+    if (!filesystem.write_bytes(dir + (if (a_real) { "/blob_a" } else { "/blob_b" }), seal_blob(k, random_bytes(12), rp))) { return dfail("cannot reseal the profile"); }
+    println("recovered: this device holds a share of the recovered quorum");
+    Result(VerifiedHead, SymbolonError) rv0 = verified_log(relay_ep(c), c.log_id);
+    _ = match rv0 { Ok(v) => send_duress_key(dir, relay_ep(c), Local {.party = c.party, .cg = 0, .hpke_sk = device_hpke(u.real.dek).sk}, cos_remote(v)), Err(_) => false };
+    // The vault, re-anchored to the recovered quorum (SPEC 18.4).
+    Result(VerifiedHead, SymbolonError) rv = verified_log(relay_ep(c), c.log_id);
+    List(SignedEvent) es = fetch_log(relay_ep(c), c.log_id, 0, []);
+    Int rk = last_recover_for(es, c.party, 0, -1);
+    return match rv {
+        Err(e) => dfail(err_text(e)),
+        Ok(vh) => if (rk < 0) { 0 } else { vault_reanchor(dir, c, u, vh, pre, es[rk].payload.sequence, pin) }
+    };
+}

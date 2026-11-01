@@ -1,0 +1,259 @@
+// Symbolon cosigner policy (SPEC Sections 12, 14.3).
+//
+// Pure: the caller supplies the verified log head, the request and the
+// current time; the cosigner's decision and its new state come back as a
+// value. The threshold rounds themselves run in src/threshold/ once the
+// decision is Proceed. The cosigner never sees rp_id, P, tau, cc, the
+// credential ID, client data or the final signature: a request carries only
+// m, the epoch, a session identifier and the requester's signature (12.2).
+
+import "../types.resid";
+import "../core/log.resid";
+import "crypto.resid";
+import "ecdsa.resid";
+import "cose.resid";
+
+// What the session is for. Everything but signing is an authority request,
+// refused during a duress window (SPEC 14.3).
+pub UInt(8) request_sign() { return 0; }
+pub UInt(8) request_reshare() { return 1; }
+pub UInt(8) request_enroll() { return 2; }
+pub UInt(8) request_recovery() { return 3; }
+pub UInt(8) request_kit_session() { return 4; }
+pub UInt(8) request_policy_change() { return 5; }
+
+pub type CosignRequest = {
+    List(Int) session_id;                // 32 fresh bytes
+    List(Int) message;                   // m, 32 bytes
+    UInt(32) epoch;
+    List(Int) requester;                 // party id of the requesting device
+    UInt(8) kind;
+    List(Int) sig;                       // r || s by the DK or the duress sub-key
+};
+
+// One accepted session, readable by the principal's devices (SPEC 12.3).
+// Refused requests are not recorded, so a duress device reading the log
+// cannot tell a duress refusal from a network failure.
+//@ serial
+pub type SessionRecord = { Int time; List(Int) requester; List(Int) message_hash; };
+
+// A device's duress sub-key, registered with the cosigner at setup.
+//@ serial
+pub type DuressKey = { List(Int) party; List(Int) subkey; };
+
+//@ serial
+pub type DuressState = { List(Int) party; Int started_at; };
+
+//@ serial
+pub type CosignerState = {
+    VerifiedHead verified;
+    List(DuressKey) duress_keys;
+    Option(DuressState) duress;
+    List(List(Int)) seen_sessions;
+    List(SessionRecord) records;
+};
+
+pub type CosignOutcome = Proceed(CosignerState) | Refuse(CosignerState, SymbolonError);
+
+// An end-duress message (SPEC 14.3), signed by policy[1] devices other than
+// the duress device.
+pub type EndDuress = { List(Int) log_id; Int started_at; List(EventSig) sigs; };
+
+pub CosignerState cosigner_new(VerifiedHead verified, List(DuressKey) duress_keys) {
+    return CosignerState {.verified = verified, .duress_keys = duress_keys, .duress = None, .seen_sessions = [], .records = []};
+}
+
+// ============================================================================
+// Signing bytes
+// ============================================================================
+
+// ["symbolon v1 cosign", session_id, m, epoch, requester, kind]
+pub List(Int) request_tbs(List(Int) session_id, List(Int) message, UInt(32) epoch, List(Int) requester, UInt(8) kind) {
+    List(Int) a = cbe_text("symbolon v1 cosign", cbe_array(6, []));
+    List(Int) b = cbe_bytes(session_id, a);
+    List(Int) c = cbe_bytes(message, b);
+    List(Int) d = cbe_uint((Int)epoch, c);
+    List(Int) e = cbe_bytes(requester, d);
+    return cbe_uint((Int)kind, e);
+}
+
+// ["symbolon v1 end-duress", log_id, started_at]
+pub List(Int) end_duress_tbs(List(Int) log_id, Int started_at) {
+    List(Int) a = cbe_text("symbolon v1 end-duress", cbe_array(3, []));
+    List(Int) b = cbe_bytes(log_id, a);
+    return cbe_uint(started_at, b);
+}
+
+// ============================================================================
+// Helpers
+// ============================================================================
+
+Option(Party) party_by_id(List(Party) ps, List(Int) id, Int i) {
+    if (i >= ps.len()) { return None; }
+    if (bytes_eq(ps[i].id, id)) { return Some(ps[i]); }
+    return party_by_id(ps, id, i + 1);
+}
+
+Option(List(Int)) duress_key_of(List(DuressKey) ks, List(Int) party, Int i) {
+    if (i >= ks.len()) { return None; }
+    if (bytes_eq(ks[i].party, party)) { return Some(ks[i].subkey); }
+    return duress_key_of(ks, party, i + 1);
+}
+
+Bool seen(List(List(Int)) ss, List(Int) id, Int i) {
+    if (i >= ss.len()) { return false; }
+    if (bytes_eq(ss[i], id)) { return true; }
+    return seen(ss, id, i + 1);
+}
+
+Int recent_count(List(SessionRecord) rs, List(Int) party, Int since, Int i, Int acc) {
+    if (i >= rs.len()) { return acc; }
+    Int add = if (rs[i].time > since && bytes_eq(rs[i].requester, party)) { 1 } else { 0 };
+    return recent_count(rs, party, since, i + 1, acc + add);
+}
+
+Bool under_limit(CosignerPolicy p, List(SessionRecord) rs, List(Int) party, Int now) {
+    return match p {
+        NoCosignerPolicy => true,
+        CosignerLimit(n) => recent_count(rs, party, now - 3600, 0, 0) < (Int)n
+    };
+}
+
+// The error a device sees when the cosigner cannot be reached. Every refusal
+// during a duress window is this one, so a coercer cannot tell it from a
+// network fault (SPEC 14.3).
+pub SymbolonError transient() { return ErrNetwork("cosigner unreachable"); }
+
+// The duress window as of `now`: one that has run policy[6] seconds is over.
+Option(DuressState) window_at(Option(DuressState) d, Policy pol, Int now) {
+    return match d {
+        None => None,
+        Some(w) => if (now >= w.started_at + (Int)pol.duress_window_sec) { None } else { Some(w) }
+    };
+}
+
+CosignerState with_duress(CosignerState s, Option(DuressState) d) {
+    return CosignerState {.verified = s.verified, .duress_keys = s.duress_keys, .duress = d, .seen_sessions = s.seen_sessions, .records = s.records};
+}
+
+CosignerState with_seen(CosignerState s, List(Int) id) {
+    return CosignerState {.verified = s.verified, .duress_keys = s.duress_keys, .duress = s.duress, .seen_sessions = s.seen_sessions.concat([id]), .records = s.records};
+}
+
+CosignerState with_record(CosignerState s, SessionRecord r) {
+    return CosignerState {.verified = s.verified, .duress_keys = s.duress_keys, .duress = s.duress, .seen_sessions = s.seen_sessions, .records = s.records.concat([r])};
+}
+
+CosignOutcome refuse_as(CosignerState s, SymbolonError e) {
+    Option(DuressState) d = s.duress;
+    return match d { None => Refuse(s, e), Some(_) => Refuse(s, transient()) };
+}
+
+// ============================================================================
+// Decision (SPEC 12.3)
+// ============================================================================
+
+// 0 neither key, 1 the DK, 2 the duress sub-key.
+Int which_key(CosignerState s, Party p, CosignRequest r) {
+    List(Int) tbs = request_tbs(r.session_id, r.message, r.epoch, r.requester, r.kind);
+    if (ecdsa_verify_raw(P256, Sha256, p.auth_key, tbs, r.sig)) { return 1; }
+    return match duress_key_of(s.duress_keys, p.id, 0) {
+        None => 0,
+        Some(k) => if (ecdsa_verify_raw(P256, Sha256, k, tbs, r.sig)) { 2 } else { 0 }
+    };
+}
+
+pub CosignOutcome cosign_decide(CosignerState s0, CosignRequest r, Int now) {
+    LogHead h = s0.verified.head;
+    CosignerState s = with_duress(s0, window_at(s0.duress, h.policy, now));
+    if (r.session_id.len() != 32 || r.message.len() != 32) { return refuse_as(s, ErrPolicyViolation("malformed request")); }
+    // The kit, the cosigner, guardians and devices named only in a pending
+    // recover are not devices of the current quorum.
+    Option(Party) op = party_by_id(h.quorum.parties, r.requester, 0);
+    return match op {
+        None => refuse_as(s, ErrPolicyViolation("requester is not a device of the current quorum")),
+        Some(p) => decide_party(s, p, r, now)
+    };
+}
+
+CosignOutcome decide_party(CosignerState s, Party p, CosignRequest r, Int now) {
+    LogHead h = s.verified.head;
+    if (p.kind != party_kind_device()) { return refuse_as(s, ErrPolicyViolation("requester is not a device of the current quorum")); }
+    Int key = which_key(s, p, r);
+    if (key == 0) { return refuse_as(s, ErrInvalidSignature("cosign request")); }
+    if (seen(s.seen_sessions, r.session_id, 0)) { return refuse_as(s, ErrPolicyViolation("session identifier seen before")); }
+    // A duress request opens (or continues) the window; its first request
+    // sets the start.
+    Option(DuressState) d = if (key == 2) {
+        Option(DuressState) cur = s.duress;
+        match cur { None => Some(DuressState {.party = p.id, .started_at = now}), Some(w) => Some(w) }
+    } else { s.duress };
+    CosignerState s2 = with_seen(with_duress(s, d), r.session_id);
+    if (r.epoch != h.quorum.epoch) { return refuse_as(s2, ErrStaleEpoch(r.epoch, h.quorum.epoch)); }
+    Bool in_duress = match d { None => false, Some(_) => true };
+    if (in_duress && r.kind != request_sign()) { return Refuse(s2, transient()); }
+    if (r.kind > request_policy_change()) { return refuse_as(s2, ErrPolicyViolation("unknown request kind")); }
+    if (!under_limit(h.policy.cosigner_policy, s2.records, p.id, now)) { return refuse_as(s2, ErrPolicyViolation("rate limit")); }
+    return Proceed(with_record(s2, SessionRecord {.time = now, .requester = p.id, .message_hash = sha256_bytes(r.message)}));
+}
+
+// ============================================================================
+// End of duress (SPEC 14.3)
+// ============================================================================
+
+Bool listed(List(List(Int)) xs, List(Int) x, Int i) {
+    if (i >= xs.len()) { return false; }
+    if (bytes_eq(xs[i], x)) { return true; }
+    return listed(xs, x, i + 1);
+}
+
+// Distinct devices other than `excluded` with a valid DK signature over tbs.
+List(List(Int)) end_signers(List(Party) ps, List(EventSig) sigs, List(Int) excluded, List(Int) tbs, Int i, List(List(Int)) acc) {
+    if (i >= sigs.len()) { return acc; }
+    EventSig g = sigs[i];
+    Bool ok = match party_by_id(ps, g.signer, 0) {
+        None => false,
+        Some(p) => p.kind == party_kind_device() && !bytes_eq(p.id, excluded) && !listed(acc, p.id, 0)
+            && ecdsa_verify_raw(P256, Sha256, p.auth_key, tbs, g.sig)
+    };
+    return end_signers(ps, sigs, excluded, tbs, i + 1, if (ok) { acc.concat([g.signer]) } else { acc });
+}
+
+pub Result(CosignerState, SymbolonError) cosigner_end_duress(CosignerState s, EndDuress m, Int now) {
+    LogHead h = s.verified.head;
+    Option(DuressState) ow = window_at(s.duress, h.policy, now);
+    return match ow {
+        None => Ok(with_duress(s, None)),
+        Some(w) => end_window(s, w, m)
+    };
+}
+
+Result(CosignerState, SymbolonError) end_window(CosignerState s, DuressState w, EndDuress m) {
+    LogHead h = s.verified.head;
+    if (!bytes_eq(m.log_id, h.log_id) || m.started_at != w.started_at) { return Err(ErrDuressContainment("end-duress names another window")); }
+    List(List(Int)) who = end_signers(h.quorum.parties, m.sigs, w.party, end_duress_tbs(m.log_id, m.started_at), 0, []);
+    if (who.len() < (Int)h.policy.device_sigs_for_authority) {
+        return Err(ErrQuorumNotMet((UInt(8))who.len(), h.policy.device_sigs_for_authority));
+    }
+    return Ok(with_duress(s, None));
+}
+
+// ============================================================================
+// Newer heads (SPEC 12.3)
+// ============================================================================
+
+// The cosigner moves only forward along one log; a fork or a rollback is
+// refused and the held head is kept.
+pub Result(CosignerState, SymbolonError) cosigner_update_head(CosignerState s, VerifiedHead v) {
+    LogHead held = s.verified.head;
+    if (!bytes_eq(held.log_id, v.head.log_id)) { return Err(ErrInvalidLog("another log")); }
+    if (is_fork(held, v.head)) { return Err(ErrInvalidLog("fork")); }
+    if (is_rollback(held, v.head)) { return Err(ErrInvalidLog("rollback")); }
+    return Ok(CosignerState {.verified = v, .duress_keys = s.duress_keys, .duress = s.duress, .seen_sessions = s.seen_sessions, .records = s.records});
+}
+
+// Whether the cosigner is in a duress window at `now` (for the threshold
+// layer, which refuses re-share rounds the same way).
+pub Bool cosigner_in_duress(CosignerState s, Int now) {
+    return match window_at(s.duress, s.verified.head.policy, now) { None => false, Some(_) => true };
+}

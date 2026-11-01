@@ -1,0 +1,165 @@
+// Headless Chromium driven over the Chrome DevTools Protocol (SPEC 26.4:
+// the recipe runs in an isolated browser profile with no other site data).
+//
+// The browser is started detached (setsid) with a fresh profile directory
+// and --remote-debugging-port=0; the port and path it chose are read from
+// the profile's DevToolsActivePort file, and the agent speaks CDP over a
+// WebSocket on loopback. Each page lives in its own browser context, so a
+// fresh session (step 3 of SPEC 26.3) shares no cookies with the change.
+
+import "json.resid";
+import "ws.resid";
+import "crypto.resid";
+import "httpserv.resid";
+
+pub type Browser = { Ws ws; Int next_id; Str profile; };
+
+// A reply: the browser state after it, and the result (None on an error
+// reply or a lost connection).
+pub type Reply = { Browser b; Option(Jv) result; Str error; };
+
+pub type Page = { Str context; Str session; };
+
+// ============================================================================
+// Launch and calls
+// ============================================================================
+
+@requires(clock)
+Bool sleep_ms(Int ms) { _ = clock.sleep_ns(ms * 1000000); return true; }
+
+// The DevToolsActivePort file: "port\npath".
+@requires(filesystem, clock)
+List(Str) wait_port_file(Str f, Int tries) {
+    if (tries <= 0) { return []; }
+    if (filesystem.exists(f)) {
+        List(Str) ls = str_split(str_trim(filesystem.read_all(f)), "\n");
+        if (ls.len() == 2) { return ls; }
+    }
+    _ = sleep_ms(100);
+    return wait_port_file(f, tries - 1);
+}
+
+// Starts `chromium` with a new profile under `root` (no spaces in either:
+// the command is split on spaces and run without a shell, through a
+// launcher script that sends the browser's output to a log).
+@requires(filesystem, process, network, clock)
+pub Result(Browser, Str) browser_launch(Str chromium, Str root) {
+    Str profile = root + "/browser-" + hex_encode(random_bytes(8));
+    _ = filesystem.create_dir(profile);
+    Str script = profile + "/launch.sh";
+    Str flags = "--headless=new --remote-debugging-port=0 --remote-debugging-address=127.0.0.1 --user-data-dir=" + profile
+        + " --no-first-run --no-default-browser-check --disable-gpu --disable-extensions --disable-sync --disable-background-networking"
+        + " --disable-component-update --password-store=basic --use-mock-keychain about:blank";
+    _ = filesystem.write_all(script, "ulimit -v unlimited 2>/dev/null\nexec " + chromium + " " + flags + " >" + profile + "/browser.log 2>&1 </dev/null\n");
+    if (process.run("setsid -f sh " + script) != 0) { return Err("cannot start the browser (" + chromium + ")"); }
+    List(Str) pf = wait_port_file(profile + "/DevToolsActivePort", 150);
+    if (pf.len() != 2) { return Err("the browser did not open its DevTools port (see " + profile + "/browser.log)"); }
+    Option(Ws) w = ws_connect("127.0.0.1", str_parse_int(pf[0]), pf[1]);
+    return match w {
+        None => Err("cannot connect to the browser's DevTools endpoint"),
+        Some(ws) => Ok(Browser {.ws = ws, .next_id = 1, .profile = profile})
+    };
+}
+
+@requires(network)
+Reply await_id(Browser b, Int id, Int left) {
+    if (left <= 0) { return Reply {.b = b, .result = None, .error = "no reply from the browser"}; }
+    WsGot g = ws_recv(b.ws, 30000);
+    Browser nb = Browser {.ws = g.ws, .next_id = b.next_id, .profile = b.profile};
+    Option(Str) m = g.msg;
+    return match m {
+        None => Reply {.b = nb, .result = None, .error = "the browser connection closed"},
+        Some(text) => match json_parse(json_utf8(text)) {
+            None => await_id(nb, id, left - 1),
+            Some(v) => if (jint(jget(v, "id")) == id) { reply_of(nb, v) } else { await_id(nb, id, left - 1) }
+        }
+    };
+}
+
+Reply reply_of(Browser b, Jv v) {
+    Option(Jv) e = jget(v, "error");
+    return match e {
+        Some(x) => Reply {.b = b, .result = None, .error = jstr(jget(x, "message"))},
+        None => Reply {.b = b, .result = jget(v, "result"), .error = ""}
+    };
+}
+
+// One CDP command; `params` is a JSON object's text, `session` "" for the
+// browser itself.
+@requires(network)
+pub Reply cdp_call(Browser b, Str session, Str method, Str params) {
+    Int id = b.next_id;
+    Str sess = if (str_len(session) == 0) { "" } else { ",\"sessionId\":" + json_quote(session) };
+    Str msg = "{\"id\":" + f"{id}" + ",\"method\":" + json_quote(method) + ",\"params\":" + params + sess + "}";
+    Browser nb = Browser {.ws = b.ws, .next_id = id + 1, .profile = b.profile};
+    if (!ws_send(nb.ws, msg)) { return Reply {.b = nb, .result = None, .error = "cannot send to the browser"}; }
+    return await_id(nb, id, 10000);
+}
+
+@requires(network)
+pub Bool browser_close(Browser b) {
+    Reply r = cdp_call(b, "", "Browser.close", "{}");
+    return ws_close(r.b.ws);
+}
+
+// ============================================================================
+// Pages
+// ============================================================================
+
+pub type PageOpen = { Browser b; Option(Page) page; Str error; };
+
+// A blank page in a new browser context (no cookies, no storage).
+@requires(network)
+pub PageOpen page_new(Browser b) {
+    Reply c = cdp_call(b, "", "Target.createBrowserContext", "{\"disposeOnDetach\":true}");
+    Str ctx = jstr(jpath_opt(c.result, ["browserContextId"]));
+    if (str_len(ctx) == 0) { return PageOpen {.b = c.b, .page = None, .error = "cannot create a browser context: " + c.error}; }
+    Reply t = cdp_call(c.b, "", "Target.createTarget", "{\"url\":\"about:blank\",\"browserContextId\":" + json_quote(ctx) + "}");
+    Str tid = jstr(jpath_opt(t.result, ["targetId"]));
+    if (str_len(tid) == 0) { return PageOpen {.b = t.b, .page = None, .error = "cannot open a page: " + t.error}; }
+    Reply a = cdp_call(t.b, "", "Target.attachToTarget", "{\"targetId\":" + json_quote(tid) + ",\"flatten\":true}");
+    Str sid = jstr(jpath_opt(a.result, ["sessionId"]));
+    if (str_len(sid) == 0) { return PageOpen {.b = a.b, .page = None, .error = "cannot attach to the page: " + a.error}; }
+    return PageOpen {.b = a.b, .page = Some(Page {.context = ctx, .session = sid}), .error = ""};
+}
+
+Option(Jv) jpath_opt(Option(Jv) v, List(Str) ks) { return match v { None => None, Some(x) => jpath(x, ks, 0) }; }
+
+@requires(network)
+pub Browser page_close(Browser b, Page p) {
+    Reply r = cdp_call(b, "", "Target.disposeBrowserContext", "{\"browserContextId\":" + json_quote(p.context) + "}");
+    return r.b;
+}
+
+// The value of a JavaScript expression in the page (by value; a promise is
+// awaited). The expression should produce a string, a number, a boolean or
+// null.
+pub type Value = { Browser b; Option(Jv) v; Str error; };
+
+@requires(network)
+pub Value page_eval(Browser b, Page p, Str expr) {
+    Reply r = cdp_call(b, p.session, "Runtime.evaluate", "{\"expression\":" + json_quote(expr) + ",\"returnByValue\":true,\"awaitPromise\":true}");
+    Option(Jv) ex = jpath_opt(r.result, ["exceptionDetails"]);
+    Str err = match ex { Some(x) => "script error: " + jstr(jpath(x, ["exception", "description"], 0)), None => r.error };
+    Option(Jv) v = match ex { Some(_) => None, None => jpath_opt(r.result, ["result", "value"]) };
+    return Value {.b = r.b, .v = v, .error = err};
+}
+
+// Waits until the page has finished loading (document.readyState).
+@requires(network, clock)
+pub Browser page_settle(Browser b, Page p, Int tries) {
+    if (tries <= 0) { return b; }
+    Value v = page_eval(b, p, "document.readyState");
+    if (jstr(v.v) == "complete") { return v.b; }
+    _ = sleep_ms(100);
+    return page_settle(v.b, p, tries - 1);
+}
+
+@requires(network, clock)
+pub Value page_navigate(Browser b, Page p, Str url) {
+    Reply r = cdp_call(b, p.session, "Page.navigate", "{\"url\":" + json_quote(url) + "}");
+    Str err = jstr(jpath_opt(r.result, ["errorText"]));
+    if (str_len(r.error) > 0 || str_len(err) > 0) { return Value {.b = r.b, .v = None, .error = "navigation failed: " + r.error + err}; }
+    _ = sleep_ms(100);
+    return Value {.b = page_settle(r.b, p, 100), .v = Some(JBool(true)), .error = ""};
+}

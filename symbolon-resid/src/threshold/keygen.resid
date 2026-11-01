@@ -1,0 +1,67 @@
+// One party's side of CGGMP21 key generation or refresh (SPEC 10.1, 11.3):
+// the five rounds of lib/cggmp_keygen.resid as a state machine over ThMsg,
+// so the messages travel the same way as signing's (src/net/).
+//
+// At inception the setup device also runs the kit's side, as its own
+// party id (decision of 2026-10-29: the setup device plays the kit, then
+// wraps the kit's halves and erases them, SPEC 10.6).
+
+import "../types.resid";
+import "threshold.resid";
+import "cggmp_keygen.resid";
+
+pub type KgState = KR1(Kg1) | KR2(Kg2) | KR3(Kg3) | KR4(Kg4) | KDone(CgConfig);
+
+pub type KgStep = { KgState state; List(ThMsg) out; };
+
+List(ThMsg) wrap(List(CgMsg) ms, Int i, ListBuf(ThMsg) acc) {
+    if (i >= ms.len()) { return acc.finish(); }
+    return wrap(ms, i + 1, acc.push(ThCg(ms[i])));
+}
+
+List(CgMsg) unwrap(List(ThMsg) ms, Int i, ListBuf(CgMsg) acc) {
+    if (i >= ms.len()) { return acc.finish(); }
+    ThMsg m = ms[i];
+    return unwrap(ms, i + 1, match m { ThCg(x) => acc.push(x), _ => acc });
+}
+
+// The context for party `self` (CGGMP id) of `ids`, with `threshold` the
+// polynomial degree (t - 1). `prev` is empty for key generation and the
+// party's current configuration for a refresh; `primes` its Paillier primes
+// (two safe primes), or empty to generate them here (slow: minutes).
+pub KgCtx kg_ctx(Int self, List(Int) ids, Int threshold, List(CgConfig) prev, List(Int) session_id, List(Int) seed, List(List(UInt(64))) primes) {
+    return KgCtx {.self = self, .ids = ids, .threshold = threshold, .prev = prev, .session_id = session_id, .seed = seed, .primes = primes};
+}
+
+pub Result(KgStep, CgFail) kg_begin(KgCtx c) {
+    Kg1 s = kg_start(c)?;
+    return Ok(KgStep {.state = KR1(s), .out = wrap(s.out, 0, ListBuf())});
+}
+
+// Advances by one round on everything addressed to this party in the last.
+pub Result(KgStep, CgFail) kg_step(KgState st, List(ThMsg) in) {
+    List(CgMsg) cin = unwrap(in, 0, ListBuf());
+    return match st {
+        KR1(s) => kg_next2(s, cin),
+        KR2(s) => kg_next3(s, cin),
+        KR3(s) => kg_next4(s, cin),
+        KR4(s) => kg_next5(s, cin),
+        KDone(c) => Ok(KgStep {.state = KDone(c), .out = []})
+    };
+}
+
+Result(KgStep, CgFail) kg_next2(Kg1 s, List(CgMsg) in) { Kg2 n = kg_r2(s, in)?; return Ok(KgStep {.state = KR2(n), .out = wrap(n.out, 0, ListBuf())}); }
+Result(KgStep, CgFail) kg_next3(Kg2 s, List(CgMsg) in) { Kg3 n = kg_r3(s, in)?; return Ok(KgStep {.state = KR3(n), .out = wrap(n.out, 0, ListBuf())}); }
+Result(KgStep, CgFail) kg_next4(Kg3 s, List(CgMsg) in) { Kg4 n = kg_r4(s, in)?; return Ok(KgStep {.state = KR4(n), .out = wrap(n.out, 0, ListBuf())}); }
+Result(KgStep, CgFail) kg_next5(Kg4 s, List(CgMsg) in) { CgConfig c = kg_r5(s, in)?; return Ok(KgStep {.state = KDone(c), .out = []}); }
+
+pub Option(CgConfig) kg_result(KgState st) { return match st { KDone(c) => Some(c), _ => None }; }
+
+// The root public key X of a configuration (SEC1 uncompressed): the sum of
+// every party's public share at its Lagrange weight for the full set is not
+// needed here; CGGMP keeps X as the polynomial's constant commitment, which
+// cg_ctx recomputes for any signing subset. This is that point for `ids`.
+pub List(Int) cfg_root_pubkey(CgConfig c, List(Int) ids) {
+    Option(CgCtx) oc = cg_ctx(c, ids, [0], [], [0]);
+    return match oc { None => [], Some(x) => sec1_uncompressed(x.pubkey) };
+}

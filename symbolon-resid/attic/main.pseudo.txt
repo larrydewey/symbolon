@@ -1,0 +1,318 @@
+// Symbolon main entry point
+// Coordinates all components
+
+import "types.resid";
+import "core/log.resid";
+import "threshold/ecdsa.resid";
+import "vault/vault.resid";
+import "sync/sync.resid";
+import "cosigner/cosigner.resid";
+import "recovery/recovery.resid";
+import "duress/duress.resid";
+import "attestation/attestation.resid";
+import "rotation/rotation.resid";
+import "recipe/recipe.resid";
+
+// ============================================================================
+// Agent types
+// ============================================================================
+
+type AgentMode = UInt(8);
+UInt(8) MODE_NORMAL = 0;
+UInt(8) MODE_DURESS = 1;
+UInt(8) MODE_RECOVERY = 2;
+
+type Agent = {
+    device_id: PartyId,
+    mode: AgentMode,
+    log_head: VerifiedLogHead,
+    quorum: Quorum,
+    device_share: ThresholdShare,
+    device_dk: TpmKey,
+    device_hpke: TpmKey,
+    vault_key: SecretKey,
+    vault_id: Digest,
+    duress_state: Secret(DuressState) / Null,
+    sync_client: SyncClient,
+    cosigner: Cosigner / Null,  // if this device is the cosigner
+    rotation_manager: RotationManager,
+    attestation_keys: AttestationKeys,
+};
+
+type AttestationKeys = {
+    ak: TpmKey,       // Attestation Key
+    dk: TpmKey,       // Device Key
+    hpke: TpmKey,     // HPKE key
+    sealing: TpmKey,  // sealing key
+};
+
+// ============================================================================
+// Initialization
+// ============================================================================
+
+@requires(device, network, filesystem)
+Result(Agent) agent_init() {
+    // 1. Load or generate device keys from TPM
+    Result(AttestationKeys) keys_r = attestation_keys_init();
+    if (keys_r.is_err()) { return Err(keys_r.unwrap_err()); }
+    AttestationKeys keys = keys_r.unwrap();
+    
+    // 2. Load or create identity log
+    Result(VerifiedLogHead) log_r = log_load_or_create(keys.dk.pubkey);
+    if (log_r.is_err()) { return Err(log_r.unwrap_err()); }
+    VerifiedLogHead log_head = log_r.unwrap();
+    
+    // 3. Initialize threshold share
+    Result(ThresholdShare) share_r = threshold_share_init(log_head);
+    if (share_r.is_err()) { return Err(share_r.unwrap_err()); }
+    ThresholdShare share = share_r.unwrap();
+    
+    // 4. Initialize vault
+    Result(SecretKey) vault_key_r = vault_key_init(log_head);
+    if (vault_key_r.is_err()) { return Err(vault_key_r.unwrap_err()); }
+    SecretKey vault_key = vault_key_r.unwrap();
+    Digest vault_id = sha256(vault_key.inner);
+    
+    // 5. Initialize sync client
+    SyncClient sync = sync_client_new(
+        config_sync_url(),
+        log_head.head.log_id,
+        keys.dk.pubkey,
+        keys.hpke.pubkey
+    );
+    Result(Void) auth_r = sync_authenticate_device(sync);
+    if (auth_r.is_err()) { return Err(auth_r.unwrap_err()); }
+    
+    // 6. Initialize cosigner (if this device is cosigner)
+    Cosigner cosigner = Null;
+    if (is_cosigner_device(log_head)) {
+        cosigner = cosigner_new(
+            log_head.head.quorum.parties.find(|p| p.kind == PARTY_KIND_COSIGNER).id,
+            share,
+            keys.dk.pubkey,
+            keys.hpke.pubkey,
+            sync
+        );
+    }
+    
+    // 7. Initialize rotation manager
+    RotationManager rotation = rotation_manager_new(
+        log_head.head.log_id,
+        log_head,
+        vault_key,
+        vault_id,
+        sync
+    );
+    
+    // 7. Check for duress PIN
+    Secret(DuressState) duress = duress_check_pin();
+    
+    return Ok(Agent {
+        device_id: log_head.head.log_id,
+        mode: if (duress.is_some()) { MODE_DURESS } else { MODE_NORMAL },
+        log_head: log_head,
+        quorum: log_head.head.quorum,
+        device_share: share,
+        device_dk: keys.dk,
+        device_hpke: keys.hpke,
+        vault_key: vault_key,
+        vault_id: vault_id,
+        duress_state: duress,
+        sync_client: sync,
+        cosigner: cosigner,
+        rotation_manager: rotation,
+        attestation_keys: keys,
+    });
+}
+
+@requires(device)
+Result(AttestationKeys) attestation_keys_init() {
+    TpmKey ak = tpm_create_key(3, true, true, true).unwrap();  // attestation key
+    TpmKey dk = tpm_create_key(0, true, true, true).unwrap();  // DK
+    TpmKey hpke = tpm_create_key(1, true, false, true).unwrap();  // DEK/HPKE
+    TpmKey sealing = tpm_create_key(2, true, false, true).unwrap();  // sealing
+    
+    // Set policies
+    tpm_policy_authvalue(dk);
+    tpm_policy_authvalue(hpke);
+    tpm_policy_authvalue(sealing);
+    
+    // Optional PCR binding via PolicyAuthorize
+    // tpm_policy_pcr(dk, config_pcr_list());
+    
+    return Ok(AttestationKeys { ak: ak, dk: dk, hpke: hpke, sealing: sealing });
+}
+
+@requires(device, filesystem)
+Result(VerifiedLogHead) log_load_or_create(PubKey my_dk) {
+    // Try to load existing log from sync service
+    // If not found and this is a new principal, create inception event
+    // Verify loaded log with il_verify
+    
+    return Ok(VerifiedLogHead{});  // placeholder
+}
+
+@requires(device, filesystem)
+Result(ThresholdShare) threshold_share_init(VerifiedLogHead log_head) {
+    // Load share from sealed storage
+    // If new device, participate in DKG
+    // Verify epoch matches log_head.head.quorum.epoch
+    
+    return Ok(ThresholdShare{});  // placeholder
+}
+
+@requires(device, filesystem)
+Result(SecretKey) vault_key_init(VerifiedLogHead log_head) {
+    // Load vault key wrapped to this device's DEK
+    // Or generate new and wrap to all current quorum parties
+    return Ok(random_bytes(32));
+}
+
+@requires()
+Bool is_cosigner_device(VerifiedLogHead log_head) {
+    for (p in log_head.head.quorum.parties) {
+        if (p.kind == PARTY_KIND_COSIGNER && p.auth_key == my_dk()) {
+            return true;
+        }
+    }
+    return false;
+}
+
+@requires(device)
+Secret(DuressState) duress_check_pin() {
+    // Check if duress PIN was entered at unlock
+    // If so, return DuressState
+    return Null;
+}
+
+@requires()
+Str config_sync_url() {
+    return Str("https://sync.symbolon.dev");
+}
+
+@requires()
+PubKey my_dk() {
+    // Return this device's DK
+    return PubKey(Bytes(33)(0));
+}
+
+// ============================================================================
+// Main loop
+// ============================================================================
+
+@requires(device, network, filesystem, display)
+Void agent_run(Agent agent) {
+    // Start background tasks:
+    // - Sync loop (push/pull log, vault, messages)
+    // - Witness polling (for recovery notifications)
+    // - Rotation check (periodic)
+    // - Proactive refresh (every 30 days)
+    
+    // Main loop:
+    while (true) {
+        // Handle incoming requests:
+        // - WebAuthn credential requests (via OS credential provider)
+        // - SSH agent requests
+        // - HTTP API requests (local)
+        // - Recovery notifications
+        // - Witness cosign requests
+        
+        // Process rotation
+        agent.rotation_manager.process();
+        
+        // Sleep until next event
+        platform_wait_for_event();
+    }
+}
+
+// ============================================================================
+// WebAuthn credential provider interface
+// ============================================================================
+
+type WebAuthnRequest = {
+    type: UInt(8),  // 0 = create, 1 = get
+    rp_id: SecretRpId,
+    challenge: Bytes(32),
+    allow_credentials: List(SecretCredentialId) / Null,
+    user_verification: UInt(8),  // 0=discouraged, 1=preferred, 2=required
+};
+
+type WebAuthnResponse =
+    | CreateResponse { credential_id: CredentialId, public_key: PubKey, attestation: Bytes }
+    | GetResponse { credential_id: CredentialId, authenticator_data: Bytes, signature: Es256Sig, user_verified: Bool };
+
+@requires(device, display, declassify)
+Result(WebAuthnResponse) agent_handle_webauthn(Agent agent, WebAuthnRequest req) {
+    // 1. Verify origin (browser/OS reported)
+    // 2. Show consent UI outside page DOM
+    // 3. Verify user gesture (PIN/biometric)
+    // 4. If duress mode: check subset
+    // 5. Run threshold signing
+    // 6. Return response
+    
+    if (req.type == 0) {
+        // Create new credential
+        Credential cred = register_credential(
+            agent.device_share.cc.unwrap(),
+            req.rp_id,
+            agent.quorum.root_pubkey
+        );
+        return Ok(CreateResponse {
+            credential_id: declassify(cred.id, "credential ID released to relying party after consent"),
+            public_key: cred.public_key,
+            attestation: Bytes(),  // format none
+        });
+    } else {
+        // Get assertion
+        // Find credential matching allow_credentials
+        // Verify RP ID matches
+        // Run threshold signing
+        
+        return Ok(GetResponse {
+            credential_id: CredentialId(Bytes(32)(0)),
+            authenticator_data: Bytes(),
+            signature: Es256Sig(Bytes(64)(0)),
+            user_verified: true,
+        });
+    }
+}
+
+// ============================================================================
+// SSH agent interface
+// ============================================================================
+
+type SshRequest = {
+    key_id: Secret(Str),
+    challenge: Bytes,
+};
+
+type SshResponse = {
+    signature: Es256Sig,
+};
+
+@requires(device)
+Result(SshResponse) agent_handle_ssh(Agent agent, SshRequest req) {
+    // Use threshold or bound profile key
+    // Sign challenge
+    return Ok(SshResponse { signature: Es256Sig(Bytes(64)(0)) });
+}
+
+// ============================================================================
+// Exports
+// ============================================================================
+
+export {
+    Agent,
+    AgentMode,
+    MODE_NORMAL,
+    MODE_DURESS,
+    MODE_RECOVERY,
+    agent_init,
+    agent_run,
+    agent_handle_webauthn,
+    agent_handle_ssh,
+    WebAuthnRequest,
+    WebAuthnResponse,
+    SshRequest,
+    SshResponse,
+};

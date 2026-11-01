@@ -1,0 +1,327 @@
+// The legacy vault from the command line (SPEC 18): `symbolon device vault
+// put | get | list`. The vault lives at the relay as one CBOR VaultState
+// (blob "vault-<log id>"): items sealed field by field under the vault key,
+// and a head signed by a device's DK over the items' Merkle root, anchored
+// to the verified log. A device accepts a state only through vault_accept
+// and never one older than it accepted before (vault.version, A-14).
+
+import "../types.resid";
+import "../core/log.resid";
+import "../vault/vault.resid";
+import "../duress/duress.resid";
+import "../net/services.resid";
+import "state.resid";
+import "common.resid";
+import "device.resid";
+import "serials.resid";
+import "crypto.resid";
+import "word.resid";
+import "cbor.resid";
+import "httpserv.resid";
+
+pub List(Int) vault_id_of(List(Int) log_id) { return sha256_bytes(utf8("symbolon v1 vault").concat(log_id)); }
+
+Str vault_blob(List(Int) log_id) { return "vault-" + hex_encode(log_id); }
+
+// Where items live: the person's own vault (share ""), or a shared
+// collection (SPEC 19; share is its id in hex) with its own key.
+pub type Place = { Str share; List(Secret(UInt(8))) vk; List(Int) vid; };
+
+pub Place own_place(DeviceConfig c, Unlocked u) { return Place {.share = "", .vk = u.real.vault_key, .vid = vault_id_of(c.log_id)}; }
+
+// The relay's blob for a place's items, and the prefix of the files this
+// device keeps for it (.version, .cache, .tag).
+pub Str place_blob(DeviceConfig c, Str share) { return if (str_len(share) == 0) { vault_blob(c.log_id) } else { "coll-" + share }; }
+pub Str place_local(Str dir, Str share) { return if (str_len(share) == 0) { dir + "/vault" } else { dir + "/share-" + share }; }
+
+// An item's id: from the vault key and the name, so the relay learns no names.
+@requires(declassify)
+pub List(Int) item_id_of(List(Secret(UInt(8))) vk, Str name) { return reveal(hk(vk, "symbolon v1 item id " + name, 16)); }
+
+pub VaultState empty_state(List(Int) vid, List(Int) l) {
+    return VaultState {.head = VaultHead {.vault_id = vid, .version = 0, .merkle_root = merkle_root([]), .log_id = l, .log_sequence = 0, .suite = 1, .signer = [], .sig = []}, .items = []};
+}
+
+pub Option(VaultState) state_of(List(Int) b) {
+    if (b.len() == 0 || b.len() > 16777216 || !cbor_well_formed(b, 24)) { return None; }
+    Result(VaultState, SerialError) r = from_cbor(b);
+    return match r { Ok(x) => Some(x), Err(_) => None };
+}
+
+List(Int) cbor_of_vault(VaultState s) { return match to_cbor(s) { Ok(b) => b, Err(_) => [] }; }
+
+@requires(filesystem)
+Int accepted_version(Str dir) { return kept_version(dir + "/vault.version"); }
+
+@requires(filesystem)
+pub Int kept_version(Str path) {
+    Str s = str_trim(filesystem.read_all(path));
+    return if (str_len(s) == 0) { 0 } else { str_parse_int(s) };
+}
+
+// The vault as the relay holds it, accepted against the verified log; an
+// empty vault when there is none yet and none was ever accepted.
+@requires(filesystem, network, clock(readonly), declassify)
+pub Result(VaultState, Str) fetch_vault(Str dir, DeviceConfig c, VerifiedHead vh) {
+    List(Int) vid = vault_id_of(c.log_id);
+    Option(List(Int)) b = blob_get(relay_ep(c), vault_blob(c.log_id));
+    Int seen = accepted_version(dir);
+    return match b {
+        None => if (seen == 0) { Ok(empty_state(vid, c.log_id)) } else { Err("the relay has no vault, but this device accepted version " + f"{seen}") },
+        Some(x) => match state_of(x) {
+            None => Err("the vault does not decode"),
+            Some(st) => match vault_accept(st, vid, vh.head, (UInt(64))seen) { Ok(v) => Ok(v), Err(e) => Err(err_text(e)) }
+        }
+    };
+}
+
+pub type Opened = { DeviceConfig c; Unlocked u; VerifiedHead vh; VaultState st; Str pin; Place p; };
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+pub Result(Opened, Str) open_vault(Str dir) {
+    Option(DeviceConfig) oc = load_config(dir);
+    DeviceConfig c = oc else { return_none() };
+    if (c.log_id.len() == 0) { return Err("not set up (device new, device init)"); }
+    Str pin = read_pin();
+    Unlocked u = unlock_dir(dir, c, pin);
+    if (u.kind != 1) { return Err("wrong PIN"); }
+    Result(VerifiedHead, SymbolonError) rv = verified_log(relay_ep(c), c.log_id);
+    return match rv {
+        Err(e) => Err(err_text(e)),
+        Ok(vh) => match fetch_vault(dir, c, vh) { Err(m) => Err(m), Ok(st) => Ok(Opened {.c = c, .u = u, .vh = vh, .st = st, .pin = pin, .p = own_place(c, u)}) }
+    };
+}
+
+DeviceConfig return_none() {
+    return DeviceConfig {.relay_host = "", .relay_port = 0, .ca = "", .witnesses = [], .unprotected = true, .argon_m_kib = 0, .argon_t = 0, .salt = [],
+        .tpm_dk = 0, .tpm_unlock_a = 0, .tpm_unlock_b = 0, .party = [], .dk_pub = [], .hpke_pub = [], .log_id = [], .mbox_next = 0, .peers = []};
+}
+
+pub Option(Item) item_by_id(List(Item) xs, List(Int) id, Int i) {
+    if (i >= xs.len()) { return None; }
+    if (bytes_eq(xs[i].id, id)) { return Some(xs[i]); }
+    return item_by_id(xs, id, i + 1);
+}
+
+pub List(Item) without_item(List(Item) xs, List(Int) id, Int i, ListBuf(Item) acc) {
+    if (i >= xs.len()) { return acc.finish(); }
+    return without_item(xs, id, i + 1, if (bytes_eq(xs[i].id, id)) { acc } else { acc.push(xs[i]) });
+}
+
+// `symbolon device vault put DIR NAME`: the PIN, then the secret, on stdin.
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+pub Int vault_put(Str dir, Str name) {
+    Result(Opened, Str) ro = open_vault(dir);
+    return match ro { Err(m) => dfail(m), Ok(o) => put_item(dir, o, name, read_pin()) };
+}
+
+@requires(filesystem, network, device, declassify, clock, environment)
+Int put_item(Str dir, Opened o, Str name, Str secret) {
+    if (str_len(name) == 0 || str_len(secret) == 0) { return dfail("a name and a secret"); }
+    List(Secret(UInt(8))) vk = o.p.vk;
+    List(Int) vid = o.p.vid;
+    List(Int) id = item_id_of(vk, name);
+    Option(Item) old = item_by_id(o.st.items, id, 0);
+    UInt(64) version = match old { None => (UInt(64))1, Some(x) => x.version + (UInt(64))1 };
+    Result(Item, SymbolonError) ri = item_seal(vk, vid, id, version, "password",
+        [FieldPlain {.name = "name", .value = secret_bytes(utf8(name))}, FieldPlain {.name = "secret", .value = secret_bytes(utf8(secret))}], false, None);
+    return match ri {
+        Err(e) => dfail(err_text(e)),
+        Ok(it) => publish_items(dir, o, without_item(o.st.items, id, 0, ListBuf()).concat([it]))
+    };
+}
+
+@requires(filesystem, network, device, declassify, clock, environment)
+pub Int publish_items(Str dir, Opened o, List(Item) items) {
+    VaultHead h0 = VaultHead {.vault_id = o.p.vid, .version = o.st.head.version + 1, .merkle_root = merkle_root(items), .log_id = o.c.log_id,
+                              .log_sequence = o.vh.head.sequence, .suite = 1, .signer = o.c.party, .sig = []};
+    Result(List(Int), Str) rs = dk_sign(o.c, o.u.real, o.u.st, head_tbs(h0));
+    return match rs {
+        Err(m) => dfail(m),
+        Ok(sig) => store_vault(dir, o, VaultState {.head = VaultHead {.vault_id = h0.vault_id, .version = h0.version, .merkle_root = h0.merkle_root, .log_id = h0.log_id,
+                                                                      .log_sequence = h0.log_sequence, .suite = 1, .signer = h0.signer, .sig = sig}, .items = items})
+    };
+}
+
+@requires(filesystem, network, clock(readonly), declassify)
+Int store_vault(Str dir, Opened o, VaultState st) {
+    // Accepting our own state first: what other devices will check.
+    Result(VaultState, SymbolonError) self_check = vault_accept(st, o.p.vid, o.vh.head, st.head.version);
+    if (match self_check { Ok(_) => false, Err(_) => true }) { return dfail("the new vault state does not verify"); }
+    if (!blob_put(relay_ep(o.c), place_blob(o.c, o.p.share), cbor_of_vault(st))) { return dfail("the relay refused the vault"); }
+    _ = filesystem.write_all(place_local(dir, o.p.share) + ".version", f"{st.head.version}");
+    _ = keep_place_copy(place_local(dir, o.p.share), o.p.vk, st);
+    println(f"vault version {st.head.version}, {st.items.len()} items");
+    return 0;
+}
+
+// ─── Reading, also offline ──────────────────────────────────────
+// After every state it accepts or publishes, the device keeps a copy in
+// vault.cache with an HMAC under a key from the vault key in vault.tag
+// (SPEC 18.8). Reading falls back to that copy when the relay or the log
+// cannot be had, and says so on standard error; a change always needs the
+// relay and the verified log.
+
+pub type View = { List(Secret(UInt(8))) vk; List(Int) vid; VaultState st; Bool offline; };
+
+@requires(declassify)
+List(Int) cache_tag(List(Secret(UInt(8))) vk, List(Int) b) { return hmac_sha256_bytes(reveal(hk(vk, "symbolon v1 vault cache", 32)), b); }
+
+@requires(filesystem, declassify)
+pub Bool keep_copy(Str dir, List(Secret(UInt(8))) vk, VaultState st) { return keep_place_copy(dir + "/vault", vk, st); }
+
+// `local` is place_local(...): the copy is local + ".cache", its tag local + ".tag".
+@requires(filesystem, declassify)
+pub Bool keep_place_copy(Str local, List(Secret(UInt(8))) vk, VaultState st) {
+    List(Int) b = cbor_of_vault(st);
+    return filesystem.write_bytes(local + ".cache", b) && filesystem.write_bytes(local + ".tag", cache_tag(vk, b));
+}
+
+@requires(filesystem, declassify)
+Option(VaultState) kept_copy(Str dir, List(Secret(UInt(8))) vk) { return kept_place_copy(dir + "/vault", vk); }
+
+@requires(filesystem, declassify)
+pub Option(VaultState) kept_place_copy(Str local, List(Secret(UInt(8))) vk) {
+    List(Int) b = get_file(local + ".cache");
+    if (b.len() == 0 || !bytes_eq(get_file(local + ".tag"), cache_tag(vk, b))) { return None; }
+    return state_of(b);
+}
+
+// The vault for reading: as the relay holds it, verified, or else this
+// device's copy.
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+pub Result(View, Str) open_view(Str dir) {
+    Option(DeviceConfig) oc = load_config(dir);
+    DeviceConfig c = oc else { return_none() };
+    if (c.log_id.len() == 0) { return Err("not set up (device new, device init)"); }
+    Unlocked u = unlock_dir(dir, c, read_pin());
+    if (u.kind != 1) { return Err("wrong PIN"); }
+    List(Secret(UInt(8))) vk = u.real.vault_key;
+    List(Int) vid = vault_id_of(c.log_id);
+    Result(VerifiedHead, SymbolonError) rv = verified_log(relay_ep(c), c.log_id);
+    Result(VaultState, Str) rs = match rv { Err(e) => Err(err_text(e)), Ok(vh) => fetch_vault(dir, c, vh) };
+    return match rs {
+        Ok(st) => online_view(dir, vk, vid, st),
+        Err(m) => match kept_copy(dir, vk) {
+            None => Err(m),
+            Some(st) => offline_view(m, View {.vk = vk, .vid = vid, .st = st, .offline = true})
+        }
+    };
+}
+
+@requires(filesystem, declassify)
+Result(View, Str) online_view(Str dir, List(Secret(UInt(8))) vk, List(Int) vid, VaultState st) {
+    _ = keep_copy(dir, vk, st);
+    return Ok(View {.vk = vk, .vid = vid, .st = st, .offline = false});
+}
+
+pub Result(View, Str) offline_view(Str why, View v) {
+    eprintln(f"local copy: {why}; showing vault version {v.st.head.version} as this device last verified it");
+    return Ok(v);
+}
+
+// `symbolon device vault get DIR NAME`: the PIN on stdin; prints the secret.
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+pub Int vault_get(Str dir, Str name) {
+    Result(View, Str) rv = open_view(dir);
+    return match rv {
+        Err(m) => dfail(m),
+        Ok(v) => match item_by_id(v.st.items, item_id_of(v.vk, name), 0) {
+            None => dfail("no such item"),
+            Some(it) => print_field(v, it, if (it.fields.contains("secret")) { "secret" } else { "current" })
+        }
+    };
+}
+
+@requires(filesystem, declassify)
+Int print_field(View v, Item it, Str field) { return print_field_after(v, it, field, ""); }
+
+// The field's text after [prefix], on one line.
+@requires(filesystem, declassify)
+Int print_field_after(View v, Item it, Str field, Str prefix) {
+    Result(List(FieldPlain), SymbolonError) r = item_open(v.vk, v.vid, it);
+    return match r {
+        Err(e) => dfail(err_text(e)),
+        Ok(fs) => print_named(fs, field, prefix, 0)
+    };
+}
+
+@requires(declassify)
+Int print_named(List(FieldPlain) fs, Str field, Str prefix, Int i) {
+    if (i >= fs.len()) { return dfail("no field " + field); }
+    if (fs[i].name == field) { println(prefix + text_of(reveal(fs[i].value))); return 0; }
+    return print_named(fs, field, prefix, i + 1);
+}
+
+pub Str text_of(List(Int) b) { return http_text(b, 0, b.len()); }
+
+// `symbolon device vault list DIR [--kinds | --long]`: the PIN on stdin;
+// prints the names; with --kinds "TYPE NAME" per item; with --long "TYPE
+// NAME-HEX DETAIL-HEX FOLDER-HEX", the detail being a login's origin or a
+// card's last four digits, else "-", and the folder "-" when it has none. An item's type is its sealed "type" field; an
+// older item without one is a secret if it has a secret, else a login.
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+pub Int vault_list(Str dir, Int form) {
+    Result(View, Str) rv = open_view(dir);
+    return match rv { Err(m) => dfail(m), Ok(v) => list_items(v, form, 0) };
+}
+
+@requires(filesystem, declassify)
+pub Int list_items(View v, Int form, Int i) {
+    if (i >= v.st.items.len()) { return 0; }
+    Result(List(FieldPlain), SymbolonError) r = item_open(v.vk, v.vid, v.st.items[i]);
+    _ = match r { Err(e) => dfail(err_text(e)), Ok(fs) => print_entry(fs, v.st.items[i].fields.contains("secret"), form) };
+    return list_items(v, form, i + 1);
+}
+
+@requires(declassify)
+Int print_entry(List(FieldPlain) fs, Bool has_secret, Int form) {
+    Str t = type_of(fs, has_secret);
+    Str name = field_text(fs, "name");
+    if (form == 0) { println(name); return 0; }
+    if (form == 1) { println(t + " " + name); return 0; }
+    Str d = if (t == "login") { field_text(fs, "origin") } else { if (t == "card") { last4(field_text(fs, "number")) } else { "" } };
+    Str f = field_text(fs, "folder");
+    println(t + " " + hex_encode(utf8(name)) + " " + (if (str_len(d) == 0) { "-" } else { hex_encode(utf8(d)) }) + " " + (if (str_len(f) == 0) { "-" } else { hex_encode(utf8(f)) }));
+    return 0;
+}
+
+@requires(declassify)
+pub Str type_of(List(FieldPlain) fs, Bool has_secret) {
+    Str t = field_text(fs, "type");
+    return if (str_len(t) > 0) { t } else { if (has_secret) { "secret" } else { "login" } };
+}
+
+Str last4(Str n) { Int k = str_len(n); return if (k < 4) { "" } else { str_slice(n, k - 4, k) }; }
+
+// A field's text, or "" when the item has no such field.
+@requires(declassify)
+pub Str field_text(List(FieldPlain) fs, Str n) { return field_text_at(fs, n, 0); }
+
+@requires(declassify)
+Str field_text_at(List(FieldPlain) fs, Str n, Int i) {
+    if (i >= fs.len()) { return ""; }
+    if (fs[i].name == n) { return text_of(reveal(fs[i].value)); }
+    return field_text_at(fs, n, i + 1);
+}
+
+// After a kit recovery (SPEC 13.2, 18.4): every device of the recovered
+// quorum is new, so no current device signed the vault head. The recovered
+// device accepts the head under the quorum in force before the recover
+// event, only if it cites a log sequence before that event (a head a
+// removed device signs afterwards is refused), and re-signs it, so later
+// accepts pass the ordinary rule. Residual risk: an older pre-recovery head
+// cannot be told from the latest (the new device has no history).
+@requires(filesystem, network, device, declassify, clock, environment)
+pub Int vault_reanchor(Str dir, DeviceConfig c, Unlocked u, VerifiedHead vh, Quorum pre, UInt(64) recover_seq, Str pin) {
+    Option(List(Int)) b = blob_get(relay_ep(c), vault_blob(c.log_id));
+    if (match b { None => true, Some(_) => false }) { println("no vault to re-anchor"); return 0; }
+    Option(VaultState) os = state_of(b else { [] });
+    VaultState st = os else { empty_state(vault_id_of(c.log_id), c.log_id) };
+    LogHead before = LogHead {.log_id = c.log_id, .sequence = recover_seq - 1, .digest = [], .quorum = pre, .policy = vh.head.policy};
+    Result(VaultState, SymbolonError) ok = vault_accept(st, vault_id_of(c.log_id), before, 0);
+    return match ok {
+        Err(e) => dfail("the vault does not verify under the quorum before the recovery: " + err_text(e)),
+        Ok(v) => publish_items(dir, Opened {.c = c, .u = u, .vh = vh, .st = v, .pin = pin, .p = own_place(c, u)}, v.items)
+    };
+}

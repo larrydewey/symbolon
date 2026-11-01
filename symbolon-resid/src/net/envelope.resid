@@ -1,0 +1,85 @@
+// End-to-end encryption between parties (SPEC 20.2): HPKE mode_auth,
+// DHKEM(P-256), HKDF-SHA256, AES-256-GCM, from the sender's static HPKE key
+// to the recipient's. info = "symbolon v1 envelope" || from || to, so an
+// envelope opens only for the pair it names, and its sender is
+// authenticated by the KEM.
+
+import "proto.resid";
+import "proto_serial.resid";
+import "../types_serial.resid";
+import "../core/log_serial.resid";
+import "../cosigner/cosigner_serial.resid";
+import "wire.resid";
+import "../vault/vault.resid";
+import "hpkeg.resid";
+import "hpke.resid";
+import "word.resid";
+import "cbor.resid";
+
+pub HpkeSuite envelope_suite() { return hpke_suite(16, 1, 2); }
+
+List(Int) env_info(List(Int) from, List(Int) to) { return utf8("symbolon v1 envelope").concat(from).concat(to); }
+
+List(Int) ints_of(List(UInt(8)) b, Int i, ListBuf(Int) acc) {
+    if (i >= b.len()) { return acc.finish(); }
+    return ints_of(b, i + 1, acc.push((Int)b[i]));
+}
+
+pub List(Int) wire_encode(Packet w) { return match to_cbor(w) { Ok(b) => b, Err(_) => [] }; }
+
+// A Packet value holds one round's batch: key generation's proof rounds
+// (Paillier-Blum modulus and Pedersen parameter proofs for each party) run
+// to megabytes, so the bound is max_batch(), not one message's.
+pub Int max_batch() { return 16777216; }
+
+pub Option(Packet) wire_decode(List(Int) b) {
+    if (b.len() == 0 || b.len() > max_batch() || !cbor_well_formed(b, 40)) { return None; }
+    Result(Packet, SerialError) r = from_cbor(b);
+    return match r { Ok(w) => Some(w), Err(_) => None };
+}
+
+// Seals `w` from `from` (static HPKE secret key `sk`) to `to` (HPKE public
+// key `pk_to`). `ikm_e` pins the ephemeral key (tests); empty draws one.
+@requires(declassify)
+pub Option(Envelope) seal(List(Int) from, List(Secret(UInt(8))) sk, List(Int) to, List(Int) pk_to, Packet w, List(Secret(UInt(8))) ikm_e) {
+    List(Int) pt = wire_encode(w);
+    if (pt.len() == 0) { return None; }
+    List(Secret(UInt(8))) none = [];
+    HpkeSenderG(Secret(UInt(8))) s = hpkeg_setup_sender_full(envelope_suite(), pk_to, env_info(from, to), none, [], sk, ikm_e);
+    if (!s.ctx.ok) { return None; }
+    HpkeSealedG(Secret(UInt(8))) sealed = hpkeg_seal(s.ctx, [], secret_bytes(pt));
+    if (sealed.ct.len() == 0) { return None; }
+    return Some(Envelope {.from = from, .to = to, .enc = s.enc, .ct = ints_of(declassify(secret_join(sealed.ct), "HPKE output is public"), 0, ListBuf())});
+}
+
+// Opens an envelope addressed to `me` (HPKE secret key `sk`) from a sender
+// whose HPKE public key is `pk_from`.
+@requires(declassify)
+pub Option(Packet) open(Envelope e, List(Int) me, List(Secret(UInt(8))) sk, List(Int) pk_from) {
+    if (!same(e.to, me)) { return None; }
+    List(Secret(UInt(8))) none = [];
+    HpkeCtxG(Secret(UInt(8))) c = hpkeg_setup_receiver_full(envelope_suite(), e.enc, sk, env_info(e.from, e.to), none, [], pk_from);
+    if (!c.ok) { return None; }
+    HpkeOpenedG(Secret(UInt(8))) o = hpkeg_open(c, [], e.ct);
+    if (!o.ok) { return None; }
+    return wire_decode(ints_of(declassify(secret_join(o.pt), "a protocol message for this party"), 0, ListBuf()));
+}
+
+Bool same(List(Int) a, List(Int) b) {
+    if (a.len() != b.len()) { return false; }
+    return same_at(a, b, 0);
+}
+
+Bool same_at(List(Int) a, List(Int) b, Int i) {
+    if (i >= a.len()) { return true; }
+    if (a[i] != b[i]) { return false; }
+    return same_at(a, b, i + 1);
+}
+
+pub List(Int) envelope_encode(Envelope e) { return match to_cbor(e) { Ok(b) => b, Err(_) => [] }; }
+
+pub Option(Envelope) envelope_decode(List(Int) b) {
+    if (b.len() == 0 || b.len() > max_batch() + 4096 || !cbor_well_formed(b, 8)) { return None; }
+    Result(Envelope, SerialError) r = from_cbor(b);
+    return match r { Ok(x) => Some(x), Err(_) => None };
+}

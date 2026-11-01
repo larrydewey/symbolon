@@ -1,0 +1,359 @@
+// Symbolon Home: one box (a NAS, a small computer) that runs everything a
+// household's devices need -- the relay, the witnesses and a cosigner for
+// each person -- with its own small certificate authority, and pairs a
+// new phone through a one-time invite shown as a QR code.
+//
+//   symbolon home init DIR HOST [HOST...] [--ports BASE] [--bind ADDR]
+//       the box's keys and certificates, for the names or addresses its
+//       devices reach it at (a LAN address, a WireGuard or Tailscale one);
+//       --bind: listen on ADDR only (default 0.0.0.0, every interface)
+//   symbolon home invite DIR NAME
+//       a cosigner for NAME and a one-time code; prints the pairing link
+//       symbolon://pair?h=HOST&p=PORT&c=CODE&f=CERT-SHA256 (the QR content)
+//   symbolon home serve DIR
+//       runs it all (ports BASE..BASE+4: pairing, relay, three witnesses)
+//
+// Pairing (port BASE, HTTPS; the phone pins the box's server certificate by
+// the fingerprint in the link on its first connection, so the code never
+// travels over a connection it has not checked, and takes the CA from the
+// setup for the agent):
+//   GET  /setup?c=CODE  the relay, NAME's cosigner keys, the witnesses and
+//                       the CA certificate (JSON)
+//   POST /pair?c=CODE   body: the new device's keys (device new); pins the
+//                       device at NAME's cosigner and spends the code
+//
+// Interim: the box runs its witnesses itself, so it vouches for its own
+// log; SPEC 20.3 wants independent ones (public logs are planned).
+
+import "../types.resid";
+import "state.resid";
+import "common.resid";
+import "cosignerd.resid";
+import "crypto.resid";
+import "cose.resid";
+import "ecdsa.resid";
+import "x509gen.resid";
+import "httpserv.resid";
+import "tlskey.resid";
+import "tlswire.resid";
+
+pub Int home_default_base() { return 47100; }
+Int invite_secs() { return 7 * 86400; }
+
+pub type HomeCfg = { Int base; List(Str) hosts; Str bind; };
+
+@requires(filesystem)
+pub Option(HomeCfg) home_cfg(Str dir) {
+    List(Str) ls = str_split(str_trim(filesystem.read_all(dir + "/home.txt")), "\n");
+    if (ls.len() < 2 || str_len(ls[0]) == 0) { return None; }
+    Str b = str_trim(filesystem.read_all(dir + "/bind.txt"));
+    return Some(HomeCfg {.base = str_parse_int(ls[0]), .hosts = rest_of(ls, 1, ListBuf()), .bind = if (str_len(b) == 0) { "0.0.0.0" } else { b }});
+}
+
+List(Str) rest_of(List(Str) ls, Int i, ListBuf(Str) acc) {
+    if (i >= ls.len()) { return acc.finish(); }
+    Str l = str_trim(ls[i]);
+    return rest_of(ls, i + 1, if (str_len(l) == 0) { acc } else { acc.push(l) });
+}
+
+// An IPv4 address as 4 octets, or [] for a name.
+pub List(Int) ipv4_of(Str h) {
+    List(Str) p = str_split(h, ".");
+    if (p.len() != 4 || !all_octets(p, 0)) { return []; }
+    return [str_parse_int(p[0]), str_parse_int(p[1]), str_parse_int(p[2]), str_parse_int(p[3])];
+}
+
+Bool all_octets(List(Str) p, Int i) {
+    if (i >= p.len()) { return true; }
+    Str s = p[i];
+    if (str_len(s) == 0 || str_len(s) > 3 || !digits(s, 0)) { return false; }
+    Int v = str_parse_int(s);
+    return v >= 0 && v <= 255 && all_octets(p, i + 1);
+}
+
+Bool digits(Str s, Int i) {
+    if (i >= str_len(s)) { return true; }
+    Str c = str_slice(s, i, i + 1);
+    return c >= "0" && c <= "9" && digits(s, i + 1);
+}
+
+List(List(Int)) ips_of(List(Str) hs, Int i, ListBuf(List(Int)) acc) {
+    if (i >= hs.len()) { return acc.finish(); }
+    List(Int) a = ipv4_of(hs[i]);
+    return ips_of(hs, i + 1, if (a.len() == 4) { acc.push(a) } else { acc });
+}
+
+List(Str) names_of(List(Str) hs, Int i, ListBuf(Str) acc) {
+    if (i >= hs.len()) { return acc.finish(); }
+    return names_of(hs, i + 1, if (ipv4_of(hs[i]).len() == 4) { acc } else { acc.push(hs[i]) });
+}
+
+Str lines(List(Str) xs, Int i, StrBuf acc) {
+    if (i >= xs.len()) { return acc.finish(); }
+    return lines(xs, i + 1, acc.push(xs[i]).push("\n"));
+}
+
+// Where the box's own processes reach its servers: loopback when it
+// listens everywhere, else the one address it listens on.
+pub Str local_of(Str bind) { return if (bind == "0.0.0.0" || str_len(bind) == 0) { "127.0.0.1" } else { bind }; }
+
+List(Str) with_local(List(Str) hosts, Str local) { return if (hosts.contains(local)) { hosts } else { hosts.concat([local]) }; }
+
+// A P-256 key drawn until it is in range.
+List(Int) fresh_key() { return ec_generate(P256); }
+
+// ─── home init ──────────────────────────────────────────────────
+
+// The CA lives 20 years and the server certificate 10; the phone pins the
+// CA, so the server certificate can be renewed under it.
+@requires(filesystem, clock(readonly))
+pub Int home_init(Str dir, List(Str) hosts, Int base, Str bind) {
+    if (filesystem.exists(dir + "/home.txt")) { eprintln("home: already set up"); return 1; }
+    if (hosts.len() == 0) { eprintln("home: name at least one host the devices reach this box at"); return 1; }
+    _ = filesystem.create_dir(dir);
+    _ = filesystem.create_dir(dir + "/tls");
+    _ = filesystem.create_dir(dir + "/people");
+    _ = filesystem.create_dir(dir + "/invites");
+    Int now = clock_now_seconds();
+    List(Int) ca_priv = fresh_key();
+    List(Int) ca_pub = ec_public_key(P256, ca_priv);
+    List(Int) srv_priv = fresh_key();
+    List(Int) srv_pub = ec_public_key(P256, srv_priv);
+    CertSpec cas = CertSpec {.cn = "Symbolon Home CA", .serial = random_bytes(16), .not_before = now - 86400, .not_after = now + 20 * 365 * 86400,
+                             .ca = true, .ips = [], .dns = []};
+    CertSpec srv = CertSpec {.cn = "Symbolon Home", .serial = random_bytes(16), .not_before = now - 86400, .not_after = now + 10 * 365 * 86400,
+                             .ca = false, .ips = ips_of(with_local(hosts, local_of(bind)), 0, ListBuf()), .dns = names_of(hosts, 0, ListBuf())};
+    List(Int) ca_der = x509g_cert(cas, ca_pub, "Symbolon Home CA", ca_priv);
+    List(Int) srv_der = x509g_cert(srv, srv_pub, "Symbolon Home CA", ca_priv);
+    if (ca_der.len() == 0 || srv_der.len() == 0) { eprintln("home: cannot make the certificates"); return 1; }
+    Str ca_pem = x509g_pem("CERTIFICATE", ca_der);
+    Bool ok = filesystem.write_all(dir + "/tls/ca.pem", ca_pem)
+           && filesystem.write_secret(dir + "/tls/ca.key", ca_priv)
+           && filesystem.write_all(dir + "/tls/server.pem", x509g_pem("CERTIFICATE", srv_der) + ca_pem)
+           && filesystem.write_all(dir + "/tls/server.key", x509g_pem("EC PRIVATE KEY", x509g_sec1_key(srv_priv, srv_pub)))
+           && make_witnesses(dir, 1)
+           && filesystem.write_all(dir + "/bind.txt", bind)
+           && filesystem.write_all(dir + "/home.txt", f"{base}\n" + lines(hosts, 0, StrBuf()));
+    if (!ok) { eprintln("home: cannot write the box's files"); return 1; }
+    println("home ready at " + hosts[0] + f" ports {base}-{base + 4}");
+    return 0;
+}
+
+@requires(filesystem)
+Bool make_witnesses(Str dir, Int i) {
+    if (i > 3) { return true; }
+    List(Int) priv = fresh_key();
+    Bool ok = filesystem.write_secret(dir + f"/w{i}.key", priv) && filesystem.write_all(dir + f"/w{i}.pub", hex_encode(ec_public_key(P256, priv)));
+    return ok && make_witnesses(dir, i + 1);
+}
+
+// SHA-256 of a certificate (DER), base64url without padding.
+pub Str ca_fingerprint(List(Int) der) { return b64url(sha256_bytes(der)); }
+
+Str b64url(List(Int) b) { return str_replace(str_replace(str_replace(base64_encode(b), "+", "-"), "/", "_"), "=", ""); }
+
+// The server certificate (the first in server.pem), as the box presents it.
+@requires(filesystem)
+List(Int) server_der_of(Str dir) { return pem_der(first_pem(filesystem.read_all(dir + "/tls/server.pem"))); }
+
+Str first_pem(Str pem) {
+    Str end = "-----END CERTIFICATE-----";
+    Int i = str_index_of(pem, end, 0);
+    return if (i < 0) { pem } else { str_slice(pem, 0, i + str_len(end)) };
+}
+
+// The DER inside a one-block PEM.
+List(Int) pem_der(Str pem) {
+    List(Str) ls = str_split(pem, "\n");
+    return base64_decode(body_lines(ls, 0, StrBuf()));
+}
+
+Str body_lines(List(Str) ls, Int i, StrBuf acc) {
+    if (i >= ls.len()) { return acc.finish(); }
+    Str l = str_trim(ls[i]);
+    if (str_len(l) > 0 && str_slice(l, 0, 5) == "-----") { return body_lines(ls, i + 1, acc); }
+    return body_lines(ls, i + 1, acc.push(l));
+}
+
+// ─── home invite ────────────────────────────────────────────────
+
+// A person: their own cosigner (a cosigner serves one identity) and a code
+// that lets one phone fetch the setup and pair, within a week.
+@requires(filesystem, clock(readonly), provision, declassify)
+pub Int home_invite(Str dir, Str name) {
+    Option(HomeCfg) oc = home_cfg(dir);
+    HomeCfg c = oc else { HomeCfg {.base = 0, .hosts = [], .bind = ""} };
+    if (c.hosts.len() == 0) { eprintln("home: not set up (home init)"); return 1; }
+    if (!name_ok(name)) { eprintln("home: a name is 1-32 of a-z, 0-9, - and _"); return 1; }
+    Str pd = dir + "/people/" + name;
+    if (filesystem.exists(pd + "/cos/cosigner.cbor")) { eprintln("home: " + name + " already has a cosigner; to pair again, start over with a new name"); return 1; }
+    _ = filesystem.create_dir(pd);
+    // The cosigner runs on the box: it reaches the relay and the witnesses
+    // locally, whatever address the devices use.
+    Str keys = cosigner_make(pd + "/cos", local_of(c.bind), c.base + 1, filesystem.read_all(dir + "/tls/ca.pem"));
+    if (str_len(keys) == 0 || !filesystem.write_all(pd + "/cos/local_host", local_of(c.bind))) { eprintln("home: cannot make the cosigner"); return 1; }
+    Str code = b64url(random_bytes(16));
+    if (!filesystem.write_all(pd + "/keys", keys) || !filesystem.write_all(dir + "/invites/" + code, name + f" {clock_now_seconds() + invite_secs()}")) {
+        eprintln("home: cannot write the invite"); return 1;
+    }
+    println("symbolon://pair?h=" + c.hosts[0] + f"&p={c.base}" + "&c=" + code + "&f=" + ca_fingerprint(server_der_of(dir)));
+    return 0;
+}
+
+Bool name_ok(Str n) {
+    List(Int) b = bytes_of(n);
+    return b.len() >= 1 && b.len() <= 32 && name_chars(b, 0);
+}
+
+Bool name_chars(List(Int) b, Int i) {
+    if (i >= b.len()) { return true; }
+    Int c = b[i];
+    return ((c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c == 45 || c == 95) && name_chars(b, i + 1);
+}
+
+// ─── home serve ─────────────────────────────────────────────────
+
+// Each server runs under its own supervisor in a spawn region; a server
+// that stops is started again after a pause. People invited later get
+// their cosigner within ten seconds.
+@requires(filesystem, process, clock)
+pub Int home_serve(Str dir, Str self) {
+    Option(HomeCfg) oc = home_cfg(dir);
+    HomeCfg c = oc else { HomeCfg {.base = 0, .hosts = [], .bind = ""} };
+    if (c.hosts.len() == 0) { eprintln("home: not set up (home init)"); return 1; }
+    Str tls = " --tls " + dir + "/tls/server.pem " + dir + "/tls/server.key --bind " + c.bind;
+    List(Str) cmds = [
+        self + " home pair-serve " + dir,
+        self + " relay serve " + dir + f"/relay {c.base + 1}" + tls,
+        self + " witness serve " + dir + f"/w1 {c.base + 2} " + dir + "/w1.key 0" + tls,
+        self + " witness serve " + dir + f"/w2 {c.base + 3} " + dir + "/w2.key 0" + tls,
+        self + " witness serve " + dir + f"/w3 {c.base + 4} " + dir + "/w3.key 0" + tls
+    ];
+    println("home serving at " + c.hosts[0] + f" ports {c.base}-{c.base + 4}");
+    return run_all(dir, self, cmds, 0, []);
+}
+
+// Starts cmds[i..] concurrently, then watches for new people.
+@requires(filesystem, process, clock)
+Int run_all(Str dir, Str self, List(Str) cmds, Int i, List(Str) started) {
+    if (i >= cmds.len()) { return watch_people(dir, self, started); }
+    Result(Int, RegionError) r = spawn (process, clock) { return keep_running(cmds[i]); };
+    return run_all(dir, self, cmds, i + 1, started);
+}
+
+@requires(process, clock)
+Int keep_running(Str cmd) {
+    _ = process.run(cmd);
+    _ = clock_sleep_ms(5000);
+    return keep_running(cmd);
+}
+
+@requires(filesystem, process, clock)
+Int watch_people(Str dir, Str self, List(Str) started) {
+    List(Str) fresh = new_people(dir, filesystem.list_dir(dir + "/people"), started, 0, ListBuf());
+    if (fresh.len() == 0) {
+        _ = clock_sleep_ms(10000);
+        return watch_people(dir, self, started);
+    }
+    Str cmd = self + " cosigner serve " + dir + "/people/" + fresh[0] + "/cos";
+    Result(Int, RegionError) r = spawn (process, clock) { return keep_running(cmd); };
+    return watch_people(dir, self, started.concat([fresh[0]]));
+}
+
+@requires(filesystem)
+List(Str) new_people(Str dir, List(Str) all, List(Str) started, Int i, ListBuf(Str) acc) {
+    if (i >= all.len()) { return acc.finish(); }
+    Bool ready = filesystem.exists(dir + "/people/" + all[i] + "/cos/cosigner.cbor");
+    return new_people(dir, all, started, i + 1, if (ready && !started.contains(all[i])) { acc.push(all[i]) } else { acc });
+}
+
+// ─── Pairing ────────────────────────────────────────────────────
+
+pub Int home_batch() { return 50; }
+
+// `symbolon home pair-serve DIR` (run by `home serve`).
+@requires(network, filesystem, declassify, provision, clock(readonly), process)
+pub Int home_pair_serve(Str dir, Str self) {
+    Option(HomeCfg) oc = home_cfg(dir);
+    HomeCfg c = oc else { HomeCfg {.base = 0, .hosts = [], .bind = ""} };
+    Int lfd = http_listen_at(c.bind, c.base);
+    if (lfd < 0) { eprintln(f"home: cannot listen on {c.base}"); return 1; }
+    return pair_children(self + " home pair-child " + dir + f" {lfd}");
+}
+
+@requires(process)
+Int pair_children(Str cmd) {
+    Int rc = process.run(cmd);
+    if (rc != 0) { return 1; }
+    return pair_children(cmd);
+}
+
+// `symbolon home pair-child DIR FD` (run by `home pair-serve`).
+@requires(network, filesystem, declassify, provision, clock(readonly))
+pub Int home_pair_child(Str dir, Int lfd) {
+    Option(ServerKey) k = tls_key_load(dir + "/tls/server.key");
+    List(List(Int)) chain = tls_chain_load(dir + "/tls/server.pem");
+    return match k {
+        None => 2,
+        Some(key) => if (chain.len() == 0) { 2 } else {
+            if (tls_accept_loop(lfd, tls_cfg(key, chain, ["http/1.1"]), lambda(q) { pair_handle(dir, q) }, http_limits(), home_batch()) > 0) { 0 } else { 3 }
+        }
+    };
+}
+
+Str query_arg(Str q, Str key) { return query_at(str_split(q, "&"), key, 0); }
+
+Str query_at(List(Str) ps, Str key, Int i) {
+    if (i >= ps.len()) { return ""; }
+    List(Str) kv = str_split(ps[i], "=");
+    return if (kv.len() == 2 && kv[0] == key) { kv[1] } else { query_at(ps, key, i + 1) };
+}
+
+// The person an unexpired code is for, or "".
+@requires(filesystem, clock(readonly))
+Str invite_of(Str dir, Str code) {
+    if (str_len(code) != 22 || !b64url_chars(bytes_of(code), 0)) { return ""; }
+    List(Str) p = str_split(str_trim(filesystem.read_all(dir + "/invites/" + code)), " ");
+    if (p.len() != 2 || str_parse_int(p[1]) < clock_now_seconds()) { return ""; }
+    return p[0];
+}
+
+Bool b64url_chars(List(Int) b, Int i) {
+    if (i >= b.len()) { return true; }
+    Int c = b[i];
+    return ((c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c == 45 || c == 95) && b64url_chars(b, i + 1);
+}
+
+Str jstr(Str s) { return "\"" + str_replace(str_replace(str_replace(s, "\\", "\\\\"), "\"", "\\\""), "\n", "\\n") + "\""; }
+
+@requires(filesystem)
+Str witnesses_json(Str dir, Str host, Int base, Int i, StrBuf acc) {
+    if (i > 3) { return acc.finish(); }
+    Str w = jstr(host + f":{base + 1 + i}:" + str_trim(filesystem.read_all(dir + f"/w{i}.pub")));
+    return witnesses_json(dir, host, base, i + 1, if (i == 1) { acc.push(w) } else { acc.push(", ").push(w) });
+}
+
+@requires(filesystem, clock(readonly), provision)
+HttpReply pair_handle(Str dir, HttpRequest r) {
+    Str name = invite_of(dir, query_arg(r.query, "c"));
+    if (str_len(name) == 0) { return http_reply_text(403, "application/json", "{\"error\": \"this invite is not valid (used or expired)\"}"); }
+    Option(HomeCfg) oc = home_cfg(dir);
+    HomeCfg c = oc else { HomeCfg {.base = 0, .hosts = [], .bind = ""} };
+    Str pd = dir + "/people/" + name;
+    if (r.method == "GET" && r.path == "/setup") {
+        Str host = c.hosts[0];
+        return http_reply_text(200, "application/json", "{\"name\": " + jstr(name) + ", \"relay_host\": " + jstr(host) + f", \"relay_port\": {c.base + 1}"
+            + ", \"cosigner_keys\": " + jstr(str_trim(filesystem.read_all(pd + "/keys")))
+            + ", \"witnesses\": [" + witnesses_json(dir, host, c.base, 1, StrBuf()) + "]"
+            + ", \"ca\": " + jstr(filesystem.read_all(dir + "/tls/ca.pem")) + "}");
+    }
+    if (r.method == "POST" && r.path == "/pair") {
+        Str keys = str_trim(http_body_text(r));
+        if (cosignerd_pair(pd + "/cos", keys) != 0) { return http_reply_text(400, "application/json", "{\"error\": \"those are not device keys\"}"); }
+        _ = filesystem.write_all(dir + "/invites/" + query_arg(r.query, "c"), name + " 0");
+        return http_reply_text(200, "application/json", "{\"paired\": true}");
+    }
+    return http_reply_status(404);
+}
+
+Str http_body_text(HttpRequest r) { return http_text(r.body, 0, r.body.len()); }

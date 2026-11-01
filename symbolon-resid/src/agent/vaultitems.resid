@@ -1,0 +1,187 @@
+// Typed vault items from the command line (SPEC 18.2): cards, identities,
+// notes, bank accounts, Wi-Fi networks, secrets and logins, each a set of
+// named fields. `symbolon device vault set | show | delete`. The type is a
+// sealed field ("type"), so the relay, which sees every item's kind as
+// "password", does not learn what kinds of things the vault holds.
+
+import "../types.resid";
+import "../vault/vault.resid";
+import "../recipe/recipe.resid";
+import "state.resid";
+import "common.resid";
+import "device.resid";
+import "vaultcli.resid";
+import "rotatecli.resid";
+import "sharecli.resid";
+import "crypto.resid";
+import "cose.resid";
+
+pub Bool known_type(Str t) {
+    return t == "card" || t == "identity" || t == "note" || t == "bank" || t == "wifi" || t == "secret" || t == "login";
+}
+
+// What a type must have: a card its number, a login a site, a username
+// or a password (an imported login may have only some of them; rotation
+// needs the origin and the password, and says so), a secret its secret, a
+// note its text; the other types at least one field besides the name.
+pub Str missing_for(Str t, List(FieldPlain) fs) {
+    if (t == "card" && !has(fs, "number")) { return "a card needs its number"; }
+    if (t == "login" && !has(fs, "origin") && !has(fs, "current") && !has(fs, "username")) { return "a login needs a site, a username or a password"; }
+    if (t == "secret" && !has(fs, "secret")) { return "a secret needs its secret"; }
+    if (t == "note" && !has(fs, "text")) { return "a note needs its text"; }
+    if (fs.len() == 0) { return "an item needs at least one field"; }
+    return "";
+}
+
+Bool has(List(FieldPlain) fs, Str n) { return has_at(fs, n, 0); }
+Bool has_at(List(FieldPlain) fs, Str n, Int i) { return if (i >= fs.len()) { false } else { if (fs[i].name == n) { true } else { has_at(fs, n, i + 1) } }; }
+
+Int max_fields() { return 40; }
+Int max_value() { return 65536; }
+
+// A field name: 1-32 of a-z, 0-9 and _, not one the item sets itself.
+pub Bool field_name_ok(Str n) {
+    Int k = str_len(n);
+    if (k == 0 || k > 32 || n == "name" || n == "type") { return false; }
+    return name_chars(utf8(n), 0);
+}
+
+Bool name_chars(List(Int) b, Int i) {
+    if (i >= b.len()) { return true; }
+    Int c = b[i];
+    if (!((c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c == 95)) { return false; }
+    return name_chars(b, i + 1);
+}
+
+pub Bool hex_ok(Str s) { List(Int) b = utf8(s); return b.len() % 2 == 0 && hex_chars(b, 0); }
+
+Bool hex_chars(List(Int) b, Int i) {
+    if (i >= b.len()) { return true; }
+    Int c = b[i];
+    if (!((c >= 48 && c <= 57) || (c >= 97 && c <= 102) || (c >= 65 && c <= 70))) { return false; }
+    return hex_chars(b, i + 1);
+}
+
+// The "FIELD VALUE-HEX" lines from standard input, up to an empty line or
+// the end (one more than allowed at most, to tell that there were too many).
+List(Str) read_lines(ListBuf(Str) acc, Int n) {
+    Str l = str_trim(read_pin());
+    if (str_len(l) == 0 || n > max_fields()) { return acc.finish(); }
+    return read_lines(acc.push(l), n + 1);
+}
+
+// What is wrong with a field line, or "".
+Str line_problem(Str l) {
+    List(Str) p = str_split(l, " ");
+    if (p.len() != 2) { return "a field line is FIELD VALUE-HEX"; }
+    if (!field_name_ok(p[0])) { return "bad field name " + p[0]; }
+    if (!hex_ok(p[1])) { return "the value of " + p[0] + " is not hex"; }
+    if (str_len(p[1]) / 2 > max_value()) { return "the value of " + p[0] + " is too long"; }
+    return "";
+}
+
+Str lines_problem(List(Str) ls, Int i) {
+    if (i >= ls.len()) { return ""; }
+    Str m = line_problem(ls[i]);
+    return if (str_len(m) > 0) { m } else { lines_problem(ls, i + 1) };
+}
+
+// The fields of checked lines; an empty value leaves the field out.
+List(FieldPlain) fields_of(List(Str) ls, Int i, ListBuf(FieldPlain) acc) {
+    if (i >= ls.len()) { return acc.finish(); }
+    List(Str) p = str_split(ls[i], " ");
+    return fields_of(ls, i + 1, if (str_len(p[1]) == 0) { acc } else { acc.push(FieldPlain {.name = p[0], .value = secret_bytes(cose_hex_decode(p[1]))}) });
+}
+
+Result(List(FieldPlain), Str) read_fields() {
+    List(Str) ls = read_lines(ListBuf(), 0);
+    if (ls.len() > max_fields()) { return Err(f"at most {max_fields()} fields"); }
+    Str m = lines_problem(ls, 0);
+    if (str_len(m) > 0) { return Err(m); }
+    return Ok(fields_of(ls, 0, ListBuf()));
+}
+
+Bool dup_free(List(FieldPlain) fs, Int i) {
+    if (i >= fs.len()) { return true; }
+    if (has_at(fs, fs[i].name, i + 1)) { return false; }
+    return dup_free(fs, i + 1);
+}
+
+// `symbolon device vault set DIR NAME TYPE [--share ID]`: the PIN, then
+// the fields, on standard input. Replaces the item of that name (its
+// version goes up). With --share, in that shared folder (as for show and
+// delete).
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+pub Int vault_set(Str dir, Str name, Str t, Str share) {
+    if (str_len(name) == 0 || str_len(name) > 128) { return dfail("a name of 1-128 characters"); }
+    if (!known_type(t)) { return dfail("unknown type " + t + " (card, identity, note, bank, wifi, secret, login)"); }
+    Result(Opened, Str) ro = open_place(dir, share);
+    return match ro {
+        Err(m) => dfail(m),
+        Ok(o) => match read_fields() {
+            Err(m) => dfail(m),
+            Ok(fs) => set_checked(dir, o, name, t, fs)
+        }
+    };
+}
+
+@requires(filesystem, network, device, declassify, clock, environment)
+Int set_checked(Str dir, Opened o, Str name, Str t, List(FieldPlain) fs) {
+    if (!dup_free(fs, 0)) { return dfail("a field is given twice"); }
+    Str miss = missing_for(t, fs);
+    if (str_len(miss) > 0) { return dfail(miss); }
+    if (t == "login" && has(fs, "origin")) {
+        Str origin = field_text(fs, "origin");
+        if (origin_of(origin) != origin) { return dfail("the origin must be scheme://host[:port], as " + origin_of(origin)); }
+    }
+    List(FieldPlain) all = [FieldPlain {.name = "name", .value = secret_bytes(utf8(name))}, FieldPlain {.name = "type", .value = secret_bytes(utf8(t))}].concat(fs);
+    return seal_publish(dir, o, name, all);
+}
+
+// `symbolon device vault show DIR NAME`: the PIN on standard input; prints
+// "FIELD VALUE-HEX" for every field of the item, offline from this
+// device's copy.
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+pub Int vault_show(Str dir, Str name, Str share) {
+    Result(View, Str) rv = view_place(dir, share);
+    return match rv {
+        Err(m) => dfail(m),
+        Ok(v) => match item_by_id(v.st.items, item_id_of(v.vk, name), 0) {
+            None => dfail("no such item"),
+            Some(it) => show_item(v, it)
+        }
+    };
+}
+
+@requires(declassify)
+Int show_item(View v, Item it) {
+    Result(List(FieldPlain), SymbolonError) r = item_open(v.vk, v.vid, it);
+    return match r {
+        Err(e) => dfail(err_text(e)),
+        Ok(fs) => show_fields(fs, type_of(fs, it.fields.contains("secret")), 0)
+    };
+}
+
+@requires(declassify)
+Int show_fields(List(FieldPlain) fs, Str t, Int i) {
+    if (i == 0) { println("type " + hex_encode(utf8(t))); }
+    if (i >= fs.len()) { return 0; }
+    if (fs[i].name != "type") { println(fs[i].name + " " + hex_encode(reveal(fs[i].value))); }
+    return show_fields(fs, t, i + 1);
+}
+
+// `symbolon device vault delete DIR NAME`: the PIN on standard input.
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+pub Int vault_delete(Str dir, Str name, Str share) {
+    Result(Opened, Str) ro = open_place(dir, share);
+    return match ro {
+        Err(m) => dfail(m),
+        Ok(o) => delete_item(dir, o, item_id_of(o.p.vk, name))
+    };
+}
+
+@requires(filesystem, network, device, declassify, clock, environment)
+Int delete_item(Str dir, Opened o, List(Int) id) {
+    if (match item_by_id(o.st.items, id, 0) { None => true, Some(_) => false }) { return dfail("no such item"); }
+    return publish_items(dir, o, without_item(o.st.items, id, 0, ListBuf()));
+}

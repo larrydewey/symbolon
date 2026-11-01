@@ -1,0 +1,630 @@
+// The device agent (SPEC 9, 10): `symbolon device new | init | register |
+// sign | status`.
+//
+// Files in its directory: config.cbor (public configuration), blob_a and
+// blob_b (the two sealed profiles, src/duress/, which one is real is not
+// recorded), slot (the duress update slot), share.enc (the CGGMP21
+// configuration under the profile's DEK), log/ (the identity log as fetched
+// and verified).
+//
+// PINs are read from standard input, one per line (they are not echoed
+// back, and only ever used through pin_stretch). TPM mode keeps the DK and
+// the two unlock HMAC keys in the TPM (lib/dev/tpm.resid); --unprotected is
+// SPEC 9.1's unprotected-device profile, and `status` says so.
+
+import "../types.resid";
+import "../core/log.resid";
+import "../core/event.resid";
+import "../cosigner/cosigner.resid";
+import "../threshold/threshold.resid";
+import "../threshold/keygen.resid";
+import "../recovery/recovery.resid";
+import "../duress/duress.resid";
+import "../vault/vault.resid";
+import "../net/proto.resid";
+import "../net/services.resid";
+import "state.resid";
+import "common.resid";
+import "session.resid";
+import "cosignerd.resid";
+import "duresscli.resid";
+import "keystore.resid";
+import "cggmp_store.resid";
+import "dev/tpm.resid";
+import "dev/tpm_wire.resid";
+import "hpkeg.resid";
+import "word.resid";
+import "ecdsa.resid";
+import "crypto.resid";
+import "clock.resid";
+
+Int srk_handle() { return 0x81000110; }
+Int dk_handle() { return 0x81000111; }
+Int unlock_a_handle() { return 0x81000112; }
+Int unlock_b_handle() { return 0x81000113; }
+
+pub Endpoint relay_ep(DeviceConfig c) { return Endpoint {.host = c.relay_host, .port = c.relay_port, .ca = c.ca}; }
+
+pub Int dfail(Str m) { eprintln("device: " + m); return 1; }
+
+@requires(filesystem)
+pub Bool save_config(Str dir, DeviceConfig c) { return filesystem.write_bytes(dir + "/config.cbor", cbor_of_device(c)); }
+
+@requires(filesystem)
+pub Option(DeviceConfig) load_config(Str dir) { return device_of_cbor(get_file(dir + "/config.cbor")); }
+
+// A PIN line from standard input, without its newline; empty at EOF.
+pub Str read_pin() {
+    Str l = resid_read_line();
+    Int n = str_len(l);
+    return if (n > 0 && str_slice(l, n - 1, n) == "\n") { str_slice(l, 0, n - 1) } else { l };
+}
+
+pub List(Secret(UInt(8))) pin_bytes(Str p) { return secret_bytes(utf8(p)); }
+
+// ─── Profiles ───────────────────────────────────────────────────
+
+@requires(declassify)
+pub List(Secret(UInt(8))) stretch(DeviceConfig c, List(Secret(UInt(8))) pin) { return pin_stretch(pin, c.salt, c.argon_m_kib, c.argon_t); }
+
+// The unlock key a PIN gives on this device, or [] when the TPM refuses it.
+// TPM mode tries the two unlock keys in a random order, so a wrong-key try
+// (counted by the lockout) does not tell which PIN was entered.
+@requires(device, declassify, provision, network, environment)
+pub List(Secret(UInt(8))) unlock_key_for(DeviceConfig c, List(Secret(UInt(8))) st, Bool a_first) {
+    if (c.unprotected) { return unlock_key(st, c.salt); }
+    if (on_keystore(c)) { return ks_unlock_key(c, if (a_first) { "unlock_a" } else { "unlock_b" }, st); }
+    Int first = if (a_first) { c.tpm_unlock_a } else { c.tpm_unlock_b };
+    Int second = if (a_first) { c.tpm_unlock_b } else { c.tpm_unlock_a };
+    List(UInt(8)) salt = u8s(c.salt);
+    Result(List(Secret(UInt(8))), TpmError) h1 = tpm_hmac(first, st, salt);
+    return match h1 {
+        Ok(h) => unlock_key(provisioned_key(h, "the TPM's HMAC of the stretched PIN under a TPM-held unlock key"), c.salt),
+        Err(_) => match tpm_hmac(second, st, salt) { Ok(h) => unlock_key(provisioned_key(h, "the TPM's HMAC of the stretched PIN under a TPM-held unlock key"), c.salt), Err(_) => [] }
+    };
+}
+
+pub List(UInt(8)) u8s(List(Int) b) { return u8s_at(b, 0, ListBuf()); }
+List(UInt(8)) u8s_at(List(Int) b, Int i, ListBuf(UInt(8)) acc) {
+    if (i >= b.len()) { return acc.finish(); }
+    return u8s_at(b, i + 1, acc.push((UInt(8))(b[i] & 255)));
+}
+
+@requires(filesystem, device, declassify, provision, network, environment)
+pub Unlocked unlock_dir(Str dir, DeviceConfig c, Str pin) {
+    List(Secret(UInt(8))) st = stretch(c, pin_bytes(pin));
+    Bool a_first = (random_bytes(1)[0] & 1) == 0;
+    // The Keystore refuses no PIN (it has no auth value): an unlock key
+    // that opens neither profile is the other key's, or a wrong PIN.
+    if (on_keystore(c)) { return with_stretched(ks_unlock_either(dir, c, st, a_first), st); }
+    List(Secret(UInt(8))) k = unlock_key_for(c, st, a_first);
+    if (k.len() == 0) { return Unlocked {.kind = 0, .real = RealProfile {.share = [], .cc = [], .vault_key = [], .dek = [], .duress_hpke_pub = []},
+                                         .duress = DuressFull {.share = [], .subkey = [], .vault_key = [], .hpke_priv = [], .tweaks = []}, .st = []}; }
+    return with_stretched(unlock(k, get_file(dir + "/blob_a"), get_file(dir + "/blob_b")), st);
+}
+
+@requires(declassify, provision, network, environment, device, filesystem)
+Unlocked ks_unlock_either(Str dir, DeviceConfig c, List(Secret(UInt(8))) st, Bool a_first) {
+    Unlocked u = unlock(unlock_key_for(c, st, a_first), get_file(dir + "/blob_a"), get_file(dir + "/blob_b"));
+    return if (u.kind != 0) { u } else { unlock(unlock_key_for(c, st, !a_first), get_file(dir + "/blob_a"), get_file(dir + "/blob_b")) };
+}
+
+// The DK's signature over `msg` (ECDSA P-256, SHA-256): the TPM key under
+// its PIN policy, the Keystore key, or the unprotected profile's software key.
+@requires(device, declassify, network, environment)
+pub Result(List(Int), Str) dk_sign(DeviceConfig c, RealProfile p, List(Secret(UInt(8))) st, List(Int) msg) {
+    if (c.unprotected) { return Ok(sw_sign(software_key(p.dek, "symbolon v1 software dk"), msg)); }
+    if (on_keystore(c)) { return ks_sign(c, msg); }
+    return match tpm_sign_policy(c.tpm_dk, st, u8s(sha256_bytes(msg))) { Ok(s) => Ok(ints(s)), Err(e) => Err(tpm_error_text(e)) };
+}
+
+// ─── `device new` ───────────────────────────────────────────────
+
+// `symbolon device new DIR RELAY_HOST RELAY_PORT [--unprotected | --keystore] [--fast-kdf]`
+// Reads the PIN and a duress PIN (an empty line: none) from standard input;
+// makes the device's keys and its two sealed profiles; prints its public
+// keys (PartyKeys, CBOR hex) for the cosigner's operator to pair.
+@requires(filesystem, device, declassify, provision, network, environment)
+pub Int device_new(Str dir, Str host, Int port, Bool unprotected, Bool keystore, Bool fast, Str ca) {
+    if (filesystem.exists(dir + "/config.cbor")) { return dfail("already set up"); }
+    _ = filesystem.create_dir(dir + "/log");
+    Str pin = read_pin();
+    Str dpin = read_pin();
+    if (str_len(pin) < 4) { return dfail("a PIN of at least 4 characters"); }
+    if (dpin == pin) { return dfail("the duress PIN must differ from the PIN"); }
+    List(Int) salt = random_bytes(16);
+    List(Secret(UInt(8))) dek = random_secret(32);
+    Int m = if (fast) { 64 } else { argon_m_kib() };
+    Int t = if (fast) { 1 } else { argon_t() };
+    DeviceConfig c0 = DeviceConfig {.relay_host = host, .relay_port = port, .ca = ca, .witnesses = [], .unprotected = unprotected, .argon_m_kib = m, .argon_t = t,
+        .salt = salt, .tpm_dk = if (keystore && !unprotected) { keystore_profile() } else { dk_handle() }, .tpm_unlock_a = unlock_a_handle(), .tpm_unlock_b = unlock_b_handle(),
+        .party = [], .dk_pub = [], .hpke_pub = device_hpke(dek).pk, .log_id = [], .mbox_next = 0, .peers = []};
+    List(Secret(UInt(8))) st = stretch(c0, pin_bytes(pin));
+    List(Secret(UInt(8))) dst = if (str_len(dpin) > 0) { stretch(c0, pin_bytes(dpin)) } else { random_secret(32) };
+    Result(List(Int), Str) dk = make_dk(c0, dek, st);
+    return match dk {
+        Err(e) => dfail(e),
+        Ok(pub) => finish_new(dir, c0, pub, dek, st, dst, str_len(dpin) > 0)
+    };
+}
+
+@requires(device, declassify, network, environment)
+Result(List(Int), Str) make_dk(DeviceConfig c, List(Secret(UInt(8))) dek, List(Secret(UInt(8))) st) {
+    if (c.unprotected) { return Ok(sw_public(software_key(dek, "symbolon v1 software dk"))); }
+    if (on_keystore(c)) { return ks_make_dk(c); }
+    _ = tpm_srk_setup(srk_handle());
+    Result(TpmBlob, TpmError) b = tpm_create(srk_handle(), tpm_policy_signing_template(tpm_policy_auth_value_digest()), st);
+    return match b {
+        Err(e) => Err("TPM: " + tpm_error_text(e)),
+        Ok(blob) => match tpm_persist(srk_handle(), blob, c.tpm_dk) {
+            Err(e) => Err("TPM: " + tpm_error_text(e)),
+            Ok(_) => Ok(public_point(blob.public_area))
+        }
+    };
+}
+
+List(Int) public_point(List(UInt(8)) pa) {
+    return match tpm_public_parse(pa) { Ok(k) => [4].concat(ints(k.ecc_x)).concat(ints(k.ecc_y)), Err(_) => [] };
+}
+
+@requires(device, declassify)
+Bool make_unlock_key(Int handle, List(Secret(UInt(8))) auth) {
+    return match tpm_create(srk_handle(), tpm_hmac_key_template(), auth) {
+        Err(_) => false,
+        Ok(b) => match tpm_persist(srk_handle(), b, handle) { Ok(_) => true, Err(_) => false }
+    };
+}
+
+@requires(filesystem, device, declassify, provision, network, environment)
+Int finish_new(Str dir, DeviceConfig c0, List(Int) dk_pub, List(Secret(UInt(8))) dek, List(Secret(UInt(8))) st, List(Secret(UInt(8))) dst, Bool has_duress) {
+    if (dk_pub.len() != 65) { return dfail("no device key"); }
+    if (on_keystore(c0) && (!ks_make_hmac(c0, "unlock_a") || !ks_make_hmac(c0, "unlock_b"))) { return dfail("Keystore: cannot make the unlock keys"); }
+    if (!c0.unprotected && !on_keystore(c0) && (!make_unlock_key(c0.tpm_unlock_a, st) || !make_unlock_key(c0.tpm_unlock_b, dst))) { return dfail("TPM: cannot make the unlock keys"); }
+    DeviceConfig c = with_identity(c0, dk_pub);
+    List(Secret(UInt(8))) ka = unlock_key_for(c, st, true);
+    List(Secret(UInt(8))) kb = if (c.unprotected) { unlock_key(dst, c.salt) } else { unlock_key_for(c, dst, false) };
+    HpkeKeyPairG(Secret(UInt(8))) dh = hpkeg_derive_keypair(16, random_secret(32));
+    RealProfile real = RealProfile {.share = random_secret(32), .cc = random_secret(32), .vault_key = random_secret(32), .dek = dek,
+                                    .duress_hpke_pub = if (has_duress) { dh.pk } else { [] }};
+    // The duress profile's 32-byte share field holds the device's HPKE key
+    // material: under duress the device speaks as itself.
+    DuressFull dur = DuressFull {.share = hk(dek, "symbolon v1 device hpke", 32), .subkey = random_secret(32), .vault_key = random_secret(32), .hpke_priv = dh.sk, .tweaks = []};
+    List(Secret(UInt(8))) rp = encode_real(real) else { [] };
+    List(Secret(UInt(8))) dp = encode_duress(dur) else { [] };
+    List(Int) blob_real = seal_blob(ka, random_bytes(12), rp);
+    List(Int) blob_dur = if (has_duress) { seal_blob(kb, random_bytes(12), dp) } else { decoy_blob(random_bytes(blob_len())) };
+    List(Int) slot = if (has_duress) { seal_slot(dh.pk, 0, dur, random_secret(32)) else { [] } } else { decoy_slot(random_bytes(slot_len())) };
+    // Which file holds the real profile is random and not recorded.
+    Bool real_first = (random_bytes(1)[0] & 1) == 0;
+    // The duress sub-key's public key; a device without a duress PIN has one
+    // too, for a key no one holds.
+    List(Int) dpub = sw_public(if (has_duress) { dur.subkey } else { random_secret(32) });
+    Bool ok = filesystem.write_bytes(dir + "/duress.pub", dpub) && filesystem.write_bytes(dir + "/blob_a", if (real_first) { blob_real } else { blob_dur })
+           && filesystem.write_bytes(dir + "/blob_b", if (real_first) { blob_dur } else { blob_real })
+           && filesystem.write_bytes(dir + "/slot", slot) && save_config(dir, c);
+    if (!ok) { return dfail("cannot write the profile"); }
+    println(hex_encode(cbor_of_keys(PartyKeys {.party = c.party, .auth_key = c.dk_pub, .hpke_key = c.hpke_pub})));
+    return 0;
+}
+
+DeviceConfig with_identity(DeviceConfig c, List(Int) dk_pub) {
+    return DeviceConfig {.relay_host = c.relay_host, .relay_port = c.relay_port, .ca = c.ca, .witnesses = c.witnesses, .unprotected = c.unprotected,
+        .argon_m_kib = c.argon_m_kib, .argon_t = c.argon_t, .salt = c.salt, .tpm_dk = c.tpm_dk, .tpm_unlock_a = c.tpm_unlock_a, .tpm_unlock_b = c.tpm_unlock_b,
+        .party = party_of_key(dk_pub), .dk_pub = dk_pub, .hpke_pub = c.hpke_pub, .log_id = c.log_id, .mbox_next = c.mbox_next, .peers = c.peers};
+}
+
+pub DeviceConfig with_log(DeviceConfig c, List(WitnessEp) ws, List(Int) l, Int next, List(PartyKeys) peers) {
+    return DeviceConfig {.relay_host = c.relay_host, .relay_port = c.relay_port, .ca = c.ca, .witnesses = ws, .unprotected = c.unprotected,
+        .argon_m_kib = c.argon_m_kib, .argon_t = c.argon_t, .salt = c.salt, .tpm_dk = c.tpm_dk, .tpm_unlock_a = c.tpm_unlock_a, .tpm_unlock_b = c.tpm_unlock_b,
+        .party = c.party, .dk_pub = c.dk_pub, .hpke_pub = c.hpke_pub, .log_id = l, .mbox_next = next, .peers = peers};
+}
+
+// ─── The CGGMP configuration under the DEK ──────────────────────
+
+List(Int) share_aad() { return utf8("symbolon v1 share"); }
+
+@requires(filesystem, declassify)
+pub Bool store_share(Str dir, List(Secret(UInt(8))) dek, CgConfig cfg) {
+    List(Int) iv = random_bytes(12);
+    List(Secret(UInt(8))) ct = aes_gcmg_seal(dek, iv, secret_bytes(cg_cfg_encode(cfg)), share_aad());
+    return put_secret_file(dir + "/share.enc", iv.concat(reveal(ct)));
+}
+
+@requires(filesystem, declassify)
+pub Option(CgConfig) load_share(Str dir, List(Secret(UInt(8))) dek) {
+    List(Int) b = get_file(dir + "/share.enc");
+    if (b.len() < 28) { return None; }
+    Option(List(Secret(UInt(8)))) pt = aes_gcmg_decrypt(dek, b[0..12], b[12..b.len()], share_aad());
+    return match pt { None => None, Some(p) => cg_cfg_decode(reveal(p)) };
+}
+
+// ─── `device init`: inception (SPEC 10.1, 10.6) ─────────────────
+
+pub type InitArgs = {
+    Str cosigner_keys;                   // the cosigner's PartyKeys, CBOR hex
+    List(WitnessEp) witnesses;
+    Str device_primes; Str kit_primes;   // files with "P Q" hex (tests), or ""
+};
+
+// `symbolon device init DIR COSIGNER_KEYS W1 W2 W3 [DEVICE_PRIMES KIT_PRIMES]`,
+// each W as host:port:pubkeyhex. Reads the PIN from standard input. The
+// device plays the kit too (decision of 2026-10-29); it prints the kit's
+// seed, which the principal writes down, and erases it.
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+pub Int device_init(Str dir, InitArgs a) {
+    Option(DeviceConfig) oc = load_config(dir);
+    Option(PartyKeys) ok = keys_of_cbor(cose_hex_decode(a.cosigner_keys));
+    if (a.witnesses.len() < 3) { return dfail("three witnesses at least (SPEC 20.3)"); }
+    return match oc {
+        None => dfail("run `symbolon device new` first"),
+        Some(c) => match ok {
+            None => dfail("those are not the cosigner's keys"),
+            Some(cos) => if (c.log_id.len() > 0) { dfail("already in a log") } else { init_unlocked(dir, c, cos, a, read_pin()) }
+        }
+    };
+}
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+Int init_unlocked(Str dir, DeviceConfig c, PartyKeys cos, InitArgs a, Str pin) {
+    Unlocked u = unlock_dir(dir, c, pin);
+    if (u.kind != 1) { return dfail("wrong PIN"); }
+    List(Int) seed = random_bytes(32);
+    KitKeys kit = kit_keys(seed) else { KitKeys {.sign_priv = [], .sign_pub = [], .hpke_priv = [], .hpke_pub = []} };
+    PartyKeys me = PartyKeys {.party = c.party, .auth_key = c.dk_pub, .hpke_key = c.hpke_pub};
+    PartyKeys kp = PartyKeys {.party = recovery_key_digest(kit.sign_pub), .auth_key = kit.sign_pub, .hpke_key = kit.hpke_pub};
+    List(PartyKeys) parties = [me, kp, cos];
+    List(Int) sid = random_bytes(32);
+    Local dev = Local {.party = me.party, .cg = 1, .hpke_sk = device_hpke(u.real.dek).sk};
+    Local kitl = Local {.party = kp.party, .cg = 2, .hpke_sk = secret_bytes(kit.hpke_priv)};
+    Remote cr = Remote {.party = cos.party, .cg = 3, .hpke_pub = cos.hpke_key};
+    Endpoint relay = relay_ep(c);
+    Int start = mailbox_end(relay, me.party, c.mbox_next);
+    if (!send_to(relay, dev, cr, WKeygen(KeygenInvite {.session_id = sid, .parties = parties, .threshold = 1}))) { return dfail("cannot reach the relay"); }
+    println("device: key generation with the cosigner (Paillier keys: this can take minutes)...");
+    Result(KgStep, CgFail) s1 = kg_begin(kg_ctx(1, [1, 2, 3], 1, [], sid, random_bytes(32), primes_of(a.device_primes)));
+    Result(KgStep, CgFail) s2 = kg_begin(kg_ctx(2, [1, 2, 3], 1, [], sid, random_bytes(32), primes_of(a.kit_primes)));
+    return match s1 {
+        Err(e) => dfail("keygen: " + e.why),
+        Ok(k1) => match s2 {
+            Err(e) => dfail("keygen: " + e.why),
+            Ok(k2) => after_keygen(dir, c, u, kit, parties, cr, a,
+                run_session(relay, sid, [Seat {.me = dev, .st = k1.state, .round = 1, .out = k1.out, .done = false},
+                                         Seat {.me = kitl, .st = k2.state, .round = 1, .out = k2.out, .done = false}],
+                            [cr], [Cursor {.party = me.party, .next = start}, Cursor {.party = kp.party, .next = 0}], [],
+                            lambda(st, msgs) { kg_adapt(st, msgs) }, 1800), pin, seed)
+        }
+    };
+}
+
+Party party_from(PartyKeys k, UInt(8) kind, Str label) {
+    return Party {.id = k.party, .kind = kind, .auth_key = k.auth_key, .hpke_key = k.hpke_key, .label = label, .attestation = NoAttestation};
+}
+
+List(WitnessRef) witness_refs(List(WitnessEp) ws, Int i, List(WitnessRef) acc) {
+    if (i >= ws.len()) { return acc; }
+    return witness_refs(ws, i + 1, acc.concat([WitnessRef {.url = "http://" + ws[i].host + ":" + f"{ws[i].port}", .key = ws[i].key}]));
+}
+
+@requires(filesystem, network, device, declassify, clock, environment)
+Int after_keygen(Str dir, DeviceConfig c, Unlocked u, KitKeys kit, List(PartyKeys) parties, Remote cr, InitArgs a, Run(KgState) r, Str pin, List(Int) seed) {
+    if (str_len(r.fail) > 0) { return dfail("keygen: " + r.fail); }
+    CgConfig none = CgConfig {.id = 0, .threshold = 0, .ecdsa = [], .elgamal = [], .p = [], .q = [], .rid = [], .chain_key = [], .public = []};
+    CgConfig mine = kg_result(r.seats[0].st) else { none };
+    CgConfig kitc = kg_result(r.seats[1].st) else { none };
+    List(Int) x = cfg_root_pubkey(mine, [1, 2, 3]);
+    if (x.len() != 65) { return dfail("keygen gave no key"); }
+    Quorum q = Quorum {.parties = [party_from(parties[0], party_kind_device(), "this device"), party_from(parties[1], party_kind_kit(), "recovery kit"),
+                                   party_from(parties[2], party_kind_cosigner(), "cosigner")],
+                       .t = 2, .root_pubkey = x, .epoch = 1, .transcript_digest = sha256_bytes(utf8("cmp/keygen"))};
+    Policy pol = Policy {.device_sigs_for_authority = 1, .recovery_delay_sec = 259200, .guardians = [], .guardian_threshold = 0,
+                         .witnesses = witness_refs(a.witnesses, 0, []), .duress_window_sec = 3600, .cosigner_policy = CosignerLimit(60)};
+    EventPayload e0 = EventPayload {.log_id = None, .sequence = 0, .predecessor_digest = None, .suite = 1, .body = InceptionBody(q, pol),
+                                    .next_recovery_key_digests = [recovery_key_digest(kit.sign_pub)], .advisory_time = (UInt(64))clock_now_seconds()};
+    List(Int) enc = payload_cbor(e0) else { [] };
+    if (enc.len() == 0) { return dfail("inception does not encode"); }
+    return sign_inception_event(dir, c, u, kit, parties, cr, a, mine, kitc, q, e0, enc, pin, seed);
+}
+
+@requires(filesystem, network, device, declassify, clock, environment)
+Int sign_inception_event(Str dir, DeviceConfig c, Unlocked u, KitKeys kit, List(PartyKeys) parties, Remote cr, InitArgs a,
+                         CgConfig mine, CgConfig kitc, Quorum q, EventPayload e0, List(Int) enc, Str pin, List(Int) seed) {
+    Endpoint relay = relay_ep(c);
+    Local dev = Local {.party = c.party, .cg = 1, .hpke_sk = device_hpke(u.real.dek).sk};
+    Int start = mailbox_end(relay, c.party, c.mbox_next);
+    if (!send_to(relay, dev, cr, WSignEvent(enc))) { return dfail("cannot reach the relay"); }
+    List(Int) csig = wait_event_sig(relay, dev, cr, Cursor {.party = c.party, .next = start}, clock_now_seconds());
+    if (csig.len() != 64) { return dfail("the cosigner did not sign the inception"); }
+    Result(List(Int), Str) dsig = dk_sign(c, u.real, u.st, enc);
+    List(Int) mysig = match dsig { Ok(s) => s, Err(_) => [] };
+    if (mysig.len() != 64) { return dfail("the device key did not sign"); }
+    List(Int) l = sha256_bytes(enc);
+    List(EventSig) sigs = [EventSig {.signer = c.party, .sig = mysig}, EventSig {.signer = parties[1].party, .sig = ecdsa_sign_raw(P256, Sha256, kit.sign_priv, enc)},
+                           EventSig {.signer = cr.party, .sig = csig}];
+    List(WitnessCosignature) cs = cosigs(a.witnesses, c.ca, l, 0, []);
+    SignedEvent se = SignedEvent {.payload = e0, .encoded = enc, .sigs = sigs, .cosigs = cs};
+    Result(VerifiedHead, SymbolonError) v = il_verify(l, [se], last_time([se], policy_of_e0([se])), lambda(p) { false });
+    return match v {
+        Err(e) => dfail("the inception does not verify: " + err_text(e)),
+        Ok(vh) => publish(dir, c, u, kit, parties, cr, a, mine, kitc, StoredEvent {.encoded = enc, .sigs = sigs, .cosigs = cs}, l, seed)
+    };
+}
+
+@requires(network, clock(readonly), declassify)
+List(WitnessCosignature) cosigs(List(WitnessEp) ws, Str ca, List(Int) l, Int i, List(WitnessCosignature) acc) { return cosigs_for(ws, ca, l, 0, l, i, acc); }
+
+// Every witness's co-signature on (l, seq, d) that verifies.
+@requires(network, clock(readonly), declassify)
+pub List(WitnessCosignature) cosigs_for(List(WitnessEp) ws, Str ca, List(Int) l, UInt(64) seq, List(Int) d, Int i, List(WitnessCosignature) acc) {
+    if (i >= ws.len()) { return acc; }
+    Option(WitnessCosignature) c = cosign_from(Endpoint {.host = ws[i].host, .port = ws[i].port, .ca = ca}, ws[i].key, l, seq, d);
+    return cosigs_for(ws, ca, l, seq, d, i + 1, match c { Some(x) => acc.concat([x]), None => acc });
+}
+
+@requires(network, declassify, clock)
+pub List(Int) wait_event_sig(Endpoint relay, Local me, Remote from, Cursor cur, Int since) {
+    Drained d = drain(relay, me, [from], cur, ListBuf());
+    List(Int) s = first_event_sig(d.got, from.party, 0);
+    if (s.len() > 0) { return s; }
+    if (clock_now_seconds() - since > 120) { return []; }
+    _ = clock_sleep_ms(200);
+    return wait_event_sig(relay, me, from, d.cur, since);
+}
+
+List(Int) first_event_sig(List(Got) gs, List(Int) from, Int i) {
+    if (i >= gs.len()) { return []; }
+    Packet w = gs[i].w;
+    List(Int) s = match w { WEventSig(x) => if (bytes_eq(gs[i].from, from)) { x } else { [] }, _ => [] };
+    return if (s.len() > 0) { s } else { first_event_sig(gs, from, i + 1) };
+}
+
+pub Str err_text(SymbolonError e) {
+    return match e {
+        ErrInvalidLog(s) => "log: " + s, ErrInvalidSignature(s) => "signature: " + s, ErrQuorumNotMet(h, n) => f"quorum {h}/{n}",
+        ErrStaleEpoch(h, c) => f"epoch {h}/{c}", ErrVaultIntegrity(s) => s, ErrPolicyViolation(s) => s, ErrDuressContainment(s) => s,
+        ErrRecoveryFailed(s) => s, ErrRotationFailed(s) => s, ErrAttestationFailed(s) => s, ErrCapabilityDenied(s) => s,
+        ErrNetwork(s) => s, ErrStorage(s) => s, ErrHardware(s) => s, ErrInternal(s) => s
+    };
+}
+
+// Publishes the log, wraps the kit's halves (SPEC 10.6), stores the share,
+// and prints the kit's seed.
+@requires(filesystem, network, device, declassify, clock)
+Int publish(Str dir, DeviceConfig c, Unlocked u, KitKeys kit, List(PartyKeys) parties, Remote cr, InitArgs a,
+            CgConfig mine, CgConfig kitc, StoredEvent se, List(Int) l, List(Int) seed) {
+    Endpoint relay = relay_ep(c);
+    if (!log_put(relay, l, 0, cbor_of_event(se))) { return dfail("the relay refused the inception"); }
+    List(Int) kk = random_bytes(32);
+    KitHalves halves = kit_split(kitc.ecdsa, kk, random_bytes(32), random_bytes(32));
+    Wrapped wa = offline_wrap(kit.hpke_pub, l, 1, parties[1].party, half_bytes(halves.a, halves.ka), random_bytes(32)) else { Wrapped {.enc = [], .ct = []} };
+    Wrapped wb = offline_wrap(cr.hpke_pub, l, 1, cr.party, half_bytes(halves.b, halves.kb), random_bytes(32)) else { Wrapped {.enc = [], .ct = []} };
+    List(Int) secrets = kit_secrets_seal(secret_bytes(kk), l, 1, u.real.cc, u.real.vault_key);
+    Local dev = Local {.party = c.party, .cg = 1, .hpke_sk = device_hpke(u.real.dek).sk};
+    Bool ok = blob_put(relay, "kit-" + hex_encode(l) + "-a", cbor_of_blob(WrappedBlob {.enc = wa.enc, .ct = wa.ct}))
+           && blob_put(relay, "kit-" + hex_encode(l) + "-secrets", secrets)
+           && send_to(relay, dev, cr, WKitHalf(WrappedBlob {.enc = wb.enc, .ct = wb.ct}))
+           && store_share(dir, u.real.dek, mine) && store_dshare(dir, u.real, mine)
+           && send_duress_key(dir, relay, dev, cr)
+           && filesystem.write_bytes(dir + "/log/0", cbor_of_event(se))
+           && save_config(dir, with_log(c, a.witnesses, l, mailbox_end(relay, c.party, c.mbox_next), parties));
+    if (!ok) { return dfail("cannot store the result"); }
+    println("log " + hex_encode(l));
+    println("root key " + hex_encode(cfg_root_pubkey(mine, [1, 2, 3])));
+    println("RECOVERY KIT (write it down; it is shown once): " + hex_encode(seed));
+    return 0;
+}
+
+// ─── `device register` and `device sign` (SPEC 10.3, 10.4) ──────
+
+// `--duress` puts the credential in the duress subset (SPEC 14.2).
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+pub Int device_register(Str dir, Str rp, Bool in_subset) {
+    Option(DeviceConfig) oc = load_config(dir);
+    return match oc {
+        None => dfail("not set up"),
+        Some(c) => register_with(dir, c, rp, unlock_dir(dir, c, read_pin()), in_subset)
+    };
+}
+
+@requires(filesystem, network, device, declassify, clock)
+Int register_with(Str dir, DeviceConfig c, Str rp, Unlocked u, Bool in_subset) {
+    if (u.kind != 1) { return dfail("wrong PIN"); }
+    Result(VerifiedHead, SymbolonError) v = verified_log(relay_ep(c), c.log_id);
+    return match v {
+        Err(e) => dfail(err_text(e)),
+        Ok(vh) => print_credential(dir, u, rp, vh.head.quorum.root_pubkey, random_bytes(16), in_subset)
+    };
+}
+
+@requires(filesystem, declassify)
+pub Int print_credential(Str dir, Unlocked u, Str rp, List(Int) x, List(Int) nonce, Bool in_subset) {
+    List(Int) cid = credential_id(u.real.cc, rp, nonce);
+    List(UInt(64)) tau = tweak_scalar(u.real.cc, rp, nonce);
+    if (!update_duress(dir, u.real, cid, bn_to_be(tau, 32), in_subset)) { return dfail("cannot update the duress profile"); }
+    println("credential-id " + hex_encode(cid));
+    println("public-key " + hex_encode(credential_pubkey(x, tau)));
+    return 0;
+}
+
+// `symbolon device sign DIR RP CREDENTIAL_ID MESSAGE`: MESSAGE is m =
+// SHA-256(authenticatorData || clientDataHash), hex. Prints r || s.
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+pub Int device_sign(Str dir, Str rp, Str cid_hex, Str m_hex) {
+    Option(DeviceConfig) oc = load_config(dir);
+    List(Int) m = cose_hex_decode(m_hex);
+    if (m.len() != 32) { return dfail("the message is 32 bytes"); }
+    return match oc {
+        None => dfail("not set up"),
+        Some(c) => sign_with(dir, c, rp, cose_hex_decode(cid_hex), m, read_pin())
+    };
+}
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+Int sign_with(Str dir, DeviceConfig c, Str rp, List(Int) cid, List(Int) m, Str pin) {
+    Unlocked u = unlock_dir(dir, c, pin);
+    if (u.kind == 2) { return duress_sign(dir, c, u, cid, m); }
+    if (u.kind != 1) { return dfail("wrong PIN"); }
+    Option(List(Int)) nonce = credential_nonce(u.real.cc, rp, cid);
+    Option(CgConfig) cg = load_share(dir, u.real.dek);
+    Result(VerifiedHead, SymbolonError) v = verified_log(relay_ep(c), c.log_id);
+    return match nonce {
+        None => dfail("that credential ID is not for this relying party (A-12)"),
+        Some(n) => match cg {
+            None => dfail("no share"),
+            Some(x) => match v {
+                Err(e) => dfail(err_text(e)),
+                Ok(vh) => run_sign(dir, c, u, x, vh, tweak_scalar(u.real.cc, rp, n), m, pin)
+            }
+        }
+    };
+}
+
+// Under the duress PIN (SPEC 14.2): the duress profile's configuration,
+// the subset's tweak for this credential (none outside the subset: the
+// duress profile has no chain code), and a request signed by the duress
+// sub-key, which the cosigner recognizes. The output is the same as a
+// normal signature's, and a credential outside the subset fails as a
+// credential presented to another relying party does.
+@requires(filesystem, network, device, declassify, clock, provision)
+Int duress_sign(Str dir, DeviceConfig c, Unlocked u, List(Int) cid, List(Int) m) {
+    Option(List(Secret(UInt(8)))) tau = subset_tweak(DuressFull {.share = u.duress.share, .subkey = u.duress.subkey, .vault_key = u.duress.vault_key,
+                                                                .hpke_priv = u.duress.hpke_priv, .tweaks = duress_tweaks(dir, u.duress)}, cid, 0);
+    Option(CgConfig) cg = load_dshare(dir, u.duress.hpke_priv);
+    Result(VerifiedHead, SymbolonError) v = verified_log(relay_ep(c), c.log_id);
+    return match tau {
+        None => dfail("that credential ID is not for this relying party (A-12)"),
+        Some(t) => match cg {
+            None => dfail("no share"),
+            Some(x) => match v {
+                Err(e) => dfail(err_text(e)),
+                Ok(vh) => run_sign_as(dir, c, u.duress.share, u.duress.subkey, x, vh, bn_from_be(reveal(t)), m)
+            }
+        }
+    };
+}
+
+// A signing session whose request is signed by the software key `rkey`
+// and whose envelopes use the HPKE key derived for this device (the duress
+// profile shares the device's identity; only the request key differs).
+@requires(filesystem, network, declassify, clock)
+Int run_sign_as(Str dir, DeviceConfig c, List(Secret(UInt(8))) hpke_ikm, List(Secret(UInt(8))) rkey, CgConfig x, VerifiedHead vh, List(UInt(64)) tau, List(Int) m) {
+    List(Int) sid = random_bytes(32);
+    List(Int) rsig = sw_sign(rkey, request_tbs(sid, m, vh.head.quorum.epoch, c.party, request_sign()));
+    return run_sign_core(dir, c, hpkeg_derive_keypair(16, hpke_ikm).sk, x, vh, tau, m, sid, rsig);
+}
+
+pub Option(Party) cosigner_of(List(Party) ps, Int i) {
+    if (i >= ps.len()) { return None; }
+    if (ps[i].kind == party_kind_cosigner()) { return Some(ps[i]); }
+    return cosigner_of(ps, i + 1);
+}
+
+@requires(filesystem, network, device, declassify, clock, environment)
+Int run_sign(Str dir, DeviceConfig c, Unlocked u, CgConfig x, VerifiedHead vh, List(UInt(64)) tau, List(Int) m, Str pin) {
+    Quorum q = vh.head.quorum;
+    Option(Party) ocos = cosigner_of(q.parties, 0);
+    Party cos = ocos else { Party {.id = [], .kind = 0, .auth_key = [], .hpke_key = [], .label = "", .attestation = NoAttestation} };
+    if (cos.id.len() == 0) { return dfail("no cosigner in the quorum"); }
+    List(Int) sid = random_bytes(32);
+    List(List(Int)) signers = [c.party, cos.id];
+    Result(List(Int), Str) rs = dk_sign(c, u.real, u.st, request_tbs(sid, m, q.epoch, c.party, request_sign()));
+    List(Int) rsig = match rs { Ok(s) => s, Err(_) => [] };
+    return run_sign_core(dir, c, device_hpke(u.real.dek).sk, x, vh, tau, m, sid, rsig);
+}
+
+// The session itself, given the HPKE key the device's envelopes use and
+// the request's signature (by the DK, or under duress by the sub-key).
+@requires(filesystem, network, declassify, clock)
+Int run_sign_core(Str dir, DeviceConfig c, List(Secret(UInt(8))) hpke_sk, CgConfig x, VerifiedHead vh, List(UInt(64)) tau, List(Int) m, List(Int) sid, List(Int) rsig) {
+    Quorum q = vh.head.quorum;
+    Party cos = cosigner_of(q.parties, 0) else { Party {.id = [], .kind = 0, .auth_key = [], .hpke_key = [], .label = "", .attestation = NoAttestation} };
+    if (cos.id.len() == 0) { return dfail("no cosigner in the quorum"); }
+    List(List(Int)) signers = [c.party, cos.id];
+    if (rsig.len() != 64) { return dfail("the device key did not sign the request"); }
+    Endpoint relay = relay_ep(c);
+    Local dev = Local {.party = c.party, .cg = cg_id_of(q, c.party, 0), .hpke_sk = hpke_sk};
+    Remote cr = Remote {.party = cos.id, .cg = cg_id_of(q, cos.id, 0), .hpke_pub = cos.hpke_key};
+    Int start = mailbox_end(relay, c.party, c.mbox_next);
+    SignInvite inv = SignInvite {.session_id = sid, .message = m, .epoch = (Int)q.epoch, .requester = c.party, .kind = (Int)request_sign(), .sig = rsig, .signers = signers};
+    if (!send_to(relay, dev, cr, WSign(inv))) { return dfail("cannot reach the relay"); }
+    Option(CgCtx) octx = th_ctx(x, q, signers, c.party, tau, sid, m, random_bytes(32));
+    return match octx {
+        None => dfail("no session context"),
+        Some(ctx) => run_sign_ctx(dir, c, q, tau, m, relay, sid, dev, cr, start, ctx)
+    };
+}
+
+@requires(filesystem, network, declassify, clock)
+Int run_sign_ctx(Str dir, DeviceConfig c, Quorum q, List(UInt(64)) tau, List(Int) m, Endpoint relay, List(Int) sid, Local dev, Remote cr, Int start, CgCtx ctx) {
+    ThStep st = th_start(ctx, th_role(ctx, q, c.party, tau));
+    return finish_sign(dir, c, q, tau, m, run_session(relay, sid, [Seat {.me = dev, .st = st.state, .round = 1, .out = st.out, .done = false}],
+        [cr], [Cursor {.party = c.party, .next = start}], [], lambda(t, msgs) { sign_adapt(t, msgs) }, 120));
+}
+
+@requires(filesystem, network, clock(readonly), declassify)
+Int finish_sign(Str dir, DeviceConfig c, Quorum q, List(UInt(64)) tau, List(Int) m, Run(ThState) r) {
+    _ = save_config(dir, with_log(c, c.witnesses, c.log_id, mailbox_end(relay_ep(c), c.party, c.mbox_next), c.peers));
+    if (str_len(r.fail) > 0) { return dfail("signing: " + r.fail + if (r.culprits.len() > 0) { f" (blames {r.culprits})" } else { "" }); }
+    ThState st = r.seats[0].st;
+    List(Int) sig = match st { ThSigned(s) => th_sig_raw(s), _ => [] };
+    if (sig.len() != 64 || !ecdsa_verify_digest(P256, credential_pubkey(q.root_pubkey, tau), m, ecdsa_sig_raw(P256, sig))) { return dfail("no valid signature"); }
+    println("signature-der " + hex_encode(ecdsa_der_of(ecdsa_sig_raw(P256, sig))));
+    println(hex_encode(sig));
+    return 0;
+}
+
+// ─── `device status` ────────────────────────────────────────────
+
+@requires(filesystem, network, clock(readonly), declassify)
+pub Int device_status(Str dir) {
+    Option(DeviceConfig) oc = load_config(dir);
+    return match oc {
+        None => dfail("not set up"),
+        Some(c) => status_of(c)
+    };
+}
+
+// `symbolon device forget DIR`: removes this device's keys from the TPM
+// (the device key, the two unlock keys and the storage key). The device
+// directory is left alone; without its TPM keys it can no longer unlock.
+@requires(filesystem, device, network, environment)
+pub Int device_forget(Str dir) {
+    Option(DeviceConfig) oc = load_config(dir);
+    return match oc {
+        None => dfail("not set up"),
+        Some(c) => forget_keys(c)
+    };
+}
+
+@requires(device, network, environment)
+Int forget_keys(DeviceConfig c) {
+    if (c.unprotected) { println("unprotected profile: no TPM keys to remove"); return 0; }
+    if (on_keystore(c)) { return ks_forget(c); }
+    Int gone = evict_all([c.tpm_dk, c.tpm_unlock_a, c.tpm_unlock_b, srk_handle()], 0, 0);
+    println(f"removed {gone} TPM key(s)");
+    return 0;
+}
+
+@requires(device)
+Int evict_all(List(Int) hs, Int i, Int n) {
+    if (i >= hs.len()) { return n; }
+    Result(Bool, TpmError) r = tpm_evict(hs[i]);
+    return evict_all(hs, i + 1, match r { Ok(_) => n + 1, Err(_) => n });
+}
+
+@requires(network, clock(readonly), declassify)
+Int status_of(DeviceConfig c) {
+    println("party " + hex_encode(c.party));
+    println(if (c.unprotected) { "profile UNPROTECTED (no TPM: the PIN alone protects this device, SPEC 9.1)" } else { if (on_keystore(c)) { "profile KEYSTORE (the Android Keystore holds the unlock keys and the device key)" } else { "profile TPM" } });
+    if (c.log_id.len() == 0) { println("log none (run `symbolon device init`)"); return 0; }
+    println("log " + hex_encode(c.log_id));
+    Result(VerifiedHead, SymbolonError) v = verified_log(relay_ep(c), c.log_id);
+    return match v {
+        Err(e) => dfail("log does not verify: " + err_text(e)),
+        Ok(vh) => print_head(vh)
+    };
+}
+
+Int print_head(VerifiedHead vh) {
+    println(f"head sequence {vh.head.sequence} epoch {vh.head.quorum.epoch} parties {vh.head.quorum.parties.len()} threshold {vh.head.quorum.t} pending {vh.pending.len()}");
+    return 0;
+}

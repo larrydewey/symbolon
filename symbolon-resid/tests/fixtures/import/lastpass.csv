@@ -1,0 +1,63 @@
+url,username,password,totp,extra,name,grouping,fav
+https://accounts.google.com/,me@gmail.com,g00gle!,,,Google,Email,0
+http://sn,,,,"NoteType:Credit Card
+Language:en-US
+Name on Card:Marie Curie
+Type:Mastercard
+Number:5555 5555 5555 4444
+Security Code:321
+Start Date:,
+Expiration Date:January,2028
+Notes:Line one
+Line two",Mastercard,Finance\Cards,0
+http://sn,,,,"NoteType:Bank Account
+Language:en-US
+Bank Name:First Bank
+Account Type:Checking
+Routing Number:021000021
+Account Number:123456789
+SWIFT Code:FBNKUS33
+IBAN Number:
+Pin:9876
+Branch Address:
+Branch Phone:
+Notes:",Checking,Finance,0
+http://sn,,,,"NoteType:Address
+Language:en-US
+Title:mrs
+First Name:Marie
+Middle Name:
+Last Name:Curie
+Username:
+Gender:f
+Birthday:November,7,1867
+Company:
+Address 1:1 Main St
+Address 2:
+Address 3:
+City / Town:Springfield
+County:
+State:IL
+Zip / Postal Code:62701
+Country:US
+Timezone:
+Email Address:marie@example.com
+Phone:{""num"":""5551234567"",""ext"":"""",""cc3l"":""USA""}
+Notes:",Home address,,0
+http://sn,,,,"NoteType:Wi-Fi Password
+Language:en-US
+SSID:HomeNet
+Password:wifipass
+Connection Type:
+Connection Mode:
+Authentication:WPA2
+Encryption:AES
+Notes:",Home Wi-Fi,,0
+http://sn,,,,"NoteType:Server
+Language:en-US
+Hostname:nas.local
+Username:admin
+Password:nas-pass
+Notes:rack 2",NAS,Home\Servers,0
+http://sn,,,,Just a plain note,Plain note,,0
+,,orphan,,,,,0

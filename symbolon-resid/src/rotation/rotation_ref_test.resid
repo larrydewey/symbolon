@@ -1,0 +1,168 @@
+// Rotation (src/rotation/rotation.resid): generated passwords against an
+// independent implementation (tests/gen_rotation_ref.py), and the rotation
+// rules by behaviour. Generated; do not edit by hand.
+
+import "../types.resid";
+import "../vault/vault.resid";
+import "rotation.resid";
+import "crypto.resid";
+import "word.resid";
+
+List(Int) rep(Int b, Int n) { return if (n == 0) { [] } else { [b].concat(rep(b, n - 1)) }; }
+List(Int) idn(Int n) { return rep(n, 32); }
+
+test "generated password 0 equals the reference" {
+    PasswordRules r = PasswordRules { .min_length = 0, .max_length = 0, .required_classes = 15, .forbidden_chars = "" };
+    Str got = match generate_password(r, [254, 235, 45, 65, 193, 17, 25, 108, 96, 89, 158, 42, 27, 210, 78, 180, 154, 103, 243, 117, 228, 85, 22, 15, 10, 238, 178, 197, 95, 162, 244, 232, 164, 225, 117, 69, 208, 95, 65, 6, 188, 226, 96, 228, 17, 62, 241, 219, 75, 108, 139, 131, 50, 161, 38, 81, 54, 211, 35, 93, 128, 238, 138, 163, 211, 254, 82, 174, 127, 152, 11, 222, 229, 202, 53, 26, 232, 57, 237, 83, 30, 245, 136, 243, 39, 202, 26, 222, 72, 228, 194, 32, 149, 193, 161, 194, 84, 115, 47, 19, 55, 27, 130, 24, 251, 223, 59, 31, 120, 215, 213, 51, 33, 144, 145, 240, 109, 78, 126, 225, 219, 112, 55, 172, 116, 181, 227, 227, 186, 9, 80, 185, 248, 223, 247, 144, 237, 66, 183, 74, 148, 113, 128, 68, 77, 234, 178, 120, 211, 219, 28, 34, 105, 162, 140, 164, 82, 10, 73, 99, 86, 145, 34, 215, 95, 227, 150, 14, 88, 101, 166, 26, 233, 81, 160, 25, 36, 12, 81, 7, 178, 31, 197, 144, 238, 254, 194, 173, 134, 89, 101, 208, 141, 16, 239, 235, 214, 184, 132, 241, 179, 26, 25, 136, 117, 149, 128, 175, 102, 4, 197, 2, 108, 252, 48, 227, 93, 19, 240, 98, 53, 120, 94, 58, 50, 207, 50, 99, 152, 249, 40, 168, 167, 227, 148, 138, 213, 35, 159, 11, 93, 134, 167, 237, 86, 115, 254, 43, 137, 118, 126, 227, 58, 46, 207, 35, 112, 20, 47, 114, 76, 17, 147, 118, 247, 63, 1, 202, 107, 2, 37, 250, 120, 198, 132, 52, 36, 239, 250, 134, 44, 199, 191, 156, 167, 11, 104, 49, 204, 152, 56, 7, 39, 141, 247, 153, 22, 143, 166, 183, 189, 155, 101, 189, 213, 244, 140, 118, 195, 225, 41, 253, 146, 194, 83, 136, 102, 212, 251, 100, 58, 243, 16, 56, 197, 173, 59, 170, 180, 250, 223, 11, 63, 243, 202, 81, 193, 108, 255, 122, 108, 155, 170, 65, 59, 34, 212, 14, 57, 108, 106, 138, 1, 123, 48, 160, 185, 199, 207, 182, 105, 194, 82, 240, 162, 28, 84, 251, 230, 175, 219, 112, 68, 88, 112, 228, 26, 111, 117, 243, 99, 221, 43, 231, 158, 10, 2, 223, 177, 253, 220, 120, 113, 201, 234, 19, 219, 1, 128, 153, 188, 63, 85, 54, 29, 163, 253, 65, 226, 77, 20, 195, 240, 14, 229, 13, 255, 168, 50, 149, 255, 102, 169, 151, 14, 65, 61, 236, 253, 81, 251, 150, 119, 124, 67, 84, 30, 103, 214, 47, 100, 57, 188, 223, 238, 107, 238, 78, 149, 123, 197, 229, 155, 165, 172, 19, 165, 35, 222, 225, 74, 191, 40, 17, 46, 102, 75, 32, 183, 44, 165, 216, 172, 89, 227, 94, 193, 115, 209, 213, 225, 162, 58, 198, 236, 114, 237, 40, 196, 164, 178, 87, 99, 142, 142, 95, 185, 9, 46, 105, 101, 81, 207, 51, 171, 192, 177, 116, 46, 156, 4, 140, 221, 214, 11, 244, 139, 221, 16, 243, 102, 206, 79, 216, 20, 140, 139, 25, 190, 145, 16, 78, 70, 167, 117, 10, 134, 147, 29, 209, 19, 18, 159, 210, 74, 170, 100, 222, 113, 170, 134, 196, 155, 65, 219, 163, 133, 235, 70, 250, 204, 78, 39, 63, 72, 157, 42, 124, 113, 19, 156, 142, 249, 149, 23, 216, 151, 226, 65, 135, 118, 62, 100, 173, 68, 141, 209, 186, 180, 132, 221, 86, 168, 170, 188, 234, 234, 200, 142, 115]) { Some(p) => p, None => "none" };
+    expect(got).toEqual("f%ggr!:sXPY,M@2JdMW.[^L!");
+}
+
+test "generated password 1 equals the reference" {
+    PasswordRules r = PasswordRules { .min_length = 12, .max_length = 16, .required_classes = 7, .forbidden_chars = "0O1lI" };
+    Str got = match generate_password(r, [48, 33, 167, 25, 194, 240, 121, 21, 25, 87, 58, 165, 226, 61, 180, 106, 232, 119, 145, 37, 118, 31, 23, 237, 30, 41, 196, 242, 54, 255, 140, 74, 162, 154, 183, 219, 204, 139, 71, 149, 163, 208, 211, 216, 56, 157, 175, 143, 228, 64, 111, 7, 207, 108, 216, 21, 107, 168, 133, 139, 0, 227, 229, 198, 226, 246, 169, 26, 246, 61, 184, 134, 213, 21, 40, 180, 219, 184, 127, 83, 235, 252, 98, 113, 43, 136, 31, 74, 241, 58, 112, 7, 47, 205, 179, 244, 60, 230, 114, 50, 15, 75, 15, 240, 188, 44, 48, 56, 132, 192, 203, 77, 109, 22, 152, 130, 167, 230, 239, 26, 225, 162, 180, 54, 106, 69, 68, 18, 222, 27, 183, 11, 133, 239, 225, 207, 193, 22, 64, 217, 110, 242, 226, 37, 140, 146, 15, 140, 0, 151, 243, 145, 117, 111, 62, 183, 214, 6, 116, 109, 161, 161, 176, 81, 126, 60, 15, 40, 43, 172, 86, 157, 196, 11, 37, 116, 47, 78, 11, 117, 93, 87, 126, 52, 202, 81, 163, 196, 6, 80, 174, 2, 233, 114, 128, 35, 71, 182, 229, 112, 247, 42, 213, 59, 34, 113, 72, 210, 6, 2, 208, 20, 35, 225, 255, 15, 129, 57, 104, 127, 189, 24, 85, 178, 107, 145, 232, 107, 14, 127, 78, 173, 205, 56, 71, 22, 71, 36, 27, 25, 170, 67, 167, 135, 43, 246, 164, 164, 247, 24, 205, 198, 191, 37, 217, 36, 137, 66, 52, 38, 118, 70, 247, 208, 225, 5, 198, 48, 85, 189, 60, 67, 247, 5, 72, 211, 248, 196, 146, 242, 133, 116, 54, 94, 245, 192, 60, 240, 254, 84, 182, 126, 58, 165, 113, 157, 42, 234, 187, 232, 199, 5, 157, 163, 255, 132, 239, 34, 215, 214, 207, 144, 110, 170, 84, 41, 175, 37, 59, 92, 101, 231, 93, 170, 216, 60, 35, 148, 32, 195, 243, 32, 34, 48, 70, 54, 201, 64, 187, 73, 65, 7, 187, 120, 5, 65, 236, 207, 249, 223, 20, 236, 25, 240, 49, 115, 152, 43, 254, 197, 40, 247, 150, 87, 155, 152, 109, 127, 245, 37, 132, 10, 115, 73, 33, 32, 39, 129, 189, 153, 22, 66, 255, 253, 228, 136, 80, 212, 155, 157, 29, 244, 45, 202, 6, 253, 199, 173, 91, 134, 240, 251, 58, 207, 215, 132, 66, 92, 241, 98, 25, 251, 142, 202, 81, 49, 182, 26, 20, 157, 163, 252, 161, 160, 94, 187, 121, 232, 42, 92, 46, 116, 36, 147, 40, 241, 92, 236, 158, 208, 113, 220, 13, 219, 147, 32, 184, 60, 158, 109, 51, 177, 246, 114, 131, 248, 208, 163, 83, 255, 87, 90, 162, 219, 11, 66, 74, 64, 21, 22, 189, 152, 225, 31, 121, 83, 240, 173, 172, 11, 144, 80, 254, 19, 62, 26, 26, 180, 127, 165, 71, 245, 225, 241, 154, 246, 205, 26, 92, 40, 252, 218, 56, 253, 230, 159, 34, 243, 176, 28, 173, 221, 156, 59, 252, 68, 32, 150, 247, 124, 55, 200, 154, 114, 228, 220, 226, 0, 38, 66, 25, 134, 225, 136, 152, 141, 142, 89, 118, 217, 5, 87, 129, 209, 221, 92, 131, 64, 203, 167, 107, 217, 126, 41, 102, 186, 91, 181, 173, 25, 155, 49, 27, 207, 244, 51, 47, 133, 122, 205, 170, 173, 187, 148, 255, 57, 35, 130, 119, 117, 23, 207, 168, 212, 119, 68, 118, 132, 196, 172, 198, 134, 99, 228, 43, 90, 20, 22, 52, 203]) { Some(p) => p, None => "none" };
+    expect(got).toEqual("ZJ|Az:MwAc#_9&kw");
+}
+
+test "generated password 2 equals the reference" {
+    PasswordRules r = PasswordRules { .min_length = 8, .max_length = 10, .required_classes = 1, .forbidden_chars = "!#$%&()*+,-./:;<=>?@[]^_{{|}}~0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ" };
+    Str got = match generate_password(r, [199, 159, 161, 24, 99, 95, 65, 29, 79, 22, 10, 55, 48, 80, 38, 160, 138, 88, 175, 140, 236, 99, 222, 66, 134, 74, 154, 211, 41, 236, 193, 182, 3, 193, 2, 148, 147, 199, 157, 164, 144, 18, 87, 16, 120, 184, 213, 132, 126, 1, 175, 186, 2, 72, 135, 224, 242, 140, 94, 191, 254, 228, 94, 175, 60, 126, 93, 86, 189, 162, 71, 80, 149, 197, 244, 143, 25, 88, 159, 235, 237, 106, 145, 157, 26, 214, 188, 54, 23, 138, 44, 25, 207, 17, 153, 239, 34, 69, 63, 74, 38, 135, 185, 214, 242, 31, 136, 95, 58, 190, 87, 71, 16, 159, 251, 50, 148, 3, 52, 151, 38, 31, 12, 252, 171, 198, 219, 26, 20, 62, 12, 185, 219, 17, 121, 27, 51, 61, 39, 86, 180, 99, 237, 189, 52, 197, 185, 247, 115, 196, 211, 39, 237, 67, 80, 62, 195, 146, 245, 134, 24, 35, 76, 116, 8, 108, 67, 224, 185, 45, 76, 19, 21, 230, 6, 163, 195, 200, 230, 55, 180, 121, 51, 229, 98, 168, 206, 25, 221, 42, 83, 53, 118, 224, 169, 198, 179, 116, 209, 244, 162, 11, 126, 25, 25, 85, 248, 202, 192, 83, 35, 66, 192, 145, 129, 24, 226, 8, 85, 87, 127, 212, 52, 254, 51, 188, 182, 190, 253, 240, 128, 168, 187, 150, 146, 132, 175, 25, 211, 41, 217, 20, 5, 134, 145, 186, 119, 95, 25, 100, 224, 137, 146, 173, 130, 161, 177, 133, 61, 82, 134, 24, 13, 255, 127, 245, 26, 214, 88, 172, 182, 2, 77, 26, 244, 192, 96, 7, 13, 96, 88, 231, 3, 133, 10, 173, 6, 238, 153, 181, 176, 64, 52, 199, 170, 165, 226, 27, 221, 77, 48, 57, 226, 196, 204, 174, 133, 174, 235, 187, 161, 37, 214, 244, 225, 76, 119, 1, 31, 140, 232, 58, 5, 8, 16, 69, 191, 88, 244, 82, 136, 172, 39, 106, 89, 188, 213, 3, 40, 144, 134, 114, 230, 91, 231, 74, 51, 199, 53, 54, 117, 187, 138, 42, 144, 255, 45, 117, 41, 105, 40, 164, 113, 173, 126, 230, 230, 170, 90, 60, 22, 107, 67, 43, 16, 10, 231, 95, 73, 29, 172, 116, 15, 227, 99, 151, 66, 218, 8, 102, 241, 40, 71, 211, 219, 49, 172, 141, 36, 141, 251, 16, 227, 145, 25, 85, 154, 54, 169, 168, 91, 118, 122, 127, 58, 110, 20, 172, 158, 57, 254, 22, 151, 206, 57, 15, 103, 83, 52, 190, 175, 239, 193, 181, 23, 247, 41, 131, 95, 208, 194, 97, 166, 163, 38, 145, 163, 128, 250, 22, 73, 155, 95, 214, 0, 68, 116, 141, 62, 7, 168, 75, 16, 225, 65, 218, 85, 41, 100, 5, 129, 198, 216, 39, 96, 57, 15, 222, 143, 150, 232, 189, 84, 141, 135, 37, 116, 41, 209, 32, 20, 97, 247, 90, 148, 9, 110, 43, 88, 148, 48, 43, 201, 39, 113, 182, 187, 231, 172, 161, 11, 127, 191, 18, 115, 80, 129, 241, 228, 246, 102, 54, 164, 232, 246, 128, 33, 84, 154, 174, 36, 214, 62, 254, 245, 10, 127, 233, 54, 128, 219, 45, 253, 178, 240, 142, 66, 70, 235, 31, 50, 138, 1, 194, 161, 195, 168, 92, 185, 90, 177, 232, 40, 29, 142, 132, 42, 118, 26, 55, 237, 194, 247, 132, 185, 74, 38, 70, 108, 252, 254, 96, 79, 225, 107, 50, 182, 59, 52, 83, 146, 21, 243, 53, 18, 118, 255, 127, 120, 73]) { Some(p) => p, None => "none" };
+    expect(got).toEqual("rdfyvrndbw");
+}
+
+test "generated password 3 equals the reference" {
+    PasswordRules r = PasswordRules { .min_length = 8, .max_length = 64, .required_classes = 8, .forbidden_chars = "!#$%&()*+,-./:;<=>?@[]^_{{|}}~" };
+    Str got = match generate_password(r, [249, 239, 227, 107, 128, 247, 98, 141, 222, 46, 243, 234, 36, 254, 117, 44, 6, 160, 124, 183, 103, 11, 34, 30, 115, 48, 7, 77, 210, 122, 152, 223, 64, 52, 249, 47, 225, 116, 90, 209, 251, 182, 31, 175, 238, 46, 124, 135, 220, 5, 55, 235, 94, 56, 165, 55, 104, 245, 128, 130, 35, 227, 126, 36, 136, 19, 145, 72, 62, 248, 218, 71, 112, 109, 146, 247, 125, 153, 96, 255, 128, 145, 40, 255, 68, 61, 84, 145, 133, 213, 101, 17, 173, 228, 138, 200, 145, 242, 140, 28, 29, 81, 103, 251, 118, 250, 255, 28, 229, 22, 28, 89, 59, 245, 211, 180, 96, 218, 107, 116, 255, 43, 75, 220, 76, 84, 20, 46, 175, 128, 241, 99, 199, 49, 69, 152, 28, 197, 224, 141, 250, 138, 230, 127, 247, 132, 118, 211, 36, 58, 54, 202, 175, 146, 240, 172, 143, 9, 121, 185, 74, 185, 165, 242, 240, 142, 147, 207, 14, 246, 177, 37, 125, 75, 242, 164, 55, 138, 39, 31, 236, 209, 174, 95, 247, 136, 254, 34, 51, 42, 23, 39, 179, 196, 177, 44, 186, 62, 210, 184, 163, 72, 73, 143, 105, 203, 54, 97, 181, 104, 248, 0, 251, 206, 234, 254, 169, 198, 241, 216, 254, 116, 221, 22, 191, 176, 160, 207, 106, 200, 51, 157, 215, 92, 150, 223, 169, 151, 134, 212, 69, 216, 206, 164, 184, 113, 128, 250, 79, 162, 39, 18, 103, 165, 143, 33, 201, 144, 85, 3, 122, 146, 244, 54, 2, 132, 248, 168, 83, 159, 40, 32, 216, 201, 91, 198, 77, 98, 26, 153, 50, 61, 13, 146, 113, 64, 16, 133, 220, 199, 198, 255, 19, 181, 138, 255, 139, 198, 95, 245, 206, 119, 66, 75, 91, 75, 107, 98, 180, 94, 0, 161, 130, 24, 12, 191, 8, 134, 156, 19, 131, 52, 255, 169, 7, 127, 56, 89, 239, 167, 243, 55, 217, 16, 81, 157, 223, 50, 81, 153, 213, 156, 11, 204, 107, 112, 246, 46, 118, 254, 5, 85, 132, 70, 118, 244, 53, 218, 113, 232, 246, 247, 178, 93, 34, 27, 241, 14, 108, 180, 152, 157, 131, 154, 239, 165, 116, 35, 176, 222, 53, 101, 7, 171, 144, 186, 41, 225, 195, 52, 246, 35, 105, 229, 140, 40, 18, 31, 41, 214, 42, 242, 46, 29, 18, 100, 181, 117, 191, 23, 234, 57, 231, 116, 125, 70, 76, 62, 75, 112, 243, 97, 69, 100, 186, 218, 134, 245, 206, 48, 175, 6, 201, 4, 168, 204, 37, 178, 103, 240, 38, 30, 211, 29, 44, 66, 204, 168, 73, 166, 126, 63, 10, 93, 223, 237, 103, 62, 118, 209, 45, 133, 31, 115, 236, 216, 113, 87, 251, 31, 167, 171, 133, 198, 110, 202, 226, 245, 173, 100, 244, 108, 30, 236, 193, 100, 182, 16, 80, 212, 99, 5, 125, 67, 157, 232, 6, 191, 72, 148, 171, 106, 161, 4, 82, 200, 122, 147, 69, 50, 113, 199, 82, 66, 25, 15, 21, 70, 76, 226, 17, 198, 189, 162, 153, 177, 93, 142, 3, 65, 226, 1, 159, 10, 181, 223, 54, 110, 229, 65, 242, 162, 146, 185, 30, 254, 4, 193, 212, 207, 54, 68, 43, 135, 14, 76, 237, 102, 189, 22, 93, 101, 91, 13, 167, 201, 171, 216, 218, 127, 249, 186, 103, 190, 223, 179, 42, 185, 116, 163, 32, 44, 138, 188, 33, 98, 164, 178, 89, 223, 82, 229, 23, 131, 13, 24, 168, 136, 155, 203]) { Some(p) => p, None => "none" };
+    expect(got).toEqual("none");
+}
+
+test "rules that forbid a required class give no password" {
+    PasswordRules r = PasswordRules { .min_length = 8, .max_length = 16, .required_classes = 4, .forbidden_chars = "0123456789" };
+    Bool none = match generate_password(r, rep(7, 600)) { Some(_) => false, None => true };
+    expect(none).toBeTrue();
+}
+
+RotationItem item(Int n, Str kind, Str domain, UInt(8) value, Option(List(Int)) via, Bool duress, Bool readable) {
+    return RotationItem { .id = idn(n), .kind = kind, .domain = domain, .value = value, .resets_via = via,
+                           .in_duress_subset = duress, .readable_by_removed = readable };
+}
+
+List(RotationItem) items() {
+    return [item(1, "password", "shop.example", 0, Some(idn(4)), false, true),
+            item(2, "password", "bank.example", 3, Some(idn(4)), true, true),
+            item(3, "passkey", "news.example", 0, None, false, true),
+            item(4, "password", "mail.example", 2, None, true, true),
+            item(5, "totp", "bank.example", 3, None, false, false),
+            item(6, "password", "blog.example", 1, Some(idn(4)), false, true)];
+}
+
+Str ids(List(RotationItem) xs, Int i, Str acc) {
+    if (i >= xs.len()) { return acc; }
+    return ids(xs, i + 1, acc + f"{xs[i].id[0]}");
+}
+
+test "a removed device: every password and seed it could read, financial and email first, email before what resets through it" {
+    expect(ids(rotation_plan(TriggerDeviceRemoved(idn(9)), items()), 0, "")).toEqual("4261");
+}
+
+test "a suspected compromise adds the passkeys" {
+    expect(ids(rotation_plan(TriggerSuspectedCompromise(idn(9)), items()), 0, "")).toEqual("42613");
+}
+
+test "a breached site, a weak password, the end of duress, a request" {
+    expect(ids(rotation_plan(TriggerBreach("bank.example"), items()), 0, "")).toEqual("25");
+    expect(ids(rotation_plan(TriggerWeakPassword(idn(6)), items()), 0, "")).toEqual("6");
+    expect(ids(rotation_plan(TriggerDuressEnd, items()), 0, "")).toEqual("42");
+    expect(ids(rotation_plan(TriggerPrincipalRequest([idn(1), idn(3)]), items()), 0, "")).toEqual("13");
+    // A schedule rotates only items the principal marked.
+    expect(ids(rotation_plan(TriggerPolicySchedule([idn(1), idn(6)]), items()), 0, "")).toEqual("6");
+}
+
+test "an email item ranked below a site that resets through it still goes first" {
+    List(RotationItem) xs = [item(1, "password", "bank.example", 3, Some(idn(2)), false, true),
+                             item(2, "password", "mail.example", 0, None, false, true)];
+    expect(ids(rotation_plan(TriggerDeviceRemoved(idn(9)), xs), 0, "")).toEqual("21");
+}
+
+FieldPlain fp(Str n, Int b) { return FieldPlain { .name = n, .value = secret_bytes([b]) }; }
+
+@requires(declassify)
+Str val(List(FieldPlain) fs, Str n, Int i) {
+    if (i >= fs.len()) { return "-"; }
+    if (fs[i].name == n) { Int v = (Int)declassify(fs[i].value[0], "test output"); return f"{v}"; }
+    return val(fs, n, i + 1);
+}
+
+@requires(declassify)
+Str said(Result(List(FieldPlain), SymbolonError) r) {
+    return match r {
+        Err(e) => match e { ErrRotationFailed(s) => s, _ => "other" },
+        Ok(fs) => "cur=" + val(fs, "current", 0) + " pen=" + val(fs, "pending", 0) + " h0=" + val(fs, "history.0", 0)
+                  + " h1=" + val(fs, "history.1", 0) + " u=" + val(fs, "unresolved", 0) + " user=" + val(fs, "username", 0)
+    };
+}
+
+List(FieldPlain) start() { return [fp("username", 7), fp("current", 10), fp("history.0", 9)]; }
+
+List(FieldPlain) prepared() { return match prepare(start(), secret_bytes([11])) { Ok(f) => f, Err(_) => [] }; }
+
+@requires(declassify)
+test "prepare keeps current and adds pending; a second prepare is refused" {
+    expect(said(prepare(start(), secret_bytes([11])))).toEqual("cur=10 pen=11 h0=9 h1=- u=- user=7");
+    expect(said(prepare(prepared(), secret_bytes([12])))).toEqual("a change is already in progress");
+}
+
+@requires(declassify)
+test "verify: the vault always holds a password the site accepts" {
+    expect(said(verify(prepared(), NewWorks))).toEqual("cur=11 pen=- h0=10 h1=9 u=- user=7");
+    expect(said(verify(prepared(), OldWorks))).toEqual("cur=10 pen=- h0=9 h1=- u=- user=7");
+    expect(said(verify(prepared(), NeitherWorks))).toEqual("cur=10 pen=11 h0=9 h1=- u=49 user=7");
+    expect(said(verify(start(), NewWorks))).toEqual("nothing pending");
+}
+
+@requires(declassify)
+test "an unresolved item is resolved by whichever candidate signs in, deleting none" {
+    List(FieldPlain) u = match verify(prepared(), NeitherWorks) { Ok(f) => f, Err(_) => [] };
+    expect(candidates(u).len()).toEqual(3);
+    expect(said(resolve(u, 1))).toEqual("cur=11 pen=- h0=10 h1=9 u=- user=7");
+    expect(said(resolve(u, 2))).toEqual("cur=9 pen=- h0=10 h1=11 u=- user=7");
+}
+
+test "a change interrupted after prepare resumes at verify" {
+    Phase p = phase_of(prepared());
+    expect(match p { Pending => true, _ => false }).toBeTrue();
+}
+
+test "sign-in attempts: three failures a day per site, with backoff" {
+    List(Attempt) none = [];
+    expect(may_attempt(none, "bank.example", 1000)).toBeTrue();
+    List(Attempt) one = [Attempt { .domain = "bank.example", .time = 1000 }];
+    expect(may_attempt(one, "bank.example", 1059)).toBeFalse();
+    expect(may_attempt(one, "bank.example", 1060)).toBeTrue();
+    expect(may_attempt(one, "mail.example", 1001)).toBeTrue();
+    List(Attempt) two = one.concat([Attempt { .domain = "bank.example", .time = 1100 }]);
+    expect(may_attempt(two, "bank.example", 1219)).toBeFalse();
+    expect(may_attempt(two, "bank.example", 1220)).toBeTrue();
+    List(Attempt) three = two.concat([Attempt { .domain = "bank.example", .time = 1300 }]);
+    expect(may_attempt(three, "bank.example", 50000)).toBeFalse();
+    expect(may_attempt(three, "bank.example", 1000 + 86401)).toBeTrue();
+}
+
+Str leased(Result(List(RotationLease), SymbolonError) r) {
+    return match r { Ok(ls) => f"{ls.len()}", Err(e) => match e { ErrRotationFailed(s) => s, _ => "other" } };
+}
+
+test "one rotation per item: another device's live lease blocks, an expired one does not" {
+    List(RotationLease) ls = match take_lease([], idn(1), idn(20), 100, 600) { Ok(x) => x, Err(_) => [] };
+    expect(leased(take_lease(ls, idn(1), idn(21), 200, 600))).toEqual("item leased by another device");
+    expect(leased(take_lease(ls, idn(1), idn(20), 200, 600))).toEqual("1");
+    expect(leased(take_lease(ls, idn(1), idn(21), 700, 600))).toEqual("1");
+    expect(leased(take_lease(ls, idn(2), idn(21), 200, 600))).toEqual("2");
+    expect(release_lease(ls, idn(1)).len()).toEqual(0);
+}
+
+test "status counts current, pending and the items that need the principal" {
+    RotationStatus s = status([Idle, Pending, Unresolved, Idle], 0, RotationStatus { .current = 0, .pending = 0, .need_principal = 0 });
+    expect(s.current).toEqual(2);
+    expect(s.pending).toEqual(1);
+    expect(s.need_principal).toEqual(1);
+}

@@ -1,0 +1,195 @@
+// Helpers shared by the device and the cosigner agents: files, keys derived
+// from a profile's DEK, software signing keys, and encodings of the stored
+// objects.
+
+import "../types.resid";
+import "../core/log.resid";
+import "../core/event_decode.resid";
+import "../vault/vault.resid";
+import "../net/proto.resid";
+import "../net/services.resid";
+import "state.resid";
+import "serials.resid";
+import "cggmp_store.resid";
+import "sha256g.resid";
+import "hpkeg.resid";
+import "word.resid";
+import "ecdsa.resid";
+import "crypto.resid";
+import "cbor.resid";
+
+pub List(Int) ints(List(UInt(8)) b) { return ints_at(b, 0, ListBuf()); }
+List(Int) ints_at(List(UInt(8)) b, Int i, ListBuf(Int) acc) {
+    if (i >= b.len()) { return acc.finish(); }
+    return ints_at(b, i + 1, acc.push((Int)b[i]));
+}
+
+@requires(declassify)
+pub List(Int) reveal(List(Secret(UInt(8))) s) { return ints(declassify(secret_join(s), "agent: value published by design")); }
+
+pub List(Secret(UInt(8))) hk(List(Secret(UInt(8))) ikm, Str label, Int n) {
+    List(Secret(UInt(8))) nil = [];
+    return hkdf256g_expand(hkdf256g_extract(nil, ikm), secret_bytes(utf8(label)), n);
+}
+
+// The device's HPKE key pair, from its DEK (no new profile field).
+@requires(declassify)
+pub HpkeKeyPairG(Secret(UInt(8))) device_hpke(List(Secret(UInt(8))) dek) { return hpkeg_derive_keypair(16, hk(dek, "symbolon v1 device hpke", 32)); }
+
+// A software ECDSA key from a 32-byte secret (the unprotected profile's
+// DK, a cosigner's DK, a duress sub-key).
+pub List(Secret(UInt(8))) software_key(List(Secret(UInt(8))) root, Str label) { return hk(root, label, 32); }
+
+@requires(declassify)
+pub List(Int) sw_public(List(Secret(UInt(8))) priv) { return ec_public_keyg(P256, priv); }
+
+@requires(declassify)
+pub List(Int) sw_sign(List(Secret(UInt(8))) priv, List(Int) msg) { return ecdsag_sign_raw(P256, Sha256, priv, msg); }
+
+pub List(Int) party_of_key(List(Int) auth_key) { return sha256_bytes(auth_key); }
+
+// ─── Files ───────────────────────────────────────────────────────
+
+@requires(filesystem)
+pub Bool put_secret_file(Str path, List(Int) b) { return filesystem.write_secret(path, b); }
+
+@requires(filesystem)
+pub List(Int) get_file(Str path) { return filesystem.read_bytes(path); }
+
+pub List(Int) cbor_of_device(DeviceConfig c) { return match to_cbor(c) { Ok(b) => b, Err(_) => [] }; }
+pub Option(DeviceConfig) device_of_cbor(List(Int) b) {
+    if (!cbor_well_formed(b, 16)) { return None; }
+    Result(DeviceConfig, SerialError) r = from_cbor(b);
+    return match r { Ok(x) => Some(x), Err(_) => None };
+}
+
+pub List(Int) cbor_of_cosigner(CosignerConfig c) { return match to_cbor(c) { Ok(b) => b, Err(_) => [] }; }
+pub Option(CosignerConfig) cosigner_of_cbor(List(Int) b) {
+    if (!cbor_well_formed(b, 16)) { return None; }
+    Result(CosignerConfig, SerialError) r = from_cbor(b);
+    return match r { Ok(x) => Some(x), Err(_) => None };
+}
+
+pub List(Int) cbor_of_state(CosignerState s) { return match to_cbor(s) { Ok(b) => b, Err(_) => [] }; }
+pub Option(CosignerState) state_of_cbor(List(Int) b) {
+    if (!cbor_well_formed(b, 24)) { return None; }
+    Result(CosignerState, SerialError) r = from_cbor(b);
+    return match r { Ok(x) => Some(x), Err(_) => None };
+}
+
+pub List(Int) cbor_of_event(StoredEvent e) { return match to_cbor(e) { Ok(b) => b, Err(_) => [] }; }
+pub Option(StoredEvent) event_of_cbor(List(Int) b) {
+    if (b.len() > 1048576 || !cbor_well_formed(b, 16)) { return None; }
+    Result(StoredEvent, SerialError) r = from_cbor(b);
+    return match r { Ok(x) => Some(x), Err(_) => None };
+}
+
+pub List(Int) cbor_of_keys(PartyKeys k) { return match to_cbor(k) { Ok(b) => b, Err(_) => [] }; }
+pub Option(PartyKeys) keys_of_cbor(List(Int) b) {
+    if (!cbor_well_formed(b, 8)) { return None; }
+    Result(PartyKeys, SerialError) r = from_cbor(b);
+    return match r { Ok(x) => Some(x), Err(_) => None };
+}
+
+pub List(Int) cbor_of_blob(WrappedBlob w) { return match to_cbor(w) { Ok(b) => b, Err(_) => [] }; }
+pub Option(WrappedBlob) blob_of_cbor(List(Int) b) {
+    if (!cbor_well_formed(b, 8)) { return None; }
+    Result(WrappedBlob, SerialError) r = from_cbor(b);
+    return match r { Ok(x) => Some(x), Err(_) => None };
+}
+
+// ─── The log ─────────────────────────────────────────────────────
+
+pub Option(SignedEvent) signed_of(StoredEvent s) {
+    Option(EventPayload) p = payload_decode(s.encoded);
+    return match p { None => None, Some(x) => Some(SignedEvent {.payload = x, .encoded = s.encoded, .sigs = s.sigs, .cosigs = s.cosigs}) };
+}
+
+// The whole log `l` from the relay, from sequence 0 until the first gap.
+@requires(network, clock(readonly), declassify)
+pub List(SignedEvent) fetch_log(Endpoint relay, List(Int) l, UInt(64) seq, List(SignedEvent) acc) {
+    Option(List(Int)) b = log_get(relay, l, seq);
+    return match b {
+        None => acc,
+        Some(x) => match event_of_cbor(x) {
+            None => acc,
+            Some(se) => match signed_of(se) { None => acc, Some(e) => fetch_log(relay, l, seq + 1, acc.concat([e])) }
+        }
+    };
+}
+
+// The median witness time of the last event: the `now` a freshly fetched
+// log is verified at.
+pub Int last_time(List(SignedEvent) es, Policy pol) {
+    if (es.len() == 0) { return 0; }
+    SignedEvent e = es[es.len() - 1];
+    return match witness_time(e.cosigs, pol, e.payload.log_id else { sha256_bytes(e.encoded) }, e.payload.sequence, sha256_bytes(e.encoded)) { Ok(t) => t, Err(_) => 0 };
+}
+
+pub Policy policy_of_e0(List(SignedEvent) es) {
+    if (es.len() == 0) { return Policy {.device_sigs_for_authority = 0, .recovery_delay_sec = 0, .guardians = [], .guardian_threshold = 0, .witnesses = [], .duress_window_sec = 0, .cosigner_policy = NoCosignerPolicy}; }
+    EventBody b = es[0].payload.body;
+    return match b { InceptionBody(_, p) => p, _ => Policy {.device_sigs_for_authority = 0, .recovery_delay_sec = 0, .guardians = [], .guardian_threshold = 0, .witnesses = [], .duress_window_sec = 0, .cosigner_policy = NoCosignerPolicy} };
+}
+
+// The log verified now (SPEC 8.3): fetched, verified once at the witness
+// time of its last event to learn its policy, then again at the current
+// witness time, the median of what the policy's witnesses sign for a fresh
+// nonce (never this machine's clock: a delay runs by witness time, SPEC
+// 13.4). Guardian approvals are not accepted yet.
+@requires(network, clock(readonly), declassify)
+pub Result(VerifiedHead, SymbolonError) verified_log(Endpoint relay, List(Int) l) { return verified_log_at(relay, l, ""); }
+
+// As verified_log, reaching the witnesses at `here` (their ports kept)
+// when it is set: a cosigner on a Symbolon Home box, which may not reach
+// the box at the address its devices use.
+@requires(network, clock(readonly), declassify)
+pub Result(VerifiedHead, SymbolonError) verified_log_at(Endpoint relay, List(Int) l, Str here) {
+    List(SignedEvent) es = fetch_log(relay, l, 0, []);
+    if (es.len() == 0) { return Err(ErrInvalidLog("no log at the relay")); }
+    Int t = last_time(es, policy_of_e0(es));
+    Result(VerifiedHead, SymbolonError) v0 = il_verify(l, es, t, lambda(p) { false });
+    return match v0 {
+        Err(e) => Err(e),
+        Ok(vh) => il_verify(l, es, at_least(witness_now(witnesses_at(vh.head.policy.witnesses, here), relay.ca, random_bytes(32)), t), lambda(p) { false })
+    };
+}
+
+pub List(WitnessRef) witnesses_at(List(WitnessRef) ws, Str here) {
+    return if (str_len(here) == 0) { ws } else { witnesses_local(ws, here, 0, ListBuf()) };
+}
+
+List(WitnessRef) witnesses_local(List(WitnessRef) ws, Str host, Int i, ListBuf(WitnessRef) acc) {
+    if (i >= ws.len()) { return acc.finish(); }
+    List(Str) p = str_split(ws[i].url, ":");
+    Str url = if (p.len() >= 2) { host + ":" + p[p.len() - 1] } else { ws[i].url };
+    return witnesses_local(ws, host, i + 1, acc.push(WitnessRef {.url = url, .key = ws[i].key}));
+}
+
+Int at_least(Int a, Int b) { return if (a > b) { a } else { b }; }
+
+// The median of the witnesses' signed times, or 0 when fewer than a
+// majority answer.
+@requires(network, clock(readonly), declassify)
+pub Int witness_now(List(WitnessRef) ws, Str ca, List(Int) nonce) {
+    List(Int) ts = sort(witness_times(ws, ca, nonce, 0, []));
+    if (ts.len() * 2 <= ws.len()) { return 0; }
+    return ts[(ts.len() - 1) / 2];
+}
+
+@requires(network, clock(readonly), declassify)
+List(Int) witness_times(List(WitnessRef) ws, Str ca, List(Int) nonce, Int i, List(Int) acc) {
+    if (i >= ws.len()) { return acc; }
+    Option(Endpoint) oe = endpoint_of_url(ws[i].url, ca);
+    Option(Int) t = match oe { None => None, Some(e) => time_from(e, ws[i].key, nonce) };
+    return witness_times(ws, ca, nonce, i + 1, match t { Some(x) => acc.concat([x]), None => acc });
+}
+
+// host:port of an http(s)://host:port URL; TLS under `ca` when it is set
+// (one trust anchor for the relay and the witnesses, from the config).
+pub Option(Endpoint) endpoint_of_url(Str u, Str ca) {
+    Str hp = if (str_len(u) > 8 && str_slice(u, 0, 8) == "https://") { str_slice(u, 8, str_len(u)) } else {
+        if (str_len(u) > 7 && str_slice(u, 0, 7) == "http://") { str_slice(u, 7, str_len(u)) } else { u } };
+    List(Str) parts = str_split(hp, ":");
+    return if (parts.len() == 2) { Some(Endpoint {.host = parts[0], .port = str_parse_int(parts[1]), .ca = ca}) } else { None };
+}
