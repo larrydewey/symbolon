@@ -92,12 +92,14 @@ recovery-request 00112233445566778899aabbccddeeff %s 1800000000
 %s 426f62 626f624061636d652e6578616d706c65 member -
 ' "$A" "$B"; exit 0 ;;
       groups) exit 0 ;;
+      changes) printf '0123456789abcdef0123456789abcdef policy 6d61785f6f66666c696e655f64617973 37 - %s pending -\n' "$A"; exit 0 ;;
     esac
     [ "$PIN" = "2468" ] || { echo "device: wrong PIN" >&2; exit 1; }
     case "$3" in
       join) echo owner > "$D/org"; echo "$5 41636d65 member" ;;
       invite) echo "fedcba9876543210fedcba9876543210 11112222333344445555666677778888" ;;
       sync) echo "joined $B 626f62" ;;
+      approve) echo "done" ;;
       *) echo "organization version 4, 2 people, 0 groups" ;;
     esac ;;
   *) echo "device: unknown command" >&2; exit 2 ;;

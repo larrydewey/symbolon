@@ -306,6 +306,12 @@ PY
 [ "$(printf '3333\n' | run 300 "$BIN" device vault get "$W/dev3" mail 2>&1)" = "c0rrect-horse" ] || fail "vault from the recovered device"
 echo "recovery finished: the recovered device signs under the same credential key (OpenSSL) and reads the vault"
 grep -q "(TLS)" "$W/relay.log" || [ -z "${TLS:-}" ] || fail "the relay did not serve TLS"
+# A new PIN on the unprotected profile.
+printf '3333\n31415\n' | run 300 "$BIN" device pin "$W/dev3" > "$W/pin.log" 2>&1 || fail "PIN change: $(cat "$W/pin.log")"
+[ "$(printf '31415\n' | run 300 "$BIN" device vault get "$W/dev3" mail 2>&1)" = "c0rrect-horse" ] || fail "vault under the new PIN"
+printf '3333\n' | run 300 "$BIN" device vault get "$W/dev3" mail > /dev/null 2>&1 && fail "the old PIN still opens"
+printf '31415\n3333\n' | run 300 "$BIN" device pin "$W/dev3" > /dev/null 2>&1 || fail "PIN change back"
+echo "PIN change: the profile opens under the new PIN only"
 # Offline (SPEC 18.8): with the relay gone, the vault reads from the
 # device's copy; changes are refused.
 pkill -f -- "relay (serve|child) $W/relay" 2>/dev/null; sleep 1

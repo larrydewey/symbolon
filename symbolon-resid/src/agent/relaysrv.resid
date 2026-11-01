@@ -36,6 +36,7 @@ import "serials.resid";
 import "orgtypes.resid";
 import "orgcore.resid";
 import "scim.resid";
+import "../browser/json.resid";
 import "crypto.resid";
 import "ecdsa.resid";
 import "cose.resid";
@@ -44,7 +45,9 @@ import "clock.resid";
 
 // `ca`: the trust anchor for the witnesses the relay asks for the time;
 // `store`: where it keeps everything (net/store.resid).
-pub type RelayCfg = { StoreCfg store; Str ca; };
+// `console`: the console's origin ("https://HOST:PORT", HOST its WebAuthn
+// RP ID), "" for no console.
+pub type RelayCfg = { StoreCfg store; Str ca; Str console; };
 
 // Who made a request: the device of a log that signed in, or nobody.
 pub type Who = { Bool on; List(Int) log; List(Int) party; List(Int) key; };
@@ -194,8 +197,40 @@ Bool folder_person(Store root, Str cid, Who w) {
     if (!w.on) { return false; }
     return match gfolder_of(b) {
         None => false,
-        Some(f) => match relay_org(root, hex_encode(f.org_id)) { None => false, Some(st) => person_in(folder_people(st, f.groups), w.log, 0) }
+        Some(f) => match relay_org(root, hex_encode(f.org_id)) { None => false, Some(st) => person_in(folder_people(st, f.groups), w.log, 0) && directory_allows(root, st, f.groups, w.log) }
     };
+}
+
+// The company directory can only take away (SPEC 29.7): an owner or
+// administrator keeps a group folder; anyone else needs one of its groups
+// that the directory does not contradict: a directory group of the same
+// name that does not list them takes that group away at once, before an
+// administrator's device signs the change.
+@requires(filesystem, network, clock(readonly), declassify)
+Bool directory_allows(Store root, OrgState st, List(List(Int)) gids, List(Int) l) {
+    Str org = hex_encode(st.org.org_id);
+    if (is_admin(st.gov, l) || !scim_on(root, org)) { return true; }
+    Int mi = member_index(st.org.members, l, 0);
+    if (mi < 0) { return false; }
+    return any_group_ok(st.org.groups, gids, l, st.org.members[mi].ext_id, all_groups(root, org), all_users(root, org), 0);
+}
+
+Bool any_group_ok(List(OrgGroup) gs, List(List(Int)) gids, List(Int) l, Str ext, List(DirGroup) dgs, List(DirUser) us, Int i) {
+    if (i >= gs.len()) { return false; }
+    Bool ok = has_log(gids, gs[i].group_id) && has_log(gs[i].members, l) && directory_keeps(gs[i].name, ext, dgs, us, 0);
+    return ok || any_group_ok(gs, gids, l, ext, dgs, us, i + 1);
+}
+
+// No directory group of this name, or one that lists the user `ext` names.
+Bool directory_keeps(Str name, Str ext, List(DirGroup) dgs, List(DirUser) us, Int i) {
+    if (i >= dgs.len()) { return true; }
+    if (dgs[i].display == name) { return lists_user(dgs[i].members, ext, us, 0); }
+    return directory_keeps(name, ext, dgs, us, i + 1);
+}
+
+Bool lists_user(List(Str) ids, Str ext, List(DirUser) us, Int i) {
+    if (i >= us.len()) { return false; }
+    return (us[i].active && has_str(ids, us[i].id, 0) && names_user(ext, us[i])) || lists_user(ids, ext, us, i + 1);
 }
 
 Bool person_in(List(Member) ms, List(Int) l, Int i) {
@@ -208,7 +243,9 @@ pub Bool may_read(Store root, Str name, Who w) {
     if (str_starts_with(name, "orggov-")) { return w.on; }
     if (str_starts_with(name, "org-")) { return in_org(root, str_slice(name, 4, str_len(name)), w); }
     if (str_starts_with(name, "audit-")) { return admin_of(root, org_part(name, 6), w); }
-    if (str_starts_with(name, "escrow-") || str_starts_with(name, "recreq-")) { return in_org(root, org_part(name, 7), w); }
+    if (str_starts_with(name, "escrow-")) { return escrow_read(root, name, w); }
+    if (str_starts_with(name, "conkey-")) { return admin_of(root, org_part(name, 7), w); }
+    if (str_starts_with(name, "recreq-")) { return in_org(root, org_part(name, 7), w); }
     if (str_starts_with(name, "invite-") || str_starts_with(name, "accept-")) { return admin_of(root, org_part(name, 7), w); }
     if (str_starts_with(name, "gfolder-")) {
         return match gfolder_of(stored(root, name)) { None => w.on, Some(f) => in_org(root, hex_encode(f.org_id), w) };
@@ -227,6 +264,7 @@ pub Str may_write(Store root, Str name, List(Int) body, Who w) {
     if (str_starts_with(name, "invite-")) { return if (admin_of(root, org_part(name, 7), w)) { "" } else { "only an owner or administrator writes an invite" }; }
     if (str_starts_with(name, "accept-")) { return accept_write(root, name, body, w); }
     if (str_starts_with(name, "escrow-")) { return escrow_write(root, name, body, w); }
+    if (str_starts_with(name, "conkey-")) { return conkey_write(root, name, body, w); }
     if (str_starts_with(name, "recreq-")) { return recreq_write(root, name, body, w); }
     Str cid = folder_of(name);
     if (str_len(cid) > 0 && !folder_person(root, cid, w)) { return "not one of the group folder's people"; }
@@ -323,6 +361,26 @@ Str accept_write(Store root, Str name, List(Int) body, Who w) {
     };
 }
 
+// A work folder's escrow is its owner's; a recovery administrator reads it
+// only with a request of their own whose delay has passed by this relay's
+// clock, a second line behind the approving devices' witness time (SPEC 29.8).
+@requires(filesystem, network, clock(readonly), declassify)
+Bool escrow_read(Store root, Str name, Who w) {
+    Str org = org_part(name, 7);
+    if (!in_org(root, org, w)) { return false; }
+    Option(OrgEscrow) oe = escrow_of(stored(root, name));
+    if (match oe { None => true, Some(e) => bytes_eq(e.owner, w.log) }) { return true; }
+    Option(OrgRecoveryRequest) oq = recreq_of(stored(root, "recreq-" + str_slice(name, 7, str_len(name))));
+    Option(OrgState) ost = relay_org(root, org);
+    return match oq {
+        None => false,
+        Some(q) => match ost {
+            None => false,
+            Some(st) => rec_admin(root, org, w) && bytes_eq(q.requester, w.log) && clock_now_seconds() >= q.time + st.gov.recovery.delay_sec
+        }
+    };
+}
+
 // A work folder's escrow, by its owner's device, in the organization.
 @requires(filesystem, network, clock(readonly), declassify)
 Str escrow_write(Store root, Str name, List(Int) body, Who w) {
@@ -332,6 +390,22 @@ Str escrow_write(Store root, Str name, List(Int) body, Who w) {
             if (by_device(w, e.owner, e.signer, escrow_tbs(e), e.sig)) { "" } else { "not signed by the device that signed in" } }
     };
 }
+
+// A console passkey, approved by an owner's or administrator's device for
+// themselves, of one waiting at the console (empty: withdrawn by an admin).
+@requires(filesystem, network, clock(readonly), declassify)
+Str conkey_write(Store root, Str name, List(Int) body, Who w) {
+    Str org = org_part(name, 7);
+    if (!admin_of(root, org, w)) { return "only an owner or administrator approves a console passkey"; }
+    if (body.len() == 0) { return ""; }
+    return match conkey_of(body) {
+        None => "the console key does not decode",
+        Some(k) => if (name != conkey_blob(k.org_id, k.cred_id) || !bytes_eq(k.log_id, w.log) || !by_device(w, k.log_id, k.signer, conkey_tbs(k), k.sig)) { "not signed by the device that signed in, for itself" } else {
+            if (pending_matches(str_split(str_trim(st_read_text(root, "console/" + org + "/pend-" + str_slice(hex_encode(sha256_bytes(k.cred_id)), 0, 32))), " "), k)) { "" } else { "no such passkey waiting at the console" } }
+    };
+}
+
+Bool pending_matches(List(Str) p, OrgConsoleKey k) { return p.len() == 5 && p[1] == hex_encode(k.cred_id) && p[2] == hex_encode(k.public_key) && p[3] == k.rp_id; }
 
 // A recovery request, by a recovery administrator's device, while recovery is on.
 @requires(filesystem, network, clock(readonly), declassify)
@@ -368,6 +442,7 @@ HttpReply handle(RelayCfg g, Store root, HttpRequest r) {
     if (r.path == "/auth/challenge" && r.method == "GET") { return challenge(root); }
     if (r.path == "/auth" && r.method == "POST") { return sign_in(g, root, r); }
     if (str_starts_with(r.path, "/scim/")) { return scim_handle(root, r); }
+    if (str_starts_with(r.path, "/console/") || r.path == "/console") { return console_handle(g, root, r); }
     List(Str) p = str_split(r.path, "/");
     Str kind = seg_at(p, 1);
     if (p.len() == 3 && kind == "directory" && r.method == "GET") { return directory_reply(root, p[2], who_of(root, r)); }
@@ -461,4 +536,284 @@ List(Str) readable(Store root, List(Str) keys, Who w, Int i, ListBuf(Str) acc) {
     if (i >= keys.len()) { return acc.finish(); }
     Str n = str_slice(keys[i], 5, str_len(keys[i]));
     return readable(root, keys, w, i + 1, if (may_read(root, n, w)) { acc.push(n) } else { acc });
+}
+
+// ─── The console (SPEC 29.10) ───────────────────────────────────
+// Served by the relay at /console/<org> when it is given an origin
+// (--console-origin). An owner or administrator signs in with a passkey
+// their device approved (conkey-, below); the console shows the
+// organization as the relay holds it (its records were verified when they
+// were written) and queues changes, which only an owner's or
+// administrator's device signs (`org changes`, `org approve`, or the app).
+//
+//   GET  /console/<org>                 the page;  GET /console/app.js  its script
+//   GET  /console/<org>/challenge       {"challenge","rpId"} for a sign-in
+//   POST /console/<org>/register        {"credentialId","publicKey"} (SPKI), base64url:
+//                                       a passkey waiting for approval; {"code"}
+//   POST /console/<org>/login           a WebAuthn assertion; sets the session cookie
+//   GET  /console/<org>/state           the organization (session)
+//   POST /console/<org>/change          {"kind","a","b","c"}: a change to approve (session)
+//   GET  /console/<org>/pending         "CODE CRED-HEX PUB-HEX RP" per waiting passkey (device session)
+//   GET  /console/<org>/changes         "ID KIND A-HEX B-HEX C-HEX BY STATUS" (device session)
+//   POST /console/<org>/done/<id>       the change done, the body its result (device session)
+
+Str b64u_text(List(Int) b) { return str_replace(str_replace(str_replace(base64_encode(b), "+", "-"), "/", "_"), "=", ""); }
+
+List(Int) b64u(Str s) {
+    Str t = str_replace(str_replace(s, "-", "+"), "_", "/");
+    Int pad = (4 - str_len(t) % 4) % 4;
+    return base64_decode(t + (if (pad == 2) { "==" } else { if (pad == 1) { "=" } else { "" } }));
+}
+
+Str jq(Str s) { return json_quote(s); }
+
+HttpReply json_reply(Int status, Str body) {
+    return http_with_header(http_reply_text(status, "application/json", body), "Cache-Control", "no-store");
+}
+
+// The P-256 point of an SPKI (DER): its last 65 bytes, uncompressed.
+List(Int) spki_point(List(Int) d) { return if (d.len() >= 65 && d[d.len() - 65] == 4) { d[d.len() - 65..d.len()] } else { [] }; }
+
+// An ECDSA signature in DER as r || s, 32 bytes each.
+List(Int) der_rs(List(Int) d) {
+    if (d.len() < 8 || d[0] != 48 || d[2] != 2) { return []; }
+    Int rl = d[3];
+    if (4 + rl + 2 > d.len() || d[4 + rl] != 2) { return []; }
+    Int sl = d[5 + rl];
+    if (6 + rl + sl > d.len()) { return []; }
+    return fixed32(d[4..4 + rl]).concat(fixed32(d[6 + rl..6 + rl + sl]));
+}
+
+List(Int) fixed32(List(Int) x) {
+    if (x.len() > 32) { return x[x.len() - 32..x.len()]; }
+    return zeros(32 - x.len()).concat(x);
+}
+
+List(Int) zeros(Int n) { return if (n <= 0) { [] } else { [0].concat(zeros(n - 1)) }; }
+
+Str rp_of(Str origin) {
+    Str h = str_slice(origin, str_index_of(origin, "://", 0) + 3, str_len(origin));
+    Int c = str_index_of(h, ":", 0);
+    return if (c < 0) { h } else { str_slice(h, 0, c) };
+}
+
+// The console session from the cookie: [org, log hex], or [].
+@requires(filesystem, network, clock(readonly), declassify)
+List(Str) con_session(Store root, HttpRequest r) {
+    Str ck = http_header(r, "cookie");
+    Int at = str_index_of(ck, "symcon=", 0);
+    if (at < 0) { return []; }
+    Str t0 = str_slice(ck, at + 7, str_len(ck));
+    Int semi = str_index_of(t0, ";", 0);
+    Str t = if (semi < 0) { t0 } else { str_slice(t0, 0, semi) };
+    if (!hex_len(t, 64)) { return []; }
+    List(Str) p = str_split(str_trim(st_read_text(root, "auth/con-" + hex_encode(sha256_bytes(utf8(t))))), " ");
+    if (p.len() != 3 || str_parse_int(p[2]) < clock_now_seconds()) { return []; }
+    List(Int) l = cose_hex_decode(p[1]);
+    if (suspended(root, l)) { return []; }
+    // Still an owner or administrator now.
+    return match relay_org(root, p[0]) { None => [], Some(st) => if (is_admin(st.gov, l) && member_index(st.org.members, l, 0) >= 0) { p[0..2] } else { [] } };
+}
+
+@requires(filesystem, network, clock(readonly), declassify)
+HttpReply console_handle(RelayCfg g, Store root, HttpRequest r) {
+    if (str_len(g.console) == 0) { return http_reply_status(404); }
+    if (r.path == "/console/app.js") { return http_with_header(http_reply_text(200, "text/javascript", console_js()), "Cache-Control", "no-store"); }
+    List(Str) p = str_split(r.path, "/");
+    Str org = seg_at(p, 2);
+    if (!hex_len(org, 32)) { return http_reply_status(404); }
+    Str what = seg_at(p, 3);
+    if (p.len() == 3 && r.method == "GET") { return console_page_html(org); }
+    if (what == "challenge" && r.method == "GET") {
+        List(Int) c = random_bytes(32);
+        _ = st_text(root, "auth/conchal-" + hex_encode(c), f"{clock_now_seconds()}");
+        return json_reply(200, "{\"challenge\":" + jq(b64u_text(c)) + ",\"rpId\":" + jq(rp_of(g.console)) + "}");
+    }
+    if (what == "register" && r.method == "POST") { return con_register(g, root, org, r); }
+    if (what == "login" && r.method == "POST") { return con_login(g, root, org, r); }
+    if (what == "state" && r.method == "GET") { return con_state(root, org, con_session(root, r)); }
+    if (what == "change" && r.method == "POST") { return con_change(root, org, con_session(root, r), r); }
+    Who w = who_of(root, r);
+    if (!admin_of(root, org, w)) { return http_reply_status(if (w.on) { 403 } else { 401 }); }
+    if (what == "pending" && r.method == "GET") { return http_reply_text(200, "text/plain", str_join(pend_lines(root, st_list(root, "console/" + org + "/pend-", "", 4096), 0, ListBuf()), "\n")); }
+    if (what == "changes" && r.method == "GET") { return http_reply_text(200, "text/plain", str_join(change_lines(root, st_list(root, "console/" + org + "/change-", "", 4096), 0, ListBuf()), "\n")); }
+    if (what == "done" && r.method == "POST" && p.len() == 5 && hex_len(p[4], 32)) { return con_done(root, org, p[4], w, r); }
+    return http_reply_status(404);
+}
+
+@requires(filesystem, network, clock(readonly), declassify)
+HttpReply con_register(RelayCfg g, Store root, Str org, HttpRequest r) {
+    Jv v = json_parse(r.body) else { JNull };
+    List(Int) cid = b64u(jstr(jget(v, "credentialId")));
+    List(Int) pt = spki_point(b64u(jstr(jget(v, "publicKey"))));
+    if (cid.len() < 16 || cid.len() > 1023 || pt.len() != 65) { return json_reply(400, "{\"error\":\"a credential id and an ES256 public key\"}"); }
+    Str code = str_slice(hex_encode(sha256_bytes(cid)), 0, 8);
+    Bool ok = st_text(root, "console/" + org + "/pend-" + str_slice(hex_encode(sha256_bytes(cid)), 0, 32), code + " " + hex_encode(cid) + " " + hex_encode(pt) + " " + rp_of(g.console) + f" {clock_now_seconds()}");
+    return if (ok) { json_reply(200, "{\"code\":" + jq(code) + "}") } else { json_reply(500, "{}") };
+}
+
+@requires(filesystem, network, clock(readonly), declassify)
+List(Str) pend_lines(Store root, List(Str) keys, Int i, ListBuf(Str) acc) {
+    if (i >= keys.len()) { return acc.finish(); }
+    List(Str) p = str_split(str_trim(st_read_text(root, keys[i])), " ");
+    // A day to approve a waiting passkey.
+    Bool live = p.len() == 5 && str_parse_int(p[4]) + 86400 > clock_now_seconds();
+    return pend_lines(root, keys, i + 1, if (live) { acc.push(str_join(p[0..4], " ")) } else { acc });
+}
+
+@requires(filesystem, network, clock(readonly), declassify)
+HttpReply con_login(RelayCfg g, Store root, Str org, HttpRequest r) {
+    Jv v = json_parse(r.body) else { JNull };
+    List(Int) cid = b64u(jstr(jget(v, "credentialId")));
+    List(Int) ad = b64u(jstr(jget(v, "authenticatorData")));
+    List(Int) cdj = b64u(jstr(jget(v, "clientDataJSON")));
+    List(Int) sig = der_rs(b64u(jstr(jget(v, "signature"))));
+    Option(OrgConsoleKey) ok = conkey_of(stored(root, conkey_blob(cose_hex_decode(org), cid)));
+    if (cid.len() == 0 || sig.len() != 64 || ad.len() < 37) { return json_reply(400, "{\"error\":\"a WebAuthn assertion\"}"); }
+    Jv cd = json_parse(cdj) else { JNull };
+    List(Int) chal = b64u(jstr(jget(cd, "challenge")));
+    Str cf = "auth/conchal-" + hex_encode(chal);
+    Str ct = str_trim(st_read_text(root, cf));
+    _ = st_text(root, cf, "used");
+    Bool fresh = chal.len() == 32 && str_len(ct) > 0 && ct != "used" && str_parse_int(ct) + 300 >= clock_now_seconds();
+    Bool shape = jstr(jget(cd, "type")) == "webauthn.get" && jstr(jget(cd, "origin")) == g.console && bytes_eq(ad[0..32], sha256_bytes(utf8(rp_of(g.console)))) && (ad[32] & 1) == 1;
+    return match ok {
+        None => json_reply(403, "{\"error\":\"this passkey is not approved for the console\"}"),
+        Some(k) => if (!fresh || !shape || !bytes_eq(k.cred_id, cid) || !bytes_eq(k.org_id, cose_hex_decode(org))) { json_reply(403, "{\"error\":\"the assertion is not for this console or challenge\"}") } else {
+            if (!ecdsa_verify_raw(P256, Sha256, k.public_key, ad.concat(sha256_bytes(cdj)), sig)) { json_reply(403, "{\"error\":\"the signature does not verify\"}") } else { con_open(root, org, k.log_id) } }
+    };
+}
+
+@requires(filesystem, network, clock(readonly), declassify)
+HttpReply con_open(Store root, Str org, List(Int) l) {
+    Option(OrgState) ost = relay_org(root, org);
+    Bool admin = match ost { None => false, Some(st) => is_admin(st.gov, l) && member_index(st.org.members, l, 0) >= 0 };
+    if (!admin || suspended(root, l)) { return json_reply(403, "{\"error\":\"not an owner or administrator\"}"); }
+    Str t = hex_encode(random_bytes(32));
+    if (!st_text(root, "auth/con-" + hex_encode(sha256_bytes(utf8(t))), org + " " + hex_encode(l) + f" {clock_now_seconds() + 28800}")) { return json_reply(500, "{}"); }
+    return http_with_header(json_reply(200, "{\"ok\":true}"), "Set-Cookie", "symcon=" + t + "; Path=/console/; HttpOnly; Secure; SameSite=Strict; Max-Age=28800");
+}
+
+@requires(filesystem, network, clock(readonly), declassify)
+HttpReply con_state(Store root, Str org, List(Str) sess) {
+    if (sess.len() != 2 || sess[0] != org) { return json_reply(401, "{\"error\":\"sign in\"}"); }
+    Option(OrgState) ost = relay_org(root, org);
+    return match ost {
+        None => json_reply(404, "{}"),
+        Some(st) => json_reply(200, "{\"name\":" + jq(st.gov.name) + f",\"version\":{st.org.version},\"gov\":{st.gov.version}" + ",\"you\":" + jq(sess[1])
+            + f",\"policy\":{{\"min_pin_len\":{st.gov.policy.min_pin_len},\"max_offline_days\":{st.gov.policy.max_offline_days}" + ",\"allow_offline_copy\":" + (if (st.gov.policy.allow_offline_copy) { "true" } else { "false" })
+            + ",\"allow_duress\":" + (if (st.gov.policy.allow_duress) { "true" } else { "false" }) + ",\"password_rules\":" + jq(st.gov.policy.password_rules) + "}"
+            + ",\"recovery\":" + (if (st.gov.recovery.on) { f"{{\"threshold\":{st.gov.recovery.threshold},\"of\":{st.gov.recovery.admins.len()},\"delay\":{st.gov.recovery.delay_sec}}}" } else { "null" })
+            + ",\"members\":[" + str_join(member_json(st, 0, ListBuf()), ",") + "],\"groups\":[" + str_join(group_json_list(st.org.groups, 0, ListBuf()), ",") + "]"
+            + ",\"changes\":[" + str_join(change_json(root, st_list(root, "console/" + org + "/change-", "", 4096), 0, ListBuf()), ",") + "]}")
+    };
+}
+
+List(Str) member_json(OrgState st, Int i, ListBuf(Str) acc) {
+    if (i >= st.org.members.len()) { return acc.finish(); }
+    OrgMember m = st.org.members[i];
+    Str role = if (is_owner(st.gov, m.log_id)) { "owner" } else { if (is_admin(st.gov, m.log_id)) { "admin" } else { "member" } };
+    return member_json(st, i + 1, acc.push("{\"log\":" + jq(hex_encode(m.log_id)) + ",\"name\":" + jq(m.label) + ",\"ext\":" + jq(m.ext_id) + ",\"role\":" + jq(role) + "}"));
+}
+
+List(Str) group_json_list(List(OrgGroup) gs, Int i, ListBuf(Str) acc) {
+    if (i >= gs.len()) { return acc.finish(); }
+    return group_json_list(gs, i + 1, acc.push("{\"id\":" + jq(hex_encode(gs[i].group_id)) + ",\"name\":" + jq(gs[i].name) + f",\"people\":{gs[i].members.len()}}}"));
+}
+
+// A queued change: "ID KIND A-HEX B-HEX C-HEX BY STATUS RESULT-HEX".
+@requires(filesystem, network, clock(readonly), declassify)
+List(Str) change_lines(Store root, List(Str) keys, Int i, ListBuf(Str) acc) {
+    if (i >= keys.len()) { return acc.finish(); }
+    Str t = str_trim(st_read_text(root, keys[i]));
+    return change_lines(root, keys, i + 1, if (str_len(t) > 0) { acc.push(t) } else { acc });
+}
+
+@requires(filesystem, network, clock(readonly), declassify)
+List(Str) change_json(Store root, List(Str) keys, Int i, ListBuf(Str) acc) {
+    if (i >= keys.len()) { return acc.finish(); }
+    List(Str) p = str_split(str_trim(st_read_text(root, keys[i])), " ");
+    Bool ok = p.len() == 8;
+    return change_json(root, keys, i + 1, if (ok) { acc.push("{\"id\":" + jq(p[0]) + ",\"kind\":" + jq(p[1]) + ",\"a\":" + jq(unhex_text(p[2])) + ",\"b\":" + jq(unhex_text(p[3]))
+        + ",\"c\":" + jq(unhex_text(p[4])) + ",\"status\":" + jq(p[6]) + ",\"result\":" + jq(unhex_text(p[7])) + "}") } else { acc });
+}
+
+Str hexd(Str s) { return if (str_len(s) == 0) { "-" } else { hex_encode(utf8(s)) }; }
+Str unhex_text(Str s) { List(Int) b = if (s == "-") { [] } else { cose_hex_decode(s) }; return http_text(b, 0, b.len()); }
+
+Bool change_kind_ok(Str k) { return k == "invite" || k == "group-add" || k == "group-remove" || k == "remove" || k == "policy" || k == "sync"; }
+
+@requires(filesystem, network, clock(readonly), declassify)
+HttpReply con_change(Store root, Str org, List(Str) sess, HttpRequest r) {
+    if (sess.len() != 2 || sess[0] != org) { return json_reply(401, "{\"error\":\"sign in\"}"); }
+    Jv v = json_parse(r.body) else { JNull };
+    Str kind = jstr(jget(v, "kind"));
+    Str a = jstr(jget(v, "a"));
+    Str b = jstr(jget(v, "b"));
+    Str c = jstr(jget(v, "c"));
+    if (!change_kind_ok(kind) || str_len(a) > 256 || str_len(b) > 256 || str_len(c) > 1024) { return json_reply(400, "{\"error\":\"invite, group-add, group-remove, remove, policy or sync\"}"); }
+    Str id = hex_encode(random_bytes(16));
+    Bool ok = st_text(root, "console/" + org + "/change-" + id, id + " " + kind + " " + hexd(a) + " " + hexd(b) + " " + hexd(c) + " " + sess[1] + " pending -");
+    return if (ok) { json_reply(200, "{\"id\":" + jq(id) + "}") } else { json_reply(500, "{}") };
+}
+
+@requires(filesystem, network, clock(readonly), declassify)
+HttpReply con_done(Store root, Str org, Str id, Who w, HttpRequest r) {
+    Str k = "console/" + org + "/change-" + id;
+    List(Str) p = str_split(str_trim(st_read_text(root, k)), " ");
+    if (p.len() != 8 || p[6] != "pending") { return http_reply_status(404); }
+    Str result = http_body_text(r);
+    Str status = if (str_starts_with(result, "refused")) { "refused" } else { "done" };
+    return if (st_text(root, k, str_join(p[0..6], " ") + " " + status + " " + hexd(result) + " ")) { http_reply_status(200) } else { http_reply_status(500) };
+}
+
+HttpReply console_page_html(Str org) {
+    HttpReply rep = http_reply_text(200, "text/html; charset=utf-8", "<!doctype html><html><head><meta charset=utf-8><meta name=viewport content=\"width=device-width\"><title>Symbolon console</title>"
+        + "<style>body{font:15px system-ui;margin:2em auto;max-width:60em;padding:0 1em}table{border-collapse:collapse;width:100%}td,th{border-bottom:1px solid #ddd;padding:.3em;text-align:left}"
+        + "button{margin:.2em}input,select{margin:.2em}.note{color:#555}</style></head><body data-org=\"" + org + "\"><h1>Symbolon console</h1>"
+        + "<div id=signin><p class=note>Owners and administrators sign in with a passkey their own device approved.</p><button id=login>Sign in with a passkey</button>"
+        + "<button id=register>Register this device's passkey</button><p id=msg></p></div><div id=app hidden></div><script src=\"/console/app.js\"></script></body></html>");
+    return http_with_header(http_with_header(rep, "Cache-Control", "no-store"), "Content-Security-Policy", "default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'");
+}
+
+// The console's script (no inline script: the page's policy allows only this file).
+Str console_js() {
+    return "const org = document.body.dataset.org, base = '/console/' + org;\n"
+         + "const $ = id => document.getElementById(id);\n"
+         + "const b64u = b => btoa(String.fromCharCode(...new Uint8Array(b))).replace(/\\+/g, '-').replace(/\\//g, '_').replace(/=+$/, '');\n"
+         + "const unb64u = s => Uint8Array.from(atob(s.replace(/-/g, '+').replace(/_/g, '/')), c => c.charCodeAt(0));\n"
+         + "const esc = s => String(s).replace(/[&<>\"]/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '\"': '&quot;'}[c]));\n"
+         + "async function api(path, body) {\n"
+         + "  const r = await fetch(base + path, body ? {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)} : {});\n"
+         + "  return {status: r.status, json: await r.json().catch(() => ({}))};\n"
+         + "}\n"
+         + "$('register').onclick = async () => {\n"
+         + "  const c = await api('/challenge');\n"
+         + "  const cred = await navigator.credentials.create({publicKey: {challenge: unb64u(c.json.challenge), rp: {id: c.json.rpId, name: 'Symbolon console'},\n"
+         + "    user: {id: crypto.getRandomValues(new Uint8Array(16)), name: 'console', displayName: 'Symbolon console'}, pubKeyCredParams: [{type: 'public-key', alg: -7}]}});\n"
+         + "  const r = await api('/register', {credentialId: b64u(cred.rawId), publicKey: b64u(cred.response.getPublicKey())});\n"
+         + "  $('msg').textContent = r.json.code ? 'On your device: symbolon device org console-key DIR ' + r.json.code + ' (or approve it in the app), then sign in.' : (r.json.error || 'refused');\n"
+         + "};\n"
+         + "$('login').onclick = async () => {\n"
+         + "  const c = await api('/challenge');\n"
+         + "  const a = await navigator.credentials.get({publicKey: {challenge: unb64u(c.json.challenge), rpId: c.json.rpId, userVerification: 'preferred'}});\n"
+         + "  const r = await api('/login', {credentialId: b64u(a.rawId), authenticatorData: b64u(a.response.authenticatorData), clientDataJSON: b64u(a.response.clientDataJSON), signature: b64u(a.response.signature)});\n"
+         + "  if (r.status === 200) show(); else $('msg').textContent = r.json.error || 'refused';\n"
+         + "};\n"
+         + "async function show() {\n"
+         + "  const r = await api('/state');\n"
+         + "  if (r.status !== 200) return;\n"
+         + "  const s = r.json;\n"
+         + "  $('signin').hidden = true; $('app').hidden = false;\n"
+         + "  $('app').innerHTML = '<h2>' + esc(s.name) + '</h2><p class=note>Membership version ' + s.version + ', governance ' + s.gov + '. Changes you queue here are signed on an owner\\'s or administrator\\'s own device.</p>'\n"
+         + "    + '<h3>Policy</h3><p>PIN at least ' + s.policy.min_pin_len + '; offline copies ' + (s.policy.allow_offline_copy ? 'allowed' : 'not allowed') + '; offline days ' + (s.policy.max_offline_days || 'no limit') + '; password rules ' + esc(s.policy.password_rules || 'none') + '; recovery ' + (s.recovery ? s.recovery.threshold + ' of ' + s.recovery.of + ' after ' + s.recovery.delay + ' s' : 'off') + '</p>'\n"
+         + "    + '<h3>People</h3><table><tr><th>Name</th><th>Directory id</th><th>Role</th></tr>' + s.members.map(m => '<tr><td>' + esc(m.name) + '</td><td>' + esc(m.ext) + '</td><td>' + m.role + '</td></tr>').join('') + '</table>'\n"
+         + "    + '<h3>Groups</h3><table><tr><th>Name</th><th>People</th><th>Id</th></tr>' + s.groups.map(g => '<tr><td>' + esc(g.name) + '</td><td>' + g.people + '</td><td><code>' + g.id + '</code></td></tr>').join('') + '</table>'\n"
+         + "    + '<h3>Queue a change</h3><select id=kind><option value=invite>Invite (directory id, name, group ids)</option><option value=group-add>Add to group (group id, log id)</option><option value=group-remove>Remove from group (group id, log id)</option><option value=remove>Remove person (log id)</option><option value=policy>Policy (key, value)</option><option value=sync>Sync</option></select>'\n"
+         + "    + '<input id=a placeholder=first><input id=b placeholder=second><input id=c placeholder=third><button id=queue>Queue</button>'\n"
+         + "    + '<h3>Changes</h3><table><tr><th>Change</th><th>Status</th><th>Result</th></tr>' + s.changes.map(c => '<tr><td>' + esc(c.kind + ' ' + c.a + ' ' + c.b + ' ' + c.c) + '</td><td>' + c.status + '</td><td>' + esc(c.result) + '</td></tr>').join('') + '</table>';\n"
+         + "  $('queue').onclick = async () => { await api('/change', {kind: $('kind').value, a: $('a').value, b: $('b').value, c: $('c').value}); show(); };\n"
+         + "}\n"
+         + "show();\n"
+         + "\n";
 }

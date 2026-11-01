@@ -12,8 +12,8 @@ cd "$(dirname "$0")/.."
 BIN="${BIN:-$PWD/target/symbolon}"
 [ -x "$BIN" ] || { echo "build target/symbolon first"; exit 2; }
 W="$(mktemp -d)"
-PG=""
-cleanup() { pkill -f -- "$W/" 2>/dev/null; [ -n "$PG" ] && docker rm -f "$PG" > /dev/null 2>&1; [ -n "${KEEP:-}" ] && echo "kept $W" || rm -rf "$W"; }
+PG=""; PGT=""
+cleanup() { pkill -f -- "$W/" 2>/dev/null; [ -n "$PG" ] && docker rm -f "$PG" > /dev/null 2>&1; [ -n "$PGT" ] && docker rm -f "$PGT" > /dev/null 2>&1; [ -n "${KEEP:-}" ] && echo "kept $W" || rm -rf "$W"; }
 trap cleanup EXIT
 trap "exit 1" INT TERM HUP
 fail() { echo "FAIL: $*"; for f in "$W"/*.log; do echo "== $f"; tail -5 "$f"; done; KEEP=1; exit 1; }
@@ -21,11 +21,11 @@ wait_port() { for _ in $(seq 150); do (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/n
 BASE=$(python3 -c 'import random; print(random.randrange(20000, 60000, 10))')
 c() { curl -sS -o "$W/out" -w '%{http_code}' "$@"; }
 
-relays() {   # NAME STORE-SPEC PORT1 PORT2
+relays() {   # NAME STORE-SPEC PORT1 PORT2 [--store-ca FILE]
     local name=$1 spec=$2 p1=$3 p2=$4
     printf '%s' "$spec" > "$W/$name.store"
-    ( setsid "$BIN" relay serve "$W/$name-a" "$p1" --store "@$W/$name.store" > "$W/$name-a.log" 2>&1 & )
-    ( setsid "$BIN" relay serve "$W/$name-b" "$p2" --store "@$W/$name.store" > "$W/$name-b.log" 2>&1 & )
+    ( setsid "$BIN" relay serve "$W/$name-a" "$p1" --store "@$W/$name.store" "${@:5}" > "$W/$name-a.log" 2>&1 & )
+    ( setsid "$BIN" relay serve "$W/$name-b" "$p2" --store "@$W/$name.store" "${@:5}" > "$W/$name-b.log" 2>&1 & )
     wait_port "$p1" && wait_port "$p2" || fail "$name relays did not start"
 }
 
@@ -54,7 +54,8 @@ exercise() {   # NAME PORT1 PORT2
 # PostgreSQL.
 PGP=$((BASE + 5))
 PG=$(docker run -d --rm -e POSTGRES_USER=sym -e POSTGRES_PASSWORD=s3cret-pw -e POSTGRES_DB=sym -p "127.0.0.1:$PGP:5432" postgres:17-alpine) || fail "docker postgres"
-for _ in $(seq 120); do docker exec "$PG" pg_isready -U sym -h 127.0.0.1 > /dev/null 2>&1 && break; sleep 0.5; done
+for _ in $(seq 120); do [ "$(docker logs "$PG" 2>&1 | grep -c 'ready to accept connections')" -ge 2 ] && break; sleep 0.5; done
+wait_port "$PGP" || fail "postgres port"
 sleep 1
 printf 'postgres://sym:wrong@127.0.0.1:%s/sym' "$PGP" > "$W/badpg.store"
 timeout 30 "$BIN" relay serve "$W/bad" $((BASE + 9)) --store "@$W/badpg.store" > "$W/badpg.log" 2>&1 && fail "a relay started with a wrong database password"
@@ -62,6 +63,35 @@ grep -q "not ready" "$W/badpg.log" || fail "wrong password: $(cat "$W/badpg.log"
 relays pg "postgres://sym:s3cret-pw@127.0.0.1:$PGP/sym" $((BASE + 1)) $((BASE + 2))
 exercise postgres $((BASE + 1)) $((BASE + 2))
 [ "$(docker exec "$PG" psql -U sym -d sym -tAc "select count(*) from symbolon_objects where k like 'mbox/%'")" = 3 ] || fail "postgres: the table does not hold the mailbox"
+pkill -f -- "relay (serve|child) $W/pg-" 2>/dev/null; sleep 1
+
+# PostgreSQL over TLS (sslmode=verify-full under a test CA).
+mkdir -p "$W/pgtls"
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 2 -subj /CN=pg-test-ca -keyout "$W/pgtls/ca.key" -out "$W/pgtls/ca.pem" > /dev/null 2>&1 || fail "test CA"
+openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -subj /CN=127.0.0.1 -keyout "$W/pgtls/server.key" -out "$W/pgtls/server.csr" > /dev/null 2>&1 || fail "server key"
+printf 'subjectAltName=IP:127.0.0.1\nbasicConstraints=CA:FALSE\nkeyUsage=digitalSignature\nextendedKeyUsage=serverAuth\n' > "$W/pgtls/ext"
+openssl x509 -req -in "$W/pgtls/server.csr" -CA "$W/pgtls/ca.pem" -CAkey "$W/pgtls/ca.key" -CAcreateserial -days 2 -extfile "$W/pgtls/ext" -out "$W/pgtls/server.crt" > /dev/null 2>&1 || fail "server cert"
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 2 -subj /CN=other-ca -keyout "$W/pgtls/other.key" -out "$W/pgtls/other.pem" > /dev/null 2>&1
+chmod 0640 "$W/pgtls/server.key"
+# Only TLS connections from outside the container: a relay that did not use TLS would be refused.
+printf 'local all all trust\nhost all all 127.0.0.1/32 trust\nhostssl all all all scram-sha-256\nhostnossl all all all reject\n' > "$W/pgtls/pg_hba.conf"
+PGTP=$((BASE + 7))
+# The key must belong to the database user: copied into place inside the container.
+PGT=$(docker create -e POSTGRES_USER=sym -e POSTGRES_PASSWORD=s3cret-pw -e POSTGRES_DB=sym -p "127.0.0.1:$PGTP:5432" --entrypoint sh postgres:17-alpine -c \
+    'cp -r /certs-in /certs && chown -R postgres /certs && chmod 600 /certs/server.key && exec docker-entrypoint.sh postgres -c ssl=on -c ssl_cert_file=/certs/server.crt -c ssl_key_file=/certs/server.key -c hba_file=/certs/pg_hba.conf') || fail "docker create postgres (TLS)"
+docker cp "$W/pgtls" "$PGT:/certs-in" > /dev/null || fail "docker cp certs"
+docker start "$PGT" > /dev/null || fail "docker start postgres (TLS)"
+# Ready once the server that replaces the image's first-run one accepts connections.
+for _ in $(seq 120); do [ "$(docker logs "$PGT" 2>&1 | grep -c 'ready to accept connections')" -ge 2 ] && break; sleep 0.5; done
+wait_port "$PGTP" || fail "postgres (TLS) port"
+sleep 1
+printf 'postgres://sym:s3cret-pw@127.0.0.1:%s/sym?sslmode=verify-full' "$PGTP" > "$W/badca.store"
+timeout 30 "$BIN" relay serve "$W/bad3" $((BASE + 9)) --store "@$W/badca.store" --store-ca "$W/pgtls/other.pem" > "$W/badca.log" 2>&1 && fail "a relay trusted a database under another CA"
+grep -q "certificate\|TLS" "$W/badca.log" || fail "wrong CA: $(cat "$W/badca.log")"
+relays pgtls "postgres://sym:s3cret-pw@127.0.0.1:$PGTP/sym?sslmode=verify-full" $((BASE + 1)) $((BASE + 2)) --store-ca "$W/pgtls/ca.pem"
+exercise "postgres over TLS" $((BASE + 1)) $((BASE + 2))
+[ "$(docker exec "$PGT" psql -U sym -d sym -tAc "show ssl")" = on ] || fail "the database is not serving TLS"
+pkill -f -- "relay (serve|child) $W/pgtls" 2>/dev/null; sleep 1
 
 # S3.
 S3P=$((BASE + 6))

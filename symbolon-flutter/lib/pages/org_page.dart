@@ -48,6 +48,32 @@ class RecoveryRequest {
   const RecoveryRequest(this.folder, this.requester, this.opensAt);
 }
 
+/// A change queued at the relay's console, waiting for a device to sign it.
+class ConsoleChange {
+  final String id;
+  final String kind;
+  final List<String> args;
+  final String status;
+  const ConsoleChange(this.id, this.kind, this.args, this.status);
+
+  static String _t(String h) {
+    if (h == '-') return '';
+    try {
+      return unhex(h);
+    } on FormatException {
+      return '';
+    }
+  }
+
+  static ConsoleChange? parse(String line) {
+    final p = line.trim().split(' ');
+    if (p.length != 8 || p[0].length != 32) return null;
+    return ConsoleChange(p[0], p[1], [_t(p[2]), _t(p[3]), _t(p[4])].where((a) => a.isNotEmpty).toList(), p[6]);
+  }
+
+  String get title => '$kind ${args.join(' ')}'.trim();
+}
+
 /// A member as `org members` prints it.
 class OrgMember {
   final String log;
@@ -83,6 +109,7 @@ class OrgPage extends StatefulWidget {
 class _OrgPageState extends State<OrgPage> {
   OrgInfo? info;
   List<OrgMember> members = [];
+  List<ConsoleChange> changes = [];
   ManagedConfig managed = const ManagedConfig();
   bool loading = true;
   String? problem;
@@ -103,6 +130,7 @@ class _OrgPageState extends State<OrgPage> {
     final m = await widget.managed();
     final r = await app.cli.orgShow(app.dir);
     final ms = r.ok ? await app.cli.orgMembers(app.dir) : null;
+    final cs = r.ok ? await app.cli.orgChanges(app.dir) : null;
     if (!mounted) return;
     setState(() {
       loading = false;
@@ -110,6 +138,7 @@ class _OrgPageState extends State<OrgPage> {
       info = r.ok ? OrgInfo.parse(r.lines) : null;
       problem = r.ok || r.err.contains('in no organization') ? null : friendlyError(r);
       members = ms != null && ms.ok ? ms.lines.map(OrgMember.parse).whereType<OrgMember>().toList() : [];
+      changes = cs != null && cs.ok ? cs.lines.map(ConsoleChange.parse).whereType<ConsoleChange>().where((c) => c.status == 'pending').toList() : [];
       if (orgC.text.isEmpty) orgC.text = m.orgId;
       if (founderC.text.isEmpty) founderC.text = m.founder;
       if (codeC.text.isEmpty) codeC.text = m.inviteCode;
@@ -186,6 +215,38 @@ class _OrgPageState extends State<OrgPage> {
     load();
   }
 
+  Future<void> approve(ConsoleChange c) async {
+    final r = await app.withPin(context, (p) => runTask(context, 'Signing ${c.kind}', () => app.cli.orgApprove(app.dir, c.id, p), usually: 'a minute'));
+    if (r == null || !mounted) return;
+    if (!r.ok) {
+      toast(context, friendlyError(r));
+    } else {
+      await showOutput(context, 'Done', r.lines.join('\n'));
+    }
+    load();
+  }
+
+  Future<void> consoleKey() async {
+    final code = TextEditingController();
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Approve a console passkey'),
+        content: Column(mainAxisSize: MainAxisSize.min, children: [
+          const Text('The console shows a code after you register a passkey there. Approve only a code you see on your own screen.'),
+          TextField(key: const Key('org-console-code'), controller: code, decoration: const InputDecoration(labelText: 'Code')),
+        ]),
+        actions: [
+          TextButton(onPressed: () => Navigator.of(ctx).pop(false), child: const Text('Cancel')),
+          FilledButton(key: const Key('org-console-ok'), onPressed: () => Navigator.of(ctx).pop(true), child: const Text('Approve')),
+        ],
+      ),
+    );
+    if (ok != true || code.text.trim().isEmpty || !mounted) return;
+    final r = await app.withPin(context, (p) => runTask(context, 'Approving', () => app.cli.orgConsoleKey(app.dir, code.text.trim(), p), usually: 'a few seconds'));
+    if (r != null && mounted) toast(context, r.ok ? 'Approved: sign in at the console.' : friendlyError(r));
+  }
+
   String when(int t) => DateTime.fromMillisecondsSinceEpoch(t * 1000).toLocal().toString().substring(0, 16);
 
   @override
@@ -230,6 +291,20 @@ class _OrgPageState extends State<OrgPage> {
                 WideButton('Invite someone', key: const Key('org-invite'), icon: Icons.person_add_alt, onPressed: invite),
                 const SizedBox(height: 8),
                 WideButton('Sync', key: const Key('org-sync'), icon: Icons.sync, onPressed: sync),
+                const SizedBox(height: 8),
+                WideButton('Approve a console passkey', key: const Key('org-console-key'), icon: Icons.key, onPressed: consoleKey),
+              ]),
+            if (o.admin && changes.isNotEmpty)
+              Section('Changes from the console (${changes.length})', children: [
+                const Text('Queued at the console; they take effect when this device signs them.'),
+                for (final c in changes)
+                  ListTile(
+                    key: Key('org-change-${c.id}'),
+                    contentPadding: EdgeInsets.zero,
+                    leading: const Icon(Icons.pending_actions),
+                    title: Text(c.title),
+                    trailing: TextButton(key: Key('org-approve-${c.id}'), onPressed: () => approve(c), child: const Text('Approve')),
+                  ),
               ]),
             Section('People (${members.length})', children: [
               for (final m in members)

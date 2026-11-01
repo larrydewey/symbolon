@@ -224,7 +224,7 @@ pub Int home_serve(Str dir, Str self) {
     Str tls = " --tls " + dir + "/tls/server.pem " + dir + "/tls/server.key --bind " + c.bind;
     List(Str) cmds = [
         self + " home pair-serve " + dir,
-        self + " relay serve " + dir + f"/relay {c.base + 1}" + tls + " --ca " + dir + "/tls/ca.pem",
+        self + " relay serve " + dir + f"/relay {c.base + 1}" + tls + " --ca " + dir + "/tls/ca.pem --console-origin https://" + c.hosts[0] + f":{c.base + 1}",
         self + " witness serve " + dir + f"/w1 {c.base + 2} " + dir + "/w1.key 0" + tls,
         self + " witness serve " + dir + f"/w2 {c.base + 3} " + dir + "/w2.key 0" + tls,
         self + " witness serve " + dir + f"/w3 {c.base + 4} " + dir + "/w3.key 0" + tls

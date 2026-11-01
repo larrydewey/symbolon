@@ -176,6 +176,15 @@ class SymbolonCli {
   /// Escrows a work folder this person owns to the organization's recovery key.
   Future<CliResult> orgEscrow(String dir, String id, String pin) => run(['device', 'org', 'escrow', dir, id], input: [pin], timeout: const Duration(minutes: 5));
 
+  /// "ID KIND A-HEX B-HEX C-HEX BY STATUS RESULT-HEX" per change queued at the relay's console (no PIN).
+  Future<CliResult> orgChanges(String dir) => run(['device', 'org', 'changes', dir], timeout: const Duration(minutes: 5));
+
+  /// Makes a change queued at the console, signed on this device.
+  Future<CliResult> orgApprove(String dir, String id, String pin) => run(['device', 'org', 'approve', dir, id], input: [pin], timeout: const Duration(minutes: 30));
+
+  /// Approves the passkey waiting at the console with [code], for this administrator.
+  Future<CliResult> orgConsoleKey(String dir, String code, String pin) => run(['device', 'org', 'console-key', dir, code], input: [pin], timeout: const Duration(minutes: 5));
+
   // ─── Shared folders ─────────────────────────────────────────────────
 
   /// "ID NAME-HEX owner|member PEOPLE [duress]" per folder; "ID - waiting

@@ -9,7 +9,8 @@
 // st_put_new, which only one writer wins, in every backend.
 //
 //   --store DIR                                  a directory (the default: the relay's DIR)
-//   --store postgres://USER:PASSWORD@HOST:PORT/DB   table symbolon_objects (made on start)
+//   --store postgres://USER:PASSWORD@HOST:PORT/DB[?sslmode=verify-full]   table symbolon_objects (made on start);
+//                                                TLS under --store-ca FILE
 //   --store s3://KEY-ID:SECRET@HOST:PORT/BUCKET?region=R   (--store-ca FILE for HTTPS)
 
 import "pg.resid";
@@ -17,11 +18,11 @@ import "s3.resid";
 import "crypto.resid";
 
 pub type StoreCfg = Fs(Str) | Pg(PgCfg) | S3(S3Cfg);
-pub type Store = FsStore(Str) | PgStore(PgConn) | S3Store(S3Cfg);
+pub type Store = FsStore(Str) | PgStore(PgConn) | PgTlsStore(PgCfg) | S3Store(S3Cfg);
 
 pub Option(StoreCfg) store_cfg(Str spec, Str dir, Str ca) {
     if (str_len(spec) == 0) { return Some(Fs(dir)); }
-    if (str_starts_with(spec, "postgres://")) { return match pg_url(spec) { Some(c) => Some(Pg(c)), None => None }; }
+    if (str_starts_with(spec, "postgres://")) { return match pg_url(spec, ca, dir) { Some(c) => Some(Pg(c)), None => None }; }
     if (str_starts_with(spec, "s3://")) { return match s3_url(spec, ca) { Some(c) => Some(S3(c)), None => None }; }
     return Some(Fs(spec));
 }
@@ -38,22 +39,32 @@ pub Str store_prepare(StoreCfg c) {
     };
 }
 
-@requires(network, declassify)
+@requires(filesystem, network, clock(readonly), declassify)
 Str pg_prepare(PgCfg p) {
+    Str make = "CREATE TABLE IF NOT EXISTS " + pg_table() + " (k text COLLATE \"C\" PRIMARY KEY, v bytea NOT NULL)";
+    if (p.tls) {
+        PgResult t = pg_tls_exec(p, make, []);
+        // Two relays starting together can race on IF NOT EXISTS; the loser's
+        // second try finds the table.
+        return if (str_len(t.err) > 0) { pg_tls_exec(p, make, []).err } else { "" };
+    }
     PgConn c = pg_connect(p);
     if (c.fd < 0) { return c.err; }
-    Str make = "CREATE TABLE IF NOT EXISTS " + pg_table() + " (k text COLLATE \"C\" PRIMARY KEY, v bytea NOT NULL)";
     PgResult r = pg_exec(c, make, []);
-    // Two relays starting together can race on IF NOT EXISTS; the loser's
-    // second try finds the table.
     PgResult r2 = if (str_len(r.err) > 0) { pg_exec(c, make, []) } else { r };
     _ = pg_close(c);
     return r2.err;
 }
 
-@requires(network, declassify)
+@requires(filesystem, network, declassify)
 pub Store store_open(StoreCfg c) {
-    return match c { Fs(d) => FsStore(d), Pg(p) => PgStore(pg_connect(p)), S3(s) => S3Store(s) };
+    return match c { Fs(d) => FsStore(d), Pg(p) => if (p.tls) { PgTlsStore(p) } else { PgStore(pg_connect(p)) }, S3(s) => S3Store(s) };
+}
+
+// One statement on whichever Postgres connection the store has.
+@requires(filesystem, network, clock(readonly), declassify)
+PgResult pgq(Store s, Str sql, List(List(Int)) ps) {
+    return match s { PgStore(c) => pg_exec(c, sql, ps), PgTlsStore(p) => pg_tls_exec(p, sql, ps), _ => PgResult {.rows = [], .tag = "", .err = "not a database"} };
 }
 
 @requires(network)
@@ -69,7 +80,8 @@ List(Int) utf(Str s) { return str_to_bytes(s); }
 pub Option(List(Int)) st_get(Store s, Str k) {
     return match s {
         FsStore(d) => if (filesystem.exists(d + "/" + k) && !filesystem.is_dir(d + "/" + k)) { Some(filesystem.read_bytes(d + "/" + k)) } else { None },
-        PgStore(c) => first_col(pg_exec(c, "SELECT v FROM " + pg_table() + " WHERE k = $1", [utf(k)])),
+        PgStore(c) => first_col(pgq(s, "SELECT v FROM " + pg_table() + " WHERE k = $1", [utf(k)])),
+        PgTlsStore(c) => first_col(pgq(s, "SELECT v FROM " + pg_table() + " WHERE k = $1", [utf(k)])),
         S3Store(c) => s3_get(c, k)
     };
 }
@@ -87,7 +99,8 @@ pub List(Int) st_bytes(Store s, Str k) { return st_get(s, k) else { [] }; }
 pub Bool st_put(Store s, Str k, List(Int) b) {
     return match s {
         FsStore(d) => fs_dirs(d, str_split(k, "/"), 0) && filesystem.write_bytes(d + "/" + k, b),
-        PgStore(c) => str_len(pg_exec(c, "INSERT INTO " + pg_table() + " (k, v) VALUES ($1, $2) ON CONFLICT (k) DO UPDATE SET v = EXCLUDED.v", [utf(k), b]).err) == 0,
+        PgStore(c) => str_len(pgq(s, "INSERT INTO " + pg_table() + " (k, v) VALUES ($1, $2) ON CONFLICT (k) DO UPDATE SET v = EXCLUDED.v", [utf(k), b]).err) == 0,
+        PgTlsStore(c) => str_len(pgq(s, "INSERT INTO " + pg_table() + " (k, v) VALUES ($1, $2) ON CONFLICT (k) DO UPDATE SET v = EXCLUDED.v", [utf(k), b]).err) == 0,
         S3Store(c) => s3_put(c, k, b)
     };
 }
@@ -97,7 +110,8 @@ pub Bool st_put(Store s, Str k, List(Int) b) {
 pub Int st_put_new(Store s, Str k, List(Int) b) {
     return match s {
         FsStore(d) => if (filesystem.exists(d + "/" + k)) { 0 } else { if (fs_dirs(d, str_split(k, "/"), 0) && filesystem.write_bytes(d + "/" + k, b)) { 1 } else { -1 } },
-        PgStore(c) => pg_new(pg_exec(c, "INSERT INTO " + pg_table() + " (k, v) VALUES ($1, $2) ON CONFLICT (k) DO NOTHING", [utf(k), b])),
+        PgStore(c) => pg_new(pgq(s, "INSERT INTO " + pg_table() + " (k, v) VALUES ($1, $2) ON CONFLICT (k) DO NOTHING", [utf(k), b])),
+        PgTlsStore(c) => pg_new(pgq(s, "INSERT INTO " + pg_table() + " (k, v) VALUES ($1, $2) ON CONFLICT (k) DO NOTHING", [utf(k), b])),
         S3Store(c) => s3_put_new(c, k, b)
     };
 }
@@ -126,7 +140,8 @@ Bool fs_dirs(Str d, List(Str) segs, Int i) {
 pub List(Str) st_list(Store s, Str prefix, Str after, Int max) {
     return match s {
         FsStore(d) => fs_list(d, prefix, after, max),
-        PgStore(c) => keys_of(pg_exec(c, "SELECT k FROM " + pg_table() + " WHERE starts_with(k, $1) AND k > $2 ORDER BY k LIMIT " + f"{max}", [utf(prefix), utf(after)]).rows, 0, ListBuf()),
+        PgStore(c) => keys_of(pgq(s, "SELECT k FROM " + pg_table() + " WHERE starts_with(k, $1) AND k > $2 ORDER BY k LIMIT " + f"{max}", [utf(prefix), utf(after)]).rows, 0, ListBuf()),
+        PgTlsStore(c) => keys_of(pgq(s, "SELECT k FROM " + pg_table() + " WHERE starts_with(k, $1) AND k > $2 ORDER BY k LIMIT " + f"{max}", [utf(prefix), utf(after)]).rows, 0, ListBuf()),
         S3Store(c) => capped(s3_list(c, prefix, after, max), max)
     };
 }

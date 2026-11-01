@@ -13,6 +13,7 @@ import "device.resid";
 import "vaultcli.resid";
 import "rotatecli.resid";
 import "sharecli.resid";
+import "orgcore.resid";
 import "crypto.resid";
 import "cose.resid";
 
@@ -134,8 +135,19 @@ Int set_checked(Str dir, Opened o, Str name, Str t, List(FieldPlain) fs) {
         Str origin = field_text(fs, "origin");
         if (origin_of(origin) != origin) { return dfail("the origin must be scheme://host[:port], as " + origin_of(origin)); }
     }
+    // An organization's password rules (SPEC 29.5) hold in its members' shared folders.
+    Str rules = if (str_len(o.p.share) > 0) { org_rules(dir) } else { "" };
+    Str weak = rules_broken(rules, reveal(field_secret(fs, if (t == "login") { "current" } else { "secret" }, 0)));
+    if (str_len(rules) > 0 && (has(fs, "current") || has(fs, "secret")) && str_len(weak) > 0) { return dfail("the organization's password rules ask for " + weak); }
     List(FieldPlain) all = [FieldPlain {.name = "name", .value = secret_bytes(utf8(name))}, FieldPlain {.name = "type", .value = secret_bytes(utf8(t))}].concat(fs);
     return seal_publish(dir, o, name, all);
+}
+
+List(Secret(UInt(8))) field_secret(List(FieldPlain) fs, Str n, Int i) {
+    List(Secret(UInt(8))) none = [];
+    if (i >= fs.len()) { return none; }
+    if (fs[i].name == n) { return fs[i].value; }
+    return field_secret(fs, n, i + 1);
 }
 
 // `symbolon device vault show DIR NAME`: the PIN on standard input; prints

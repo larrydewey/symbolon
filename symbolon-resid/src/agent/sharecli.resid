@@ -26,6 +26,7 @@ import "device.resid";
 import "serials.resid";
 import "sharetypes.resid";
 import "orgcore.resid";
+import "escrowcore.resid";
 import "vaultcli.resid";
 import "crypto.resid";
 import "ecdsa.resid";
@@ -195,6 +196,7 @@ Bool keep_signed_in(Str dir, Dev d) {
 pub Result(Ctx, Str) unlocked(Str dir) {
     Dev d = unlocked_dev(dir)?;
     if (d.u.kind != 1) { return Err("the relay refused the change; try again later"); }
+    if (str_len(d.pin) < org_min_pin(dir)) { return Err(f"the organization asks for a PIN of at least {org_min_pin(dir)} characters: change it (device pin)"); }
     _ = keep_signed_in(dir, d);
     return online(dir, d);
 }
@@ -827,6 +829,7 @@ Result(Int, Str) change_members(Str dir, Ctx x, Loaded ld, List(Member) ms, List
     if (!blob_put(x.ep, roster_blob(cid), cbor_or_empty(to_cbor(r)))) { return Err("the relay refused the roster"); }
     _ = filesystem.write_all(place_local(dir, cid) + ".roster", f"{r.version}");
     println(f"shared folder version {v}, {1 + ms.len()} people");
+    if (!rescrow(dir, x.c, x.u, x.vh, x.ep, r.coll_id, v, key)) { eprintln("the folder's escrow could not be renewed: run org escrow"); }
     return Ok(0);
 }
 

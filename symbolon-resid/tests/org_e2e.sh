@@ -205,6 +205,10 @@ scim "$RELAY/scim/v2/Users?filter=userName%20eq%20%22erin%40acme.example%22" | g
 scim -X POST --data "{\"displayName\":\"Engineering\",\"members\":[{\"value\":\"$UC\"}]}" "$RELAY/scim/v2/Groups" > "$W/sg.json" || fail "SCIM group"
 SG=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["id"])' "$W/sg.json")
 scim -X PATCH --data "{\"Operations\":[{\"op\":\"add\",\"path\":\"members\",\"value\":[{\"value\":\"$UE\"}]}]}" "$RELAY/scim/v2/Groups/$SG" | grep -q "$UE" || fail "SCIM group patch"
+scim -X PATCH --data "{\"Operations\":[{\"op\":\"remove\",\"path\":\"members[value eq \\\"$UC\\\"]\"}]}" "$RELAY/scim/v2/Groups/$SG" > /dev/null || fail "SCIM group remove"
+[ "$(code -H "Authorization: Bearer $(tok "$C")" "$RELAY/blob/wrap-$CLOG-$FID")" = 403 ] || fail "carol kept the group folder after the directory took her out of the group"
+scim -X PATCH --data "{\"Operations\":[{\"op\":\"add\",\"path\":\"members\",\"value\":[{\"value\":\"$UC\"}]}]}" "$RELAY/scim/v2/Groups/$SG" > /dev/null || fail "SCIM group add back"
+[ "$(code -H "Authorization: Bearer $(tok "$C")" "$RELAY/blob/wrap-$CLOG-$FID")" = 200 ] || fail "carol did not get the group folder back"
 pin device org sync "$A" > "$W/dsync.log" 2>&1 || fail "directory sync: $(cat "$W/dsync.log")"
 grep -q "^invite $(hx erin@acme.example) [0-9a-f]\{32\} [0-9a-f]\{32\}$" "$W/dsync.log" || fail "directory sync did not invite erin: $(cat "$W/dsync.log")"
 grep -q "^removed" "$W/dsync.log" && fail "directory sync removed someone listed: $(cat "$W/dsync.log")"
@@ -218,16 +222,20 @@ grep -qx "removed $CLOG $(hx carol@acme.example)" "$W/dsync3.log" && grep -qx "$
 run 120 "$BIN" device org members "$A" | grep -q "$CLOG" && fail "carol is still a member after the directory turned her off"
 echo "directory: SCIM users and groups; sync invites the new person once; turning carol off ends her sessions at once, and the next sync removes her and re-keys"
 # Opt-in recovery of work folders (SPEC 29.8).
-pin device org recovery on "$A" 2 3600 "$ALOG,$BLOG" > "$W/recon.log" 2>&1 || fail "recovery on: $(cat "$W/recon.log")"
+pin device org recovery on "$A" 2 3600 "$ALOG,$BLOG" > "$W/recshort.log" 2>&1 && fail "a short recovery delay without --short-delay"
+grep -q "short-delay" "$W/recshort.log" || fail "short delay: $(cat "$W/recshort.log")"
+pin device org recovery on "$A" 2 3600 "$ALOG,$BLOG" --short-delay > "$W/recon.log" 2>&1 || fail "recovery on: $(cat "$W/recon.log")"
 run 120 "$BIN" device org show "$B" | grep -qx "recovery on 2/2 delay 3600" || fail "recovery on: $(run 120 "$BIN" device org show "$B")"
 WID=$(pin device share new "$B" Work) || fail "bob's work folder"
 printf '2468\ntext %s\n' "$(hx 'q3 plan')" | run 300 "$BIN" device vault set "$B" Plan note --share "$WID" > /dev/null 2>&1 || fail "bob writes his work folder"
 pin device org escrow "$B" "$WID" | grep -qx "escrowed $WID 1" || fail "escrow"
 pin device org recover request "$A" "$WID" > "$W/req.log" 2>&1 || fail "request: $(cat "$W/req.log")"
 run 120 "$BIN" device org show "$B" | grep -q "^recovery-request $WID $ALOG " || fail "bob was not told of the request"
+[ "$(code -H "Authorization: Bearer $(tok "$A")" "$RELAY/blob/escrow-$ORG-$WID")" = 403 ] || fail "the relay served the escrow before the delay"
+[ "$(code -H "Authorization: Bearer $(tok "$B")" "$RELAY/blob/escrow-$ORG-$WID")" = 200 ] || fail "the owner could not read his escrow"
 pin device org recover approve "$B" "$WID" > "$W/early.log" 2>&1 && fail "approved before the delay"
 grep -q "opens at" "$W/early.log" || fail "early approval: $(cat "$W/early.log")"
-pin device org recovery on "$A" 2 0 "$ALOG,$BLOG" > /dev/null 2>&1 || fail "recovery on, no delay"
+pin device org recovery on "$A" 2 0 "$ALOG,$BLOG" --short-delay > /dev/null 2>&1 || fail "recovery on, no delay"
 pin device org recover request "$A" "$WID" > /dev/null 2>&1 || fail "request again"
 pin device org recover open "$A" "$WID" > "$W/open0.log" 2>&1 && fail "opened without approvals"
 pin device org recover approve "$A" "$WID" > /dev/null 2>&1 || fail "alice approves"
@@ -236,6 +244,8 @@ grep -q "1 of 2" "$W/open1.log" || fail "one approval: $(cat "$W/open1.log")"
 pin device org recover approve "$B" "$WID" > /dev/null 2>&1 || fail "bob approves"
 pin device org recover open "$A" "$WID" > "$W/open2.log" 2>&1 && fail "opened an escrow made under the old recovery key"
 pin device org escrow "$B" "$WID" > /dev/null 2>&1 || fail "escrow again"
+pin device share add "$B" "$WID" "$ALOG" Alice > "$W/wadd.log" 2>&1 || fail "bob shares his work folder: $(cat "$W/wadd.log")"
+pin device share remove "$B" "$WID" "$ALOG" > "$W/wrm.log" 2>&1 || fail "bob takes alice out again: $(cat "$W/wrm.log")"
 pin device org recover open "$A" "$WID" > "$W/open3.log" 2>&1 || fail "open: $(cat "$W/open3.log")"
 grep -qx "opened $WID 1" "$W/open3.log" && grep -q "Plan" "$W/open3.log" || fail "open: $(cat "$W/open3.log")"
 run 120 "$BIN" device org audit "$A" > "$W/raudit.log" 2>&1; grep -q " recovery $WID " "$W/raudit.log" || fail "recovery not audited"
@@ -309,4 +319,54 @@ curl -sS "$CURL" > "$W/console.html" || fail "console"
 grep -q "Acme" "$W/console.html" && grep -q "class=ok>verified" "$W/console.html" && grep -q "class=bad>" "$W/console.html" && grep -q "erin\|bob-ext" "$W/console.html" || fail "console page: $(head -c 400 "$W/console.html")"
 pkill -f -- "org console $A" 2>/dev/null
 echo "console: a read-only page on 127.0.0.1 behind a token: people, policy, and the audit log with each event verified"
+# The relay's console (SPEC 29.10): a passkey the admin's device approved
+# signs in; a change queued there is made only when the device approves it.
+# The device's own passkey commands stand in for a browser.
+b64u() { python3 -c 'import base64,sys; print(base64.urlsafe_b64encode(bytes.fromhex(sys.argv[1])).decode().rstrip("="))' "$1"; }
+pin device webauthn register "$A" 127.0.0.1 > "$W/wa.log" 2>&1 || fail "console passkey: $(cat "$W/wa.log")"
+WCID=$(awk '/^credential-id/ {print $2}' "$W/wa.log"); WPUB=$(awk '/^public-key/ {print $2}' "$W/wa.log")
+SPKI="3059301306072a8648ce3d020106082a8648ce3d030107034200$WPUB"
+curl -sS --cacert "$W/box/tls/ca.pem" -X POST -H 'Content-Type: application/json' --data "{\"credentialId\":\"$(b64u "$WCID")\",\"publicKey\":\"$(b64u "$SPKI")\"}" "$RELAY/console/$ORG/register" > "$W/creg.json" || fail "console register"
+CCODE=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["code"])' "$W/creg.json") || fail "console register: $(cat "$W/creg.json")"
+[ "$(code -H "Content-Type: application/json" "$RELAY/console/$ORG/state")" = 401 ] || fail "the console's state without signing in"
+login() {   # DIR ORIGIN -> status of the login
+    curl -sS --cacert "$W/box/tls/ca.pem" "$RELAY/console/$ORG/challenge" > "$W/cchal.json"
+    local cj chal cdh
+    chal=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["challenge"])' "$W/cchal.json")
+    cj=$(printf '{"type":"webauthn.get","challenge":"%s","origin":"%s"}' "$chal" "$2")
+    cdh=$(printf '%s' "$cj" | sha256sum | cut -d' ' -f1)
+    pin device webauthn assert "$1" 127.0.0.1 "$WCID" "$cdh" > "$W/wassert.log" 2>&1 || { echo 0; return; }
+    local ad sig
+    ad=$(awk '/^authenticator-data/ {print $2}' "$W/wassert.log"); sig=$(awk '/^signature-der/ {print $2}' "$W/wassert.log")
+    curl -s -o "$W/clogin.json" -w '%{http_code}' -c "$W/jar" --cacert "$W/box/tls/ca.pem" -X POST -H 'Content-Type: application/json' \
+        --data "{\"credentialId\":\"$(b64u "$WCID")\",\"authenticatorData\":\"$(b64u "$ad")\",\"clientDataJSON\":\"$(b64u "$(printf '%s' "$cj" | od -An -tx1 | tr -d ' \n')")\",\"signature\":\"$(b64u "$sig")\"}" "$RELAY/console/$ORG/login"
+}
+[ "$(login "$A" "$RELAY")" = 403 ] || fail "a passkey no device approved signed in to the console"
+pin device org console-key "$A" "$CCODE" > "$W/ckey.log" 2>&1 || fail "console-key: $(cat "$W/ckey.log")"
+[ "$(login "$A" "https://evil.example")" = 403 ] || fail "an assertion for another origin signed in"
+[ "$(login "$A" "$RELAY")" = 200 ] || fail "console login: $(cat "$W/clogin.json")"
+curl -sS -b "$W/jar" --cacert "$W/box/tls/ca.pem" "$RELAY/console/$ORG/state" > "$W/cstate.json"
+grep -q '"name":"Acme"' "$W/cstate.json" || fail "console state: $(head -c 300 "$W/cstate.json")"
+curl -sS -b "$W/jar" --cacert "$W/box/tls/ca.pem" -X POST -H 'Content-Type: application/json' --data '{"kind":"policy","a":"max_offline_days","b":"7","c":""}' "$RELAY/console/$ORG/change" > "$W/cchange.json"
+CHID=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["id"])' "$W/cchange.json") || fail "console change: $(cat "$W/cchange.json")"
+run 120 "$BIN" device org show "$A" | grep -q "max_offline_days=7" && fail "a console change took effect without a device"
+run 120 "$BIN" device org changes "$A" | grep -q "^$CHID policy .* pending" || fail "org changes: $(run 120 "$BIN" device org changes "$A")"
+pin device org approve "$A" "$CHID" > "$W/approve.log" 2>&1 || fail "approve: $(cat "$W/approve.log")"
+run 120 "$BIN" device org show "$A" | grep -q "max_offline_days=7" || fail "the approved change did not take effect"
+curl -sS -b "$W/jar" --cacert "$W/box/tls/ca.pem" "$RELAY/console/$ORG/state" | grep -q '"status":"done"' || fail "the console does not show the change done"
+echo "console: a passkey the admin's device approved signs in at the relay; a change queued there takes effect only when the device signs it"
+
+# Password rules and the minimum PIN length.
+pin device org policy "$A" password_rules min=12,digit > /dev/null 2>&1 || fail "password rules"
+printf '2468\nsecret %s\n' "$(hx short1)" | run 300 "$BIN" device vault set "$B" Weak secret --share "$FID" > "$W/weak.log" 2>&1 && fail "a password against the rules was saved"
+grep -q "password rules ask for at least 12 characters" "$W/weak.log" || fail "rules: $(cat "$W/weak.log")"
+printf '2468\nsecret %s\n' "$(hx long-enough-pass-42)" | run 300 "$BIN" device vault set "$B" Strong secret --share "$FID" > "$W/strong.log" 2>&1 || fail "a good password: $(cat "$W/strong.log")"
+pin device org policy "$A" min_pin_len 5 > /dev/null 2>&1 || fail "min_pin_len"
+run 120 "$BIN" device org show "$B" > /dev/null 2>&1
+pin device org sync "$B" > "$W/shortpin.log" 2>&1 && fail "a PIN shorter than the policy was used"
+grep -q "device pin" "$W/shortpin.log" || fail "short PIN: $(cat "$W/shortpin.log")"
+printf '2468\n24680\n' | run 300 "$BIN" device pin "$B" > "$W/bpin.log" 2>&1 || fail "bob's new PIN: $(cat "$W/bpin.log")"
+printf '24680\n' | run 300 "$BIN" device org sync "$B" > "$W/bsync.log" 2>&1 || fail "sync with the new PIN: $(cat "$W/bsync.log")"
+printf '2468\n123\n' | run 300 "$BIN" device pin "$A" > /dev/null 2>&1 && fail "a PIN shorter than 4 was set"
+echo "policy: weak passwords stay out of shared folders; a short PIN is refused until it is changed (device pin)"
 echo "PASS org_e2e"

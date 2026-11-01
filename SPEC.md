@@ -2149,17 +2149,23 @@ policy = { min_pin_len, allow_biometric, allow_duress, allow_offline_copy,
            password_rules }
 ```
 
-A device warns when its PIN is shorter than `min_pin_len` (a PIN cannot
-be changed yet), does not keep offline copies of group folders when
-`allow_offline_copy` is false (and forgets them), reads a shared folder
-from its own copy no longer than `max_offline_days` after it last reached
-the relay for that folder (`share-<id>.seen`), and offers no duress
-choice for group folders when `allow_duress` is false. Android device
-management can also hide the duress setting (managed configuration
-`disable_duress`, 29.9). `require_attestation` names the
-platform attestation kinds (Section 21) a member device must present at
-enrolment. Policy never reaches a person's own vault or passkeys beyond
-the PIN length.
+A device in an organization refuses to join, and refuses every change,
+with a PIN shorter than `min_pin_len` (default 4, the device minimum)
+until the person changes it (`device pin`: the real profile sealed again
+under the new PIN on the unprotected and Keystore profiles; on the TPM
+profile the device key's and the real unlock key's authValue changed with
+TPM2_ObjectChangeAuth, both made persistent again at a second handle and
+the old ones evicted; the new PIN may not be the duress PIN). It does not
+keep offline copies of group folders when `allow_offline_copy` is false
+(and forgets them), reads a shared folder from its own copy no longer
+than `max_offline_days` after it last reached the relay for that folder
+(`share-<id>.seen`), and offers no duress choice for group folders when
+`allow_duress` is false (Android device management can also hide the
+setting, 29.9). `password_rules` is a comma list of `min=N`, `upper`,
+`lower`, `digit`, `symbol`: a device refuses to save a password or secret
+into a shared folder that breaks it. `require_attestation` names the
+platform attestation kinds (Section 21) a member device must present.
+Policy never reaches a person's own vault or passkeys beyond the PIN.
 
 ### 29.6 Audit
 
@@ -2201,7 +2207,11 @@ changes act in two ways:
 
 - at once, at the server (29.4): a user made inactive or deleted has every
   member log they name suspended: sign-in is refused and their sessions
-  stop, so they read and write nothing of the organization's;
+  stop, so they read and write nothing of the organization's; and a
+  directory group that no longer lists a member takes away, at once, the
+  group folders the member has only through the organization's group of
+  that name (the directory can take away, never give: owners and
+  administrators keep every group folder);
 - in the signed record, when an owner's or administrator's device next
   runs `org sync`: it reads the directory (`GET /directory/<org>`, active
   users and groups), takes out members whose `ext_id` the directory no
@@ -2250,13 +2260,17 @@ An organization's owners may turn on recovery for **work folders** only
   the secret, checks it gives the recorded public key, opens the escrow
   and reads the folder (`org recover open`); each step is an audit event.
 
-Owners choose `delay_sec`; 72 hours (259200) is the recommended minimum,
-so a person has time to see a request and the company to react.
-Residual risk, stated: k administrators acting together can read a
-person's escrowed work folders after the delay; turning recovery on is
-visible to every member in the signed governance; the delay is enforced
-by the approving administrators' devices (witness time), not by the
-server.
+The delay is enforced twice: approving devices refuse before the
+request's witness time plus `delay_sec`, and the relay serves an escrow
+to anyone but its owner only to a recovery administrator with a request
+of their own whose delay has passed by the relay's clock. A delay under
+72 hours (259200 seconds) needs `--short-delay`, so an owner sets one
+only on purpose. The owner's device escrows a folder again by itself
+whenever it changes the folder's roster (people added or removed, a new
+key), so an escrow follows the folder. Residual risk, stated: k
+administrators acting together can read a person's escrowed work folders
+after the delay; turning recovery on is visible to every member in the
+signed governance.
 
 ### 29.9 Running at scale
 
@@ -2274,8 +2288,12 @@ its own and several relay processes run behind a load balancer.
   authenticated with SCRAM-SHA-256 (the password never crosses the wire),
   the extended query protocol with binary parameters. Objects written
   once (log events, mailbox messages, audit events) use `INSERT ... ON
-  CONFLICT DO NOTHING`, so one writer wins across relays. The connection
-  is plain TCP: run the database on the relay's private network.
+  CONFLICT DO NOTHING`, so one writer wins across relays. With
+  `?sslmode=verify-full` and `--store-ca` the relay asks for TLS
+  (SSLRequest) and runs TLS 1.3 on the same socket, the server's
+  certificate checked for its address; each statement then has a
+  connection of its own, and the SCRAM salted password is cached on the
+  relay's disk so that costs a handshake, not a key derivation.
 - S3: path-style requests signed with Signature Version 4; objects
   written once use `If-None-Match: *` (412 for the loser); listings use
   ListObjectsV2 with `start-after` and continuation tokens.
@@ -2290,17 +2308,38 @@ and lock settings policy fixes. Device management carries no keys.
 
 ### 29.10 The administrator console
 
-`org console DIR PORT` serves a page on the administrator's own machine
-(127.0.0.1 only, behind a random token in its address, no caching, a
-content security policy that allows no scripts): the governance, policy,
-recovery setting and open requests, people, groups and the audit log,
-everything verified by that device as `org show` and `org audit` verify
-it, with each event marked verified or broken. The console is read-only
-and holds no key of its own. Changes to signed records are signed on an
-owner's or administrator's own device, in the app (Organization: invite,
-sync) or with the `org` commands, because the server holds no
-administrator key. A console served by the relay, with passkey sign-in
-and changes the app confirms, is future work.
+The relay serves a console at `/console/<org>` when it is given its origin
+(`--console-origin https://HOST:PORT`; Symbolon Home sets it). Owners and
+administrators sign in with a passkey:
+
+- A browser registers a passkey at the console (ES256); the relay keeps it
+  waiting for a day and shows a short code (the first 8 hex digits of the
+  credential id's SHA-256). The administrator's own device approves that
+  code (`org console-key`, or the app): it signs a record binding the
+  credential and its public key to their log (`conkey-<org>-<id>`), which
+  the relay stores only from that device's session and only for a passkey
+  waiting with the same key.
+- Signing in is a WebAuthn assertion over a fresh relay challenge (once,
+  five minutes): the client data's type, challenge and origin, the
+  authenticator data's RP ID hash and user-presence flag, and the ECDSA
+  signature under the approved key are checked; the person must still be an
+  owner or administrator. The session is an HttpOnly, Secure, SameSite=Strict
+  cookie for eight hours. The page loads no inline script (its policy allows
+  only the console's own script).
+
+The console shows the organization as the relay holds it (records the
+relay verified when they were written: governance, policy, recovery,
+people, groups) and the changes queued there. It changes nothing signed:
+a change made in the console (invite, add to or remove from a group,
+remove a person, a policy setting, a sync) is queued, and takes effect only
+when an owner's or administrator's device approves it (`org changes`, `org
+approve`, or the app's list): the device shows the change, signs it as it
+would its own, and tells the console the result. The server holds no
+administrator key.
+
+`org console DIR PORT` also serves a read-only page on the
+administrator's own machine (127.0.0.1, behind a token) with everything
+verified by that device, each audit event marked verified or broken.
 
 ---
 

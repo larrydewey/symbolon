@@ -4,13 +4,22 @@
 // protocol with binary parameters and results, so object bytes are never
 // quoted into SQL.
 //
-// The connection is plain TCP: run the database on the relay's private
-// network (or behind a TLS tunnel); every object is end-to-end protected,
-// and the database password never crosses the wire (SCRAM).
+// Plain TCP keeps one connection per request. With TLS (`?sslmode=verify-full`
+// and a trust anchor) the client asks for it (SSLRequest) and runs TLS 1.3
+// over the same socket, the server's certificate checked for the host;
+// each statement then has a connection of its own (a TLS connection's
+// state cannot outlive the call that holds it), and the SCRAM salted
+// password is kept in `cache` (a file per salt) so a connection costs one
+// handshake, not a key derivation. The database password never crosses
+// the wire (SCRAM).
 
 import "crypto.resid";
+import "wire.resid";
+import "tlsclient.resid";
+import "clock.resid";
 
-pub type PgCfg = { Str host; Int port; Str user; Str password; Str db; };
+// `ca`: PEM trust anchor when `tls`; `cache`: a directory for the SCRAM salted password.
+pub type PgCfg = { Str host; Int port; Str user; Str password; Str db; Bool tls; Str ca; Str cache; };
 
 // An open, authenticated connection; fd < 0 when it failed (`err` says why).
 pub type PgConn = { Int fd; Str err; };
@@ -19,9 +28,13 @@ pub type PgConn = { Int fd; Str err; };
 // command tag ("INSERT 0 1", "SELECT 3", ...).
 pub type PgResult = { List(List(Option(List(Int)))) rows; Str tag; Str err; };
 
-// postgres://USER:PASSWORD@HOST:PORT/DB
-pub Option(PgCfg) pg_url(Str u) {
-    if (!str_starts_with(u, "postgres://")) { return None; }
+// postgres://USER:PASSWORD@HOST:PORT/DB[?sslmode=verify-full]
+pub Option(PgCfg) pg_url(Str u0, Str ca, Str cache) {
+    if (!str_starts_with(u0, "postgres://")) { return None; }
+    Int q = str_index_of(u0, "?", 0);
+    Str u = if (q < 0) { u0 } else { str_slice(u0, 0, q) };
+    Bool tls = q >= 0 && str_contains(str_slice(u0, q, str_len(u0)), "sslmode=verify-full");
+    if (tls && str_len(ca) == 0) { return None; }
     Str rest = str_slice(u, 11, str_len(u));
     Int at = str_last_index_of(rest, "@");
     if (at < 0) { return None; }
@@ -33,7 +46,8 @@ pub Option(PgCfg) pg_url(Str u) {
     Str hp = str_slice(hp_db, 0, slash);
     Int pc = str_index_of(hp, ":", 0);
     return Some(PgCfg {.host = if (pc < 0) { hp } else { str_slice(hp, 0, pc) }, .port = if (pc < 0) { 5432 } else { str_parse_int(str_slice(hp, pc + 1, str_len(hp))) },
-                       .user = str_slice(cred, 0, colon), .password = str_slice(cred, colon + 1, str_len(cred)), .db = str_slice(hp_db, slash + 1, str_len(hp_db))});
+                       .user = str_slice(cred, 0, colon), .password = str_slice(cred, colon + 1, str_len(cred)), .db = str_slice(hp_db, slash + 1, str_len(hp_db)),
+                       .tls = tls, .ca = ca, .cache = cache});
 }
 
 Int str_last_index_of(Str s, Str c) { return last_at(s, c, str_len(s) - 1); }
@@ -67,25 +81,25 @@ Str text_of(List(Int) b, Int i, Int end, StrBuf acc) {
 // ─── Reading messages ───────────────────────────────────────────
 
 type Msg = { Int t; List(Int) body; };
-type Rx = { List(Msg) ms; List(Int) rest; Bool ok; };
+type Rx(T) = { T w; List(Msg) ms; List(Int) rest; Bool ok; };
 
-// Messages from `buf` and the socket until one of type `until` arrives
-// (included), or the connection fails.
-@requires(network)
-Rx read_until(Int fd, List(Int) buf, Int until, ListBuf(Msg) acc, Int n) {
+// Messages from `buf` and the connection until one of type `until`
+// arrives (included), or the connection fails.
+@needs(Wire(T))
+Rx(T) read_until(T w, List(Int) buf, Int until, ListBuf(Msg) acc) {
     if (buf.len() >= 5) {
         Int len = rd32(buf, 1);
-        if (len < 4 || len > 268435456) { return Rx {.ms = acc.finish(), .rest = [], .ok = false}; }
+        if (len < 4 || len > 268435456) { return Rx {.w = w, .ms = acc.finish(), .rest = [], .ok = false}; }
         if (buf.len() >= 1 + len) {
             Msg m = Msg {.t = buf[0], .body = buf[5..1 + len]};
             List(Int) rest = buf[1 + len..buf.len()];
-            if (m.t == until) { return Rx {.ms = acc.push(m).finish(), .rest = rest, .ok = true}; }
-            return read_until(fd, rest, until, acc.push(m), n + 1);
+            if (m.t == until) { return Rx {.w = w, .ms = acc.push(m).finish(), .rest = rest, .ok = true}; }
+            return read_until(w, rest, until, acc.push(m));
         }
     }
-    List(Int) more = resid_tcp_recv_some(fd, 65536);
-    if (more.len() == 0) { return Rx {.ms = acc.finish(), .rest = [], .ok = false}; }
-    return read_until(fd, buf.concat(more), until, acc, n);
+    WireIn(T) more = wire_fill(w, buf, buf.len() + 1, buf.len() + 65536);
+    if (more.data.len() <= buf.len()) { return Rx {.w = more.conn, .ms = acc.finish(), .rest = [], .ok = false}; }
+    return read_until(more.conn, more.data, until, acc);
 }
 
 // The 'M' (message) field of an ErrorResponse.
@@ -123,11 +137,8 @@ pub type Scram = { Str client_final; List(Int) server_sig; };
 
 // The client's final message and the server signature it expects, from
 // the client-first-bare and server-first messages (RFC 5802 section 3).
-pub Scram scram_final(Str password, Str client_first_bare, Str server_first) {
+pub Scram scram_final(List(Int) salted, Str client_first_bare, Str server_first) {
     Str nonce = attr(server_first, "r");
-    List(Int) salt = base64_decode(attr(server_first, "s"));
-    Int iters = str_parse_int(attr(server_first, "i"));
-    List(Int) salted = pbkdf2_hmac_sha256(asc(password), salt, if (iters < 1) { 1 } else { iters }, 1);
     List(Int) client_key = hmac_sha256_bytes(salted, asc("Client Key"));
     List(Int) stored_key = sha256_bytes(client_key);
     Str without_proof = "c=biws,r=" + nonce;
@@ -139,54 +150,73 @@ pub Scram scram_final(Str password, Str client_first_bare, Str server_first) {
 
 // ─── Connecting ─────────────────────────────────────────────────
 
-@requires(network)
-PgConn failed(Int fd, Str why) {
-    _ = if (fd >= 0) { resid_tcp_close(fd) } else { true };
-    return PgConn {.fd = -1, .err = why};
+// An authenticated session over the transport `T`; `err` when it failed.
+pub type PgSess(T) = { T w; List(Int) rest; Str err; };
+
+@needs(Wire(T))
+PgSess(T) sess_fail(T w, Str why) { _ = wire_close(w); return PgSess {.w = w, .rest = [], .err = why}; }
+
+// The SCRAM salted password, from `cache` when it is there.
+@requires(filesystem)
+List(Int) salted_password(PgCfg c, List(Int) salt, Int iters) {
+    List(Int) id = sha256_bytes(asc(c.user + " " + c.password + " ").concat(salt).concat(asc(f"{iters}")));
+    Str f = c.cache + "/pg-scram-" + hex_encode(id[0..16]);
+    List(Int) kept = if (str_len(c.cache) > 0 && filesystem.exists(f)) { filesystem.read_bytes(f) } else { [] };
+    if (kept.len() == 32) { return kept; }
+    List(Int) sp = pbkdf2_hmac_sha256(asc(c.password), salt, if (iters < 1) { 1 } else { iters }, 1);
+    _ = if (str_len(c.cache) > 0) { filesystem.write_secret(f, sp) } else { false };
+    return sp;
 }
 
-@requires(network, declassify)
-pub PgConn pg_connect(PgCfg c) {
-    Int fd = resid_tcp_connect(c.host, c.port);
-    if (fd < 0) { return PgConn {.fd = -1, .err = "cannot reach the database"}; }
-    _ = resid_tcp_deadline(fd, 30000);
+// The startup message and authentication (SCRAM-SHA-256 or trust).
+@needs(Wire(T))
+@requires(filesystem, network, declassify)
+pub PgSess(T) pg_auth(T w0, PgCfg c) {
     List(Int) params = cstr("user").concat(cstr(c.user)).concat(cstr("database")).concat(cstr(c.db)).concat([0]);
-    List(Int) startup = be32(params.len() + 8).concat(be32(196608)).concat(params);
-    _ = resid_tcp_send_bin(fd, startup);
-    Rx r = read_until(fd, [], 82, ListBuf(), 0);
-    if (!r.ok) { return failed(fd, auth_error(r.ms, "the database closed the connection")); }
-    Msg a = r.ms[r.ms.len() - 1];
-    Int code = rd32(a.body, 0);
-    if (code == 0) { return ready(fd, r.rest); }
-    if (code != 10) { return failed(fd, f"the database asks for authentication {code}; use scram-sha-256"); }
+    WireOut(T) s0 = wire_send(w0, be32(params.len() + 8).concat(be32(196608)).concat(params));
+    Rx(T) r = read_until(s0.conn, [], 82, ListBuf());
+    if (!r.ok) { return sess_fail(r.w, auth_error(r.ms, "the database closed the connection")); }
+    Int code = rd32(r.ms[r.ms.len() - 1].body, 0);
+    if (code == 0) { return ready(r.w, r.rest); }
+    if (code != 10) { return sess_fail(r.w, f"the database asks for authentication {code}; use scram-sha-256"); }
     Str cnonce = base64_encode(random_bytes(18));
     Str first_bare = "n=,r=" + cnonce;
     Str first = "n,," + first_bare;
-    _ = resid_tcp_send_bin(fd, msg(112, cstr("SCRAM-SHA-256").concat(be32(str_len(first))).concat(asc(first))));
-    Rx r2 = read_until(fd, r.rest, 82, ListBuf(), 0);
-    if (!r2.ok) { return failed(fd, auth_error(r2.ms, "the database ended SCRAM")); }
+    WireOut(T) s1 = wire_send(r.w, msg(112, cstr("SCRAM-SHA-256").concat(be32(str_len(first))).concat(asc(first))));
+    Rx(T) r2 = read_until(s1.conn, r.rest, 82, ListBuf());
+    if (!r2.ok) { return sess_fail(r2.w, auth_error(r2.ms, "the database ended SCRAM")); }
     Msg m2 = r2.ms[r2.ms.len() - 1];
-    if (rd32(m2.body, 0) != 11) { return failed(fd, "the database did not continue SCRAM"); }
+    if (rd32(m2.body, 0) != 11) { return sess_fail(r2.w, "the database did not continue SCRAM"); }
     Str server_first = text_of(m2.body, 4, m2.body.len(), StrBuf());
-    if (!str_starts_with(attr(server_first, "r"), cnonce)) { return failed(fd, "the database's SCRAM nonce is not ours"); }
-    Scram s = scram_final(c.password, first_bare, server_first);
-    _ = resid_tcp_send_bin(fd, msg(112, asc(s.client_final)));
-    Rx r3 = read_until(fd, r2.rest, 82, ListBuf(), 0);
-    if (!r3.ok) { return failed(fd, auth_error(r3.ms, "the database refused the password")); }
+    if (!str_starts_with(attr(server_first, "r"), cnonce)) { return sess_fail(r2.w, "the database's SCRAM nonce is not ours"); }
+    Scram sc = scram_final(salted_password(c, base64_decode(attr(server_first, "s")), str_parse_int(attr(server_first, "i"))), first_bare, server_first);
+    WireOut(T) s2 = wire_send(r2.w, msg(112, asc(sc.client_final)));
+    Rx(T) r3 = read_until(s2.conn, r2.rest, 82, ListBuf());
+    if (!r3.ok) { return sess_fail(r3.w, auth_error(r3.ms, "the database refused the password")); }
     Msg m3 = r3.ms[r3.ms.len() - 1];
     Str server_final = text_of(m3.body, 4, m3.body.len(), StrBuf());
-    if (rd32(m3.body, 0) != 12 || !bytes_eq(base64_decode(attr(server_final, "v")), s.server_sig)) { return failed(fd, "the database did not prove it knows the password"); }
-    Rx r4 = read_until(fd, r3.rest, 82, ListBuf(), 0);
-    if (!r4.ok || rd32(r4.ms[r4.ms.len() - 1].body, 0) != 0) { return failed(fd, auth_error(r4.ms, "the database refused the password")); }
-    return ready(fd, r4.rest);
+    if (rd32(m3.body, 0) != 12 || !bytes_eq(base64_decode(attr(server_final, "v")), sc.server_sig)) { return sess_fail(r3.w, "the database did not prove it knows the password"); }
+    Rx(T) r4 = read_until(r3.w, r3.rest, 82, ListBuf());
+    if (!r4.ok || rd32(r4.ms[r4.ms.len() - 1].body, 0) != 0) { return sess_fail(r4.w, auth_error(r4.ms, "the database refused the password")); }
+    return ready(r4.w, r4.rest);
 }
 
 Str auth_error(List(Msg) ms, Str dflt) { return match first_of(ms, 69, 0) { Some(e) => error_text(e.body, 0), None => dflt }; }
 
-@requires(network)
-PgConn ready(Int fd, List(Int) rest) {
-    Rx r = read_until(fd, rest, 90, ListBuf(), 0);
-    return if (r.ok) { PgConn {.fd = fd, .err = ""} } else { failed(fd, auth_error(r.ms, "the database did not become ready")) };
+@needs(Wire(T))
+PgSess(T) ready(T w, List(Int) rest) {
+    Rx(T) r = read_until(w, rest, 90, ListBuf());
+    return if (r.ok) { PgSess {.w = r.w, .rest = [], .err = ""} } else { sess_fail(r.w, auth_error(r.ms, "the database did not become ready")) };
+}
+
+// A plain connection, authenticated: kept for a whole request.
+@requires(filesystem, network, declassify)
+pub PgConn pg_connect(PgCfg c) {
+    Int fd = resid_tcp_connect(c.host, c.port);
+    if (fd < 0) { return PgConn {.fd = -1, .err = "cannot reach the database"}; }
+    _ = resid_tcp_deadline(fd, 30000);
+    PgSess(Int) s = pg_auth(fd, c);
+    return if (str_len(s.err) == 0) { PgConn {.fd = fd, .err = ""} } else { PgConn {.fd = -1, .err = s.err} };
 }
 
 @requires(network)
@@ -197,6 +227,32 @@ pub Int pg_close(PgConn c) {
     return 0;
 }
 
+// TLS over a socket that asked for it (SSLRequest answered 'S'): the
+// handshake as tls_client_connect does it, on this descriptor.
+@requires(network, clock(readonly), declassify)
+TlsDial tls_on(Int fd, PgCfg c) {
+    _ = resid_tcp_send_bin(fd, be32(8).concat(be32(80877103)));
+    List(Int) yes = resid_tcp_recv_some(fd, 1);
+    if (yes.len() != 1 || yes[0] != 83) { _ = resid_tcp_close(fd); return tls_client_on(-1, tls_client_cfg(c.host, trust_store_empty(), [])); }
+    return tls_client_on(fd, tls_client_cfg(c.host, trust_store_add_pem(trust_store_empty(), c.ca), []));
+}
+
+// One statement on a TLS connection of its own.
+@requires(filesystem, network, clock(readonly), declassify)
+pub PgResult pg_tls_exec(PgCfg c, Str sql, List(List(Int)) ps) {
+    Int fd = resid_tcp_connect(c.host, c.port);
+    if (fd < 0) { return PgResult {.rows = [], .tag = "", .err = "cannot reach the database"}; }
+    _ = resid_tcp_deadline(fd, 30000);
+    TlsDial d = tls_on(fd, c);
+    if (d.err != "") { return PgResult {.rows = [], .tag = "", .err = "the database refused TLS, or its certificate does not verify: " + d.err}; }
+    PgSess(TlsClient) s = pg_auth(d.conn, c);
+    if (str_len(s.err) > 0) { return PgResult {.rows = [], .tag = "", .err = s.err}; }
+    Ran(TlsClient) r = exec_on(s.w, sql, ps);
+    WireOut(TlsClient) bye = wire_send(r.w, msg(88, []));
+    _ = wire_close(bye.conn);
+    return r.res;
+}
+
 // ─── Statements ─────────────────────────────────────────────────
 
 List(Int) param_bytes(List(List(Int)) ps, Int i, List(Int) acc) {
@@ -204,21 +260,28 @@ List(Int) param_bytes(List(List(Int)) ps, Int i, List(Int) acc) {
     return param_bytes(ps, i + 1, acc.concat(be32(ps[i].len())).concat(ps[i]));
 }
 
+type Ran(T) = { T w; PgResult res; };
+
 // `sql` with parameters $1.. (each sent as binary: text columns take
 // their UTF-8, bytea its bytes), results in binary.
-@requires(network)
-pub PgResult pg_exec(PgConn c, Str sql, List(List(Int)) ps) {
-    if (c.fd < 0) { return PgResult {.rows = [], .tag = "", .err = c.err}; }
+@needs(Wire(T))
+Ran(T) exec_on(T w, Str sql, List(List(Int)) ps) {
     List(Int) parse = msg(80, cstr("").concat(cstr(sql)).concat(be16(0)));
     List(Int) bind = msg(66, cstr("").concat(cstr("")).concat(be16(1)).concat(be16(1)).concat(be16(ps.len())).concat(param_bytes(ps, 0, [])).concat(be16(1)).concat(be16(1)));
     List(Int) exec = msg(69, cstr("").concat(be32(0)));
-    _ = resid_tcp_send_bin(c.fd, parse.concat(bind).concat(exec).concat(msg(83, [])));
-    Rx r = read_until(c.fd, [], 90, ListBuf(), 0);
-    if (!r.ok) { return PgResult {.rows = [], .tag = "", .err = "the database closed the connection"}; }
-    return match first_of(r.ms, 69, 0) {
+    WireOut(T) sent = wire_send(w, parse.concat(bind).concat(exec).concat(msg(83, [])));
+    Rx(T) r = read_until(sent.conn, [], 90, ListBuf());
+    if (!r.ok) { return Ran {.w = r.w, .res = PgResult {.rows = [], .tag = "", .err = "the database closed the connection"}}; }
+    return Ran {.w = r.w, .res = match first_of(r.ms, 69, 0) {
         Some(e) => PgResult {.rows = [], .tag = "", .err = error_text(e.body, 0)},
         None => PgResult {.rows = rows_of(r.ms, 0, ListBuf()), .tag = tag_of(r.ms), .err = ""}
-    };
+    }};
+}
+
+@requires(network)
+pub PgResult pg_exec(PgConn c, Str sql, List(List(Int)) ps) {
+    if (c.fd < 0) { return PgResult {.rows = [], .tag = "", .err = c.err}; }
+    return exec_on(c.fd, sql, ps).res;
 }
 
 Str tag_of(List(Msg) ms) { return match first_of(ms, 67, 0) { Some(m) => text_of(m.body, 0, zero_at(m.body, 0), StrBuf()), None => "" }; }

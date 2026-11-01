@@ -138,6 +138,19 @@ pub List(Int) escrow_info(List(Int) org, List(Int) cid, UInt(64) version) {
 pub Str escrow_blob(List(Int) org, Str cid) { return "escrow-" + hex_encode(org) + "-" + cid; }
 pub Str recreq_blob(List(Int) org, Str cid) { return "recreq-" + hex_encode(org) + "-" + cid; }
 
+pub Option(OrgConsoleKey) conkey_of(List(Int) b) {
+    if (b.len() == 0 || b.len() > 8192 || !cbor_well_formed(b, 4)) { return None; }
+    Result(OrgConsoleKey, SerialError) r = from_cbor(b);
+    return match r { Ok(x) => Some(x), Err(_) => None };
+}
+
+pub OrgConsoleKey conkey_signed(OrgConsoleKey k, List(Int) sig) {
+    return OrgConsoleKey {.org_id = k.org_id, .cred_id = k.cred_id, .public_key = k.public_key, .rp_id = k.rp_id, .log_id = k.log_id, .log_sequence = k.log_sequence, .signer = k.signer, .sig = sig};
+}
+
+pub List(Int) conkey_tbs(OrgConsoleKey k) { return utf8("symbolon v1 console key").concat(cbor_bytes(to_cbor(conkey_signed(k, [])))); }
+pub Str conkey_blob(List(Int) org, List(Int) cred_id) { return "conkey-" + hex_encode(org) + "-" + hex_encode(sha256_bytes(cred_id)[0..16]); }
+
 pub OrgInvite invite_signed(OrgInvite v, List(Int) sig) {
     return OrgInvite {.org_id = v.org_id, .id = v.id, .public_key = v.public_key, .ext_id = v.ext_id, .label = v.label, .groups = v.groups, .expires = v.expires,
                       .log_sequence = v.log_sequence, .signer_log = v.signer_log, .signer = v.signer, .sig = sig};
@@ -269,7 +282,7 @@ pub Result(OrgState, Str) org_at(Str dir, DeviceConfig c, VerifiedHead mine) {
     Int seen = kept_version(dir + "/org.version");
     if ((Int)r.version < seen) { return Err(f"the membership record went back to version {r.version} (this device saw {seen})"); }
     _ = filesystem.write_all(dir + "/org.version", f"{r.version}");
-    _ = filesystem.write_all(dir + "/org.policy", (if (g.policy.allow_offline_copy) { "offline " } else { "no-offline " }) + (if (g.policy.allow_duress) { "duress" } else { "no-duress" }) + f" max_offline_days={g.policy.max_offline_days}");
+    _ = filesystem.write_all(dir + "/org.policy", (if (g.policy.allow_offline_copy) { "offline " } else { "no-offline " }) + (if (g.policy.allow_duress) { "duress" } else { "no-duress" }) + f" max_offline_days={g.policy.max_offline_days} min_pin={g.policy.min_pin_len}" + (if (rules_ok(g.policy.password_rules)) { " rules=" + g.policy.password_rules } else { "" }));
     return Ok(OrgState {.gov = g, .org = r});
 }
 
@@ -278,7 +291,53 @@ pub Result(OrgState, Str) org_at(Str dir, DeviceConfig c, VerifiedHead mine) {
 @requires(filesystem)
 pub Int org_max_offline(Str dir) {
     List(Str) p = str_split(str_trim(filesystem.read_all(dir + "/org.policy")), "max_offline_days=");
-    return if (p.len() == 2) { str_parse_int(p[1]) } else { 0 };
+    return if (p.len() == 2) { str_parse_int(str_split(p[1], " ")[0]) } else { 0 };
+}
+
+// Password rules (SPEC 29.5): a comma list of min=N, upper, lower, digit,
+// symbol, with no spaces; "" for none.
+pub Bool rules_ok(Str r) { return str_len(r) > 0 && str_len(r) <= 128 && !str_contains(r, " ") && rules_known(str_split(r, ","), 0); }
+
+Bool rules_known(List(Str) xs, Int i) {
+    if (i >= xs.len()) { return true; }
+    Str x = xs[i];
+    Bool ok = x == "upper" || x == "lower" || x == "digit" || x == "symbol" || (str_starts_with(x, "min=") && str_parse_int(str_slice(x, 4, str_len(x))) > 0);
+    return ok && rules_known(xs, i + 1);
+}
+
+// The rules the last verified policy sets, or "".
+@requires(filesystem)
+pub Str org_rules(Str dir) {
+    List(Str) p = str_split(str_trim(filesystem.read_all(dir + "/org.policy")), " rules=");
+    return if (p.len() == 2) { p[1] } else { "" };
+}
+
+// Why `pw` breaks `rules`; "" when it keeps them.
+pub Str rules_broken(Str rules, List(Int) pw) {
+    if (str_len(rules) == 0) { return ""; }
+    return rule_at(str_split(rules, ","), 0, pw);
+}
+
+Str rule_at(List(Str) xs, Int i, List(Int) pw) {
+    if (i >= xs.len()) { return ""; }
+    Str x = xs[i];
+    Int n = if (str_starts_with(x, "min=")) { str_parse_int(str_slice(x, 4, str_len(x))) } else { 0 };
+    if (n > 0 && chars_of(pw, 0, 0) < n) { return f"at least {n} characters"; }
+    if (x == "upper" && !has_class(pw, 65, 90, 0)) { return "an upper-case letter"; }
+    if (x == "lower" && !has_class(pw, 97, 122, 0)) { return "a lower-case letter"; }
+    if (x == "digit" && !has_class(pw, 48, 57, 0)) { return "a digit"; }
+    if (x == "symbol" && !has_symbol(pw, 0)) { return "a symbol"; }
+    return rule_at(xs, i + 1, pw);
+}
+
+// UTF-8 characters (bytes that do not continue one).
+Int chars_of(List(Int) b, Int i, Int n) { return if (i >= b.len()) { n } else { chars_of(b, i + 1, if ((b[i] & 192) == 128) { n } else { n + 1 }) }; }
+Bool has_class(List(Int) b, Int lo, Int hi, Int i) { return i < b.len() && ((b[i] >= lo && b[i] <= hi) || has_class(b, lo, hi, i + 1)); }
+Bool has_symbol(List(Int) b, Int i) {
+    if (i >= b.len()) { return false; }
+    Int c = b[i];
+    Bool sym = c >= 33 && c <= 126 && !((c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122));
+    return sym || has_symbol(b, i + 1);
 }
 
 @requires(filesystem)

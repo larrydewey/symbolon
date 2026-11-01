@@ -1,0 +1,53 @@
+// Escrow of work folders to the organization's recovery key (SPEC 29.8):
+// sealing a folder's key, here so that a folder's owner re-escrows it by
+// itself whenever the folder's roster changes (sharecli), not only with
+// `org escrow`.
+
+import "../types.resid";
+import "../core/log.resid";
+import "../net/services.resid";
+import "state.resid";
+import "common.resid";
+import "device.resid";
+import "serials.resid";
+import "orgtypes.resid";
+import "orgcore.resid";
+import "auditlog.resid";
+import "crypto.resid";
+import "hpkeg.resid";
+import "hpke.resid";
+
+HpkeSuite escrow_suite() { return hpke_suite(16, 1, 2); }
+
+List(Int) cbor_or_none(Result(List(Int), SerialError) r) { return match r { Ok(b) => b, Err(_) => [] }; }
+
+// The folder's key at `version` sealed to `rec`'s key, signed, stored.
+@requires(network, device, declassify, clock, environment)
+pub Result(OrgEscrow, Str) put_escrow(DeviceConfig c, Unlocked u, VerifiedHead vh, Endpoint ep, List(Int) org, OrgRecovery rec, List(Int) cid, UInt(64) version, List(Secret(UInt(8))) key) {
+    HpkeMessageG(Secret(UInt(8))) m = hpkeg_seal_to(escrow_suite(), rec.public_key, escrow_info(org, cid, version), [], key);
+    if (!m.ok) { return Err("cannot seal the key"); }
+    OrgEscrow e0 = OrgEscrow {.org_id = org, .coll_id = cid, .owner = c.log_id, .roster_version = version, .enc = m.enc, .ct = reveal(m.ct),
+                              .log_sequence = vh.head.sequence, .signer = c.party, .sig = []};
+    List(Int) sig = dk_sign(c, u.real, u.st, escrow_tbs(e0))?;
+    OrgEscrow e = escrow_signed(e0, sig);
+    if (!blob_put(ep, escrow_blob(org, hex_encode(cid)), cbor_or_none(to_cbor(e)))) { return Err("the server refused the escrow"); }
+    return Ok(e);
+}
+
+// After the owner's device changed a folder's roster: escrowed again when
+// it was escrowed and recovery is on. True when nothing was needed.
+@requires(filesystem, network, device, declassify, clock, environment)
+pub Bool rescrow(Str dir, DeviceConfig c, Unlocked u, VerifiedHead vh, Endpoint ep, List(Int) cid, UInt(64) version, List(Secret(UInt(8))) key) {
+    List(Int) org = org_id_here(dir);
+    if (org.len() == 0) { return true; }
+    Option(OrgEscrow) old = escrow_of(blob_get(ep, escrow_blob(org, hex_encode(cid))) else { [] });
+    if (match old { None => true, Some(e) => !bytes_eq(e.owner, c.log_id) }) { return true; }
+    Result(OrgState, Str) rs = org_at(dir, c, vh);
+    return match rs {
+        Err(_) => false,
+        Ok(st) => if (!st.gov.recovery.on) { true } else { match put_escrow(c, u, vh, ep, org, st.gov.recovery, cid, version, key) {
+            Err(_) => false,
+            Ok(e) => audit_event(dir, c, u, vh, ep, org, "recovery", hex_encode(cid), f"escrowed again at version {version}")
+        } }
+    };
+}

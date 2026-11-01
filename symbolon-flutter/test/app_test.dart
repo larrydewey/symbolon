@@ -431,8 +431,9 @@ void main() {
     expect(find.text('Acme'), findsOneWidget);
     expect(find.text('You are an owner'), findsOneWidget);
     expect(find.byKey(const Key('org-request-00112233445566778899aabbccddeeff')), findsOneWidget);
-    expect(find.byKey(const Key('org-member-Bob')), findsOneWidget);
+    await t.scrollUntilVisible(find.byKey(const Key('org-member-Bob')), 200, scrollable: find.byType(Scrollable).first);
     expect(find.text('bob@acme.example · member'), findsOneWidget);
+    await t.scrollUntilVisible(find.byKey(const Key('org-invite')), -200, scrollable: find.byType(Scrollable).first);
     await t.ensureVisible(find.byKey(const Key('org-invite')));
     await t.tap(find.byKey(const Key('org-invite')));
     await t.pumpAndSettle();
@@ -446,8 +447,19 @@ void main() {
     expect(agent.argsLog.readAsStringSync(), contains('device org invite ${settings.deviceDir} erin@acme.example Erin'));
     await t.tap(find.text('Done'));
     await t.pumpAndSettle();
-    await t.pageBack();
+    expect(find.text('policy max_offline_days 7'), findsOneWidget);
+    await t.ensureVisible(find.byKey(const Key('org-approve-0123456789abcdef0123456789abcdef')));
+    await t.tap(find.byKey(const Key('org-approve-0123456789abcdef0123456789abcdef')));
+    await t.pump();
+    await settle(t);
+    expect(agent.argsLog.readAsStringSync(), contains('device org approve ${settings.deviceDir} 0123456789abcdef0123456789abcdef'));
+    await t.tap(find.text('Close').last);
     await t.pumpAndSettle();
-    await lock(t);
+    await settle(t);
+    if (find.byType(BackButton).evaluate().isNotEmpty) {
+      await t.tap(find.byType(BackButton).first);
+      await t.pumpAndSettle();
+    }
+    if (find.byKey(const Key('lock')).evaluate().isNotEmpty) await lock(t);
   });
 }

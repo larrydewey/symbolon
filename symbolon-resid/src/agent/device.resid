@@ -628,3 +628,97 @@ Int print_head(VerifiedHead vh) {
     println(f"head sequence {vh.head.sequence} epoch {vh.head.quorum.epoch} parties {vh.head.quorum.parties.len()} threshold {vh.head.quorum.t} pending {vh.pending.len()}");
     return 0;
 }
+
+// ─── `device pin` ───────────────────────────────────────────────
+
+// `symbolon device pin DIR`: the PIN, then the new PIN, on standard
+// input. The real profile opens under the new PIN; the duress PIN stays.
+// Unprotected and Keystore profiles: the real profile sealed again under
+// the new PIN's unlock key. TPM profile: the device key's and the real
+// unlock key's authValue changed (TPM2_ObjectChangeAuth with the old
+// one), the keys made persistent again at the other of two handles and
+// the old ones evicted; the unlock key's output does not depend on its
+// authValue, so the profile stays as it is. An organization's
+// min_pin_len (SPEC 29.5, from dir/org.policy) holds.
+@requires(filesystem, device, declassify, provision, network, environment)
+pub Int device_pin(Str dir) {
+    Option(DeviceConfig) oc = load_config(dir);
+    if (match oc { None => true, Some(_) => false }) { return dfail("not set up (device new)"); }
+    DeviceConfig c = oc else { with_identity(load_config(dir) else { DeviceConfig {.relay_host = "", .relay_port = 0, .ca = "", .witnesses = [], .unprotected = true, .argon_m_kib = 0, .argon_t = 0, .salt = [], .tpm_dk = 0, .tpm_unlock_a = 0, .tpm_unlock_b = 0, .party = [], .dk_pub = [], .hpke_pub = [], .log_id = [], .mbox_next = 0, .peers = []} }, []) };
+    Str pin = read_pin();
+    Str npin = read_pin();
+    Int need = org_min_pin(dir);
+    if (str_len(npin) < 4 || str_len(npin) < need) { return dfail(f"a PIN of at least {if (need > 4) { need } else { 4 }} characters"); }
+    if (npin == pin) { return dfail("the new PIN is the PIN"); }
+    Unlocked u = unlock_dir(dir, c, pin);
+    if (u.kind != 1) { return dfail("wrong PIN"); }
+    if (unlock_dir(dir, c, npin).kind == 2) { return dfail("the new PIN must differ from the duress PIN"); }
+    List(Secret(UInt(8))) st = stretch(c, pin_bytes(pin));
+    List(Secret(UInt(8))) nst = stretch(c, pin_bytes(npin));
+    return if (c.unprotected || on_keystore(c)) { reseal_real(dir, c, u, st, nst) } else { tpm_new_auth(dir, c, st, nst) };
+}
+
+// The organization's minimum PIN length the device last verified, or 0.
+@requires(filesystem)
+pub Int org_min_pin(Str dir) {
+    List(Str) p = str_split(str_trim(filesystem.read_all(dir + "/org.policy")), "min_pin=");
+    return if (p.len() == 2) { str_parse_int(str_split(p[1], " ")[0]) } else { 0 };
+}
+
+@requires(filesystem, device, declassify, provision, network, environment)
+Int reseal_real(Str dir, DeviceConfig c, Unlocked u, List(Secret(UInt(8))) st, List(Secret(UInt(8))) nst) {
+    List(Secret(UInt(8))) old_key = unlock_key_for(c, st, true);
+    Bool in_a = unlock(old_key, get_file(dir + "/blob_a"), []).kind == 1;
+    List(Secret(UInt(8))) rp = encode_real(u.real) else { [] };
+    if (rp.len() == 0) { return dfail("cannot encode the profile"); }
+    List(Int) blob = seal_blob(unlock_key_for(c, nst, true), random_bytes(12), rp);
+    if (unlock(unlock_key_for(c, nst, true), blob, []).kind != 1) { return dfail("the profile does not open under the new PIN; nothing changed"); }
+    if (!filesystem.write_bytes(dir + (if (in_a) { "/blob_a" } else { "/blob_b" }), blob)) { return dfail("cannot write the profile"); }
+    println("PIN changed");
+    return 0;
+}
+
+// The other of a key's two persistent handles.
+Int other_handle(Int h, Int base) { return if (h == base) { base + 256 } else { base }; }
+
+@requires(filesystem, device, declassify, provision, network, environment)
+Int tpm_new_auth(Str dir, DeviceConfig c, List(Secret(UInt(8))) st, List(Secret(UInt(8))) nst) {
+    Int dk2 = other_handle(c.tpm_dk, dk_handle());
+    Int ua2 = other_handle(c.tpm_unlock_a, unlock_a_handle());
+    Result(Int, Str) r1 = moved_key(c.tpm_dk, dk2, st, nst);
+    if (match r1 { Err(_) => true, Ok(_) => false }) { return dfail(match r1 { Err(m) => m, Ok(_) => "" }); }
+    Result(Int, Str) r2 = moved_key(c.tpm_unlock_a, ua2, st, nst);
+    if (match r2 { Err(_) => true, Ok(_) => false }) {
+        _ = tpm_evict(dk2);
+        return dfail(match r2 { Err(m) => m, Ok(_) => "" });
+    }
+    DeviceConfig n = DeviceConfig {.relay_host = c.relay_host, .relay_port = c.relay_port, .ca = c.ca, .witnesses = c.witnesses, .unprotected = c.unprotected,
+        .argon_m_kib = c.argon_m_kib, .argon_t = c.argon_t, .salt = c.salt, .tpm_dk = dk2, .tpm_unlock_a = ua2, .tpm_unlock_b = c.tpm_unlock_b,
+        .party = c.party, .dk_pub = c.dk_pub, .hpke_pub = c.hpke_pub, .log_id = c.log_id, .mbox_next = c.mbox_next, .peers = c.peers};
+    if (!save_config(dir, n)) { return dfail("cannot store the configuration (the keys at the new handles are made)"); }
+    _ = tpm_evict(c.tpm_dk);
+    _ = tpm_evict(c.tpm_unlock_a);
+    println("PIN changed");
+    return 0;
+}
+
+// The key at `from` with authValue `nst`, persistent at `to` (the old one stays until the caller evicts it).
+@requires(device, declassify)
+Result(Int, Str) moved_key(Int from, Int to, List(Secret(UInt(8))) st, List(Secret(UInt(8))) nst) {
+    Result(TpmPublic, TpmError) rp = tpm_read_public(from);
+    TpmPublic p = match rp { Ok(x) => x, Err(e) => return_none_pub() };
+    if (p.public_area.len() == 0) { return Err("TPM: cannot read the key's public area"); }
+    List(UInt(8)) priv = change_auth(from, srk_handle(), st, nst)?;
+    _ = tpm_evict(to);
+    return match tpm_persist(srk_handle(), TpmBlob {.private_area = priv, .public_area = p.public_area}, to) {
+        Ok(_) => Ok(0),
+        Err(e) => Err("TPM: " + tpm_error_text(e))
+    };
+}
+
+TpmPublic return_none_pub() { return TpmPublic {.public_area = [], .type_alg = 0, .name_alg = 0, .name = [], .qualified_name = []}; }
+
+@requires(device, declassify)
+Result(List(UInt(8)), Str) change_auth(Int object, Int parent, List(Secret(UInt(8))) st, List(Secret(UInt(8))) nst) {
+    return match tpm_change_auth(object, parent, st, nst) { Ok(p) => Ok(p), Err(e) => Err("TPM: " + tpm_error_text(e)) };
+}

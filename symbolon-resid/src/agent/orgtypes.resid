@@ -160,3 +160,18 @@ pub type OrgRecoveryRequest = {
     List(Int) signer;
     List(Int) sig;
 };
+
+// "conkey-<org>-<id>": a passkey an owner or administrator uses to sign in
+// to the relay's console (SPEC 29.10), approved by one of their devices;
+// `id` is the first 16 bytes of SHA-256 of the credential id.
+//@ serial
+pub type OrgConsoleKey = {
+    List(Int) org_id;
+    List(Int) cred_id;
+    List(Int) public_key;                // uncompressed P-256 point
+    Str rp_id;
+    List(Int) log_id;                    // the administrator
+    UInt(64) log_sequence;
+    List(Int) signer;
+    List(Int) sig;
+};

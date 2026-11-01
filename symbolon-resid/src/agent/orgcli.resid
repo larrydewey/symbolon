@@ -15,12 +15,15 @@
 //   org folder new DIR NAME GROUP[,GROUP...]   PIN; a group folder; prints its id
 //   org sync DIR                     PIN; an owner or administrator adds those who answered invites,
 //                                    then re-keys the group folders people left
-//   org recovery on DIR K DELAY ADMIN-LOG,...   PIN; an owner turns on opt-in recovery (SPEC 29.8)
+//   org recovery on DIR K DELAY ADMIN-LOG,... [--short-delay]   PIN; an owner turns on opt-in recovery (SPEC 29.8)
 //   org recovery off DIR             PIN
 //   org escrow DIR CID               PIN; a work folder you own, escrowed to the recovery key
 //   org recover request|approve|open DIR CID   PIN; recovery administrators open a work folder
 //   org export DIR [--https URL [--token T]] [--syslog HOST:PORT] [--ca FILE]   verified audit events to a SIEM
 //   org console DIR PORT             a read-only page on 127.0.0.1 for owners and administrators
+//   org console-key DIR CODE         PIN; approves a passkey waiting at the relay's console
+//   org changes DIR                  the changes queued at the relay's console
+//   org approve DIR ID               PIN; makes a queued change, signed here
 //   org audit DIR                    "TIME LOG SEQ ACTION OBJECT DETAIL-HEX" per verified event
 //
 // Group folders are then used like any shared folder: `device vault ...
@@ -37,6 +40,7 @@ import "serials.resid";
 import "orgtypes.resid";
 import "orgcore.resid";
 import "auditlog.resid";
+import "escrowcore.resid";
 import "sharetypes.resid";
 import "sharecli.resid";
 import "scim.resid";
@@ -53,7 +57,7 @@ import "hpke.resid";
 import "shamir.resid";
 
 pub OrgPolicy default_policy() {
-    return OrgPolicy {.min_pin_len = 6, .allow_biometric = true, .allow_duress = true, .allow_offline_copy = true, .max_offline_days = 0,
+    return OrgPolicy {.min_pin_len = 4, .allow_biometric = true, .allow_duress = true, .allow_offline_copy = true, .max_offline_days = 0,
                       .allow_personal_export = true, .require_attestation = [], .password_rules = ""};
 }
 
@@ -185,6 +189,7 @@ Result(Int, Str) join(Str dir, Str id, Str founder, Str code) {
 // (org sync), until when the relay does not show them the membership.
 @requires(filesystem, network, device, declassify, clock, provision, environment)
 Result(Int, Str) answered(Str dir, Ctx x, OrgGov g, Str code) {
+    if (str_len(x.pin) < g.policy.min_pin_len) { return Err(f"the organization asks for a PIN of at least {g.policy.min_pin_len} characters: change it first (device pin)"); }
     Int sent = if (str_len(code) == 0) { 0 } else { send_accept(x, g.org_id, code)? };
     Result(OrgState, Str) rs = org_at(dir, x.c, x.vh);
     return match rs {
@@ -254,7 +259,6 @@ Result(Int, Str) forget_org(Str dir, Str before, Str m) { _ = filesystem.write_a
 @requires(filesystem, network, device, declassify, clock, environment)
 Result(Int, Str) joined(Str dir, Ctx x, OrgState st) {
     Bool member = member_index(st.org.members, x.c.log_id, 0) >= 0;
-    if (str_len(x.pin) < st.gov.policy.min_pin_len) { eprintln(f"the organization asks for a PIN of at least {st.gov.policy.min_pin_len} digits; this device's is shorter"); }
     _ = audit(dir, x, st.org.org_id, "member", hex_encode(x.c.log_id), "joined");
     println(hex_encode(st.org.org_id) + " " + hex_encode(utf8(st.gov.name)) + (if (member) { " member" } else { " pending" }));
     return Ok(0);
@@ -376,8 +380,13 @@ pub Int org_remove(Str dir, Str who) { return done(remove(dir, who)); }
 
 @requires(filesystem, network, device, declassify, clock, provision, environment)
 Result(Int, Str) remove(Str dir, Str who) {
-    if (!log_hex_ok(who)) { return Err("a person is named by their log id, 64 hex digits"); }
     OrgCtx o = org_unlocked(dir)?;
+    return remove_in(dir, o, who);
+}
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+Result(Int, Str) remove_in(Str dir, OrgCtx o, Str who) {
+    if (!log_hex_ok(who)) { return Err("a person is named by their log id, 64 hex digits"); }
     Int ok = admin_only(o)?;
     List(Int) l = cose_hex_decode(who);
     if (member_index(o.st.org.members, l, 0) < 0) { return Err("not in the organization"); }
@@ -433,6 +442,11 @@ pub Int org_policy(Str dir, Str key, Str value) { return done(set_policy(dir, ke
 @requires(filesystem, network, device, declassify, clock, provision, environment)
 Result(Int, Str) set_policy(Str dir, Str key, Str value) {
     OrgCtx o = org_unlocked(dir)?;
+    return set_policy_in(dir, o, key, value);
+}
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+Result(Int, Str) set_policy_in(Str dir, OrgCtx o, Str key, Str value) {
     OrgPolicy p = changed_policy(o.st.gov.policy, key, value)?;
     return store_gov(dir, o.x, o.st, o.st.gov.owners, o.st.gov.admins, p, "policy", key + "=" + value);
 }
@@ -452,7 +466,8 @@ Result(OrgPolicy, Str) changed_policy(OrgPolicy p, Str k, Str v) {
     if (k == "allow_offline_copy") { Bool b = flag(v)?; return Ok(OrgPolicy {.min_pin_len = p.min_pin_len, .allow_biometric = p.allow_biometric, .allow_duress = p.allow_duress, .allow_offline_copy = b, .max_offline_days = p.max_offline_days, .allow_personal_export = p.allow_personal_export, .require_attestation = p.require_attestation, .password_rules = p.password_rules}); }
     if (k == "max_offline_days") { Int n = count(v, 0, 3650)?; return Ok(OrgPolicy {.min_pin_len = p.min_pin_len, .allow_biometric = p.allow_biometric, .allow_duress = p.allow_duress, .allow_offline_copy = p.allow_offline_copy, .max_offline_days = n, .allow_personal_export = p.allow_personal_export, .require_attestation = p.require_attestation, .password_rules = p.password_rules}); }
     if (k == "allow_personal_export") { Bool b = flag(v)?; return Ok(OrgPolicy {.min_pin_len = p.min_pin_len, .allow_biometric = p.allow_biometric, .allow_duress = p.allow_duress, .allow_offline_copy = p.allow_offline_copy, .max_offline_days = p.max_offline_days, .allow_personal_export = b, .require_attestation = p.require_attestation, .password_rules = p.password_rules}); }
-    if (k == "password_rules") { return Ok(OrgPolicy {.min_pin_len = p.min_pin_len, .allow_biometric = p.allow_biometric, .allow_duress = p.allow_duress, .allow_offline_copy = p.allow_offline_copy, .max_offline_days = p.max_offline_days, .allow_personal_export = p.allow_personal_export, .require_attestation = p.require_attestation, .password_rules = v}); }
+    if (k == "password_rules" && str_len(v) > 0 && v != "none" && !rules_ok(v)) { return Err("password_rules: a comma list of min=N, upper, lower, digit, symbol (or none)"); }
+    if (k == "password_rules") { return Ok(OrgPolicy {.min_pin_len = p.min_pin_len, .allow_biometric = p.allow_biometric, .allow_duress = p.allow_duress, .allow_offline_copy = p.allow_offline_copy, .max_offline_days = p.max_offline_days, .allow_personal_export = p.allow_personal_export, .require_attestation = p.require_attestation, .password_rules = if (v == "none") { "" } else { v }}); }
     return Err("policy keys: min_pin_len, allow_biometric, allow_duress, allow_offline_copy, max_offline_days, allow_personal_export, password_rules");
 }
 
@@ -478,8 +493,13 @@ pub Int org_group_set(Str dir, Str gid, Str who, Bool add_it) { return done(grou
 
 @requires(filesystem, network, device, declassify, clock, provision, environment)
 Result(Int, Str) group_set(Str dir, Str gid, Str who, Bool add_it) {
-    if (!share_id_ok(gid) || !log_hex_ok(who)) { return Err("a group id (32 hex digits) and a log id (64)"); }
     OrgCtx o = org_unlocked(dir)?;
+    return group_set_in(dir, o, gid, who, add_it);
+}
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+Result(Int, Str) group_set_in(Str dir, OrgCtx o, Str gid, Str who, Bool add_it) {
+    if (!share_id_ok(gid) || !log_hex_ok(who)) { return Err("a group id (32 hex digits) and a log id (64)"); }
     Int ok = admin_only(o)?;
     List(Int) g = cose_hex_decode(gid);
     List(Int) l = cose_hex_decode(who);
@@ -553,6 +573,11 @@ pub Int org_sync(Str dir) { return done(sync(dir)); }
 @requires(filesystem, network, device, declassify, clock, provision, environment)
 Result(Int, Str) sync(Str dir) {
     OrgCtx o0 = org_unlocked(dir)?;
+    return sync_in(dir, o0);
+}
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+Result(Int, Str) sync_in(Str dir, OrgCtx o0) {
     Int ok = admin_only(o0)?;
     OrgCtx o1 = admit(dir, o0)?;
     OrgCtx o = directory_sync(dir, o1)?;
@@ -871,10 +896,13 @@ List(UInt(256)) coeffs(Int k, ListBuf(UInt(256)) acc) {
 }
 
 @requires(filesystem, network, device, declassify, clock, provision, environment)
-pub Int org_recovery(Str dir, Str on, Str k, Str delay, Str admins_arg) { return done(recovery(dir, on, k, delay, admins_arg)); }
+pub Int org_recovery(Str dir, Str on, Str k, Str delay, Str admins_arg, Bool short) { return done(recovery(dir, on, k, delay, admins_arg, short)); }
+
+// The shortest delay an owner sets without --short-delay: 72 hours.
+pub Int min_recovery_delay() { return 259200; }
 
 @requires(filesystem, network, device, declassify, clock, provision, environment)
-Result(Int, Str) recovery(Str dir, Str on, Str k_arg, Str delay_arg, Str admins_arg) {
+Result(Int, Str) recovery(Str dir, Str on, Str k_arg, Str delay_arg, Str admins_arg, Bool short) {
     OrgCtx o = org_unlocked(dir)?;
     if (!is_owner(o.st.gov, o.x.c.log_id)) { return Err("only an owner turns recovery on or off"); }
     if (on == "off") { return store_gov_r(dir, o.x, o.st, o.st.gov.owners, o.st.gov.admins, o.st.gov.policy, no_recovery(), "recovery", "off"); }
@@ -882,6 +910,7 @@ Result(Int, Str) recovery(Str dir, Str on, Str k_arg, Str delay_arg, Str admins_
     Int k = str_parse_int(k_arg);
     Int delay = str_parse_int(delay_arg);
     if (admins.len() == 0 || admins.len() > 255 || k < 1 || k > admins.len() || delay < 0) { return Err("recovery on K DELAY-SECONDS ADMIN-LOG,...: 1 <= K <= administrators <= 255"); }
+    if (delay < min_recovery_delay() && !short) { return Err(f"a delay under {min_recovery_delay()} seconds (72 hours) leaves a person little time to see a request: add --short-delay to mean it"); }
     if (!all_admins(o.st, admins, 0)) { return Err("each recovery administrator must be an owner or administrator in the organization"); }
     List(Int) r = small_secret();
     HpkeKeyPair kp = hpke_derive_keypair(16, r);
@@ -923,12 +952,7 @@ Result(Int, Str) escrow(Str dir, Str cid) {
     if (!rec.on) { return Err("the organization has not turned recovery on"); }
     Loaded ld = load_folder(dir, o.x, cid)?;
     if (is_group_roster(ld.r) || !bytes_eq(ld.r.owner, o.x.c.log_id)) { return Err("only a shared folder you own is escrowed (group folders need none)"); }
-    HpkeMessageG(Secret(UInt(8))) m = hpkeg_seal_to(share_suite(), rec.public_key, escrow_info(o.st.org.org_id, ld.r.coll_id, ld.r.version), [], ld.key);
-    if (!m.ok) { return Err("cannot seal the key"); }
-    OrgEscrow e0 = OrgEscrow {.org_id = o.st.org.org_id, .coll_id = ld.r.coll_id, .owner = o.x.c.log_id, .roster_version = ld.r.version, .enc = m.enc, .ct = reveal(m.ct),
-                              .log_sequence = o.x.vh.head.sequence, .signer = o.x.c.party, .sig = []};
-    List(Int) sig = dk_sign(o.x.c, o.x.u.real, o.x.u.st, escrow_tbs(e0))?;
-    Int put = put_blob(o.x, escrow_blob(e0.org_id, cid), cbor_or_empty(to_cbor(escrow_signed(e0, sig))), "escrow")?;
+    OrgEscrow e0 = put_escrow(o.x.c, o.x.u, o.x.vh, o.x.ep, o.st.org.org_id, rec, ld.r.coll_id, ld.r.version, ld.key)?;
     _ = audit(dir, o.x, e0.org_id, "recovery", cid, f"escrowed at version {ld.r.version}");
     println(f"escrowed {cid} {ld.r.version}");
     return Ok(0);
@@ -954,10 +978,9 @@ Result(Int, Str) rec_admin_only(OrgCtx o) {
 Result(Int, Str) rec_request(Str dir, Str cid) {
     OrgCtx o = org_unlocked(dir)?;
     Int me = rec_admin_only(o)?;
-    OrgEscrow e = need(escrow_of(blob_get(o.x.ep, escrow_blob(o.st.org.org_id, cid)) else { [] }), "the folder has no escrow")?;
     Int now = witness_now(o.x.vh.head.policy.witnesses, o.x.c.ca, random_bytes(32));
     if (now == 0) { return Err("the witnesses did not answer for the time"); }
-    OrgRecoveryRequest q0 = OrgRecoveryRequest {.org_id = o.st.org.org_id, .coll_id = e.coll_id, .requester = o.x.c.log_id, .time = now,
+    OrgRecoveryRequest q0 = OrgRecoveryRequest {.org_id = o.st.org.org_id, .coll_id = cose_hex_decode(cid), .requester = o.x.c.log_id, .time = now,
                                                 .log_sequence = o.x.vh.head.sequence, .signer = o.x.c.party, .sig = []};
     List(Int) sig = dk_sign(o.x.c, o.x.u.real, o.x.u.st, recreq_tbs(q0))?;
     Int put = put_blob(o.x, recreq_blob(q0.org_id, cid), cbor_or_empty(to_cbor(recreq_signed(q0, sig))), "recovery request")?;
@@ -1195,3 +1218,93 @@ List(Str) frames(Str org, List(Str) lines, Int i, ListBuf(Str) acc) {
     return frames(org, lines, i + 1, acc.push(syslog_frame(org, lines[i])));
 }
 
+
+// ─── The relay's console, from this device (SPEC 29.10) ─────────
+// `org console-key DIR CODE`: approves the passkey waiting at the console
+// with this code, for this owner or administrator. `org changes DIR`:
+// "ID KIND A-HEX B-HEX C-HEX BY STATUS RESULT-HEX" per change queued at the
+// console. `org approve DIR ID`: makes that change, signed here, and tells
+// the console what came of it.
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+pub Int org_console_key(Str dir, Str code) { return done(console_key(dir, code)); }
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+Result(Int, Str) console_key(Str dir, Str code) {
+    OrgCtx o = org_unlocked(dir)?;
+    Int ok = admin_only(o)?;
+    HttpOut r = http_call_ep(o.x.ep, "GET", "/console/" + hex_encode(o.st.org.org_id) + "/pending", []);
+    if (r.status != 200) { return Err(f"the relay's console did not answer ({r.status})"); }
+    List(Str) p = pending_with(str_split(http_text(r.body, 0, r.body.len()), "\n"), code, 0);
+    if (p.len() != 4) { return Err("no passkey with this code is waiting at the console"); }
+    OrgConsoleKey k0 = OrgConsoleKey {.org_id = o.st.org.org_id, .cred_id = cose_hex_decode(p[1]), .public_key = cose_hex_decode(p[2]), .rp_id = p[3], .log_id = o.x.c.log_id,
+                                      .log_sequence = o.x.vh.head.sequence, .signer = o.x.c.party, .sig = []};
+    List(Int) sig = dk_sign(o.x.c, o.x.u.real, o.x.u.st, conkey_tbs(k0))?;
+    Int put = put_blob(o.x, conkey_blob(k0.org_id, k0.cred_id), cbor_or_empty(to_cbor(conkey_signed(k0, sig))), "console key")?;
+    _ = audit(dir, o.x, k0.org_id, "member", hex_encode(sha256_bytes(k0.cred_id)[0..16]), "console passkey approved");
+    println("approved " + code);
+    return Ok(0);
+}
+
+List(Str) pending_with(List(Str) lines, Str code, Int i) {
+    if (i >= lines.len()) { return []; }
+    List(Str) p = str_split(lines[i], " ");
+    return if (p.len() == 4 && p[0] == code) { p } else { pending_with(lines, code, i + 1) };
+}
+
+@requires(filesystem, network, clock(readonly), declassify)
+pub Int org_changes(Str dir) { return done(changes(dir)); }
+
+@requires(filesystem, network, clock(readonly), declassify)
+Result(Int, Str) changes(Str dir) {
+    OrgCtx o = org_view(dir)?;
+    HttpOut r = http_call_ep(o.x.ep, "GET", "/console/" + hex_encode(o.st.org.org_id) + "/changes", []);
+    if (r.status != 200) { return Err(f"the relay's console did not answer ({r.status})"); }
+    Str t = http_text(r.body, 0, r.body.len());
+    if (str_len(t) > 0) { println(t); }
+    return Ok(0);
+}
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+pub Int org_approve(Str dir, Str id) { return done(approve(dir, id)); }
+
+Str unhex_s(Str s) { List(Int) b = if (s == "-") { [] } else { cose_hex_decode(s) }; return http_text(b, 0, b.len()); }
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+Result(Int, Str) approve(Str dir, Str id) {
+    if (!share_id_ok(id)) { return Err("a change id is 32 hex digits"); }
+    OrgCtx o = org_unlocked(dir)?;
+    Int ok = admin_only(o)?;
+    Str org = hex_encode(o.st.org.org_id);
+    HttpOut r = http_call_ep(o.x.ep, "GET", "/console/" + org + "/changes", []);
+    if (r.status != 200) { return Err(f"the relay's console did not answer ({r.status})"); }
+    List(Str) p = change_with(str_split(http_text(r.body, 0, r.body.len()), "\n"), id, 0);
+    if (p.len() != 8) { return Err("no such change"); }
+    if (p[6] != "pending") { return Err("the change is " + p[6]); }
+    println("change " + p[1] + " " + unhex_s(p[2]) + " " + unhex_s(p[3]) + " " + unhex_s(p[4]) + " queued by " + str_slice(p[5], 0, 12));
+    Result(Str, Str) res = run_change(dir, o, p[1], unhex_s(p[2]), unhex_s(p[3]), unhex_s(p[4]));
+    Str told = match res { Ok(t) => t, Err(m) => "refused: " + m };
+    _ = http_call_ep(o.x.ep, "POST", "/console/" + org + "/done/" + id, utf8(told));
+    _ = audit(dir, o.x, o.st.org.org_id, "member", id, "console change " + p[1] + ": " + told);
+    return match res { Ok(t) => Ok(say_ok(t)), Err(m) => Err(m) };
+}
+
+Int say_ok(Str t) { println(t); return 0; }
+
+List(Str) change_with(List(Str) lines, Str id, Int i) {
+    if (i >= lines.len()) { return []; }
+    List(Str) p = str_split(lines[i], " ");
+    return if (p.len() == 8 && p[0] == id) { p } else { change_with(lines, id, i + 1) };
+}
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+Result(Str, Str) run_change(Str dir, OrgCtx o, Str kind, Str a, Str b, Str c) {
+    if (kind == "invite") {
+        if (!label_ok(b) || str_len(a) == 0) { return Err("an invite needs a directory id and a name"); }
+        List(List(Int)) gs = if (str_len(c) == 0) { [] } else { group_ids(o.st.org.groups, str_split(c, ","), 0, ListBuf())? };
+        return make_invite(dir, o, a, b, gs);
+    }
+    Int n = if (kind == "group-add" || kind == "group-remove") { group_set_in(dir, o, a, b, kind == "group-add")? } else {
+        if (kind == "remove") { remove_in(dir, o, a)? } else { if (kind == "policy") { set_policy_in(dir, o, a, b)? } else { if (kind == "sync") { sync_in(dir, o)? } else { -1 } } } };
+    return if (n < 0) { Err("unknown change " + kind) } else { Ok("done") };
+}

@@ -753,3 +753,62 @@ Result(Parsed(OrgRecoveryRequest, F), SerialError) derive_org_recovery_request_d
     return parsed(OrgRecoveryRequest {.org_id = d_org_id, .coll_id = d_coll_id, .requester = d_requester, .time = d_time, .log_sequence = d_log_sequence, .signer = d_signer, .sig = d_sig}, s);
 }
 Decode(OrgRecoveryRequest, F) = derive_org_recovery_request_decode;
+
+// ── OrgConsoleKey (line 168)
+/// The serialized field names of `OrgConsoleKey`, in declaration order.
+pub List(Str) derive_org_console_key_names() { return ["org_id", "cred_id", "public_key", "rp_id", "log_id", "log_sequence", "signer", "sig"]; }
+/// Encodes a `OrgConsoleKey` through the encoder `s`.
+@needs(Encoder(F))
+pub Result(F, SerialError) derive_org_console_key_encode(OrgConsoleKey v, F s) {
+    Int n = 8;
+    F s0 = write_struct_begin(s, "OrgConsoleKey", n)?;
+    F s1 = write_named(s0, "org_id", v.org_id)?;
+    F s2 = write_named(s1, "cred_id", v.cred_id)?;
+    F s3 = write_named(s2, "public_key", v.public_key)?;
+    F s4 = write_named(s3, "rp_id", v.rp_id)?;
+    F s5 = write_named(s4, "log_id", v.log_id)?;
+    F s6 = write_named(s5, "log_sequence", v.log_sequence)?;
+    F s7 = write_named(s6, "signer", v.signer)?;
+    F s8 = write_named(s7, "sig", v.sig)?;
+    return write_struct_end(s8);
+}
+Encode(OrgConsoleKey, F) = derive_org_console_key_encode;
+/// Decodes a `OrgConsoleKey` from the decoder `s`, with the input left over.
+@needs(Decoder(F))
+pub Result(Parsed(OrgConsoleKey, F), SerialError) derive_org_console_key_decode(F s) {
+    F s0 = read_struct_begin(s, "OrgConsoleKey", derive_org_console_key_names())?;
+    return derive_org_console_key_fields(s0, None, None, None, None, None, None, None, None);
+}
+@needs(Decoder(F))
+Result(Parsed(OrgConsoleKey, F), SerialError) derive_org_console_key_fields(F s, Option(List(Int)) f_org_id, Option(List(Int)) f_cred_id, Option(List(Int)) f_public_key, Option(Str) f_rp_id, Option(List(Int)) f_log_id, Option(UInt(64)) f_log_sequence, Option(List(Int)) f_signer, Option(List(Int)) f_sig) {
+    Parsed(FieldKey, F) k = read_field(s, derive_org_console_key_names())?;
+    FieldKey key = k.value;
+    return match key {
+        KnownField(i) => derive_org_console_key_field(k.rest, i, f_org_id, f_cred_id, f_public_key, f_rp_id, f_log_id, f_log_sequence, f_signer, f_sig),
+        UnknownField(name) => derive_org_console_key_fields(skip_unknown(k.rest, name, derive_org_console_key_names(), false)?, f_org_id, f_cred_id, f_public_key, f_rp_id, f_log_id, f_log_sequence, f_signer, f_sig),
+        EndOfFields => derive_org_console_key_done(k.rest, f_org_id, f_cred_id, f_public_key, f_rp_id, f_log_id, f_log_sequence, f_signer, f_sig)
+    };
+}
+@needs(Decoder(F))
+Result(Parsed(OrgConsoleKey, F), SerialError) derive_org_console_key_field(F s, Int i, Option(List(Int)) f_org_id, Option(List(Int)) f_cred_id, Option(List(Int)) f_public_key, Option(Str) f_rp_id, Option(List(Int)) f_log_id, Option(UInt(64)) f_log_sequence, Option(List(Int)) f_signer, Option(List(Int)) f_sig) {
+    if (i == 0) { Parsed(Option(List(Int)), F) p = read_slot(s, f_org_id, "org_id")?; return derive_org_console_key_fields(p.rest, p.value, f_cred_id, f_public_key, f_rp_id, f_log_id, f_log_sequence, f_signer, f_sig); }
+    if (i == 1) { Parsed(Option(List(Int)), F) p = read_slot(s, f_cred_id, "cred_id")?; return derive_org_console_key_fields(p.rest, f_org_id, p.value, f_public_key, f_rp_id, f_log_id, f_log_sequence, f_signer, f_sig); }
+    if (i == 2) { Parsed(Option(List(Int)), F) p = read_slot(s, f_public_key, "public_key")?; return derive_org_console_key_fields(p.rest, f_org_id, f_cred_id, p.value, f_rp_id, f_log_id, f_log_sequence, f_signer, f_sig); }
+    if (i == 3) { Parsed(Option(Str), F) p = read_slot(s, f_rp_id, "rp_id")?; return derive_org_console_key_fields(p.rest, f_org_id, f_cred_id, f_public_key, p.value, f_log_id, f_log_sequence, f_signer, f_sig); }
+    if (i == 4) { Parsed(Option(List(Int)), F) p = read_slot(s, f_log_id, "log_id")?; return derive_org_console_key_fields(p.rest, f_org_id, f_cred_id, f_public_key, f_rp_id, p.value, f_log_sequence, f_signer, f_sig); }
+    if (i == 5) { Parsed(Option(UInt(64)), F) p = read_slot(s, f_log_sequence, "log_sequence")?; return derive_org_console_key_fields(p.rest, f_org_id, f_cred_id, f_public_key, f_rp_id, f_log_id, p.value, f_signer, f_sig); }
+    if (i == 6) { Parsed(Option(List(Int)), F) p = read_slot(s, f_signer, "signer")?; return derive_org_console_key_fields(p.rest, f_org_id, f_cred_id, f_public_key, f_rp_id, f_log_id, f_log_sequence, p.value, f_sig); }
+    Parsed(Option(List(Int)), F) p = read_slot(s, f_sig, "sig")?; return derive_org_console_key_fields(p.rest, f_org_id, f_cred_id, f_public_key, f_rp_id, f_log_id, f_log_sequence, f_signer, p.value);
+}
+Result(Parsed(OrgConsoleKey, F), SerialError) derive_org_console_key_done(F s, Option(List(Int)) f_org_id, Option(List(Int)) f_cred_id, Option(List(Int)) f_public_key, Option(Str) f_rp_id, Option(List(Int)) f_log_id, Option(UInt(64)) f_log_sequence, Option(List(Int)) f_signer, Option(List(Int)) f_sig) {
+    List(Int) d_org_id = require(f_org_id, "org_id")?;
+    List(Int) d_cred_id = require(f_cred_id, "cred_id")?;
+    List(Int) d_public_key = require(f_public_key, "public_key")?;
+    Str d_rp_id = require(f_rp_id, "rp_id")?;
+    List(Int) d_log_id = require(f_log_id, "log_id")?;
+    UInt(64) d_log_sequence = require(f_log_sequence, "log_sequence")?;
+    List(Int) d_signer = require(f_signer, "signer")?;
+    List(Int) d_sig = require(f_sig, "sig")?;
+    return parsed(OrgConsoleKey {.org_id = d_org_id, .cred_id = d_cred_id, .public_key = d_public_key, .rp_id = d_rp_id, .log_id = d_log_id, .log_sequence = d_log_sequence, .signer = d_signer, .sig = d_sig}, s);
+}
+Decode(OrgConsoleKey, F) = derive_org_console_key_decode;
