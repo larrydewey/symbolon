@@ -22,7 +22,7 @@ access carry much of the design's enforcement.
 
 ## Status
 
-v0.1.0: the agent, relay, witnesses and cosigner, Symbolon Home (a
+v0.1.3: the agent, relay, witnesses and cosigner, Symbolon Home (a
 self-hosted box for a household) and organizations for companies, with an
 Android and Linux app. See the
 [releases](https://github.com/larrydewey/symbolon/releases).
