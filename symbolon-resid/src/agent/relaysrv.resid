@@ -170,7 +170,7 @@ Bool in_org(Store root, Str id, Who w) {
 @requires(filesystem, network, clock(readonly), declassify)
 Bool admin_of(Store root, Str id, Who w) {
     if (!w.on || !hex_len(id, 32)) { return false; }
-    return match relay_org(root, id) { None => false, Some(st) => member_index(st.org.members, w.log, 0) >= 0 && is_admin(st.gov, w.log) };
+    return match relay_org(root, id) { None => false, Some(st) => member_index(st.org.members, w.log, 0) >= 0 && is_admin(st.gov, w.log) && att_ok(st, w) };
 }
 
 // The org id in "audit-<org>-...", "invite-<org>-...", "accept-<org>-...".
@@ -197,7 +197,7 @@ Bool folder_person(Store root, Str cid, Who w) {
     if (!w.on) { return false; }
     return match gfolder_of(b) {
         None => false,
-        Some(f) => match relay_org(root, hex_encode(f.org_id)) { None => false, Some(st) => person_in(folder_people(st, f.groups), w.log, 0) && directory_allows(root, st, f.groups, w.log) }
+        Some(f) => match relay_org(root, hex_encode(f.org_id)) { None => false, Some(st) => person_in(folder_people(st, f.groups), w.log, 0) && directory_allows(root, st, f.groups, w.log) && att_ok(st, w) }
     };
 }
 
@@ -245,6 +245,7 @@ pub Bool may_read(Store root, Str name, Who w) {
     if (str_starts_with(name, "audit-")) { return admin_of(root, org_part(name, 6), w); }
     if (str_starts_with(name, "escrow-")) { return escrow_read(root, name, w); }
     if (str_starts_with(name, "conkey-")) { return admin_of(root, org_part(name, 7), w); }
+    if (str_starts_with(name, "attev-") || str_starts_with(name, "attresp-") || str_starts_with(name, "attchal-")) { return in_org(root, org_part(name, str_index_of(name, "-", 0) + 1), w); }
     if (str_starts_with(name, "recreq-")) { return in_org(root, org_part(name, 7), w); }
     if (str_starts_with(name, "invite-") || str_starts_with(name, "accept-")) { return admin_of(root, org_part(name, 7), w); }
     if (str_starts_with(name, "gfolder-")) {
@@ -265,6 +266,7 @@ pub Str may_write(Store root, Str name, List(Int) body, Who w) {
     if (str_starts_with(name, "accept-")) { return accept_write(root, name, body, w); }
     if (str_starts_with(name, "escrow-")) { return escrow_write(root, name, body, w); }
     if (str_starts_with(name, "conkey-")) { return conkey_write(root, name, body, w); }
+    if (str_starts_with(name, "attev-") || str_starts_with(name, "attresp-") || str_starts_with(name, "attchal-")) { return att_write(root, name, body, w); }
     if (str_starts_with(name, "recreq-")) { return recreq_write(root, name, body, w); }
     Str cid = folder_of(name);
     if (str_len(cid) > 0 && !folder_person(root, cid, w)) { return "not one of the group folder's people"; }
@@ -390,6 +392,26 @@ Str escrow_write(Store root, Str name, List(Int) body, Who w) {
             if (by_device(w, e.owner, e.signer, escrow_tbs(e), e.sig)) { "" } else { "not signed by the device that signed in" } }
     };
 }
+
+// Attestation records (SPEC 29.5): evidence and answers by the device they
+// are about, challenges by an owner's or administrator's device.
+@requires(filesystem, network, clock(readonly), declassify)
+Str att_write(Store root, Str name, List(Int) body, Who w) {
+    Str org = org_part(name, str_index_of(name, "-", 0) + 1);
+    if (!in_org(root, org, w)) { return "not in the organization"; }
+    if (str_starts_with(name, "attev-")) {
+        return match attev_of(body) { None => "the evidence does not decode", Some(e) => if (name == att_blob("attev", e.org_id, e.party) && bytes_eq(e.party, w.party) && by_device(w, e.log_id, e.signer, attev_tbs(e), e.sig)) { "" } else { "not the signed-in device's own evidence" } };
+    }
+    if (str_starts_with(name, "attresp-")) {
+        return match attresp_of(body) { None => "the response does not decode", Some(r) => if (name == att_blob("attresp", r.org_id, r.party) && bytes_eq(r.party, w.party) && by_device(w, w.log, r.signer, attresp_tbs(r), r.sig)) { "" } else { "not the signed-in device's own response" } };
+    }
+    if (!admin_of(root, org, w)) { return "only an owner or administrator challenges a device"; }
+    return match attchal_of(body) { None => "the challenge does not decode", Some(c) => if (name == att_blob("attchal", c.org_id, c.party) && by_device(w, c.by_log, c.signer, attchal_tbs(c), c.sig)) { "" } else { "not signed by the device that signed in" } };
+}
+
+// When the policy requires attestation, an unattested device of a member
+// reads and writes no group folder and no audit event (SPEC 29.5).
+Bool att_ok(OrgState st, Who w) { return !requires_att(st.gov, "tpm") || has_log(st.org.attested, w.party); }
 
 // A console passkey, approved by an owner's or administrator's device for
 // themselves, of one waiting at the console (empty: withdrawn by an admin).

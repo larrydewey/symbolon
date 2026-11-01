@@ -24,6 +24,7 @@
 //   org console-key DIR CODE         PIN; approves a passkey waiting at the relay's console
 //   org changes DIR                  the changes queued at the relay's console
 //   org approve DIR ID               PIN; makes a queued change, signed here
+//   org attest DIR [CHAIN,...] [CRL,...]   PIN; a TPM device's platform attestation, in two steps (SPEC 29.5)
 //   org audit DIR                    "TIME LOG SEQ ACTION OBJECT DETAIL-HEX" per verified event
 //
 // Group folders are then used like any shared folder: `device vault ...
@@ -49,6 +50,15 @@ import "crypto.resid";
 import "ecdsa.resid";
 import "cbor.resid";
 import "cose.resid";
+import "keystore.resid";
+import "../attestation/attestation.resid";
+import "challenge_export.resid";
+import "challenge.resid";
+import "verify/core.resid";
+import "verify/tpm_anchors.resid";
+import "verify/tpm.resid";
+import "dev/tpm_wire.resid";
+import "dev/tpm.resid";
 import "tlsclient.resid";
 import "../browser/json.resid";
 import "random.resid";
@@ -74,8 +84,8 @@ Result(OrgGov, Str) sign_gov(Ctx x, OrgGov g0) {
 }
 
 @requires(device, declassify, network, environment)
-Result(Org, Str) sign_org(Ctx x, List(Int) id, UInt(64) version, UInt(64) gov_version, List(OrgMember) ms, List(OrgGroup) gs) {
-    Org o = Org {.org_id = id, .version = version, .gov_version = gov_version, .members = ms, .groups = gs, .log_sequence = x.vh.head.sequence,
+Result(Org, Str) sign_org(Ctx x, List(Int) id, UInt(64) version, UInt(64) gov_version, List(OrgMember) ms, List(OrgGroup) gs, List(List(Int)) att) {
+    Org o = Org {.org_id = id, .version = version, .gov_version = gov_version, .members = ms, .groups = gs, .attested = att, .log_sequence = x.vh.head.sequence,
                  .signer_log = x.c.log_id, .signer = x.c.party, .sig = []};
     List(Int) sig = dk_sign(x.c, x.u.real, x.u.st, org_tbs(o))?;
     return Ok(org_signed(o, sig));
@@ -90,7 +100,7 @@ Result(Int, Str) put_blob(Ctx x, Str name, List(Int) b, Str what) {
 // The membership record again, one version up, under governance `gv`.
 @requires(filesystem, network, device, declassify, clock, environment)
 Result(Int, Str) store_org(Str dir, Ctx x, OrgState st, UInt(64) gv, List(OrgMember) ms, List(OrgGroup) gs, Str action, Str detail) {
-    Org o = sign_org(x, st.org.org_id, st.org.version + (UInt(64))1, gv, ms, gs)?;
+    Org o = sign_org(x, st.org.org_id, st.org.version + (UInt(64))1, gv, ms, gs, st.org.attested)?;
     Int stored = put_blob(x, org_blob(o.org_id), cbor_or_empty(to_cbor(o)), "membership record")?;
     _ = filesystem.write_all(dir + "/org.version", f"{o.version}");
     _ = audit(dir, x, o.org_id, action, hex_encode(o.org_id), detail);
@@ -150,7 +160,7 @@ Result(Int, Str) found(Str dir, Str name) {
     OrgGov g = sign_gov(x, OrgGov {.org_id = id, .version = (UInt(64))1, .founder = x.c.log_id, .nonce = nonce, .name = name, .owners = [x.c.log_id], .admins = [],
                                    .policy = default_policy(), .recovery = no_recovery(), .log_sequence = (UInt(64))0, .signer_log = [], .signer = [], .sig = []})?;
     Str me = own_name(x.c);
-    Org o = sign_org(x, id, (UInt(64))1, (UInt(64))1, [OrgMember {.log_id = x.c.log_id, .label = if (str_len(me) > 0) { me } else { "Founder" }, .ext_id = ""}], [])?;
+    Org o = sign_org(x, id, (UInt(64))1, (UInt(64))1, [OrgMember {.log_id = x.c.log_id, .label = if (str_len(me) > 0) { me } else { "Founder" }, .ext_id = ""}], [], [])?;
     Int a = put_blob(x, gov_blob(id, g.version), cbor_or_empty(to_cbor(g)), "governance record")?;
     Int b = put_blob(x, org_blob(id), cbor_or_empty(to_cbor(o)), "membership record")?;
     if (!filesystem.write_all(dir + "/org", hex_encode(id) + " " + hex_encode(x.c.log_id))) { return Err("cannot write the organization to the device"); }
@@ -448,6 +458,8 @@ Result(Int, Str) set_policy(Str dir, Str key, Str value) {
 @requires(filesystem, network, device, declassify, clock, provision, environment)
 Result(Int, Str) set_policy_in(Str dir, OrgCtx o, Str key, Str value) {
     OrgPolicy p = changed_policy(o.st.gov.policy, key, value)?;
+    // Requiring attestation from a device that is not attested would shut its owner out.
+    if (key == "require_attestation" && value != "none" && !has_log(o.st.org.attested, o.x.c.party)) { return Err("attest this device first (org attest), or the policy shuts it out"); }
     return store_gov(dir, o.x, o.st, o.st.gov.owners, o.st.gov.admins, p, "policy", key + "=" + value);
 }
 
@@ -466,6 +478,8 @@ Result(OrgPolicy, Str) changed_policy(OrgPolicy p, Str k, Str v) {
     if (k == "allow_offline_copy") { Bool b = flag(v)?; return Ok(OrgPolicy {.min_pin_len = p.min_pin_len, .allow_biometric = p.allow_biometric, .allow_duress = p.allow_duress, .allow_offline_copy = b, .max_offline_days = p.max_offline_days, .allow_personal_export = p.allow_personal_export, .require_attestation = p.require_attestation, .password_rules = p.password_rules}); }
     if (k == "max_offline_days") { Int n = count(v, 0, 3650)?; return Ok(OrgPolicy {.min_pin_len = p.min_pin_len, .allow_biometric = p.allow_biometric, .allow_duress = p.allow_duress, .allow_offline_copy = p.allow_offline_copy, .max_offline_days = n, .allow_personal_export = p.allow_personal_export, .require_attestation = p.require_attestation, .password_rules = p.password_rules}); }
     if (k == "allow_personal_export") { Bool b = flag(v)?; return Ok(OrgPolicy {.min_pin_len = p.min_pin_len, .allow_biometric = p.allow_biometric, .allow_duress = p.allow_duress, .allow_offline_copy = p.allow_offline_copy, .max_offline_days = p.max_offline_days, .allow_personal_export = b, .require_attestation = p.require_attestation, .password_rules = p.password_rules}); }
+    if (k == "require_attestation" && v != "tpm" && v != "none") { return Err("require_attestation: tpm or none"); }
+    if (k == "require_attestation") { return Ok(OrgPolicy {.min_pin_len = p.min_pin_len, .allow_biometric = p.allow_biometric, .allow_duress = p.allow_duress, .allow_offline_copy = p.allow_offline_copy, .max_offline_days = p.max_offline_days, .allow_personal_export = p.allow_personal_export, .require_attestation = if (v == "none") { [] } else { [v] }, .password_rules = p.password_rules}); }
     if (k == "password_rules" && str_len(v) > 0 && v != "none" && !rules_ok(v)) { return Err("password_rules: a comma list of min=N, upper, lower, digit, symbol (or none)"); }
     if (k == "password_rules") { return Ok(OrgPolicy {.min_pin_len = p.min_pin_len, .allow_biometric = p.allow_biometric, .allow_duress = p.allow_duress, .allow_offline_copy = p.allow_offline_copy, .max_offline_days = p.max_offline_days, .allow_personal_export = p.allow_personal_export, .require_attestation = p.require_attestation, .password_rules = if (v == "none") { "" } else { v }}); }
     return Err("policy keys: min_pin_len, allow_biometric, allow_duress, allow_offline_copy, max_offline_days, allow_personal_export, password_rules");
@@ -580,7 +594,8 @@ Result(Int, Str) sync(Str dir) {
 Result(Int, Str) sync_in(Str dir, OrgCtx o0) {
     Int ok = admin_only(o0)?;
     OrgCtx o1 = admit(dir, o0)?;
-    OrgCtx o = directory_sync(dir, o1)?;
+    OrgCtx o2 = directory_sync(dir, o1)?;
+    OrgCtx o = attest_sync(dir, o2)?;
     List(Str) wraps = blob_list(o.x.ep, "wrap-");
     return Ok(sync_all(dir, o, wraps, ids_of(blob_list(o.x.ep, "gfolder-"), 0, ListBuf()), 0));
 }
@@ -1308,3 +1323,170 @@ Result(Str, Str) run_change(Str dir, OrgCtx o, Str kind, Str a, Str b, Str c) {
         if (kind == "remove") { remove_in(dir, o, a)? } else { if (kind == "policy") { set_policy_in(dir, o, a, b)? } else { if (kind == "sync") { sync_in(dir, o)? } else { -1 } } } };
     return if (n < 0) { Err("unknown change " + kind) } else { Ok("done") };
 }
+
+// ─── Platform attestation (SPEC 29.5, 21.1) ─────────────────────
+// `org attest DIR [CHAIN-FILE,...] [CRL-FILE,...]` on a device in the TPM
+// profile: first its evidence (the TPM's EK certificate, any chain the TPM
+// stores and the DER files given, the CRLs given, the AK), then, once an
+// administrator's sync answered with a credential challenge, its response
+// (the credential the TPM activates for that EK and AK, and TPM2_Certify of
+// the device key by the AK over the challenge and its log id). The
+// administrator's next sync verifies it with Resid's TPM verifier: the EK
+// chain to a TPM maker's root with a current CRL for every certificate
+// below the root (a chain without one is refused as stale), the AK in the
+// same TPM, the device key fixed to it, PIN-gated, signing only; and adds
+// the device's party to the membership record's `attested`.
+
+List(UInt(8)) u8b(List(Int) b) { return u8s(b); }
+List(Int) intb(List(UInt(8)) b) { return ints(b); }
+
+@requires(filesystem)
+List(List(Int)) der_files(Str arg, Int i, List(Str) fs, ListBuf(List(Int)) acc) {
+    if (i >= fs.len()) { return acc.finish(); }
+    Str f = fs[i];
+    return der_files(arg, i + 1, fs, if (str_len(f) > 0 && filesystem.exists(f)) { acc.push(filesystem.read_bytes(f)) } else { acc });
+}
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+pub Int org_attest(Str dir, Str chain_arg, Str crl_arg) { return done(attest_step(dir, chain_arg, crl_arg)); }
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+Result(Int, Str) attest_step(Str dir, Str chain_arg, Str crl_arg) {
+    OrgCtx o = org_unlocked(dir)?;
+    DeviceConfig c = o.x.c;
+    if (c.unprotected || on_keystore(c)) { return Err("only a device in the TPM profile attests its key (the Keystore and unprotected profiles cannot)"); }
+    List(Int) org = o.st.org.org_id;
+    if (has_log(o.st.org.attested, c.party)) { println("attested"); return Ok(0); }
+    Option(OrgAttestChallenge) och = attchal_of(blob_get(o.x.ep, att_blob("attchal", org, c.party)) else { [] });
+    return match och {
+        None => send_evidence(dir, o, str_split(chain_arg, ","), str_split(crl_arg, ",")),
+        Some(ch) => answer_challenge(dir, o, ch)
+    };
+}
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+Result(Int, Str) send_evidence(Str dir, OrgCtx o, List(Str) chain_files, List(Str) crl_files) {
+    Bool ecc = match tpm_ek_cert(true) { Ok(b) => b.len() > 0, Err(_) => false };
+    List(UInt(8)) ek = match tpm_ek_cert(ecc) { Ok(b) => b, Err(e) => [] };
+    if (ek.len() == 0) { return Err("the TPM holds no EK certificate"); }
+    List(List(Int)) nv_chain = match tpm_ek_chain_certs() { Ok(cs) => ints_all(cs, 0, ListBuf()), Err(_) => [] };
+    TpmKeys keys = match tpm_ek_ak(ecc) { Ok(k) => k, Err(e) => return_none_keys() };
+    if (keys.ak.public_area.len() == 0) { return Err("the TPM did not make its attestation key"); }
+    _ = filesystem.write_all(dir + "/attest.ecc", if (ecc) { "1" } else { "0" });
+    OrgAttestEvidence e0 = OrgAttestEvidence {.org_id = o.st.org.org_id, .log_id = o.x.c.log_id, .party = o.x.c.party, .kind = "tpm", .ek_cert = intb(ek),
+        .ek_chain = nv_chain.concat(der_files("", 0, chain_files, ListBuf())), .crls = der_files("", 0, crl_files, ListBuf()), .ak_public = intb(keys.ak.public_area),
+        .log_sequence = o.x.vh.head.sequence, .signer = o.x.c.party, .sig = []};
+    List(Int) sig = dk_sign(o.x.c, o.x.u.real, o.x.u.st, attev_tbs(e0))?;
+    Int put = put_blob(o.x, att_blob("attev", e0.org_id, e0.party), cbor_or_empty(to_cbor(attev_signed(e0, sig))), "attestation evidence")?;
+    println(f"evidence sent ({e0.ek_chain.len()} chain certificates, {e0.crls.len()} CRLs): run org attest again after an administrator's sync");
+    return Ok(0);
+}
+
+TpmKeys return_none_keys() { return TpmKeys {.ek = TpmCreated {.handle = 0, .public_area = [], .name = []}, .ak = TpmCreated {.handle = 0, .public_area = [], .name = []}}; }
+
+List(List(Int)) ints_all(List(List(UInt(8))) xs, Int i, ListBuf(List(Int)) acc) { return if (i >= xs.len()) { acc.finish() } else { ints_all(xs, i + 1, acc.push(intb(xs[i]))) }; }
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+Result(Int, Str) answer_challenge(Str dir, OrgCtx o, OrgAttestChallenge ch) {
+    if (!is_admin(o.st.gov, ch.by_log)) { return Err("the challenge is not an administrator's"); }
+    VerifiedHead h = head_of(o.x.c, o.x.vh, ch.by_log)?;
+    if (match device_party(h.head.quorum.parties, ch.signer, 0) { None => true, Some(d) => !ecdsa_verify_raw(P256, Sha256, d.auth_key, attchal_tbs(ch), ch.sig) }) { return Err("the challenge's signature does not verify"); }
+    Bool ecc = str_trim(filesystem.read_all(dir + "/attest.ecc")) == "1";
+    List(UInt(8)) act = match tpm_activate_credential(ecc, u8b(ch.blob), u8b(ch.secret)) { Ok(a) => a, Err(e) => [] };
+    if (act.len() == 0) { return Err("the TPM did not activate the credential (not its EK and AK?)"); }
+    TpmCertified2 cert = match tpm_certify(o.x.c.tpm_dk, o.x.u.st, u8b(enroll_extra(ch.value, o.x.c.log_id))) { Ok(x) => x, Err(e) => TpmCertified2 {.ak_public = [], .attest = [], .sig = []} };
+    if (cert.attest.len() == 0) { return Err("the TPM did not certify the device key"); }
+    List(UInt(8)) dkp = match tpm_read_public(o.x.c.tpm_dk) { Ok(p) => p.public_area, Err(_) => [] };
+    OrgAttestResponse r0 = OrgAttestResponse {.org_id = o.st.org.org_id, .party = o.x.c.party, .activated = intb(act), .attest = intb(cert.attest), .attest_sig = intb(cert.sig),
+        .dk_public = intb(dkp), .log_sequence = o.x.vh.head.sequence, .signer = o.x.c.party, .sig = []};
+    List(Int) sig = dk_sign(o.x.c, o.x.u.real, o.x.u.st, attresp_tbs(r0))?;
+    Int put = put_blob(o.x, att_blob("attresp", r0.org_id, r0.party), cbor_or_empty(to_cbor(attresp_signed(r0, sig))), "attestation response")?;
+    println("answered: an administrator's next sync verifies it");
+    return Ok(0);
+}
+
+// The administrator's side, in `org sync`: challenges new evidence, and
+// verifies answers to this device's challenges. "challenged PARTY",
+// "attested PARTY", "refused PARTY WHY-HEX".
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+Result(OrgCtx, Str) attest_sync(Str dir, OrgCtx o) {
+    List(Str) names = blob_list(o.x.ep, "attev-" + hex_encode(o.st.org.org_id) + "-");
+    if (names.len() == 0) { return Ok(o); }
+    _ = filesystem.create_dir(dir + "/attest");
+    List(List(Int)) newly = attest_each(dir, o, names, 0, ListBuf());
+    if (newly.len() == 0) { return Ok(o); }
+    Org cur = o.st.org;
+    Org o2 = sign_org(o.x, cur.org_id, cur.version + (UInt(64))1, cur.gov_version, cur.members, cur.groups, cur.attested.concat(newly))?;
+    Int put = put_blob(o.x, org_blob(o2.org_id), cbor_or_empty(to_cbor(o2)), "membership record")?;
+    _ = filesystem.write_all(dir + "/org.version", f"{o2.version}");
+    _ = audit(dir, o.x, o2.org_id, "member", hex_encode(o2.org_id), f"{newly.len()} devices attested");
+    OrgState st = org_at(dir, o.x.c, o.x.vh)?;
+    return Ok(OrgCtx {.x = o.x, .st = st});
+}
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+List(List(Int)) attest_each(Str dir, OrgCtx o, List(Str) names, Int i, ListBuf(List(Int)) acc) {
+    if (i >= names.len()) { return acc.finish(); }
+    Option(OrgAttestEvidence) oe = attev_of(blob_get(o.x.ep, names[i]) else { [] });
+    Result(Str, Str) r = match oe { None => Err("the evidence does not decode"), Some(e) => attest_one(dir, o, e) };
+    Str p = str_slice(names[i], str_len(names[i]) - 32, str_len(names[i]));
+    _ = match r { Ok(s) => say_line(s + " " + p), Err(m) => say_line("refused " + p + " " + hex_encode(utf8(m))) };
+    return attest_each(dir, o, names, i + 1, match r { Ok(s) => if (s == "attested") { acc.push(match oe { Some(e) => e.party, None => [] }) } else { acc }, Err(_) => acc });
+}
+
+Int say_line(Str s) { println(s); return 0; }
+
+List(Secret(UInt(8))) att_export_key(Unlocked u) { return hk(u.real.vault_key, "symbolon v1 attest export", 32); }
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+Result(Str, Str) attest_one(Str dir, OrgCtx o, OrgAttestEvidence e) {
+    if (has_log(o.st.org.attested, e.party)) { return Ok("already"); }
+    if (member_index(o.st.org.members, e.log_id, 0) < 0 || e.kind != "tpm") { return Err("not a member's TPM evidence"); }
+    VerifiedHead h = head_of(o.x.c, o.x.vh, e.log_id)?;
+    Party d = need(device_party(h.head.quorum.parties, e.party, 0), "the device is not in its owner's log")?;
+    if (!signed_by(h, e.log_sequence, e.signer, attev_tbs(e), e.sig) || !bytes_eq(e.signer, e.party)) { return Err("the evidence is not signed by its device"); }
+    Str tf = dir + "/attest/" + hex_encode(e.party[0..16]);
+    Option(OrgAttestChallenge) och = attchal_of(blob_get(o.x.ep, att_blob("attchal", e.org_id, e.party)) else { [] });
+    Bool mine = match och { None => false, Some(ch) => bytes_eq(ch.by_log, o.x.c.log_id) && filesystem.exists(tf + ".tok") };
+    if (!mine) { return challenge_device(o, e, tf); }
+    Option(OrgAttestResponse) orr = attresp_of(blob_get(o.x.ep, att_blob("attresp", e.org_id, e.party)) else { [] });
+    return match orr {
+        None => Ok("waiting"),
+        Some(r) => verify_response(o, e, d, och else { OrgAttestChallenge {.org_id = [], .party = [], .blob = [], .secret = [], .value = [], .by_log = [], .signer = [], .sig = []} }, r, tf, h)
+    };
+}
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+Result(Str, Str) challenge_device(OrgCtx o, OrgAttestEvidence e, Str tf) {
+    ChallengeRecord c = challenge_issue(32, [], 2592000);
+    TpmCredential cred = match tpm_ak_challenge(u8b(e.ek_cert), u8b(e.ak_public), c) { Ok(x) => x, Err(ve) => TpmCredential {.blob = [], .secret = []} };
+    if (cred.blob.len() == 0) { return Err("the EK certificate or the AK cannot take a credential"); }
+    List(Int) value = intb(challenge_value(c));
+    List(UInt(8)) tok = match challenge_export(c, export_key(att_export_key(o.x.u))) { Ok(t) => t, Err(ce) => [] };
+    if (tok.len() == 0 || !filesystem.write_secret(tf + ".tok", intb(tok))) { return Err("cannot keep the challenge"); }
+    OrgAttestChallenge ch0 = OrgAttestChallenge {.org_id = e.org_id, .party = e.party, .blob = cred.blob, .secret = cred.secret, .value = value,
+                                                 .by_log = o.x.c.log_id, .signer = o.x.c.party, .sig = []};
+    List(Int) sig = dk_sign(o.x.c, o.x.u.real, o.x.u.st, attchal_tbs(ch0))?;
+    if (!blob_put(o.x.ep, att_blob("attchal", e.org_id, e.party), cbor_or_empty(to_cbor(attchal_signed(ch0, sig))))) { return Err("the relay refused the challenge"); }
+    return Ok("challenged");
+}
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+Result(Str, Str) verify_response(OrgCtx o, OrgAttestEvidence e, Party d, OrgAttestChallenge ch, OrgAttestResponse r, Str tf, VerifiedHead h) {
+    if (!signed_by(h, r.log_sequence, r.signer, attresp_tbs(r), r.sig) || !bytes_eq(r.signer, e.party)) { return Err("the response is not signed by its device"); }
+    if (str_trim(filesystem.read_all(tf + ".used")) == "1") { return Err("the challenge was spent: the device sends new evidence"); }
+    _ = filesystem.write_all(tf + ".used", "1");
+    Result(Imported(MemSpentStore), ChallengeError) im = challenge_import(u8b(filesystem.read_bytes(tf + ".tok")), export_key(att_export_key(o.x.u)), mem_spent_store());
+    return match im {
+        Err(ce) => Err("the challenge: " + challenge_error_text(ce)),
+        Ok(imp) => match tpm_verify_ak(u8s_all([e.ek_cert].concat(e.ek_chain), 0, ListBuf()), u8s_all(e.crls, 0, ListBuf()), u8b(e.ak_public), u8b(r.activated), imp.record, tpm_ek_roots(), kernel_time()) {
+            Err(ve) => Err(verify_error_text(ve)),
+            Ok(v) => match dk_certified(DkEvidence {.attest = u8b(r.attest), .sig = u8b(r.attest_sig), .dk_public = u8b(r.dk_public)}, u8b(e.ak_public), d.auth_key, ch.value, e.log_id) {
+                Err(se) => Err(err_text(se)),
+                Ok(_) => Ok("attested")
+            }
+        }
+    };
+}
+
+List(List(UInt(8))) u8s_all(List(List(Int)) xs, Int i, ListBuf(List(UInt(8))) acc) { return if (i >= xs.len()) { acc.finish() } else { u8s_all(xs, i + 1, acc.push(u8b(xs[i]))) }; }

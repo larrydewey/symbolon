@@ -64,6 +64,7 @@ pub type Org = {
     UInt(64) gov_version;                // must be the latest governance version
     List(OrgMember) members;             // everyone, owners and administrators too
     List(OrgGroup) groups;
+    List(List(Int)) attested;            // device parties whose platform attestation an administrator verified (SPEC 29.5)
     UInt(64) log_sequence;
     List(Int) signer_log;                // an owner or administrator at gov_version
     List(Int) signer;
@@ -171,6 +172,53 @@ pub type OrgConsoleKey = {
     List(Int) public_key;                // uncompressed P-256 point
     Str rp_id;
     List(Int) log_id;                    // the administrator
+    UInt(64) log_sequence;
+    List(Int) signer;
+    List(Int) sig;
+};
+
+// Platform attestation of a member device's key (SPEC 29.5, 21.1), in
+// three steps through the relay, keyed by the device's party id:
+// "attev-<org>-<p>" the device's evidence (its TPM's EK certificate and
+// chain, the CRLs it found, the AK's public area); "attchal-<org>-<p>" an
+// administrator's credential challenge for that EK and AK;
+// "attresp-<org>-<p>" the device's answer (the activated credential and
+// TPM2_Certify of its device key by the AK).
+//@ serial
+pub type OrgAttestEvidence = {
+    List(Int) org_id;
+    List(Int) log_id;
+    List(Int) party;
+    Str kind;                            // "tpm"
+    List(Int) ek_cert;
+    List(List(Int)) ek_chain;            // intermediates, leaf side first
+    List(List(Int)) crls;
+    List(Int) ak_public;
+    UInt(64) log_sequence;
+    List(Int) signer;
+    List(Int) sig;
+};
+
+//@ serial
+pub type OrgAttestChallenge = {
+    List(Int) org_id;
+    List(Int) party;
+    List(Int) blob;                      // TPM2_MakeCredential's credential blob
+    List(Int) secret;                    // and its encrypted seed
+    List(Int) value;                     // the challenge value TPM2_Certify binds
+    List(Int) by_log;
+    List(Int) signer;
+    List(Int) sig;
+};
+
+//@ serial
+pub type OrgAttestResponse = {
+    List(Int) org_id;
+    List(Int) party;
+    List(Int) activated;
+    List(Int) attest;                    // TPMS_ATTEST of the device key
+    List(Int) attest_sig;
+    List(Int) dk_public;                 // the device key's TPMT_PUBLIC
     UInt(64) log_sequence;
     List(Int) signer;
     List(Int) sig;

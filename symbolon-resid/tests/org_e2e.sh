@@ -356,6 +356,14 @@ run 120 "$BIN" device org show "$A" | grep -q "max_offline_days=7" || fail "the 
 curl -sS -b "$W/jar" --cacert "$W/box/tls/ca.pem" "$RELAY/console/$ORG/state" | grep -q '"status":"done"' || fail "the console does not show the change done"
 echo "console: a passkey the admin's device approved signs in at the relay; a change queued there takes effect only when the device signs it"
 
+# Platform attestation (SPEC 29.5): an unprotected device cannot attest,
+# and an owner cannot require it from a device that is not attested.
+pin device org attest "$A" > "$W/att.log" 2>&1 && fail "an unprotected device attested"
+grep -q "TPM profile" "$W/att.log" || fail "attest: $(cat "$W/att.log")"
+pin device org policy "$A" require_attestation tpm > "$W/reqatt.log" 2>&1 && fail "attestation required from an unattested owner's device"
+grep -q "attest this device first" "$W/reqatt.log" || fail "require_attestation: $(cat "$W/reqatt.log")"
+echo "attestation: only TPM devices attest; requiring it never shuts out the owner's own device"
+
 # Password rules and the minimum PIN length.
 pin device org policy "$A" password_rules min=12,digit > /dev/null 2>&1 || fail "password rules"
 printf '2468\nsecret %s\n' "$(hx short1)" | run 300 "$BIN" device vault set "$B" Weak secret --share "$FID" > "$W/weak.log" 2>&1 && fail "a password against the rules was saved"

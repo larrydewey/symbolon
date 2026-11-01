@@ -151,6 +151,48 @@ pub OrgConsoleKey conkey_signed(OrgConsoleKey k, List(Int) sig) {
 pub List(Int) conkey_tbs(OrgConsoleKey k) { return utf8("symbolon v1 console key").concat(cbor_bytes(to_cbor(conkey_signed(k, [])))); }
 pub Str conkey_blob(List(Int) org, List(Int) cred_id) { return "conkey-" + hex_encode(org) + "-" + hex_encode(sha256_bytes(cred_id)[0..16]); }
 
+pub Option(OrgAttestEvidence) attev_of(List(Int) b) {
+    if (b.len() == 0 || b.len() > 262144 || !cbor_well_formed(b, 6)) { return None; }
+    Result(OrgAttestEvidence, SerialError) r = from_cbor(b);
+    return match r { Ok(x) => Some(x), Err(_) => None };
+}
+
+pub Option(OrgAttestChallenge) attchal_of(List(Int) b) {
+    if (b.len() == 0 || b.len() > 65536 || !cbor_well_formed(b, 4)) { return None; }
+    Result(OrgAttestChallenge, SerialError) r = from_cbor(b);
+    return match r { Ok(x) => Some(x), Err(_) => None };
+}
+
+pub Option(OrgAttestResponse) attresp_of(List(Int) b) {
+    if (b.len() == 0 || b.len() > 65536 || !cbor_well_formed(b, 4)) { return None; }
+    Result(OrgAttestResponse, SerialError) r = from_cbor(b);
+    return match r { Ok(x) => Some(x), Err(_) => None };
+}
+
+pub OrgAttestEvidence attev_signed(OrgAttestEvidence e, List(Int) sig) {
+    return OrgAttestEvidence {.org_id = e.org_id, .log_id = e.log_id, .party = e.party, .kind = e.kind, .ek_cert = e.ek_cert, .ek_chain = e.ek_chain, .crls = e.crls,
+                              .ak_public = e.ak_public, .log_sequence = e.log_sequence, .signer = e.signer, .sig = sig};
+}
+
+pub OrgAttestChallenge attchal_signed(OrgAttestChallenge c, List(Int) sig) {
+    return OrgAttestChallenge {.org_id = c.org_id, .party = c.party, .blob = c.blob, .secret = c.secret, .value = c.value, .by_log = c.by_log, .signer = c.signer, .sig = sig};
+}
+
+pub OrgAttestResponse attresp_signed(OrgAttestResponse r, List(Int) sig) {
+    return OrgAttestResponse {.org_id = r.org_id, .party = r.party, .activated = r.activated, .attest = r.attest, .attest_sig = r.attest_sig, .dk_public = r.dk_public,
+                              .log_sequence = r.log_sequence, .signer = r.signer, .sig = sig};
+}
+
+pub List(Int) attev_tbs(OrgAttestEvidence e) { return utf8("symbolon v1 attest evidence").concat(cbor_bytes(to_cbor(attev_signed(e, [])))); }
+pub List(Int) attchal_tbs(OrgAttestChallenge c) { return utf8("symbolon v1 attest challenge").concat(cbor_bytes(to_cbor(attchal_signed(c, [])))); }
+pub List(Int) attresp_tbs(OrgAttestResponse r) { return utf8("symbolon v1 attest response").concat(cbor_bytes(to_cbor(attresp_signed(r, [])))); }
+
+pub Str att_blob(Str step, List(Int) org, List(Int) party) { return step + "-" + hex_encode(org) + "-" + hex_encode(party[0..16]); }
+
+// Whether the policy requires platform attestation of kind `k`.
+pub Bool requires_att(OrgGov g, Str k) { return has_text(g.policy.require_attestation, k, 0); }
+Bool has_text(List(Str) xs, Str s, Int i) { return i < xs.len() && (xs[i] == s || has_text(xs, s, i + 1)); }
+
 pub OrgInvite invite_signed(OrgInvite v, List(Int) sig) {
     return OrgInvite {.org_id = v.org_id, .id = v.id, .public_key = v.public_key, .ext_id = v.ext_id, .label = v.label, .groups = v.groups, .expires = v.expires,
                       .log_sequence = v.log_sequence, .signer_log = v.signer_log, .signer = v.signer, .sig = sig};
@@ -166,7 +208,7 @@ pub OrgGov gov_signed(OrgGov g, List(Int) sig) {
 }
 
 pub Org org_signed(Org o, List(Int) sig) {
-    return Org {.org_id = o.org_id, .version = o.version, .gov_version = o.gov_version, .members = o.members, .groups = o.groups,
+    return Org {.org_id = o.org_id, .version = o.version, .gov_version = o.gov_version, .members = o.members, .groups = o.groups, .attested = o.attested,
                 .log_sequence = o.log_sequence, .signer_log = o.signer_log, .signer = o.signer, .sig = sig};
 }
 

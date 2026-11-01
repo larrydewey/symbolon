@@ -2164,7 +2164,35 @@ than `max_offline_days` after it last reached the relay for that folder
 setting, 29.9). `password_rules` is a comma list of `min=N`, `upper`,
 `lower`, `digit`, `symbol`: a device refuses to save a password or secret
 into a shared folder that breaks it. `require_attestation` names the
-platform attestation kinds (Section 21) a member device must present.
+platform attestation kinds (Section 21) a member device must present;
+`tpm` is the one defined:
+
+- A device in the TPM profile sends its evidence (`attev-<org>-<party>`,
+  signed by the device): its TPM's EK certificate, the chain the TPM
+  stores plus any intermediates and CRLs the organization supplies, and
+  the AK's public area (the TCG template AK, a primary key, so the same AK
+  each time).
+- An owner's or administrator's `org sync` answers with a credential
+  challenge for that EK and AK (`attchal-`, TPM2_MakeCredential with a
+  fresh challenge record kept on the administrator's device, sealed under a
+  key from its vault key, used once). The device's next `org attest`
+  activates it in its TPM and adds TPM2_Certify of its device key by the
+  AK over `"symbolon v1 enroll"`, the challenge value and its log id
+  (`attresp-`).
+- The administrator's next sync verifies with Resid's TPM verifier: the
+  EK chain to a TPM maker's root pinned in Resid, with a current CRL for
+  every certificate below the root (a chain without one is refused as
+  stale, never accepted), the AK in the TPM whose EK it is, and the device
+  key the log names fixed to that TPM, signing only and usable only
+  through its PIN policy (11.1, 21.1). The device's party then joins the
+  membership record's `attested` list.
+
+When the policy requires `tpm`, the relay serves group folders, the audit
+log and the administrators' objects only to attested devices; an owner's
+device cannot turn the requirement on until it is attested itself. A TPM
+whose maker publishes no CRL for an intermediate cannot be attested until
+it does (the STMicroelectronics STSAFE intermediate on the reference
+machine publishes none: the exchange completes and is refused as stale).
 Policy never reaches a person's own vault or passkeys beyond the PIN.
 
 ### 29.6 Audit

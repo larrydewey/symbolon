@@ -299,6 +299,7 @@ Int org_command(Int n) {
     if (c == "escrow" && n == 6) { return org_escrow(d, args.get(5)); }
     if (c == "recover" && n == 7) { return org_recover(args.get(5), d, args.get(6)); }
     if (c == "audit" && n == 5) { return org_audit(d); }
+    if (c == "attest" && n >= 5 && n <= 7) { return org_attest(d, if (n >= 6) { args.get(5) } else { "" }, if (n == 7) { args.get(6) } else { "" }); }
     if (c == "console" && n == 6) { return org_console(d, str_parse_int(args.get(5))); }
     if (c == "console-key" && n == 6) { return org_console_key(d, args.get(5)); }
     if (c == "changes" && n == 5) { return org_changes(d); }
