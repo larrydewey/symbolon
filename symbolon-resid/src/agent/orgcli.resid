@@ -1373,13 +1373,82 @@ Result(Int, Str) send_evidence(Str dir, OrgCtx o, List(Str) chain_files, List(St
     TpmKeys keys = match tpm_ek_ak(ecc) { Ok(k) => k, Err(e) => return_none_keys() };
     if (keys.ak.public_area.len() == 0) { return Err("the TPM did not make its attestation key"); }
     _ = filesystem.write_all(dir + "/attest.ecc", if (ecc) { "1" } else { "0" });
+    // What the TPM does not store, from where its certificates say: the
+    // issuers (authority information access) and their CRLs (distribution
+    // points), from the TPM maker's servers. Signed, so whoever serves them
+    // cannot forge them; files given add to them (an organization's mirror).
+    List(List(Int)) given = nv_chain.concat(der_files("", 0, chain_files, ListBuf()));
+    List(List(Int)) fetched = if (given.len() == 0) { issuers_of(o.x.c, intb(ek), 0, ListBuf()) } else { [] };
+    List(List(Int)) chain_all = given.concat(fetched);
+    List(List(Int)) crls_all = der_files("", 0, crl_files, ListBuf()).concat(crls_of(o.x.c, [intb(ek)].concat(chain_all), 0, ListBuf()));
     OrgAttestEvidence e0 = OrgAttestEvidence {.org_id = o.st.org.org_id, .log_id = o.x.c.log_id, .party = o.x.c.party, .kind = "tpm", .ek_cert = intb(ek),
-        .ek_chain = nv_chain.concat(der_files("", 0, chain_files, ListBuf())), .crls = der_files("", 0, crl_files, ListBuf()), .ak_public = intb(keys.ak.public_area),
+        .ek_chain = chain_all, .crls = crls_all, .ak_public = intb(keys.ak.public_area),
         .log_sequence = o.x.vh.head.sequence, .signer = o.x.c.party, .sig = []};
     List(Int) sig = dk_sign(o.x.c, o.x.u.real, o.x.u.st, attev_tbs(e0))?;
     Int put = put_blob(o.x, att_blob("attev", e0.org_id, e0.party), cbor_or_empty(to_cbor(attev_signed(e0, sig))), "attestation evidence")?;
     println(f"evidence sent ({e0.ek_chain.len()} chain certificates, {e0.crls.len()} CRLs): run org attest again after an administrator's sync");
     return Ok(0);
+}
+
+// URLs a certificate names after the extension `oid` (DER bytes): the
+// GeneralName uniformResourceIdentifier entries ([6] IA5String) that
+// follow it, within the extension.
+List(Str) urls_after(List(Int) der, List(Int) oid) {
+    Int at = find_bytes(der, oid, 0);
+    if (at < 0) { return []; }
+    Int end = if (at + 400 < der.len()) { at + 400 } else { der.len() };
+    return uri_names(der, at + oid.len(), end, ListBuf());
+}
+
+Int find_bytes(List(Int) b, List(Int) pat, Int i) {
+    if (i + pat.len() > b.len()) { return -1; }
+    if (bytes_eq(b[i..i + pat.len()], pat)) { return i; }
+    return find_bytes(b, pat, i + 1);
+}
+
+List(Str) uri_names(List(Int) b, Int i, Int end, ListBuf(Str) acc) {
+    if (i + 2 >= end) { return acc.finish(); }
+    Int n = b[i + 1];
+    Bool uri = b[i] == 134 && n > 7 && n < 128 && i + 2 + n <= b.len() && b[i + 2] == 104;   // [6] "h..."
+    return if (uri) { uri_names(b, i + 2 + n, end, acc.push(http_text(b, i + 2, i + 2 + n))) } else { uri_names(b, i + 1, end, acc) };
+}
+
+// authorityInfoAccess (1.3.6.1.5.5.7.1.1) and cRLDistributionPoints (2.5.29.31).
+List(Int) oid_aia() { return [6, 8, 43, 6, 1, 5, 5, 7, 1, 1]; }
+List(Int) oid_crldp() { return [6, 3, 85, 29, 31]; }
+
+// A DER object by URL: https first (makers redirect there), the body as
+// DER, or PEM (any label) decoded.
+@requires(filesystem, network, clock(readonly), declassify)
+List(Int) fetch_der(DeviceConfig c, Str url) {
+    Str u = if (str_starts_with(url, "http://")) { "https://" + str_slice(url, 7, str_len(url)) } else { url };
+    HttpsGet g = tls_https_request(u, "", trust_store_add_pem(trust_store_empty(), filesystem.read_all("/etc/ssl/certs/ca-certificates.crt")), ["http/1.1"], 30000, "GET", "", []);
+    List(Int) b = if (g.status == 200) { g.bytes } else { [] };
+    if (b.len() > 0 && b[0] == 48) { return b; }
+    Str t = http_text(b, 0, b.len());
+    Int s0 = str_index_of(t, "-----BEGIN", 0);
+    if (s0 < 0) { return []; }
+    Int s1 = str_index_of(t, "\n", s0);
+    Int e0 = str_index_of(t, "-----END", s1);
+    return if (s1 < 0 || e0 < 0) { [] } else { base64_decode(str_replace(str_replace(str_slice(t, s1 + 1, e0), "\r", ""), "\n", "")) };
+}
+
+// The issuers above `cert`, by authority information access, up to three.
+@requires(filesystem, network, clock(readonly), declassify)
+List(List(Int)) issuers_of(DeviceConfig c, List(Int) cert, Int depth, ListBuf(List(Int)) acc) {
+    List(Str) us = urls_after(cert, oid_aia());
+    if (depth >= 3 || us.len() == 0) { return acc.finish(); }
+    List(Int) up = fetch_der(c, us[0]);
+    return if (up.len() == 0 || bytes_eq(up, cert)) { acc.finish() } else { issuers_of(c, up, depth + 1, acc.push(up)) };
+}
+
+// The CRLs the certificates' distribution points give.
+@requires(filesystem, network, clock(readonly), declassify)
+List(List(Int)) crls_of(DeviceConfig c, List(List(Int)) certs, Int i, ListBuf(List(Int)) acc) {
+    if (i >= certs.len()) { return acc.finish(); }
+    List(Str) us = urls_after(certs[i], oid_crldp());
+    List(Int) crl = if (us.len() > 0) { fetch_der(c, us[0]) } else { [] };
+    return crls_of(c, certs, i + 1, if (crl.len() > 0) { acc.push(crl) } else { acc });
 }
 
 TpmKeys return_none_keys() { return TpmKeys {.ek = TpmCreated {.handle = 0, .public_area = [], .name = []}, .ak = TpmCreated {.handle = 0, .public_area = [], .name = []}}; }
