@@ -28,9 +28,21 @@ class _TutorialPageState extends State<TutorialPage> {
     (Icons.key, 'Passkeys and the vault',
         'Passkeys sign you in to sites without a password. The vault keeps logins and secrets, encrypted on this device; the relay keeps '
             'a copy it cannot read. Symbolon can even change a login\'s password for you.'),
+    (Icons.home_outlined, 'Symbolon Home',
+        'A household can run everything on one box at home: the relay that keeps the encrypted copies, the witnesses and a cosigner for '
+            'each person. You set up a phone by scanning the box\'s code; nobody else\'s servers are involved.'),
+    (Icons.folder_shared_outlined, 'Sharing',
+        'Shared folders hold what several people use, like the Wi-Fi or a streaming login. Each folder has its own key that only its '
+            'people\'s devices hold. Compare fingerprints when you add someone; removing a person gives the folder a new key.'),
+    (Icons.business_outlined, 'At work',
+        'A company can run Symbolon for its people: group folders for teams, a policy the devices follow, an audit log, and its directory '
+            '(Okta, Entra ID, Google) to add and remove people. Your own vault stays yours: no one at work can open it.'),
+    (Icons.move_down, 'Moving in, and moving on',
+        'Bring your passwords from another manager under More › Import. A new phone joins your identity from one you have (More › '
+            'Devices), and your passkeys keep working. Lost every device? The recovery kit brings it all back.'),
     (Icons.healing, 'If things go wrong',
         'Setup gives you a recovery kit: write it down, and you can get your identity back even if you lose every device. A duress PIN '
-            'opens a harmless view if someone forces you to unlock.'),
+            'opens a harmless view if someone forces you to unlock. The full guide is at larrydewey.github.io/symbolon.'),
   ];
 
   @override

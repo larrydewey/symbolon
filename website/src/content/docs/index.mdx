@@ -1,0 +1,58 @@
+---
+title: Symbolon
+description: Passkeys and passwords held under a key no single device, server or company has.
+template: splash
+hero:
+  tagline: Your passkeys and passwords, under a key that is never in one place. No single device, server or company can sign for you, and losing a phone loses nothing.
+  image:
+    html: '<img src="/symbolon/symbolon.svg" alt="A token broken in two halves that fit" class="invert-dark" />'
+  actions:
+    - text: How it works
+      link: /symbolon/guide/how-it-works/
+      icon: right-arrow
+    - text: Install
+      link: /symbolon/guide/install/
+      variant: minimal
+    - text: Organizations
+      link: /symbolon/org/
+      variant: minimal
+---
+
+import { Card, CardGrid, LinkCard } from '@astrojs/starlight/components';
+
+A *symbolon* was a token broken in two: each party kept one half, and the
+halves fitting together proved who was who, with nothing secret said aloud.
+Symbolon does the same with your keys. Every passkey you use is backed by a
+threshold key: your device holds one share and a cosigner holds another, and
+both must take part to sign. Sites see an ordinary passkey.
+
+<CardGrid>
+	<Card title="Nothing to steal in one place">
+		A stolen phone cannot sign alone, and neither can a hacked cosigner.
+		Your vault is encrypted on your devices; the server keeps a copy it
+		cannot read.
+	</Card>
+	<Card title="Nothing lost with a device">
+		Add a new phone from one you have, or recover with the kit you wrote
+		down. Every passkey keeps working: sites never notice.
+	</Card>
+	<Card title="Watched, not trusted">
+		Every change to your identity goes into a signed log that witnesses
+		countersign, so no server can quietly swap your keys.
+	</Card>
+	<Card title="Safe under pressure">
+		A duress PIN opens a real but limited view and blocks lasting changes,
+		with no trace a coercer can see.
+	</Card>
+</CardGrid>
+
+## Pick your setup
+
+<CardGrid>
+	<LinkCard title="Mobile app" href="/symbolon/guide/mobile/" description="Android: setup by QR code, passkeys for sites and apps, fingerprint unlock." />
+	<LinkCard title="Desktop app" href="/symbolon/guide/desktop/" description="Linux: the app and the command-line agent, with the TPM as the key store." />
+	<LinkCard title="Symbolon Home" href="/symbolon/guide/home/" description="One box at home runs everything a household needs. Nobody else's servers." />
+	<LinkCard title="Organizations" href="/symbolon/org/" description="Group folders, policy, audit, directory sync and opt-in recovery for companies." />
+	<LinkCard title="Moving in" href="/symbolon/guide/migration/" description="Bring your passwords, add a new phone, recover, or join your company." />
+	<LinkCard title="Reference" href="/symbolon/reference/" description="Every command, and the security model in brief." />
+</CardGrid>

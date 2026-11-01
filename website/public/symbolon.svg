@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 230 200" role="img" aria-label="A token broken in two halves that fit">
+  <g fill="none" stroke="currentColor" stroke-width="6" stroke-linejoin="round">
+    <path d="M100 20 A80 80 0 0 0 100 180 L92 160 L108 140 L90 120 L110 100 L92 80 L108 60 L94 40 Z"/>
+    <path d="M114 22 A80 80 0 0 1 114 182 L106 162 L122 142 L104 122 L124 102 L106 82 L122 62 L108 42 Z" transform="translate(10 -2)"/>
+  </g>
+</svg>

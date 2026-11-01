@@ -1,0 +1,48 @@
+# book.toml — the Symbolon guide, served and exported by resid-book.
+#
+#   ../../resid-book/resid-book book.toml               # serve, from this directory
+#   ../../resid-book/resid-book export book.toml dist   # static files for GitHub Pages
+#
+# `base = "/symbolon"`: the site lives under that path on GitHub Pages
+# (https://larrydewey.github.io/symbolon/) and every link in the content
+# is written for it.
+[book]
+title = "Symbolon"
+tagline = "Two halves that fit"
+base = "/symbolon"
+content = "src/content/docs"
+assets = "public"
+repository = "https://github.com/larrydewey/symbolon"
+edit_base = "https://github.com/larrydewey/symbolon/edit/main/website/"
+
+nav = [
+    "topic|Guide|guide/how-it-works",
+    "group|Start",
+    "page|",
+    "page|guide/how-it-works",
+    "page|guide/install",
+    "group|Apps",
+    "page|guide/mobile",
+    "page|guide/desktop",
+    "page|guide/home",
+    "group|Everyday",
+    "page|guide/vault",
+    "page|guide/sharing",
+    "page|guide/recovery",
+    "page|guide/migration",
+
+    "topic|Organizations|org",
+    "group|Organizations",
+    "page|org",
+    "page|org/setup",
+    "page|org/directory",
+    "page|org/policy",
+    "page|org/recovery",
+    "page|org/console",
+    "page|org/servers",
+
+    "topic|Reference|reference",
+    "group|Reference",
+    "page|reference",
+    "page|reference/security",
+]

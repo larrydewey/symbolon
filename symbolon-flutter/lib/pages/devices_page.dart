@@ -47,7 +47,7 @@ class _DevicesPageState extends State<DevicesPage> {
       context: context,
       builder: (ctx) => AlertDialog(
         title: const Text("Remove this device's TPM keys?"),
-        content: const Text('This device will no longer unlock or sign, and it cannot be undone. Remove it from your identity first.'),
+        content: const Text('This device will no longer unlock or sign, and it cannot be undone. Do this only for a device you are retiring, after another device has joined your identity.'),
         actions: [
           TextButton(onPressed: () => Navigator.of(ctx).pop(false), child: const Text('Cancel')),
           FilledButton(style: FilledButton.styleFrom(backgroundColor: Colors.red), onPressed: () => Navigator.of(ctx).pop(true), child: const Text('Remove')),

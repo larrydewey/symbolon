@@ -27,12 +27,17 @@ self-hosted box for a household) and organizations for companies, with an
 Android and Linux app. See the
 [releases](https://github.com/larrydewey/symbolon/releases).
 
+The guide, for people using it and for those running it, is at
+**[larrydewey.github.io/symbolon](https://larrydewey.github.io/symbolon/)**:
+the mobile app, the desktop app, Symbolon Home, organizations, and moving in.
+
 ## Layout
 
 - [SPEC.md](SPEC.md) -- the specification, with its red-team audit in Appendix A.
 - [symbolon-resid](symbolon-resid) -- the agent and servers, in Resid.
 - [symbolon-flutter](symbolon-flutter) -- the app (Android, Linux).
 - [symbolon-home](symbolon-home) -- Symbolon Home's container build.
+- [website](website) -- the guide's pages, published by resid-book.
 
 ## License
 

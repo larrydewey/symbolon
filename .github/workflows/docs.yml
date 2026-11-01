@@ -1,0 +1,91 @@
+# Builds the Symbolon guide and publishes it to GitHub Pages at
+# https://larrydewey.github.io/symbolon/.
+#
+# The site is exported by resid-book (the book server, in Resid): the
+# Resid repository's committed compiler builds resid-book, which exports
+# every page of website/ to static HTML plus its assets. No Node.
+name: docs
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "website/**"
+      - ".github/workflows/docs.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: symbolon
+
+      # The compiler (committed in Resid), the book server, and the
+      # libraries the server's Datastar SDK imports, side by side.
+      - uses: actions/checkout@v4
+        with:
+          repository: larrydewey/Resid
+          path: resid
+      - uses: actions/checkout@v4
+        with:
+          repository: larrydewey/resid-book
+          path: resid-book
+      - uses: actions/checkout@v4
+        with:
+          repository: larrydewey/resid-datastar
+          path: resid-datastar
+      - uses: actions/checkout@v4
+        with:
+          repository: larrydewey/resid-json
+          path: resid-json
+      - uses: actions/checkout@v4
+        with:
+          repository: larrydewey/resid-serial
+          path: resid-serial
+      - uses: actions/checkout@v4
+        with:
+          repository: larrydewey/resid-toml
+          path: resid-toml
+
+      - name: Dependency map
+        working-directory: resid
+        env:
+          RESID_HOME: ${{ github.workspace }}/resid/build/boot
+        run: |
+          mkdir -p target
+          build/boot/stage2.bin tools/resid-manifest.resid -o target/resid-manifest --profile debug
+          cd ../resid-book
+          ../resid/target/resid-manifest depmap resid.toml deps.txt
+
+      - name: Export the site
+        working-directory: resid-book
+        env:
+          RESID_HOME: ${{ github.workspace }}/resid/build/boot
+        run: |
+          ../resid/build/boot/stage2.bin src/site.resid -o resid-book --profile debug -depmap deps.txt
+          ./resid-book export ../symbolon/website/book.toml ../symbolon/website/dist
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: symbolon/website/dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
