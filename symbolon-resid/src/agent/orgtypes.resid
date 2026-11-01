@@ -1,0 +1,98 @@
+// Organizations (SPEC 29) as the server stores them. Governance (owners,
+// administrators, policy, recovery) is a chain of records each signed by
+// an owner of the one before ("orggov-<id>-<version>"), from a founder
+// bound into the org id, so a device verifies it with no history of its
+// own. The membership record ("org-<id>") cites the governance version it
+// was signed under; owners and administrators sign it. A group folder
+// ("gfolder-<id>") is a shared collection whose people are the members of
+// its groups.
+
+import "../types.resid";
+
+//@ serial
+pub type OrgAdmin = { List(Int) log_id; Str label; };
+
+//@ serial
+pub type OrgPolicy = {
+    Int min_pin_len;
+    Bool allow_biometric;
+    Bool allow_duress;
+    Bool allow_offline_copy;
+    Int max_offline_days;                // 0: no limit
+    Bool allow_personal_export;
+    List(Str) require_attestation;
+    Str password_rules;
+};
+
+// Opt-in recovery of work folders (SPEC 29.8); off unless the owners turn it on.
+//@ serial
+pub type OrgRecovery = { Bool on; List(Int) public_key; Int threshold; List(List(Int)) admins; Int delay_sec; };
+
+// "orggov-<id>-<version>": version 1 is signed by the founder; each later
+// one by an owner of the version before.
+//@ serial
+pub type OrgGov = {
+    List(Int) org_id;                    // first 16 bytes of SHA-256("symbolon v1 org" || founder || nonce)
+    UInt(64) version;
+    List(Int) founder;                   // the founder's log id
+    List(Int) nonce;                     // 16 random bytes
+    Str name;
+    List(List(Int)) owners;
+    List(OrgAdmin) admins;
+    OrgPolicy policy;
+    OrgRecovery recovery;
+    UInt(64) log_sequence;               // signer's log sequence
+    List(Int) signer_log;
+    List(Int) signer;                    // party id of the signing device
+    List(Int) sig;
+};
+
+//@ serial
+pub type OrgMember = { List(Int) log_id; Str label; Str ext_id; };
+
+//@ serial
+pub type OrgGroup = { List(Int) group_id; Str name; List(List(Int)) members; };
+
+// "org-<id>": who is in the organization and its groups.
+//@ serial
+pub type Org = {
+    List(Int) org_id;
+    UInt(64) version;
+    UInt(64) gov_version;                // must be the latest governance version
+    List(OrgMember) members;             // everyone, owners and administrators too
+    List(OrgGroup) groups;
+    UInt(64) log_sequence;
+    List(Int) signer_log;                // an owner or administrator at gov_version
+    List(Int) signer;
+    List(Int) sig;
+};
+
+// "gfolder-<id>": a group folder.
+//@ serial
+pub type GroupFolder = {
+    List(Int) coll_id;
+    UInt(64) version;
+    List(Int) org_id;
+    List(List(Int)) groups;
+    List(Int) name_ct;                   // the name, sealed under the folder key at this version
+    Bool deleted;
+    UInt(64) log_sequence;
+    List(Int) signer_log;                // an owner or administrator
+    List(Int) signer;
+    List(Int) sig;
+};
+
+// "audit-<org>-<log>-<seq>": what a device did, chained per device.
+//@ serial
+pub type AuditEvent = {
+    List(Int) org_id;
+    List(Int) log_id;
+    List(Int) party;
+    UInt(64) seq;
+    List(Int) prev;                      // SHA-256 of the previous event's CBOR, empty for the first
+    Int time;
+    Str action;
+    Str object;
+    Str detail;
+    List(Int) sig;
+};

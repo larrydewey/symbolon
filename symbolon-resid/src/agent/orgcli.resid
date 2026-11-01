@@ -1,0 +1,564 @@
+// Organizations from the command line (SPEC 29): `symbolon device org ...`.
+//
+//   org new DIR NAME                 PIN; founds an organization; prints "ORG-ID FOUNDER"
+//   org join DIR ORG-ID FOUNDER      PIN; this device's organization (from its invite)
+//   org show DIR                     "org ID NAME-HEX", "version V gov G", "role R", policy, recovery
+//   org members DIR                  "LOG NAME-HEX EXT-HEX|- owner|admin|member GROUP-IDS|-"
+//   org add DIR LOG NAME [EXT-ID]    PIN; an owner or administrator adds a person
+//   org remove DIR LOG               PIN; takes them out of the organization and every group
+//   org role DIR LOG owner|admin|member   PIN; an owner changes someone's role
+//   org policy DIR KEY VALUE         PIN; an owner changes the policy
+//   org group new DIR NAME           PIN; prints the group's id
+//   org group add|remove DIR GROUP LOG    PIN
+//   org groups DIR                   "GROUP-ID NAME-HEX PEOPLE"
+//   org folder new DIR NAME GROUP[,GROUP...]   PIN; a group folder; prints its id
+//   org sync DIR                     PIN; an owner or administrator re-keys the group folders people left
+//   org audit DIR                    "TIME LOG SEQ ACTION OBJECT DETAIL-HEX" per verified event
+//
+// Group folders are then used like any shared folder: `device vault ...
+// --share ID`, and they appear in `device share list`.
+
+import "../types.resid";
+import "../core/log.resid";
+import "../vault/vault.resid";
+import "../net/services.resid";
+import "state.resid";
+import "common.resid";
+import "device.resid";
+import "serials.resid";
+import "orgtypes.resid";
+import "orgcore.resid";
+import "sharetypes.resid";
+import "sharecli.resid";
+import "vaultcli.resid";
+import "crypto.resid";
+import "ecdsa.resid";
+import "cbor.resid";
+import "cose.resid";
+
+pub OrgPolicy default_policy() {
+    return OrgPolicy {.min_pin_len = 6, .allow_biometric = true, .allow_duress = true, .allow_offline_copy = true, .max_offline_days = 0,
+                      .allow_personal_export = true, .require_attestation = [], .password_rules = ""};
+}
+
+OrgRecovery no_recovery() { return OrgRecovery {.on = false, .public_key = [], .threshold = 0, .admins = [], .delay_sec = 0}; }
+
+// ─── Signing and storing ────────────────────────────────────────
+
+@requires(device, declassify, network, environment)
+Result(OrgGov, Str) sign_gov(Ctx x, OrgGov g0) {
+    OrgGov g = OrgGov {.org_id = g0.org_id, .version = g0.version, .founder = g0.founder, .nonce = g0.nonce, .name = g0.name, .owners = g0.owners, .admins = g0.admins,
+                       .policy = g0.policy, .recovery = g0.recovery, .log_sequence = x.vh.head.sequence, .signer_log = x.c.log_id, .signer = x.c.party, .sig = []};
+    List(Int) sig = dk_sign(x.c, x.u.real, x.u.st, gov_tbs(g))?;
+    return Ok(gov_signed(g, sig));
+}
+
+@requires(device, declassify, network, environment)
+Result(Org, Str) sign_org(Ctx x, List(Int) id, UInt(64) version, UInt(64) gov_version, List(OrgMember) ms, List(OrgGroup) gs) {
+    Org o = Org {.org_id = id, .version = version, .gov_version = gov_version, .members = ms, .groups = gs, .log_sequence = x.vh.head.sequence,
+                 .signer_log = x.c.log_id, .signer = x.c.party, .sig = []};
+    List(Int) sig = dk_sign(x.c, x.u.real, x.u.st, org_tbs(o))?;
+    return Ok(org_signed(o, sig));
+}
+
+@requires(network, clock(readonly), declassify)
+Result(Int, Str) put_blob(Ctx x, Str name, List(Int) b, Str what) {
+    if (b.len() == 0 || !blob_put(relay_ep(x.c), name, b)) { return Err("the server refused the " + what); }
+    return Ok(0);
+}
+
+// The membership record again, one version up, under governance `gv`.
+@requires(filesystem, network, device, declassify, clock, environment)
+Result(Int, Str) store_org(Str dir, Ctx x, OrgState st, UInt(64) gv, List(OrgMember) ms, List(OrgGroup) gs, Str action, Str detail) {
+    Org o = sign_org(x, st.org.org_id, st.org.version + (UInt(64))1, gv, ms, gs)?;
+    Int stored = put_blob(x, org_blob(o.org_id), cbor_or_empty(to_cbor(o)), "membership record")?;
+    _ = filesystem.write_all(dir + "/org.version", f"{o.version}");
+    _ = audit(dir, x, o.org_id, action, hex_encode(o.org_id), detail);
+    println(f"organization version {o.version}, {ms.len()} people, {gs.len()} groups");
+    return Ok(stored);
+}
+
+// A new governance version (an owner only), then the membership record under it.
+@requires(filesystem, network, device, declassify, clock, environment)
+Result(Int, Str) store_gov(Str dir, Ctx x, OrgState st, List(List(Int)) owners, List(OrgAdmin) admins, OrgPolicy p, Str action, Str detail) {
+    if (!is_owner(st.gov, x.c.log_id)) { return Err("only an owner changes roles and policy"); }
+    if (owners.len() == 0) { return Err("an organization needs an owner"); }
+    OrgGov g = sign_gov(x, OrgGov {.org_id = st.gov.org_id, .version = st.gov.version + (UInt(64))1, .founder = st.gov.founder, .nonce = st.gov.nonce, .name = st.gov.name,
+                                   .owners = owners, .admins = admins, .policy = p, .recovery = st.gov.recovery, .log_sequence = (UInt(64))0, .signer_log = [], .signer = [], .sig = []})?;
+    Int put = put_blob(x, gov_blob(g.org_id, g.version), cbor_or_empty(to_cbor(g)), "governance record")?;
+    _ = filesystem.write_all(dir + "/org.gov", f"{g.version}");
+    return store_org(dir, x, st, g.version, st.org.members, st.org.groups, action, detail);
+}
+
+// This device unlocked, with its organization verified.
+type OrgCtx = { Ctx x; OrgState st; };
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+Result(OrgCtx, Str) org_unlocked(Str dir) {
+    Ctx x = unlocked(dir)?;
+    OrgState st = org_at(dir, x.c, x.vh)?;
+    return Ok(OrgCtx {.x = x, .st = st});
+}
+
+Result(Int, Str) admin_only(OrgCtx o) { return if (is_admin(o.st.gov, o.x.c.log_id)) { Ok(0) } else { Err("only an owner or administrator does that") }; }
+
+// ─── Founding and joining ───────────────────────────────────────
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+pub Int org_new(Str dir, Str name) { return done(found(dir, name)); }
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+Result(Int, Str) found(Str dir, Str name) {
+    if (!label_ok(name)) { return Err("a name of 1-64 characters"); }
+    Ctx x = unlocked(dir)?;
+    if (match org_ref(dir) { Some(_) => true, None => false }) { return Err("this device is already in an organization"); }
+    List(Int) nonce = random_bytes(16);
+    List(Int) id = org_id_of(x.c.log_id, nonce);
+    OrgGov g = sign_gov(x, OrgGov {.org_id = id, .version = (UInt(64))1, .founder = x.c.log_id, .nonce = nonce, .name = name, .owners = [x.c.log_id], .admins = [],
+                                   .policy = default_policy(), .recovery = no_recovery(), .log_sequence = (UInt(64))0, .signer_log = [], .signer = [], .sig = []})?;
+    Str me = own_name(x.c);
+    Org o = sign_org(x, id, (UInt(64))1, (UInt(64))1, [OrgMember {.log_id = x.c.log_id, .label = if (str_len(me) > 0) { me } else { "Founder" }, .ext_id = ""}], [])?;
+    Int a = put_blob(x, gov_blob(id, g.version), cbor_or_empty(to_cbor(g)), "governance record")?;
+    Int b = put_blob(x, org_blob(id), cbor_or_empty(to_cbor(o)), "membership record")?;
+    if (!filesystem.write_all(dir + "/org", hex_encode(id) + " " + hex_encode(x.c.log_id))) { return Err("cannot write the organization to the device"); }
+    _ = filesystem.write_all(dir + "/org.gov", "1");
+    _ = filesystem.write_all(dir + "/org.version", "1");
+    _ = audit(dir, x, id, "policy", hex_encode(id), "founded");
+    println(hex_encode(id) + " " + hex_encode(x.c.log_id));
+    return Ok(0);
+}
+
+// `org join DIR ORG-ID FOUNDER`: the founder's log id binds the org id
+// (SPEC 29.1), so a server cannot hand the device another organization.
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+pub Int org_join(Str dir, Str id, Str founder) { return done(join(dir, id, founder)); }
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+Result(Int, Str) join(Str dir, Str id, Str founder) {
+    if (!share_id_ok(id) || !log_hex_ok(founder)) { return Err("an organization id (32 hex digits) and its founder's log id (64)"); }
+    Ctx x = unlocked(dir)?;
+    Option(OrgRef) old = org_ref(dir);
+    if (match old { Some(r) => !bytes_eq(r.id, cose_hex_decode(id)), None => false }) { return Err("this device is already in another organization"); }
+    Str before = filesystem.read_all(dir + "/org");
+    if (!filesystem.write_all(dir + "/org", id + " " + founder)) { return Err("cannot write the organization to the device"); }
+    Result(OrgState, Str) rs = org_at(dir, x.c, x.vh);
+    return match rs {
+        Err(m) => forget_org(dir, before, m),
+        Ok(st) => joined(dir, x, st)
+    };
+}
+
+@requires(filesystem)
+Result(Int, Str) forget_org(Str dir, Str before, Str m) { _ = filesystem.write_all(dir + "/org", before); return Err(m); }
+
+@requires(filesystem, network, device, declassify, clock, environment)
+Result(Int, Str) joined(Str dir, Ctx x, OrgState st) {
+    Bool member = member_index(st.org.members, x.c.log_id, 0) >= 0;
+    if (str_len(x.pin) < st.gov.policy.min_pin_len) { eprintln(f"the organization asks for a PIN of at least {st.gov.policy.min_pin_len} digits; this device's is shorter"); }
+    _ = audit(dir, x, st.org.org_id, "member", hex_encode(x.c.log_id), "joined");
+    println(hex_encode(st.org.org_id) + " " + hex_encode(utf8(st.gov.name)) + (if (member) { " member" } else { " pending" }));
+    return Ok(0);
+}
+
+// ─── Reading ────────────────────────────────────────────────────
+
+// Reading needs the verified log, not the PIN.
+@requires(filesystem, network, clock(readonly), declassify)
+Result(OrgCtx, Str) org_view(Str dir) {
+    DeviceConfig c = set_up(dir)?;
+    Result(VerifiedHead, SymbolonError) rv = verified_log(relay_ep(c), c.log_id);
+    VerifiedHead vh = match rv { Err(e) => Err(err_text(e)), Ok(h) => Ok(h) }?;
+    OrgState st = org_at(dir, c, vh)?;
+    List(Secret(UInt(8))) none = [];
+    Unlocked u = Unlocked {.kind = 0, .real = RealProfile {.share = none, .cc = none, .vault_key = none, .dek = none, .duress_hpke_pub = []},
+                           .duress = DuressFull {.share = none, .subkey = none, .vault_key = none, .hpke_priv = none, .tweaks = []}, .st = none};
+    return Ok(OrgCtx {.x = Ctx {.c = c, .u = u, .vh = vh, .pin = ""}, .st = st});
+}
+
+Str role_of(OrgGov g, List(Int) l) { return if (is_owner(g, l)) { "owner" } else { if (is_admin(g, l)) { "admin" } else { "member" } }; }
+
+Str yes(Bool b) { return if (b) { "yes" } else { "no" }; }
+
+@requires(filesystem, network, clock(readonly), declassify)
+pub Int org_show(Str dir) { return done(show(dir)); }
+
+@requires(filesystem, network, clock(readonly), declassify)
+Result(Int, Str) show(Str dir) {
+    OrgCtx o = org_view(dir)?;
+    OrgGov g = o.st.gov;
+    OrgPolicy p = g.policy;
+    Bool member = member_index(o.st.org.members, o.x.c.log_id, 0) >= 0;
+    println("org " + hex_encode(g.org_id) + " " + hex_encode(utf8(g.name)));
+    println(f"version {o.st.org.version} gov {g.version}");
+    println("role " + (if (member) { role_of(g, o.x.c.log_id) } else { "pending" }));
+    println(f"policy min_pin_len={p.min_pin_len} allow_biometric={yes(p.allow_biometric)} allow_duress={yes(p.allow_duress)} allow_offline_copy={yes(p.allow_offline_copy)} max_offline_days={p.max_offline_days} allow_personal_export={yes(p.allow_personal_export)}");
+    println(if (g.recovery.on) { f"recovery on {g.recovery.threshold}/{g.recovery.admins.len()} delay {g.recovery.delay_sec}" } else { "recovery off" });
+    return Ok(0);
+}
+
+@requires(filesystem, network, clock(readonly), declassify)
+pub Int org_members(Str dir) { return done(members(dir)); }
+
+@requires(filesystem, network, clock(readonly), declassify)
+Result(Int, Str) members(Str dir) {
+    OrgCtx o = org_view(dir)?;
+    return Ok(print_members(o.st, 0));
+}
+
+Int print_members(OrgState st, Int i) {
+    if (i >= st.org.members.len()) { return 0; }
+    OrgMember m = st.org.members[i];
+    Str gs = groups_of(st.org.groups, m.log_id, 0, StrBuf(), true);
+    println(hex_encode(m.log_id) + " " + hex_or_dash(m.label) + " " + hex_or_dash(m.ext_id) + " " + role_of(st.gov, m.log_id) + " " + (if (str_len(gs) == 0) { "-" } else { gs }));
+    return print_members(st, i + 1);
+}
+
+Str hex_or_dash(Str s) { return if (str_len(s) == 0) { "-" } else { hex_encode(utf8(s)) }; }
+
+Str groups_of(List(OrgGroup) gs, List(Int) l, Int i, StrBuf acc, Bool first) {
+    if (i >= gs.len()) { return acc.finish(); }
+    Bool inside = has_log(gs[i].members, l);
+    return groups_of(gs, l, i + 1, if (inside) { acc.push(if (first) { "" } else { "," }).push(hex_encode(gs[i].group_id)) } else { acc }, first && !inside);
+}
+
+@requires(filesystem, network, clock(readonly), declassify)
+pub Int org_groups(Str dir) { return done(groups(dir)); }
+
+@requires(filesystem, network, clock(readonly), declassify)
+Result(Int, Str) groups(Str dir) {
+    OrgCtx o = org_view(dir)?;
+    return Ok(print_groups(o.st.org.groups, 0));
+}
+
+Int print_groups(List(OrgGroup) gs, Int i) {
+    if (i >= gs.len()) { return 0; }
+    println(hex_encode(gs[i].group_id) + " " + hex_encode(utf8(gs[i].name)) + f" {gs[i].members.len()}");
+    return print_groups(gs, i + 1);
+}
+
+// ─── People ─────────────────────────────────────────────────────
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+pub Int org_add(Str dir, Str who, Str label, Str ext) { return done(add(dir, who, label, ext)); }
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+Result(Int, Str) add(Str dir, Str who, Str label, Str ext) {
+    if (!log_hex_ok(who)) { return Err("a person is named by their log id, 64 hex digits"); }
+    if (!label_ok(label) || str_len(ext) > 256) { return Err("a name of 1-64 characters and a directory id of at most 256"); }
+    OrgCtx o = org_unlocked(dir)?;
+    Int ok = admin_only(o)?;
+    List(Int) l = cose_hex_decode(who);
+    if (member_index(o.st.org.members, l, 0) >= 0) { return Err("already in the organization"); }
+    VerifiedHead known = head_of(o.x.c, o.x.vh, l)?;
+    return store_org(dir, o.x, o.st, o.st.gov.version, o.st.org.members.concat([OrgMember {.log_id = l, .label = label, .ext_id = ext}]), o.st.org.groups, "member", "add " + who);
+}
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+pub Int org_remove(Str dir, Str who) { return done(remove(dir, who)); }
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+Result(Int, Str) remove(Str dir, Str who) {
+    if (!log_hex_ok(who)) { return Err("a person is named by their log id, 64 hex digits"); }
+    OrgCtx o = org_unlocked(dir)?;
+    Int ok = admin_only(o)?;
+    List(Int) l = cose_hex_decode(who);
+    if (member_index(o.st.org.members, l, 0) < 0) { return Err("not in the organization"); }
+    if (is_admin(o.st.gov, l)) { return Err("an owner or administrator: an owner makes them a member first (org role)"); }
+    Int stored = store_org(dir, o.x, o.st, o.st.gov.version, without_member(o.st.org.members, l, 0, ListBuf()), without_in_groups(o.st.org.groups, l, 0, ListBuf()), "member", "remove " + who)?;
+    eprintln("the group folders they were in get a new key at the next org sync");
+    return Ok(stored);
+}
+
+List(OrgMember) without_member(List(OrgMember) ms, List(Int) l, Int i, ListBuf(OrgMember) acc) {
+    if (i >= ms.len()) { return acc.finish(); }
+    return without_member(ms, l, i + 1, if (bytes_eq(ms[i].log_id, l)) { acc } else { acc.push(ms[i]) });
+}
+
+List(List(Int)) without_log(List(List(Int)) ls, List(Int) l, Int i, ListBuf(List(Int)) acc) {
+    if (i >= ls.len()) { return acc.finish(); }
+    return without_log(ls, l, i + 1, if (bytes_eq(ls[i], l)) { acc } else { acc.push(ls[i]) });
+}
+
+List(OrgGroup) without_in_groups(List(OrgGroup) gs, List(Int) l, Int i, ListBuf(OrgGroup) acc) {
+    if (i >= gs.len()) { return acc.finish(); }
+    return without_in_groups(gs, l, i + 1, acc.push(OrgGroup {.group_id = gs[i].group_id, .name = gs[i].name, .members = without_log(gs[i].members, l, 0, ListBuf())}));
+}
+
+List(OrgAdmin) without_admin(List(OrgAdmin) xs, List(Int) l, Int i, ListBuf(OrgAdmin) acc) {
+    if (i >= xs.len()) { return acc.finish(); }
+    return without_admin(xs, l, i + 1, if (bytes_eq(xs[i].log_id, l)) { acc } else { acc.push(xs[i]) });
+}
+
+// `org role DIR LOG owner|admin|member`: an owner only.
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+pub Int org_role(Str dir, Str who, Str role) { return done(set_role(dir, who, role)); }
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+Result(Int, Str) set_role(Str dir, Str who, Str role) {
+    if (!log_hex_ok(who)) { return Err("a person is named by their log id, 64 hex digits"); }
+    if (role != "owner" && role != "admin" && role != "member") { return Err("owner, admin or member"); }
+    OrgCtx o = org_unlocked(dir)?;
+    List(Int) l = cose_hex_decode(who);
+    Int mi = member_index(o.st.org.members, l, 0);
+    if (mi < 0) { return Err("not in the organization: add them first"); }
+    List(List(Int)) owners = without_log(o.st.gov.owners, l, 0, ListBuf());
+    List(OrgAdmin) admins = without_admin(o.st.gov.admins, l, 0, ListBuf());
+    return store_gov(dir, o.x, o.st, if (role == "owner") { owners.concat([l]) } else { owners },
+                     if (role == "admin") { admins.concat([OrgAdmin {.log_id = l, .label = o.st.org.members[mi].label}]) } else { admins },
+                     o.st.gov.policy, "member", "role " + who + " " + role);
+}
+
+// `org policy DIR KEY VALUE`: an owner only.
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+pub Int org_policy(Str dir, Str key, Str value) { return done(set_policy(dir, key, value)); }
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+Result(Int, Str) set_policy(Str dir, Str key, Str value) {
+    OrgCtx o = org_unlocked(dir)?;
+    OrgPolicy p = changed_policy(o.st.gov.policy, key, value)?;
+    return store_gov(dir, o.x, o.st, o.st.gov.owners, o.st.gov.admins, p, "policy", key + "=" + value);
+}
+
+Result(Bool, Str) flag(Str v) { return if (v == "yes") { Ok(true) } else { if (v == "no") { Ok(false) } else { Err("yes or no") } }; }
+
+Result(Int, Str) count(Str v, Int lo, Int hi) {
+    Int n = str_parse_int(v);
+    if (f"{n}" != v || n < lo || n > hi) { return Err(f"a number from {lo} to {hi}"); }
+    return Ok(n);
+}
+
+Result(OrgPolicy, Str) changed_policy(OrgPolicy p, Str k, Str v) {
+    if (k == "min_pin_len") { Int n = count(v, 4, 32)?; return Ok(OrgPolicy {.min_pin_len = n, .allow_biometric = p.allow_biometric, .allow_duress = p.allow_duress, .allow_offline_copy = p.allow_offline_copy, .max_offline_days = p.max_offline_days, .allow_personal_export = p.allow_personal_export, .require_attestation = p.require_attestation, .password_rules = p.password_rules}); }
+    if (k == "allow_biometric") { Bool b = flag(v)?; return Ok(OrgPolicy {.min_pin_len = p.min_pin_len, .allow_biometric = b, .allow_duress = p.allow_duress, .allow_offline_copy = p.allow_offline_copy, .max_offline_days = p.max_offline_days, .allow_personal_export = p.allow_personal_export, .require_attestation = p.require_attestation, .password_rules = p.password_rules}); }
+    if (k == "allow_duress") { Bool b = flag(v)?; return Ok(OrgPolicy {.min_pin_len = p.min_pin_len, .allow_biometric = p.allow_biometric, .allow_duress = b, .allow_offline_copy = p.allow_offline_copy, .max_offline_days = p.max_offline_days, .allow_personal_export = p.allow_personal_export, .require_attestation = p.require_attestation, .password_rules = p.password_rules}); }
+    if (k == "allow_offline_copy") { Bool b = flag(v)?; return Ok(OrgPolicy {.min_pin_len = p.min_pin_len, .allow_biometric = p.allow_biometric, .allow_duress = p.allow_duress, .allow_offline_copy = b, .max_offline_days = p.max_offline_days, .allow_personal_export = p.allow_personal_export, .require_attestation = p.require_attestation, .password_rules = p.password_rules}); }
+    if (k == "max_offline_days") { Int n = count(v, 0, 3650)?; return Ok(OrgPolicy {.min_pin_len = p.min_pin_len, .allow_biometric = p.allow_biometric, .allow_duress = p.allow_duress, .allow_offline_copy = p.allow_offline_copy, .max_offline_days = n, .allow_personal_export = p.allow_personal_export, .require_attestation = p.require_attestation, .password_rules = p.password_rules}); }
+    if (k == "allow_personal_export") { Bool b = flag(v)?; return Ok(OrgPolicy {.min_pin_len = p.min_pin_len, .allow_biometric = p.allow_biometric, .allow_duress = p.allow_duress, .allow_offline_copy = p.allow_offline_copy, .max_offline_days = p.max_offline_days, .allow_personal_export = b, .require_attestation = p.require_attestation, .password_rules = p.password_rules}); }
+    if (k == "password_rules") { return Ok(OrgPolicy {.min_pin_len = p.min_pin_len, .allow_biometric = p.allow_biometric, .allow_duress = p.allow_duress, .allow_offline_copy = p.allow_offline_copy, .max_offline_days = p.max_offline_days, .allow_personal_export = p.allow_personal_export, .require_attestation = p.require_attestation, .password_rules = v}); }
+    return Err("policy keys: min_pin_len, allow_biometric, allow_duress, allow_offline_copy, max_offline_days, allow_personal_export, password_rules");
+}
+
+// ─── Groups ─────────────────────────────────────────────────────
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+pub Int org_group_new(Str dir, Str name) { return done(group_new(dir, name)); }
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+Result(Int, Str) group_new(Str dir, Str name) {
+    if (!label_ok(name)) { return Err("a name of 1-64 characters"); }
+    OrgCtx o = org_unlocked(dir)?;
+    Int ok = admin_only(o)?;
+    List(Int) gid = random_bytes(16);
+    Int stored = store_org(dir, o.x, o.st, o.st.gov.version, o.st.org.members, o.st.org.groups.concat([OrgGroup {.group_id = gid, .name = name, .members = []}]), "group", "new " + hex_encode(gid))?;
+    println(hex_encode(gid));
+    return Ok(stored);
+}
+
+// `org group add|remove DIR GROUP LOG`.
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+pub Int org_group_set(Str dir, Str gid, Str who, Bool add_it) { return done(group_set(dir, gid, who, add_it)); }
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+Result(Int, Str) group_set(Str dir, Str gid, Str who, Bool add_it) {
+    if (!share_id_ok(gid) || !log_hex_ok(who)) { return Err("a group id (32 hex digits) and a log id (64)"); }
+    OrgCtx o = org_unlocked(dir)?;
+    Int ok = admin_only(o)?;
+    List(Int) g = cose_hex_decode(gid);
+    List(Int) l = cose_hex_decode(who);
+    Int gi = group_index(o.st.org.groups, g, 0);
+    if (gi < 0) { return Err("no such group"); }
+    if (member_index(o.st.org.members, l, 0) < 0) { return Err("not in the organization: add them first"); }
+    Bool inside = has_log(o.st.org.groups[gi].members, l);
+    if (add_it && inside) { return Err("already in the group"); }
+    if (!add_it && !inside) { return Err("not in the group"); }
+    OrgGroup old = o.st.org.groups[gi];
+    OrgGroup nw = OrgGroup {.group_id = old.group_id, .name = old.name, .members = if (add_it) { old.members.concat([l]) } else { without_log(old.members, l, 0, ListBuf()) }};
+    return store_org(dir, o.x, o.st, o.st.gov.version, o.st.org.members, replace_group(o.st.org.groups, nw, 0, ListBuf()), "group", (if (add_it) { "add " } else { "remove " }) + gid + " " + who);
+}
+
+List(OrgGroup) replace_group(List(OrgGroup) gs, OrgGroup g, Int i, ListBuf(OrgGroup) acc) {
+    if (i >= gs.len()) { return acc.finish(); }
+    return replace_group(gs, g, i + 1, acc.push(if (bytes_eq(gs[i].group_id, g.group_id)) { g } else { gs[i] }));
+}
+
+// ─── Group folders ──────────────────────────────────────────────
+
+@requires(device, declassify, network, environment)
+Result(GroupFolder, Str) sign_gfolder(Ctx x, List(Int) id, UInt(64) version, List(Int) org_id, List(List(Int)) gs, List(Secret(UInt(8))) key, Str name, Bool deleted) {
+    GroupFolder f = GroupFolder {.coll_id = id, .version = version, .org_id = org_id, .groups = gs, .name_ct = sealed_name(key, id, version, name), .deleted = deleted,
+                                 .log_sequence = x.vh.head.sequence, .signer_log = x.c.log_id, .signer = x.c.party, .sig = []};
+    List(Int) sig = dk_sign(x.c, x.u.real, x.u.st, gfolder_tbs(f))?;
+    return Ok(gfolder_signed(f, sig));
+}
+
+List(List(Int)) people_logs(List(Member) ms, Int i, ListBuf(List(Int)) acc) {
+    if (i >= ms.len()) { return acc.finish(); }
+    return people_logs(ms, i + 1, acc.push(ms[i].log_id));
+}
+
+// `org folder new DIR NAME GROUP[,GROUP...]`.
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+pub Int org_folder_new(Str dir, Str name, Str groups_arg) { return done(folder_new(dir, name, groups_arg)); }
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+Result(Int, Str) folder_new(Str dir, Str name, Str groups_arg) {
+    if (!label_ok(name)) { return Err("a name of 1-64 characters"); }
+    OrgCtx o = org_unlocked(dir)?;
+    Int ok = admin_only(o)?;
+    List(List(Int)) gs = group_ids(o.st.org.groups, str_split(groups_arg, ","), 0, ListBuf())?;
+    List(Int) id = random_bytes(16);
+    List(Secret(UInt(8))) key = random_secret(32);
+    GroupFolder f = sign_gfolder(o.x, id, (UInt(64))1, o.st.org.org_id, gs, key, name, false)?;
+    Str m = put_wraps(o.x, id, f.version, key, people_logs(folder_people(o.st, gs), 0, ListBuf()), 0);
+    if (str_len(m) > 0) { return Err(m); }
+    Str cid = hex_encode(id);
+    Int put = put_blob(o.x, gfolder_blob(cid), cbor_or_empty(to_cbor(f)), "group folder")?;
+    _ = filesystem.write_all(place_local(dir, cid) + ".roster", "1");
+    _ = audit(dir, o.x, o.st.org.org_id, "share", cid, "group folder for " + groups_arg);
+    println(cid);
+    return Ok(0);
+}
+
+Result(List(List(Int)), Str) group_ids(List(OrgGroup) gs, List(Str) ids, Int i, ListBuf(List(Int)) acc) {
+    if (i >= ids.len()) { List(List(Int)) done_ids = acc.finish(); return if (done_ids.len() == 0) { Err("at least one group") } else { Ok(done_ids) }; }
+    if (!share_id_ok(ids[i]) || group_index(gs, cose_hex_decode(ids[i]), 0) < 0) { acc.discard(); return Err("no such group " + ids[i]); }
+    return group_ids(gs, ids, i + 1, acc.push(cose_hex_decode(ids[i])));
+}
+
+// `org sync DIR`: per group folder, "ID ok" when everyone holding its key
+// is still one of its people (adding wraps for new people), "ID rekeyed N"
+// after giving it a new key because N people left, "ID - WHY-HEX" when it
+// cannot.
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+pub Int org_sync(Str dir) { return done(sync(dir)); }
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+Result(Int, Str) sync(Str dir) {
+    OrgCtx o = org_unlocked(dir)?;
+    Int ok = admin_only(o)?;
+    List(Str) wraps = blob_list(relay_ep(o.x.c), "wrap-");
+    return Ok(sync_all(dir, o, wraps, ids_of(blob_list(relay_ep(o.x.c), "gfolder-"), 0, ListBuf()), 0));
+}
+
+List(Str) ids_of(List(Str) names, Int i, ListBuf(Str) acc) {
+    if (i >= names.len()) { return acc.finish(); }
+    Str id = if (str_len(names[i]) == 40) { str_slice(names[i], 8, 40) } else { "" };
+    return ids_of(names, i + 1, if (share_id_ok(id)) { acc.push(id) } else { acc });
+}
+
+@requires(filesystem, network, device, declassify, clock, environment)
+Int sync_all(Str dir, OrgCtx o, List(Str) wraps, List(Str) ids, Int i) {
+    if (i >= ids.len()) { return 0; }
+    Result(Str, Str) r = sync_one(dir, o, wraps, ids[i]);
+    println(ids[i] + " " + match r { Ok(s) => s, Err(m) => "- " + hex_encode(utf8(m)) });
+    return sync_all(dir, o, wraps, ids, i + 1);
+}
+
+@requires(filesystem, network, device, declassify, clock, environment)
+Result(Str, Str) sync_one(Str dir, OrgCtx o, List(Str) wraps, Str cid) {
+    Loaded ld = load_folder(dir, o.x, cid)?;
+    if (ld.r.deleted) { return Ok("deleted"); }
+    List(List(Int)) people = people_of(ld.r);
+    List(List(Int)) gone = holders_gone(o.x, wraps, cid, ld.r.version, people, 0, ListBuf());
+    if (gone.len() == 0) {
+        _ = fill_wraps(o.x, ld, people, 0, 0);
+        return Ok("ok");
+    }
+    GroupFolder f = need(gfolder_of(blob_get(relay_ep(o.x.c), gfolder_blob(cid)) else { [] }), "the group folder does not decode")?;
+    Opened op = opened_with(dir, o.x, cid, true)?;
+    List(Secret(UInt(8))) key = random_secret(32);
+    List(Item) items = reseal(ld.key, key, op.p.vid, op.st.items, 0, ListBuf())?;
+    Opened next = Opened {.c = op.c, .u = op.u, .vh = op.vh, .st = op.st, .pin = op.pin, .p = Place {.share = cid, .vk = key, .vid = op.p.vid}};
+    if (publish_items(dir, next, items) != 0) { return Err("the server refused the items sealed again"); }
+    UInt(64) v = ld.r.version + (UInt(64))1;
+    GroupFolder nf = sign_gfolder(o.x, ld.r.coll_id, v, f.org_id, f.groups, key, ld.name, false)?;
+    Str m = put_wraps(o.x, ld.r.coll_id, v, key, people, 0);
+    if (str_len(m) > 0) { return Err(m); }
+    if (!clear_wraps(o.x, ld.r.coll_id, v, gone, 0)) { return Err("the server refused a key wrap"); }
+    Int put = put_blob(o.x, gfolder_blob(cid), cbor_or_empty(to_cbor(nf)), "group folder")?;
+    _ = filesystem.write_all(place_local(dir, cid) + ".roster", f"{v}");
+    _ = load_folder(dir, o.x, cid);       // this device's copy of the new key
+    _ = audit(dir, o.x, o.st.org.org_id, "share", cid, f"rekeyed: {gone.len()} left");
+    return Ok(f"rekeyed {gone.len()}");
+}
+
+// The people holding a wrap set of the folder at `version` who are no
+// longer among its people.
+@requires(network, clock(readonly), declassify)
+List(List(Int)) holders_gone(Ctx x, List(Str) wraps, Str cid, UInt(64) version, List(List(Int)) people, Int i, ListBuf(List(Int)) acc) {
+    if (i >= wraps.len()) { return acc.finish(); }
+    Str n = wraps[i];
+    Bool mine = str_len(n) == 5 + 64 + 1 + 32 && str_slice(n, 70, 102) == cid;
+    List(Int) l = if (mine) { cose_hex_decode(str_slice(n, 5, 69)) } else { [] };
+    Bool holds = mine && !has_log(people, l) && match wraps_of(blob_get(relay_ep(x.c), n) else { [] }) { None => false, Some(ws) => ws.roster_version == version && ws.wraps.len() > 0 };
+    return holders_gone(x, wraps, cid, version, people, i + 1, if (holds) { acc.push(l) } else { acc });
+}
+
+// ─── Audit ──────────────────────────────────────────────────────
+// Each device chains its events: dir/audit.seq holds the last sequence
+// number, dir/audit.prev the SHA-256 of the last event's CBOR.
+
+@requires(filesystem, network, device, declassify, clock, environment)
+pub Bool audit(Str dir, Ctx x, List(Int) org_id, Str action, Str object, Str detail) {
+    UInt(64) seq = (UInt(64))(kept_version(dir + "/audit.seq") + 1);
+    List(Int) prev = get_file(dir + "/audit.prev");
+    AuditEvent e0 = AuditEvent {.org_id = org_id, .log_id = x.c.log_id, .party = x.c.party, .seq = seq, .prev = prev,
+                                .time = witness_now(x.vh.head.policy.witnesses, x.c.ca, random_bytes(32)), .action = action, .object = object, .detail = detail, .sig = []};
+    Result(List(Int), Str) rs = dk_sign(x.c, x.u.real, x.u.st, event_tbs(e0));
+    return match rs {
+        Err(_) => false,
+        Ok(sig) => stored_event(dir, x, event_signed(e0, sig))
+    };
+}
+
+@requires(filesystem, network, clock(readonly), declassify)
+Bool stored_event(Str dir, Ctx x, AuditEvent e) {
+    List(Int) b = cbor_or_empty(to_cbor(e));
+    if (!blob_put(relay_ep(x.c), audit_blob(e.org_id, e.log_id, e.seq), b)) { return false; }
+    return filesystem.write_all(dir + "/audit.seq", f"{e.seq}") && filesystem.write_bytes(dir + "/audit.prev", sha256_bytes(b));
+}
+
+Str audit_blob(List(Int) org_id, List(Int) log_id, UInt(64) seq) { return "audit-" + hex_encode(org_id) + "-" + hex_encode(log_id) + "-" + f"{seq:zero, width 12}"; }
+
+// `org audit DIR`: every event at the server for the organization, in
+// order per device: "TIME LOG SEQ ACTION OBJECT DETAIL-HEX ok", or
+// "... broken WHY-HEX" for one whose signature, chain or sequence fails.
+@requires(filesystem, network, clock(readonly), declassify)
+pub Int org_audit(Str dir) { return done(audit_list(dir)); }
+
+@requires(filesystem, network, clock(readonly), declassify)
+Result(Int, Str) audit_list(Str dir) {
+    OrgCtx o = org_view(dir)?;
+    List(Str) names = blob_list(relay_ep(o.x.c), "audit-" + hex_encode(o.st.org.org_id) + "-");
+    return Ok(print_events(o, names, 0, [], (UInt(64))0, []));
+}
+
+@requires(network, clock(readonly), declassify)
+Int print_events(OrgCtx o, List(Str) names, Int i, List(Int) log, UInt(64) last, List(Int) prev) {
+    if (i >= names.len()) { return 0; }
+    Option(AuditEvent) oe = event_of(blob_get(relay_ep(o.x.c), names[i]) else { [] });
+    return match oe {
+        None => print_events(o, names, i + 1, log, last, prev),
+        Some(e) => next_event(o, names, i, e, bytes_eq(e.log_id, log), last, prev)
+    };
+}
+
+@requires(network, clock(readonly), declassify)
+Int next_event(OrgCtx o, List(Str) names, Int i, AuditEvent e, Bool same, UInt(64) last, List(Int) prev) {
+    List(Int) b = blob_get(relay_ep(o.x.c), names[i]) else { [] };
+    Str why = event_problem(o, names[i], e, if (same) { last } else { (UInt(64))0 }, if (same) { prev } else { [] });
+    println(f"{e.time} " + hex_encode(e.log_id) + f" {e.seq} " + e.action + " " + e.object + " " + hex_or_dash(e.detail) + (if (str_len(why) == 0) { " ok" } else { " broken " + hex_encode(utf8(why)) }));
+    return print_events(o, names, i + 1, e.log_id, e.seq, sha256_bytes(b));
+}
+
+@requires(network, clock(readonly), declassify)
+Str event_problem(OrgCtx o, Str name, AuditEvent e, UInt(64) last, List(Int) prev) {
+    if (name != audit_blob(e.org_id, e.log_id, e.seq) || !bytes_eq(e.org_id, o.st.org.org_id)) { return "stored under another name"; }
+    if (e.seq != last + (UInt(64))1) { return f"after {last} comes {e.seq}: events are missing"; }
+    if (!bytes_eq(e.prev, prev)) { return "does not follow the event before"; }
+    Result(VerifiedHead, Str) rh = head_of(o.x.c, o.x.vh, e.log_id);
+    return match rh {
+        Err(m) => m,
+        Ok(h) => if (match device_party(h.head.quorum.parties, e.party, 0) { None => false, Some(d) => ecdsa_verify_raw(P256, Sha256, d.auth_key, event_tbs(e), e.sig) }) { "" } else { "signature does not verify" }
+    };
+}

@@ -9,6 +9,7 @@ import "../net/proto_serial.resid";
 import "../threshold/threshold_serial.resid";
 import "state_serial.resid";
 import "sharetypes_serial.resid";
+import "orgtypes_serial.resid";
 import "cggmp_serial.resid";
 import "../threshold/rsmsg_serial.resid";
 import "cggmp_blind_serial.resid";

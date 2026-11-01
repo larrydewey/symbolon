@@ -45,6 +45,8 @@
 //   symbolon device share leave DIR ID         PIN on stdin; a member leaves (the owner's device then re-keys)
 //   symbolon device share duress DIR ID on|off PIN on stdin; read the folder under the duress PIN on this device
 //   symbolon device share card DIR NAME        PIN on stdin; the name others see; prints LOG-ID FINGERPRINT
+//   symbolon device org new|join|show|members|add|remove|role|policy|group|groups|folder|sync|audit ...
+//                                              organizations (SPEC 29); see src/agent/orgcli.resid
 //   symbolon device share me DIR               prints LOG-ID FINGERPRINT
 //   symbolon device share people DIR           "LOG-ID NAME-HEX FINGERPRINT me|-" per card at the relay
 //   symbolon home init DIR HOST [HOST...] [--ports BASE] [--bind ADDR]   Symbolon Home: the box's CA, certificates, witnesses
@@ -75,6 +77,7 @@ import "agent/rotatecli.resid";
 import "agent/vaultitems.resid";
 import "agent/importers.resid";
 import "agent/sharecli.resid";
+import "agent/orgcli.resid";
 import "agent/webauthn.resid";
 import "agent/home.resid";
 import "httpserv.resid";
@@ -236,6 +239,30 @@ Bool has_flag(Str f, Int i) {
     return has_flag(f, i + 1);
 }
 
+// `symbolon device org ...` (src/agent/orgcli.resid).
+@requires(filesystem, network, device, declassify, clock, provision, environment, args)
+Int org_command(Int n) {
+    Str c = args.get(3);
+    Str d = args.get(4);
+    if (c == "new" && n == 6) { return org_new(d, args.get(5)); }
+    if (c == "join" && n == 7) { return org_join(d, args.get(5), args.get(6)); }
+    if (c == "show" && n == 5) { return org_show(d); }
+    if (c == "members" && n == 5) { return org_members(d); }
+    if (c == "groups" && n == 5) { return org_groups(d); }
+    if (c == "add" && (n == 7 || n == 8)) { return org_add(d, args.get(5), args.get(6), if (n == 8) { args.get(7) } else { "" }); }
+    if (c == "remove" && n == 6) { return org_remove(d, args.get(5)); }
+    if (c == "role" && n == 7) { return org_role(d, args.get(5), args.get(6)); }
+    if (c == "policy" && n == 7) { return org_policy(d, args.get(5), args.get(6)); }
+    if (c == "sync" && n == 5) { return org_sync(d); }
+    if (c == "audit" && n == 5) { return org_audit(d); }
+    // `org group new DIR NAME`, `org group add|remove DIR GROUP LOG`, `org folder new DIR NAME GROUPS`
+    if (c == "group" && d == "new" && n == 7) { return org_group_new(args.get(5), args.get(6)); }
+    if (c == "group" && (d == "add" || d == "remove") && n == 8) { return org_group_set(args.get(5), args.get(6), args.get(7), d == "add"); }
+    if (c == "folder" && d == "new" && n == 8) { return org_folder_new(args.get(5), args.get(6), args.get(7)); }
+    eprintln("device org: unknown form (see src/agent/orgcli.resid)");
+    return 2;
+}
+
 @requires(args, environment, network, filesystem, device, declassify, clock, process, provision)
 Int main() {
     Str a1 = args.get(1);
@@ -285,6 +312,7 @@ Int main() {
     if (a1 == "device" && a2 == "share" && args.get(3) == "add" && n == 8) { return share_add(args.get(4), args.get(5), args.get(6), args.get(7)); }
     if (a1 == "device" && a2 == "share" && args.get(3) == "remove" && n == 7) { return share_remove(args.get(4), args.get(5), args.get(6)); }
     if (a1 == "device" && a2 == "share" && args.get(3) == "delete" && n == 6) { return share_delete(args.get(4), args.get(5)); }
+    if (a1 == "device" && a2 == "org") { return org_command(n); }
     if (a1 == "device" && a2 == "share" && args.get(3) == "leave" && n == 6) { return share_leave(args.get(4), args.get(5)); }
     if (a1 == "device" && a2 == "share" && args.get(3) == "duress" && n == 7) { return share_duress(args.get(4), args.get(5), args.get(6)); }
     if (a1 == "device" && a2 == "share" && args.get(3) == "card" && n == 6) { return share_card(args.get(4), args.get(5)); }

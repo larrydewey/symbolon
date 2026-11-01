@@ -1,0 +1,257 @@
+// Organizations (SPEC 29): verifying what the server holds. Shared by the
+// shared-folder commands (a group folder is a shared collection whose
+// people come from the organization record) and the `org` commands.
+//
+// Every record is checked on the device: the governance chain from the
+// founder bound into the org id, each version signed by an owner of the
+// one before; the membership record signed by an owner or administrator
+// under the latest governance; a group folder signed by one of them. A
+// device keeps the highest versions it saw and refuses older ones.
+
+import "../types.resid";
+import "../core/log.resid";
+import "../net/services.resid";
+import "state.resid";
+import "common.resid";
+import "serials.resid";
+import "orgtypes.resid";
+import "sharetypes.resid";
+import "vaultcli.resid";
+import "crypto.resid";
+import "ecdsa.resid";
+import "cbor.resid";
+import "cose.resid";
+
+// An Option as a Result, for `?`.
+pub Result(T, Str) need(Option(T) o, Str m) { return match o { Some(v) => Ok(v), None => Err(m) }; }
+
+// A log's verified head: this device's own as it has it, another's
+// verified now (events signed by its quorum, witnessed under its policy).
+@requires(network, clock(readonly), declassify)
+pub Result(VerifiedHead, Str) head_of(DeviceConfig c, VerifiedHead mine, List(Int) l) {
+    if (bytes_eq(l, c.log_id)) { return Ok(mine); }
+    Result(VerifiedHead, SymbolonError) r = verified_log(relay_ep(c), l);
+    return match r { Ok(h) => Ok(h), Err(e) => Err("the log " + str_slice(hex_encode(l), 0, 12) + " does not verify: " + err_text(e)) };
+}
+
+pub Option(Party) device_party(List(Party) ps, List(Int) id, Int i) {
+    if (i >= ps.len()) { return None; }
+    if (ps[i].kind == party_kind_device() && bytes_eq(ps[i].id, id)) { return Some(ps[i]); }
+    return device_party(ps, id, i + 1);
+}
+
+// The devices of a quorum: not the cosigner (it runs on the box), not the
+// kit or a guardian.
+pub List(Party) devices_of(List(Party) ps, Int i, ListBuf(Party) acc) {
+    if (i >= ps.len()) { return acc.finish(); }
+    return devices_of(ps, i + 1, if (ps[i].kind == party_kind_device()) { acc.push(ps[i]) } else { acc });
+}
+
+// Whether a device of the verified log `h` signed `tbs`, at a sequence
+// already verified.
+@requires(declassify)
+pub Bool signed_by(VerifiedHead h, UInt(64) seq, List(Int) party, List(Int) tbs, List(Int) sig) {
+    if (seq > h.head.sequence) { return false; }
+    return match device_party(h.head.quorum.parties, party, 0) { None => false, Some(d) => ecdsa_verify_raw(P256, Sha256, d.auth_key, tbs, sig) };
+}
+
+pub Bool has_log(List(List(Int)) ls, List(Int) l) { return log_at(ls, l, 0) >= 0; }
+
+pub Int log_at(List(List(Int)) ls, List(Int) l, Int i) {
+    if (i >= ls.len()) { return -1; }
+    if (bytes_eq(ls[i], l)) { return i; }
+    return log_at(ls, l, i + 1);
+}
+
+List(Int) cbor_bytes(Result(List(Int), SerialError) r) { return match r { Ok(b) => b, Err(_) => [] }; }
+
+// ─── Records ────────────────────────────────────────────────────
+
+pub Int max_org_record() { return 8388608; }
+
+pub Option(OrgGov) gov_of(List(Int) b) {
+    if (b.len() == 0 || b.len() > max_org_record() || !cbor_well_formed(b, 12)) { return None; }
+    Result(OrgGov, SerialError) r = from_cbor(b);
+    return match r { Ok(x) => Some(x), Err(_) => None };
+}
+
+pub Option(Org) org_of(List(Int) b) {
+    if (b.len() == 0 || b.len() > max_org_record() || !cbor_well_formed(b, 12)) { return None; }
+    Result(Org, SerialError) r = from_cbor(b);
+    return match r { Ok(x) => Some(x), Err(_) => None };
+}
+
+pub Option(GroupFolder) gfolder_of(List(Int) b) {
+    if (b.len() == 0 || b.len() > 1048576 || !cbor_well_formed(b, 8)) { return None; }
+    Result(GroupFolder, SerialError) r = from_cbor(b);
+    return match r { Ok(x) => Some(x), Err(_) => None };
+}
+
+pub Option(AuditEvent) event_of(List(Int) b) {
+    if (b.len() == 0 || b.len() > 65536 || !cbor_well_formed(b, 6)) { return None; }
+    Result(AuditEvent, SerialError) r = from_cbor(b);
+    return match r { Ok(x) => Some(x), Err(_) => None };
+}
+
+pub OrgGov gov_signed(OrgGov g, List(Int) sig) {
+    return OrgGov {.org_id = g.org_id, .version = g.version, .founder = g.founder, .nonce = g.nonce, .name = g.name, .owners = g.owners, .admins = g.admins,
+                   .policy = g.policy, .recovery = g.recovery, .log_sequence = g.log_sequence, .signer_log = g.signer_log, .signer = g.signer, .sig = sig};
+}
+
+pub Org org_signed(Org o, List(Int) sig) {
+    return Org {.org_id = o.org_id, .version = o.version, .gov_version = o.gov_version, .members = o.members, .groups = o.groups,
+                .log_sequence = o.log_sequence, .signer_log = o.signer_log, .signer = o.signer, .sig = sig};
+}
+
+pub GroupFolder gfolder_signed(GroupFolder f, List(Int) sig) {
+    return GroupFolder {.coll_id = f.coll_id, .version = f.version, .org_id = f.org_id, .groups = f.groups, .name_ct = f.name_ct, .deleted = f.deleted,
+                        .log_sequence = f.log_sequence, .signer_log = f.signer_log, .signer = f.signer, .sig = sig};
+}
+
+pub AuditEvent event_signed(AuditEvent e, List(Int) sig) {
+    return AuditEvent {.org_id = e.org_id, .log_id = e.log_id, .party = e.party, .seq = e.seq, .prev = e.prev, .time = e.time,
+                       .action = e.action, .object = e.object, .detail = e.detail, .sig = sig};
+}
+
+// What a device signs: a label, then the record's CBOR without the signature.
+pub List(Int) gov_tbs(OrgGov g) { return utf8("symbolon v1 org gov").concat(cbor_bytes(to_cbor(gov_signed(g, [])))); }
+pub List(Int) org_tbs(Org o) { return utf8("symbolon v1 org").concat(cbor_bytes(to_cbor(org_signed(o, [])))); }
+pub List(Int) gfolder_tbs(GroupFolder f) { return utf8("symbolon v1 group folder").concat(cbor_bytes(to_cbor(gfolder_signed(f, [])))); }
+pub List(Int) event_tbs(AuditEvent e) { return utf8("symbolon v1 audit").concat(cbor_bytes(to_cbor(event_signed(e, [])))); }
+
+pub List(Int) org_id_of(List(Int) founder, List(Int) nonce) { return sha256_bytes(utf8("symbolon v1 org").concat(founder).concat(nonce))[0..16]; }
+
+pub Str gov_blob(List(Int) id, UInt(64) v) { return "orggov-" + hex_encode(id) + "-" + f"{v}"; }
+pub Str org_blob(List(Int) id) { return "org-" + hex_encode(id); }
+pub Str gfolder_blob(Str cid) { return "gfolder-" + cid; }
+
+// ─── This device's organization ─────────────────────────────────
+// dir/org holds "ORG-ID FOUNDER" in hex, from the enrolment.
+
+pub type OrgRef = { List(Int) id; List(Int) founder; };
+
+@requires(filesystem)
+pub Option(OrgRef) org_ref(Str dir) {
+    List(Str) p = str_split(str_trim(filesystem.read_all(dir + "/org")), " ");
+    if (p.len() != 2 || str_len(p[0]) != 32 || str_len(p[1]) != 64) { return None; }
+    return Some(OrgRef {.id = cose_hex_decode(p[0]), .founder = cose_hex_decode(p[1])});
+}
+
+pub type OrgState = { OrgGov gov; Org org; };
+
+pub Bool is_owner(OrgGov g, List(Int) l) { return has_log(g.owners, l); }
+pub Bool is_admin(OrgGov g, List(Int) l) { return is_owner(g, l) || admin_at(g.admins, l, 0) >= 0; }
+
+pub Int admin_at(List(OrgAdmin) xs, List(Int) l, Int i) {
+    if (i >= xs.len()) { return -1; }
+    if (bytes_eq(xs[i].log_id, l)) { return i; }
+    return admin_at(xs, l, i + 1);
+}
+
+pub Int member_index(List(OrgMember) ms, List(Int) l, Int i) {
+    if (i >= ms.len()) { return -1; }
+    if (bytes_eq(ms[i].log_id, l)) { return i; }
+    return member_index(ms, l, i + 1);
+}
+
+pub Int group_index(List(OrgGroup) gs, List(Int) id, Int i) {
+    if (i >= gs.len()) { return -1; }
+    if (bytes_eq(gs[i].group_id, id)) { return i; }
+    return group_index(gs, id, i + 1);
+}
+
+// The governance chain, versions 1 to the latest at the server, each
+// checked against the one before.
+@requires(filesystem, network, clock(readonly), declassify)
+pub Result(OrgGov, Str) gov_chain(Str dir, DeviceConfig c, VerifiedHead mine, OrgRef o) {
+    Int n = blob_list(relay_ep(c), "orggov-" + hex_encode(o.id) + "-").len();
+    Int seen = kept_version(dir + "/org.gov");
+    if (n == 0) { return Err("the server has no record of the organization"); }
+    if (n < seen) { return Err(f"the organization's governance went back to version {n} (this device saw {seen})"); }
+    OrgGov g = chain_from(c, mine, o, (UInt(64))1, (UInt(64))n, None)?;
+    _ = filesystem.write_all(dir + "/org.gov", f"{g.version}");
+    return Ok(g);
+}
+
+@requires(network, clock(readonly), declassify)
+Result(OrgGov, Str) chain_from(DeviceConfig c, VerifiedHead mine, OrgRef o, UInt(64) v, UInt(64) n, Option(OrgGov) prev) {
+    if (v > n) { return need(prev, "the server has no record of the organization"); }
+    OrgGov g = need(gov_of(blob_get(relay_ep(c), gov_blob(o.id, v)) else { [] }), f"the organization's governance version {v} is missing or does not decode")?;
+    if (!bytes_eq(g.org_id, o.id) || g.version != v || !bytes_eq(g.founder, o.founder) || !bytes_eq(org_id_of(g.founder, g.nonce), o.id)) {
+        return Err(f"the organization's governance version {v} is for another organization");
+    }
+    if (g.owners.len() == 0) { return Err(f"the organization's governance version {v} has no owner"); }
+    Bool may = match prev { None => bytes_eq(g.signer_log, o.founder), Some(p) => is_owner(p, g.signer_log) && bytes_eq(p.nonce, g.nonce) };
+    if (!may) { return Err(f"the organization's governance version {v} is not signed by an owner of the version before"); }
+    VerifiedHead h = head_of(c, mine, g.signer_log)?;
+    if (!signed_by(h, g.log_sequence, g.signer, gov_tbs(g), g.sig)) { return Err(f"the signature on the organization's governance version {v} does not verify"); }
+    return chain_from(c, mine, o, v + (UInt(64))1, n, Some(g));
+}
+
+// The organization as the server holds it, verified.
+@requires(filesystem, network, clock(readonly), declassify)
+pub Result(OrgState, Str) org_at(Str dir, DeviceConfig c, VerifiedHead mine) {
+    OrgRef o = need(org_ref(dir), "this device is in no organization (org join)")?;
+    OrgGov g = gov_chain(dir, c, mine, o)?;
+    Org r = need(org_of(blob_get(relay_ep(c), org_blob(o.id)) else { [] }), "the organization's membership record is missing or does not decode")?;
+    if (!bytes_eq(r.org_id, o.id)) { return Err("the membership record is for another organization"); }
+    if (r.gov_version != g.version) { return Err("the membership record is behind the organization's governance: an owner or administrator signs it again (org sync)"); }
+    if (!is_admin(g, r.signer_log)) { return Err("the membership record is not signed by an owner or administrator"); }
+    VerifiedHead h = head_of(c, mine, r.signer_log)?;
+    if (!signed_by(h, r.log_sequence, r.signer, org_tbs(r), r.sig)) { return Err("the membership record's signature does not verify"); }
+    Int seen = kept_version(dir + "/org.version");
+    if ((Int)r.version < seen) { return Err(f"the membership record went back to version {r.version} (this device saw {seen})"); }
+    _ = filesystem.write_all(dir + "/org.version", f"{r.version}");
+    _ = filesystem.write_all(dir + "/org.policy", (if (g.policy.allow_offline_copy) { "offline " } else { "no-offline " }) + (if (g.policy.allow_duress) { "duress" } else { "no-duress" }));
+    return Ok(OrgState {.gov = g, .org = r});
+}
+
+// What the last verified policy forbids this device for group folders:
+// "offline" or "duress".
+@requires(filesystem)
+pub Bool org_forbids(Str dir, Str what) { return str_contains(filesystem.read_all(dir + "/org.policy"), "no-" + what); }
+
+// The people of a group folder: the members of its groups, and every owner
+// and administrator (they re-key it when people leave, so they hold the key).
+pub List(Member) folder_people(OrgState st, List(List(Int)) groups) {
+    List(List(Int)) logs = st.gov.owners.concat(admin_logs(st.gov.admins, 0, ListBuf())).concat(group_logs(st.org.groups, groups, 0, ListBuf()));
+    return people_from(st.org.members, logs, 0, ListBuf());
+}
+
+List(List(Int)) admin_logs(List(OrgAdmin) xs, Int i, ListBuf(List(Int)) acc) {
+    if (i >= xs.len()) { return acc.finish(); }
+    return admin_logs(xs, i + 1, acc.push(xs[i].log_id));
+}
+
+List(List(Int)) group_logs(List(OrgGroup) gs, List(List(Int)) want, Int i, ListBuf(List(Int)) acc) {
+    if (i >= gs.len()) { return acc.finish(); }
+    return group_logs(gs, want, i + 1, if (has_log(want, gs[i].group_id)) { push_all(acc, gs[i].members, 0) } else { acc });
+}
+
+ListBuf(List(Int)) push_all(ListBuf(List(Int)) acc, List(List(Int)) xs, Int i) { return if (i >= xs.len()) { acc } else { push_all(acc.push(xs[i]), xs, i + 1) }; }
+
+// Each org member whose log is in `logs`, once, in the record's order.
+List(Member) people_from(List(OrgMember) ms, List(List(Int)) logs, Int i, ListBuf(Member) acc) {
+    if (i >= ms.len()) { return acc.finish(); }
+    return people_from(ms, logs, i + 1, if (has_log(logs, ms[i].log_id)) { acc.push(Member {.log_id = ms[i].log_id, .label = ms[i].label}) } else { acc });
+}
+
+pub List(Int) no_owner() { return zero_bytes(32, ListBuf()); }
+List(Int) zero_bytes(Int n, ListBuf(Int) acc) { return if (n <= 0) { acc.finish() } else { zero_bytes(n - 1, acc.push(0)) }; }
+
+// A group folder as a roster: its people as members, no owner (no one
+// adds or removes people by hand; the organization record decides).
+@requires(filesystem, network, clock(readonly), declassify)
+pub Result(Roster, Str) group_roster(Str dir, DeviceConfig c, VerifiedHead mine, Str cid, List(Int) b) {
+    GroupFolder f = need(gfolder_of(b), "the group folder does not decode")?;
+    if (!bytes_eq(f.coll_id, cose_hex_decode(cid))) { return Err("the group folder record is for another folder"); }
+    OrgState st = org_at(dir, c, mine)?;
+    if (!bytes_eq(f.org_id, st.org.org_id)) { return Err("the group folder is for another organization"); }
+    if (!is_admin(st.gov, f.signer_log)) { return Err("the group folder is not signed by an owner or administrator"); }
+    VerifiedHead h = head_of(c, mine, f.signer_log)?;
+    if (!signed_by(h, f.log_sequence, f.signer, gfolder_tbs(f), f.sig)) { return Err("the group folder's signature does not verify"); }
+    return Ok(Roster {.coll_id = f.coll_id, .version = f.version, .owner = no_owner(), .owner_label = "", .members = folder_people(st, f.groups), .name_ct = f.name_ct,
+                      .deleted = f.deleted, .log_sequence = f.log_sequence, .signer = f.signer, .sig = f.sig});
+}
+
+pub Bool is_group_roster(Roster r) { return bytes_eq(r.owner, no_owner()); }
