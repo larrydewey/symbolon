@@ -39,7 +39,8 @@ class ItemType {
   final IconData icon;
   final Color color;
   final List<FieldSpec> fields;
-  const ItemType(this.id, this.label, this.plural, this.icon, this.color, this.fields);
+  final bool editable;      // false: made and changed by its own commands (SSH keys), not the editor
+  const ItemType(this.id, this.label, this.plural, this.icon, this.color, this.fields, {this.editable = true});
 
   FieldSpec? field(String name) => fields.where((f) => f.name == name).firstOrNull;
 }
@@ -91,6 +92,13 @@ final itemTypes = <ItemType>[
     const FieldSpec('security', 'Security', hint: 'WPA2, WPA3, open'),
     _notes,
   ]),
+  // SSH keys (SPEC 16.1): made, imported and deleted on the SSH keys page;
+  // the private part never leaves the agent.
+  ItemType('ssh', 'SSH key', 'SSH keys', Icons.vpn_key_outlined, Colors.brown, [
+    const FieldSpec('public', 'Public key'),
+    const FieldSpec('kind', 'Kind'),
+    const FieldSpec('comment', 'Comment'),
+  ], editable: false),
   ItemType('secret', 'Secret', 'Secrets', Icons.key_outlined, Colors.deepPurple, [
     const FieldSpec('secret', 'Secret', input: Input.secret, required: true),
     _notes,

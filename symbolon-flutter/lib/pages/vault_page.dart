@@ -100,7 +100,7 @@ class _VaultPageState extends State<VaultPage> {
         child: SingleChildScrollView(
           child: Column(mainAxisSize: MainAxisSize.min, children: [
             ListTile(title: Text(share.isEmpty ? 'Add to your vault' : 'Add to the shared folder', style: Theme.of(ctx).textTheme.titleLarge)),
-            for (final t in itemTypes)
+            for (final t in itemTypes.where((t) => t.editable))
               ListTile(
                 key: Key('add-${t.id}'),
                 leading: TypeAvatar(t),

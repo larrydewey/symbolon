@@ -1,0 +1,255 @@
+// The SSH agent (SPEC 16.1): `symbolon ssh-agent DIR [SOCKET]`.
+//
+// It serves the agent protocol on a Unix socket the runtime keeps to this
+// user (resid_unix_*). It lists the keys of DIR/ssh-keys without the PIN.
+// For each signature it opens the consent window (the app run as
+// --ssh-consent REQUEST): the window shows the key, the program asking
+// (by its pid, read from SO_PEERCRED), what is signed and the server the
+// session is bound to, takes the PIN, signs with `symbolon device ssh
+// sign`, and sends back only the signature, on a per-request Unix socket
+// that must first receive the request's one-time token. The agent checks
+// the signature against the key before it answers. It holds no secret.
+
+import "sshwire.resid";
+import "../agent/sshcli.resid";
+import "../browser/json.resid";
+import "crypto.resid";
+import "word.resid";
+import "ecdsa.resid";
+import "ed25519.resid";
+import "rsa.resid";
+import "hash.resid";
+import "httpserv.resid";
+
+// ============================================================================
+// Checks
+// ============================================================================
+
+// Does `sig_blob` verify over `data` under the public key `blob`?
+pub Bool verifies(List(Int) blob, List(Int) data, List(Int) sig_blob) {
+    Option(SshPub) ok = pub_of_blob(blob);
+    SshPub k = ok else { no_pub() };
+    Int size = if (k.kind == "p384") { 48 } else { 32 };
+    Option(SigParts) os = sig_parts(sig_blob, size);
+    SigParts s = os else { SigParts {.alg = "", .sig = []} };
+    if (k.kind == "ed25519") { return s.alg == "ssh-ed25519" && verify_sig_bytes(data, s.sig, k.point); }
+    if (k.kind == "p256") { return s.alg == k.alg && ecdsa_verify_raw(P256, Sha256, k.point, data, s.sig); }
+    if (k.kind == "p384") { return s.alg == k.alg && ecdsa_verify_raw(P384, Sha384, k.point, data, s.sig); }
+    if (k.kind == "rsa") {
+        RsaPub r = rsa_pub(k.n, k.e);
+        if (s.alg == "rsa-sha2-256") { return rsa_pkcs1_verify(Sha256, r, data, s.sig); }
+        if (s.alg == "rsa-sha2-512") { return rsa_pkcs1_verify(Sha512, r, data, s.sig); }
+    }
+    return false;
+}
+
+// The session a client bound (session-bind@openssh.com), checked: the
+// host key's signature over the session identifier.
+pub type AgentSession = { List(Int) host_key; List(Int) session_id; Bool forwarding; Bool bound; };
+
+pub AgentSession unbound() { return AgentSession {.host_key = [], .session_id = [], .forwarding = false, .bound = false}; }
+
+pub Option(AgentSession) checked_bind(List(Int) body) {
+    Option(Bind) ob = bind_of(body);
+    return match ob {
+        None => None,
+        Some(b) => if (verifies(b.host_key, b.session_id, b.sig)) { Some(AgentSession {.host_key = b.host_key, .session_id = b.session_id, .forwarding = b.forwarding, .bound = true}) } else { None }
+    };
+}
+
+// Why a sign request is refused before anyone is asked, or "".
+pub Str refused(AgentSession s, List(Int) key, Signed w) {
+    if (w.kind == "auth" && hex_encode(w.key) != hex_encode(key)) { return "the request names another key"; }
+    if (w.kind == "auth" && s.bound && hex_encode(w.session_id) != hex_encode(s.session_id)) { return "the request is for another session than the one bound"; }
+    if (w.kind == "auth" && w.host_key.len() > 0 && s.bound && hex_encode(w.host_key) != hex_encode(s.host_key)) { return "the request names another server than the one bound"; }
+    return "";
+}
+
+// ============================================================================
+// The consent request
+// ============================================================================
+
+pub Str consent_json(SshEntry e, Signed w, AgentSession s, Int pid, List(Int) data, Str sock, Str token) {
+    Str what = if (w.kind == "auth") { "{\"kind\":\"auth\",\"user\":" + json_quote(w.user) + "}" }
+               else { if (w.kind == "sshsig") { "{\"kind\":\"sshsig\",\"namespace\":" + json_quote(w.namespace) + "}" } else { "{\"kind\":\"unknown\"}" } };
+    Str host = if (s.bound) { "{\"key\":" + json_quote(base64_encode(s.host_key)) + ",\"fingerprint\":" + json_quote(ssh_fingerprint(s.host_key)) + ",\"forwarding\":" + (if (s.forwarding) { "true" } else { "false" }) + "}" } else { "null" };
+    Option(List(Int)) ob = ssh_blob_of_line(e.line);
+    List(Int) blob = ob else { [] };
+    return "{\"key\":" + json_quote(e.name) + ",\"fingerprint\":" + json_quote(ssh_fingerprint(blob)) + ",\"what\":" + what + ",\"host\":" + host
+        + ",\"pid\":" + f"{pid}" + ",\"data\":" + json_quote(hex_encode(data)) + ",\"socket\":" + json_quote(sock) + ",\"token\":" + json_quote(token) + "}";
+}
+
+Bool shell_safe(Str s) { return str_len(s) > 0 && !str_contains(s, "'") && !str_contains(s, "\n"); }
+Bool word_safe(Str s) { return shell_safe(s) && !str_contains(s, " "); }
+
+@requires(clock)
+Bool nap(Int ms) { _ = clock.sleep_ns(ms * 1000000); return true; }
+
+Bool has_nl(List(Int) b, Int i) {
+    if (i >= b.len()) { return false; }
+    if (b[i] == 10) { return true; }
+    return has_nl(b, i + 1);
+}
+
+@requires(network)
+List(Int) read_line_from(Int fd, List(Int) acc, Int cap) {
+    if (acc.len() > cap || has_nl(acc, 0)) { return acc; }
+    List(Int) chunk = resid_unix_recv_some(fd, 65536);
+    if (chunk.len() == 0) { return acc; }
+    return read_line_from(fd, acc.concat(chunk), cap);
+}
+
+// The window's connection: the first that sends "TOKEN\n" within two
+// seconds of connecting (others are dropped); about `tries` tenths of a
+// second in all.
+@requires(network, clock)
+Int accept_token(Int l, Str token, Int tries) {
+    if (tries <= 0) { return -1; }
+    Int c = resid_unix_accept_now(l);
+    if (c < 0) {
+        _ = nap(100);
+        return accept_token(l, token, tries - 1);
+    }
+    _ = resid_unix_deadline(c, 2000);
+    List(Int) h = read_line_from(c, [], 4096);
+    if (http_text(h, 0, h.len()) == token + "\n") { return c; }
+    _ = resid_unix_close(c);
+    return accept_token(l, token, tries - 20);
+}
+
+// The signature the window sends ("ok HEX\n"), [] for cancel or nothing.
+@requires(filesystem, network, clock, process, environment)
+pub List(Int) ask_window(SshEntry e, Signed w, AgentSession s, Int pid, List(Int) data, Str rt) {
+    Str ui = environment.get("SYMBOLON_CONSENT");
+    if (!shell_safe(ui) || !word_safe(rt)) { return []; }
+    Str base = rt + "/symbolon/sign-" + hex_encode(random_bytes(8));
+    Str sock = base + ".sock";
+    Int l = resid_unix_listen(sock);
+    if (l < 0) { return []; }
+    Str token = hex_encode(random_bytes(32));
+    Str req = base + ".json";
+    Str sh = base + ".sh";
+    _ = filesystem.write_secret(req, json_utf8(consent_json(e, w, s, pid, data, sock, token)));
+    _ = filesystem.write_secret(sh, json_utf8("exec '" + ui + "' --ssh-consent '" + req + "' </dev/null >/dev/null 2>&1\n"));
+    Int started = process.run("setsid -f sh " + sh);
+    Int c = if (started == 0) { accept_token(l, token, 600) } else { -1 };
+    _ = process.run("rm -f " + sh);
+    _ = resid_unix_close(l);
+    if (c < 0) { _ = process.run("rm -f " + req); return []; }
+    _ = resid_unix_deadline(c, 300000);
+    List(Int) ans = read_line_from(c, [], 262144);
+    _ = resid_unix_close(c);
+    _ = process.run("rm -f " + req);
+    Str t = str_trim(http_text(ans, 0, ans.len()));
+    if (!str_starts_with(t, "ok ")) { return []; }
+    Str hx = str_slice(t, 3, str_len(t));
+    return if (str_len(hx) % 2 == 0 && str_len(hx) > 0) { cose_hex_decode(hx) } else { [] };
+}
+
+// ============================================================================
+// Messages
+// ============================================================================
+
+Option(SshEntry) entry_for(List(SshEntry) es, List(Int) blob, Int i) {
+    if (i >= es.len()) { return None; }
+    Option(List(Int)) b = ssh_blob_of_line(es[i].line);
+    List(Int) eb = b else { [] };
+    if (hex_encode(eb) == hex_encode(blob)) { return Some(es[i]); }
+    return entry_for(es, blob, i + 1);
+}
+
+List(Ident) idents_of(List(SshEntry) es, Int i, List(Ident) acc) {
+    if (i >= es.len()) { return acc; }
+    Option(List(Int)) b = ssh_blob_of_line(es[i].line);
+    return idents_of(es, i + 1, match b { None => acc, Some(x) => acc.concat([Ident {.blob = x, .comment = es[i].name}]) });
+}
+
+pub List(Int) failure() { return agent_msg(msg_failure(), []); }
+
+pub type Reply = { List(Int) out; AgentSession s; };
+
+@requires(filesystem, network, clock, process, environment)
+pub Reply answer(Str dir, Str rt, Int pid, AgentSession s, Int t, List(Int) body) {
+    if (t == msg_request_identities()) { return Reply {.out = identities_answer(idents_of(read_index(dir), 0, [])), .s = s}; }
+    if (t == msg_extension()) {
+        Option(AgentSession) b = checked_bind(body);
+        return match b { None => Reply {.out = failure(), .s = s}, Some(x) => Reply {.out = agent_msg(msg_success(), []), .s = x} };
+    }
+    if (t == msg_sign_request()) { return Reply {.out = sign_reply(dir, rt, pid, s, body), .s = s}; }
+    return Reply {.out = failure(), .s = s};
+}
+
+@requires(filesystem, network, clock, process, environment)
+List(Int) sign_reply(Str dir, Str rt, Int pid, AgentSession s, List(Int) body) {
+    Option(SignReq) or = sign_req_of(body);
+    SignReq r = or else { SignReq {.key = [], .data = [], .flags = 0} };
+    Option(SshEntry) oe = entry_for(read_index(dir), r.key, 0);
+    SshEntry e = oe else { SshEntry {.name = "", .line = ""} };
+    if (str_len(e.name) == 0) { return failure(); }
+    Signed w = signed_of(r.data);
+    if (str_len(refused(s, r.key, w)) > 0) { return failure(); }
+    List(Int) sig = ask_window(e, w, s, pid, r.data, rt);
+    if (sig.len() == 0 || !verifies(r.key, r.data, sig)) { return failure(); }
+    return agent_msg(msg_sign_response(), sstring(sig));
+}
+
+// ============================================================================
+// Connections
+// ============================================================================
+
+// The next message's type and body, or type -1 at EOF, on a bad length or
+// after `idle` ms without one.
+pub type Msg = { Int t; List(Int) body; };
+
+@requires(network)
+List(Int) read_exact(Int fd, Int n, List(Int) acc) {
+    if (acc.len() >= n) { return acc; }
+    List(Int) chunk = resid_unix_recv_some(fd, n - acc.len());
+    if (chunk.len() == 0) { return acc; }
+    return read_exact(fd, n, acc.concat(chunk));
+}
+
+@requires(network)
+Msg read_msg(Int fd) {
+    _ = resid_unix_deadline(fd, 30000);
+    Int n = msg_len(read_exact(fd, 4, []));
+    if (n < 0) { return Msg {.t = -1, .body = []}; }
+    List(Int) b = read_exact(fd, n, []);
+    if (b.len() != n) { return Msg {.t = -1, .body = []}; }
+    return Msg {.t = b[0], .body = b[1..n]};
+}
+
+@requires(filesystem, network, clock, process, environment)
+Int serve_conn(Str dir, Str rt, Int fd, Int pid, AgentSession s) {
+    Msg m = read_msg(fd);
+    if (m.t < 0) { return 0; }
+    Reply r = answer(dir, rt, pid, s, m.t, m.body);
+    if (!resid_unix_send(fd, r.out)) { return 0; }
+    return serve_conn(dir, rt, fd, pid, r.s);
+}
+
+// One connection at a time; the loop carries only scalars and strings.
+@requires(filesystem, network, clock, process, environment)
+Int agent_loop(Str dir, Str rt, Int l) {
+    Int c = resid_unix_accept(l);
+    if (c < 0) { return 1; }
+    List(Int) peer = resid_unix_peer(c);
+    Int pid = if (peer.len() == 3) { peer[0] } else { 0 };
+    _ = serve_conn(dir, rt, c, pid, unbound());
+    _ = resid_unix_close(c);
+    return agent_loop(dir, rt, l);
+}
+
+// `symbolon ssh-agent DIR [SOCKET]`
+@requires(filesystem, network, clock, process, environment)
+pub Int ssh_agent(Str dir, Str sock0) {
+    Str rt = environment.get("XDG_RUNTIME_DIR");
+    if (!word_safe(rt)) { eprintln("ssh-agent: XDG_RUNTIME_DIR is not set (the per-user runtime directory)"); return 2; }
+    Str sock = if (str_len(sock0) > 0) { sock0 } else { rt + "/symbolon/ssh-agent.sock" };
+    Int l = resid_unix_listen(sock);
+    if (l == -2) { eprintln("ssh-agent: another agent answers on " + sock); return 1; }
+    if (l == -3) { eprintln("ssh-agent: " + sock + " is in a directory others can reach, or a file that is not this user's socket is there"); return 1; }
+    if (l < 0) { eprintln("ssh-agent: cannot listen on " + sock); return 1; }
+    println("SSH_AUTH_SOCK=" + sock + "; export SSH_AUTH_SOCK;");
+    return agent_loop(dir, rt, l);
+}

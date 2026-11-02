@@ -11,6 +11,7 @@ import 'org_page.dart';
 import 'recovery_page.dart';
 import 'settings_page.dart';
 import 'sharing_page.dart';
+import 'ssh_page.dart';
 import 'setup_page.dart';
 import 'tutorial_page.dart';
 
@@ -47,6 +48,14 @@ class MorePage extends StatelessWidget {
             subtitle: const Text('Your company: people, invites, recovery'),
             trailing: const Icon(Icons.chevron_right),
             onTap: () => open(OrgPage(app: app)),
+          ),
+          ListTile(
+            key: const Key('open-ssh'),
+            leading: const Icon(Icons.vpn_key_outlined),
+            title: const Text('SSH keys'),
+            subtitle: const Text('For ssh and git, through the Symbolon agent'),
+            trailing: const Icon(Icons.chevron_right),
+            onTap: () => open(SshPage(app: app)),
           ),
           ListTile(
             key: const Key('open-import'),

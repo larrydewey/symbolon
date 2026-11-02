@@ -7,6 +7,7 @@ import 'package:flutter/services.dart';
 
 import 'app.dart';
 import 'fill_consent.dart';
+import 'ssh_consent.dart';
 import 'pages/home_page.dart';
 import 'pages/more_page.dart';
 import 'pages/passkeys_page.dart';
@@ -18,6 +19,8 @@ import 'settings.dart';
 Future<void> main(List<String> args) async {
   // The browser extension's fill request (SPEC 22.5), opened by the agent.
   if (args.length == 2 && args[0] == '--fill-consent') return runFillConsent(args[1]);
+  // The SSH agent's signature request (SPEC 16.1).
+  if (args.length == 2 && args[0] == '--ssh-consent') return runSshConsent(args[1]);
   WidgetsFlutterBinding.ensureInitialized();
   runApp(SymbolonApp(settings: await loadSettings()));
 }

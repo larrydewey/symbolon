@@ -240,6 +240,24 @@ class SymbolonCli {
   Future<CliResult> rotate(String dir, String name, String bundle, String repo, String pin, {String chromium = '', String share = ''}) =>
       run(['device', 'rotate', dir, name, bundle, repo, if (chromium.isNotEmpty) chromium, ..._in(share)], input: [pin], timeout: const Duration(minutes: 15));
 
+  // ─── SSH keys (SPEC 16.1) ───────────────────────────────────────────
+
+  /// "NAME-HEX PUBLIC-LINE" per key (no PIN).
+  Future<CliResult> sshList(String dir) => run(['device', 'ssh', 'list', dir], timeout: const Duration(minutes: 1));
+
+  /// A threshold key; prints its public line.
+  Future<CliResult> sshNew(String dir, String name, String pin) => run(['device', 'ssh', 'new', dir, name], input: [pin], timeout: const Duration(minutes: 5));
+
+  /// [passphrase] for a key file that has one.
+  Future<CliResult> sshImport(String dir, String name, String file, String pin, {String passphrase = ''}) =>
+      run(['device', 'ssh', 'import', dir, name, file], input: [pin, if (passphrase.isNotEmpty) passphrase], timeout: const Duration(minutes: 5));
+
+  Future<CliResult> sshDelete(String dir, String name, String pin) => run(['device', 'ssh', 'delete', dir, name], input: [pin], timeout: const Duration(minutes: 5));
+
+  /// Prints "signature BLOB-HEX" for [dataHex].
+  Future<CliResult> sshSign(String dir, String name, String dataHex, String pin) =>
+      run(['device', 'ssh', 'sign', dir, name], input: [pin, dataHex], timeout: const Duration(minutes: 5));
+
   // ─── Devices and recovery ───────────────────────────────────────────
 
   Future<CliResult> enroll(String dir, String newKeys, String pin, {String primes = ''}) =>

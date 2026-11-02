@@ -960,6 +960,65 @@ duress windows effect even for Bound credentials.
 - SSH and code-signing keys: Threshold or Bound profile, used through the
   agent's SSH-agent endpoint; never written to disk in the clear.
 
+### 16.1 SSH agent
+
+`symbolon ssh-agent DIR` serves the SSH agent protocol
+(draft-ietf-sshm-ssh-agent) on a Unix socket, by default
+`$XDG_RUNTIME_DIR/symbolon/ssh-agent.sock`. The runtime makes the socket
+0600 in a 0700 directory owned by the principal, refuses another user's
+connections by `SO_PEERCRED`, and opens it close-on-exec (Resid
+`resid_unix_*`). The principal points `SSH_AUTH_SOCK` at the socket.
+
+**Keys.** Two kinds, both kept as `ssh` items in the vault:
+
+- *Threshold* (`device ssh new`): an `ecdsa-sha2-nistp256` key made by
+  the quorum like a passkey (Section 10), under the relying-party label
+  `ssh:NAME`. No party holds the private key. Each signature is a
+  threshold signature with the cosigner over SHA-256 of the data, so
+  revoking a device (Section 11) revokes its part of every SSH key, with
+  no change at any server.
+- *Imported* (`device ssh import`): an existing OpenSSH private key
+  (`ssh-ed25519`, `ecdsa-sha2-nistp256` or `ecdsa-sha2-nistp384`),
+  unencrypted or protected by a passphrase (bcrypt-pbkdf with
+  aes128/192/256-ctr, ssh-keygen's default; bcrypt is not constant time,
+  and runs once, at import). Its private part is sealed in the vault like
+  any secret field and is opened only inside the process that signs
+  (`device ssh sign`), as `Secret` bytes. The file is not removed; the
+  principal is told to delete it. Not yet: RSA keys (signing needs a
+  constant-time big-number layer in Resid).
+
+The public keys, with their names, are also written to `DIR/ssh-keys`, so
+`REQUEST_IDENTITIES` is answered without the PIN.
+
+**Signing.** A `SIGN_REQUEST` opens the consent window (the app run with
+`--ssh-consent REQUEST`) for each signature. The window shows:
+
+- the key's name;
+- the program asking: the executable and command line of the peer
+  process, from `SO_PEERCRED` and `/proc`;
+- what is being signed. The data is parsed as an SSH user-authentication
+  request (the user name and the key algorithm), or as an `SSHSIG`
+  signature with its namespace (`git` for commits and tags, `file`, ...),
+  or else marked unrecognized;
+- the server, when the client bound the session with
+  `session-bind@openssh.com`. The agent checks the host key's signature
+  over the session identifier before it shows the host key's fingerprint
+  and the names `~/.ssh/known_hosts` gives it (hashed entries are matched
+  against the host names in the caller's command line). A
+  user-authentication request whose session identifier, or whose server
+  host key (`publickey-hostbound-v00@openssh.com`), differs from the bound
+  session's is refused. A forwarded agent request is marked and warned
+  about.
+
+The window takes the PIN and runs `symbolon device ssh sign`, which opens
+the item and signs. Only the signature, which is public, goes back to the
+agent, on a per-request Unix socket that requires the request's one-time
+token; the agent checks the signature against the key before the client
+gets it. Each signature takes the PIN. The agent refuses `ADD_IDENTITY`, `REMOVE_IDENTITY`, `LOCK` and the smartcard
+messages: keys are managed in Symbolon, not added through `ssh-add`.
+Connections are served one at a time, each with a 30-second idle limit
+outside a pending consent.
+
 ---
 
 ## 17. Attribute presentation and verifier-constrained release

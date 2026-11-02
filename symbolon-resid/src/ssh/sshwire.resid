@@ -1,0 +1,351 @@
+// SSH formats for the agent (SPEC 16.1): the wire types of RFC 4251, key
+// and signature blobs (RFC 5656, RFC 8709, RFC 8332), the OpenSSH private
+// key file (PROTOCOL.key), the agent's messages (draft-ietf-sshm-ssh-agent),
+// and the two kinds of data an agent is asked to sign: a user
+// authentication request (RFC 4252 7) and an SSHSIG blob (PROTOCOL.sshsig).
+// Every parser is total: a truncated or malformed input gives None.
+
+import "crypto.resid";
+import "word.resid";
+import "httpserv.resid";
+import "../vault/vault.resid";
+
+// ============================================================================
+// Wire types
+// ============================================================================
+
+pub List(Int) u32_be(Int n) { return [(n >> 24) & 255, (n >> 16) & 255, (n >> 8) & 255, n & 255]; }
+pub List(Int) sstring(List(Int) b) { return u32_be(b.len()).concat(b); }
+pub List(Int) sstr(Str s) { return sstring(utf8(s)); }
+
+// An mpint from big-endian magnitude bytes: no leading zeros, a zero byte
+// before a set top bit.
+pub List(Int) mpint(List(Int) be) {
+    List(Int) t = strip0(be, 0);
+    if (t.len() == 0) { return u32_be(0); }
+    return sstring(if (t[0] >= 128) { [0].concat(t) } else { t });
+}
+
+List(Int) strip0(List(Int) b, Int i) {
+    if (i < b.len() && b[i] == 0) { return strip0(b, i + 1); }
+    return b[i..b.len()];
+}
+
+// A reader over bytes: the position, or -1 once anything was malformed.
+pub type SshRd = { List(Int) b; Int at; };
+pub type SshGot = { SshRd r; List(Int) v; };
+
+pub SshRd ssh_rd(List(Int) b) { return SshRd {.b = b, .at = 0}; }
+pub Bool ssh_ok(SshRd r) { return r.at >= 0; }
+pub Bool ssh_done(SshRd r) { return r.at == r.b.len(); }
+SshRd bad(SshRd r) { return SshRd {.b = r.b, .at = -1}; }
+
+pub SshGot ssh_take(SshRd r, Int n) {
+    if (r.at < 0 || n < 0 || r.at + n > r.b.len()) { return SshGot {.r = bad(r), .v = []}; }
+    return SshGot {.r = SshRd {.b = r.b, .at = r.at + n}, .v = r.b[r.at..r.at + n]};
+}
+
+pub Int ssh_be(List(Int) b) {
+    if (b.len() != 4) { return -1; }
+    return (b[0] << 24) | (b[1] << 16) | (b[2] << 8) | b[3];
+}
+
+pub SshGot ssh_u32(SshRd r) { return ssh_take(r, 4); }
+
+// A string (uint32 length, then the bytes), at most 1 MiB.
+pub SshGot ssh_str(SshRd r) {
+    SshGot n = ssh_take(r, 4);
+    Int len = ssh_be(n.v);
+    if (!ssh_ok(n.r) || len > 1048576) { return SshGot {.r = bad(r), .v = []}; }
+    return ssh_take(n.r, len);
+}
+
+pub Str ssh_text(List(Int) b) { return http_text(b, 0, b.len()); }
+
+// ============================================================================
+// Keys and signatures
+// ============================================================================
+
+// A public key: its algorithm name and blob. kind is "ed25519", "p256",
+// "p384" or "rsa"; point is the Ed25519 key or the uncompressed EC point;
+// for RSA, e and n are the big-endian magnitudes.
+pub type SshPub = { Str kind; Str alg; List(Int) blob; List(Int) point; List(Int) e; List(Int) n; };
+
+pub SshPub no_pub() { return SshPub {.kind = "", .alg = "", .blob = [], .point = [], .e = [], .n = []}; }
+
+pub List(Int) ed25519_blob(List(Int) pk) { return sstr("ssh-ed25519").concat(sstring(pk)); }
+pub List(Int) ecdsa_blob(Str curve, List(Int) q) { return sstr("ecdsa-sha2-" + curve).concat(sstr(curve)).concat(sstring(q)); }
+pub List(Int) rsa_blob(List(Int) e, List(Int) n) { return sstr("ssh-rsa").concat(mpint(e)).concat(mpint(n)); }
+
+pub Option(SshPub) pub_of_blob(List(Int) blob) {
+    SshGot a = ssh_str(ssh_rd(blob));
+    Str alg = ssh_text(a.v);
+    if (alg == "ssh-ed25519") {
+        SshGot k = ssh_str(a.r);
+        if (!ssh_ok(k.r) || !ssh_done(k.r) || k.v.len() != 32) { return None; }
+        return Some(SshPub {.kind = "ed25519", .alg = alg, .blob = blob, .point = k.v, .e = [], .n = []});
+    }
+    if (alg == "ecdsa-sha2-nistp256" || alg == "ecdsa-sha2-nistp384") {
+        SshGot c = ssh_str(a.r);
+        SshGot q = ssh_str(c.r);
+        Str curve = str_slice(alg, 11, str_len(alg));
+        Int qlen = if (curve == "nistp256") { 65 } else { 97 };
+        if (!ssh_ok(q.r) || !ssh_done(q.r) || ssh_text(c.v) != curve || q.v.len() != qlen || q.v[0] != 4) { return None; }
+        return Some(SshPub {.kind = if (curve == "nistp256") { "p256" } else { "p384" }, .alg = alg, .blob = blob, .point = q.v, .e = [], .n = []});
+    }
+    if (alg == "ssh-rsa") {
+        SshGot e = ssh_str(a.r);
+        SshGot n = ssh_str(e.r);
+        if (!ssh_ok(n.r) || !ssh_done(n.r) || e.v.len() == 0 || n.v.len() < 128) { return None; }
+        return Some(SshPub {.kind = "rsa", .alg = alg, .blob = blob, .point = [], .e = strip0(e.v, 0), .n = strip0(n.v, 0)});
+    }
+    return None;
+}
+
+// SHA256:BASE64 without padding, as ssh-keygen -l prints it.
+pub Str ssh_fingerprint(List(Int) blob) {
+    Str b = base64_encode(sha256_bytes(blob));
+    return "SHA256:" + str_replace(b, "=", "");
+}
+
+// An authorized_keys line.
+pub Str ssh_pub_line(List(Int) blob, Str comment) {
+    Str alg = ssh_text(ssh_str(ssh_rd(blob)).v);
+    return alg + " " + base64_encode(blob) + if (str_len(comment) > 0) { " " + comment } else { "" };
+}
+
+// The blob from an authorized_keys line ("ALG BASE64 [comment]").
+pub Option(List(Int)) ssh_blob_of_line(Str line) {
+    List(Str) p = str_split(str_trim(line), " ");
+    if (p.len() < 2) { return None; }
+    List(Int) b = base64_decode(p[1]);
+    Option(SshPub) k = pub_of_blob(b);
+    return match k { None => None, Some(x) => if (x.alg == p[0]) { Some(b) } else { None } };
+}
+
+pub List(Int) ed25519_sig_blob(List(Int) sig) { return sstr("ssh-ed25519").concat(sstring(sig)); }
+
+// r || s (each the curve's size) as an ECDSA signature blob.
+pub List(Int) ecdsa_sig_blob(Str curve, List(Int) rs) {
+    Int h = rs.len() / 2;
+    return sstr("ecdsa-sha2-" + curve).concat(sstring(mpint(rs[0..h]).concat(mpint(rs[h..rs.len()]))));
+}
+
+pub List(Int) rsa_sig_blob(Str alg, List(Int) sig) { return sstr(alg).concat(sstring(sig)); }
+
+// The signature algorithm and the signature bytes of a blob; for ECDSA the
+// bytes are r || s, each padded to `size`.
+pub type SigParts = { Str alg; List(Int) sig; };
+
+pub Option(SigParts) sig_parts(List(Int) blob, Int size) {
+    SshGot a = ssh_str(ssh_rd(blob));
+    SshGot s = ssh_str(a.r);
+    if (!ssh_ok(s.r) || !ssh_done(s.r)) { return None; }
+    Str alg = ssh_text(a.v);
+    if (!str_starts_with(alg, "ecdsa-sha2-")) { return Some(SigParts {.alg = alg, .sig = s.v}); }
+    SshGot r = ssh_str(ssh_rd(s.v));
+    SshGot t = ssh_str(r.r);
+    if (!ssh_ok(t.r) || !ssh_done(t.r) || r.v.len() > size + 1 || t.v.len() > size + 1) { return None; }
+    return Some(SigParts {.alg = alg, .sig = ssh_pad(strip0(r.v, 0), size).concat(ssh_pad(strip0(t.v, 0), size))});
+}
+
+pub List(Int) ssh_pad(List(Int) b, Int n) {
+    if (b.len() >= n) { return b; }
+    return ssh_pad([0].concat(b), n);
+}
+
+// ============================================================================
+// OpenSSH private keys (PROTOCOL.key)
+// ============================================================================
+
+// The parts of the file before decryption.
+pub type KeyFile = { Str cipher; Str kdf; List(Int) kdf_opts; List(Int) pub_blob; List(Int) sealed; };
+
+Str pem_body(List(Str) ls, Int i, Bool inside, Str acc) {
+    if (i >= ls.len()) { return ""; }
+    Str l = str_trim(ls[i]);
+    if (l == "-----BEGIN OPENSSH PRIVATE KEY-----") { return pem_body(ls, i + 1, true, ""); }
+    if (l == "-----END OPENSSH PRIVATE KEY-----") { return if (inside) { acc } else { "" }; }
+    return pem_body(ls, i + 1, inside, if (inside) { acc + l } else { acc });
+}
+
+pub Option(KeyFile) key_file_of(Str text) {
+    Str body = pem_body(str_split(text, "\n"), 0, false, "");
+    if (str_len(body) == 0) { return None; }
+    List(Int) b = base64_decode(body);
+    List(Int) magic = utf8("openssh-key-v1").concat([0]);
+    SshGot m = ssh_take(ssh_rd(b), magic.len());
+    if (!ssh_ok(m.r) || hex_encode(m.v) != hex_encode(magic)) { return None; }
+    SshGot c = ssh_str(m.r);
+    SshGot k = ssh_str(c.r);
+    SshGot o = ssh_str(k.r);
+    SshGot n = ssh_u32(o.r);
+    if (ssh_be(n.v) != 1) { return None; }
+    SshGot p = ssh_str(n.r);
+    SshGot s = ssh_str(p.r);
+    if (!ssh_ok(s.r) || !ssh_done(s.r)) { return None; }
+    return Some(KeyFile {.cipher = ssh_text(c.v), .kdf = ssh_text(k.v), .kdf_opts = o.v, .pub_blob = p.v, .sealed = s.v});
+}
+
+// A private key: its public half, the private bytes (the Ed25519 seed or
+// the EC scalar in `secret`; for RSA d, p, q and iqmp), and the comment.
+pub type SshPriv = { SshPub pub; List(Secret(UInt(8))) secret; List(Secret(UInt(8))) d; List(Secret(UInt(8))) p; List(Secret(UInt(8))) q; List(Secret(UInt(8))) iqmp; Str comment; };
+
+// The decrypted section: two equal check words, one key, a comment, then
+// padding 1, 2, 3, ... Its bytes are secret; the parse reads lengths and
+// the algorithm name (public) and keeps the key material as Secret.
+pub Option(SshPriv) priv_of_section(List(Int) b, List(Int) pub_blob) {
+    SshGot c1 = ssh_u32(ssh_rd(b));
+    SshGot c2 = ssh_u32(c1.r);
+    if (!ssh_ok(c2.r) || hex_encode(c1.v) != hex_encode(c2.v)) { return None; }
+    SshGot a = ssh_str(c2.r);
+    Str alg = ssh_text(a.v);
+    Option(SshPub) op = pub_of_blob(pub_blob);
+    SshPub pk = op else { no_pub() };
+    if (pk.alg != alg) { return None; }
+    if (alg == "ssh-ed25519") {
+        SshGot p = ssh_str(a.r);
+        SshGot s = ssh_str(p.r);
+        SshGot cm = ssh_str(s.r);
+        if (!ssh_ok(cm.r) || s.v.len() != 64 || hex_encode(p.v) != hex_encode(pk.point) || !padding_ok(cm.r)) { return None; }
+        return Some(SshPriv {.pub = pk, .secret = secret_bytes(s.v[0..32]), .d = [], .p = [], .q = [], .iqmp = [], .comment = ssh_text(cm.v)});
+    }
+    if (pk.kind == "p256" || pk.kind == "p384") {
+        SshGot cv = ssh_str(a.r);
+        SshGot q = ssh_str(cv.r);
+        SshGot d = ssh_str(q.r);
+        SshGot cm = ssh_str(d.r);
+        Int size = if (pk.kind == "p256") { 32 } else { 48 };
+        List(Int) dd = strip0(d.v, 0);
+        if (!ssh_ok(cm.r) || dd.len() > size || hex_encode(q.v) != hex_encode(pk.point) || !padding_ok(cm.r)) { return None; }
+        return Some(SshPriv {.pub = pk, .secret = secret_bytes(ssh_pad(dd, size)), .d = [], .p = [], .q = [], .iqmp = [], .comment = ssh_text(cm.v)});
+    }
+    if (alg == "ssh-rsa") {
+        SshGot n = ssh_str(a.r);
+        SshGot e = ssh_str(n.r);
+        SshGot d = ssh_str(e.r);
+        SshGot iq = ssh_str(d.r);
+        SshGot p = ssh_str(iq.r);
+        SshGot q = ssh_str(p.r);
+        SshGot cm = ssh_str(q.r);
+        if (!ssh_ok(cm.r) || hex_encode(strip0(n.v, 0)) != hex_encode(pk.n) || hex_encode(strip0(e.v, 0)) != hex_encode(pk.e) || !padding_ok(cm.r)) { return None; }
+        return Some(SshPriv {.pub = pk, .secret = [], .d = secret_bytes(strip0(d.v, 0)), .p = secret_bytes(strip0(p.v, 0)), .q = secret_bytes(strip0(q.v, 0)), .iqmp = secret_bytes(strip0(iq.v, 0)), .comment = ssh_text(cm.v)});
+    }
+    return None;
+}
+
+// What is left is 1, 2, 3, ... (fewer than the cipher's block size).
+Bool padding_ok(SshRd r) {
+    if (r.at < 0) { return false; }
+    return pad_from(r.b, r.at, 1) && r.b.len() - r.at < 16;
+}
+Bool pad_from(List(Int) b, Int i, Int k) {
+    if (i >= b.len()) { return true; }
+    if (b[i] != k) { return false; }
+    return pad_from(b, i + 1, k + 1);
+}
+
+// ============================================================================
+// Agent messages
+// ============================================================================
+
+pub Int msg_failure() { return 5; }
+pub Int msg_success() { return 6; }
+pub Int msg_request_identities() { return 11; }
+pub Int msg_identities_answer() { return 12; }
+pub Int msg_sign_request() { return 13; }
+pub Int msg_sign_response() { return 14; }
+pub Int msg_extension() { return 27; }
+
+pub Int flag_rsa_sha2_256() { return 2; }
+pub Int flag_rsa_sha2_512() { return 4; }
+
+// A message on the wire: length, then type and body.
+pub List(Int) agent_msg(Int t, List(Int) body) { return u32_be(body.len() + 1).concat([t]).concat(body); }
+
+// The length of the next message from its four-byte header; -1 if over
+// 256 KiB (the draft's limit).
+pub Int msg_len(List(Int) h) {
+    Int n = ssh_be(h);
+    return if (n < 1 || n > 262144) { -1 } else { n };
+}
+
+pub type Ident = { List(Int) blob; Str comment; };
+
+pub List(Int) identities_answer(List(Ident) ks) {
+    return agent_msg(msg_identities_answer(), u32_be(ks.len()).concat(idents(ks, 0, ListBuf()).finish()));
+}
+ListBuf(Int) idents(List(Ident) ks, Int i, ListBuf(Int) acc) {
+    if (i >= ks.len()) { return acc; }
+    return idents(ks, i + 1, push_all(push_all(acc, sstring(ks[i].blob), 0), sstr(ks[i].comment), 0));
+}
+ListBuf(Int) push_all(ListBuf(Int) acc, List(Int) b, Int i) {
+    if (i >= b.len()) { return acc; }
+    return push_all(acc.push(b[i]), b, i + 1);
+}
+
+pub type SignReq = { List(Int) key; List(Int) data; Int flags; };
+
+pub Option(SignReq) sign_req_of(List(Int) body) {
+    SshGot k = ssh_str(ssh_rd(body));
+    SshGot d = ssh_str(k.r);
+    SshGot f = ssh_u32(d.r);
+    if (!ssh_ok(f.r) || !ssh_done(f.r)) { return None; }
+    return Some(SignReq {.key = k.v, .data = d.v, .flags = ssh_be(f.v)});
+}
+
+// session-bind@openssh.com: the server's host key, the session
+// identifier, the host key's signature over it, and whether the request
+// came through a forwarded agent.
+pub type Bind = { List(Int) host_key; List(Int) session_id; List(Int) sig; Bool forwarding; };
+
+pub Option(Bind) bind_of(List(Int) body) {
+    SshGot n = ssh_str(ssh_rd(body));
+    if (!ssh_ok(n.r) || ssh_text(n.v) != "session-bind@openssh.com") { return None; }
+    SshGot h = ssh_str(n.r);
+    SshGot s = ssh_str(h.r);
+    SshGot g = ssh_str(s.r);
+    SshGot f = ssh_take(g.r, 1);
+    if (!ssh_ok(f.r) || !ssh_done(f.r) || f.v[0] > 1) { return None; }
+    return Some(Bind {.host_key = h.v, .session_id = s.v, .sig = g.v, .forwarding = f.v[0] == 1});
+}
+
+pub Str extension_name(List(Int) body) { return ssh_text(ssh_str(ssh_rd(body)).v); }
+
+// ============================================================================
+// What is signed
+// ============================================================================
+
+// A user authentication request (RFC 4252 7, and OpenSSH's
+// publickey-hostbound-v00@openssh.com, which adds the server's host key):
+// kind "auth"; an SSHSIG blob: kind "sshsig" with its namespace; else
+// kind "".
+pub type Signed = { Str kind; List(Int) session_id; Str user; Str service; Str alg; List(Int) key; List(Int) host_key; Str namespace; };
+
+pub Signed nothing_known() { return Signed {.kind = "", .session_id = [], .user = "", .service = "", .alg = "", .key = [], .host_key = [], .namespace = ""}; }
+
+pub Signed signed_of(List(Int) d) {
+    List(Int) magic = utf8("SSHSIG");
+    if (d.len() > 6 && hex_encode(d[0..6]) == hex_encode(magic)) {
+        SshGot ns = ssh_str(SshRd {.b = d, .at = 6});
+        SshGot rs = ssh_str(ns.r);
+        SshGot ha = ssh_str(rs.r);
+        SshGot h = ssh_str(ha.r);
+        if (!ssh_ok(h.r) || !ssh_done(h.r) || str_len(ssh_text(ns.v)) == 0) { return nothing_known(); }
+        return Signed {.kind = "sshsig", .session_id = [], .user = "", .service = "", .alg = ssh_text(ha.v), .key = [], .host_key = [], .namespace = ssh_text(ns.v)};
+    }
+    SshGot sid = ssh_str(ssh_rd(d));
+    SshGot t = ssh_take(sid.r, 1);
+    if (!ssh_ok(t.r) || t.v[0] != 50) { return nothing_known(); }
+    SshGot u = ssh_str(t.r);
+    SshGot sv = ssh_str(u.r);
+    SshGot m = ssh_str(sv.r);
+    SshGot b = ssh_take(m.r, 1);
+    SshGot a = ssh_str(b.r);
+    SshGot k = ssh_str(a.r);
+    Str method = ssh_text(m.v);
+    Bool hostbound = method == "publickey-hostbound-v00@openssh.com";
+    SshGot hk = if (hostbound) { ssh_str(k.r) } else { SshGot {.r = k.r, .v = []} };
+    if (!ssh_ok(hk.r) || !ssh_done(hk.r) || (method != "publickey" && !hostbound) || b.v[0] != 1) { return nothing_known(); }
+    return Signed {.kind = "auth", .session_id = sid.v, .user = ssh_text(u.v), .service = ssh_text(sv.v), .alg = ssh_text(a.v), .key = k.v, .host_key = hk.v, .namespace = ""};
+}

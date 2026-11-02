@@ -1,0 +1,249 @@
+// SSH keys in the vault (SPEC 16.1): the commands the agent and the consent
+// window use.
+//
+//   symbolon device ssh new DIR NAME          threshold ecdsa-sha2-nistp256 (PIN on stdin)
+//   symbolon device ssh import DIR NAME FILE  an OpenSSH private key file (PIN on stdin)
+//   symbolon device ssh list DIR              "NAME-HEX PUBLIC-LINE" per key, no PIN
+//   symbolon device ssh sign DIR NAME         PIN, then the data in hex, on stdin;
+//                                             prints "signature BLOB-HEX"
+//   symbolon device ssh delete DIR NAME       (PIN on stdin)
+//
+// A key is an item of type "ssh": kind "threshold" (rp, cid, public) or
+// "imported" (alg, private, public, comment). The public lines are also
+// kept in DIR/ssh-keys so the agent lists them without the PIN.
+
+import "../types.resid";
+import "../core/log.resid";
+import "../vault/vault.resid";
+import "../threshold/threshold.resid";
+import "../ssh/sshwire.resid";
+import "state.resid";
+import "common.resid";
+import "device.resid";
+import "duresscli.resid";
+import "vaultcli.resid";
+import "vaultitems.resid";
+import "rotatecli.resid";
+import "crypto.resid";
+import "cose.resid";
+import "word.resid";
+import "ecdsa.resid";
+import "ed25519g.resid";
+import "hash.resid";
+import "bcrypt_pbkdf.resid";
+
+// ============================================================================
+// The public index
+// ============================================================================
+
+pub type SshEntry = { Str name; Str line; };
+
+pub Str ssh_index(Str dir) { return dir + "/ssh-keys"; }
+
+pub List(SshEntry) entries_of(Str text) { return entries_at(str_split(text, "\n"), 0, []); }
+
+List(SshEntry) entries_at(List(Str) ls, Int i, List(SshEntry) acc) {
+    if (i >= ls.len()) { return acc; }
+    List(Str) p = str_split(str_trim(ls[i]), " ");
+    Bool ok = p.len() >= 3 && str_len(p[0]) > 0 && hex_ok(p[0]);
+    Str line = if (ok) { str_slice(str_trim(ls[i]), str_len(p[0]) + 1, str_len(str_trim(ls[i]))) } else { "" };
+    return entries_at(ls, i + 1, if (ok) { acc.concat([SshEntry {.name = text_of(cose_hex_decode(p[0])), .line = line}]) } else { acc });
+}
+
+@requires(filesystem)
+pub List(SshEntry) read_index(Str dir) {
+    Str f = ssh_index(dir);
+    return if (filesystem.exists(f)) { entries_of(filesystem.read_all(f)) } else { [] };
+}
+
+Str index_text(List(SshEntry) es, Int i, Str acc) {
+    if (i >= es.len()) { return acc; }
+    return index_text(es, i + 1, acc + hex_encode(utf8(es[i].name)) + " " + es[i].line + "\n");
+}
+
+List(SshEntry) without_entry(List(SshEntry) es, Str name, Int i, List(SshEntry) acc) {
+    if (i >= es.len()) { return acc; }
+    return without_entry(es, name, i + 1, if (es[i].name == name) { acc } else { acc.concat([es[i]]) });
+}
+
+@requires(filesystem)
+Bool write_index(Str dir, List(SshEntry) es) { return filesystem.write_all(ssh_index(dir), index_text(es, 0, "")); }
+
+@requires(filesystem)
+Bool index_put(Str dir, Str name, Str line) {
+    return write_index(dir, without_entry(read_index(dir), name, 0, []).concat([SshEntry {.name = name, .line = line}]));
+}
+
+// `device ssh list DIR`
+@requires(filesystem)
+pub Int ssh_list(Str dir) { return print_entries(read_index(dir), 0); }
+
+Int print_entries(List(SshEntry) es, Int i) {
+    if (i >= es.len()) { return 0; }
+    println(hex_encode(utf8(es[i].name)) + " " + es[i].line);
+    return print_entries(es, i + 1);
+}
+
+// ============================================================================
+// New, import, delete
+// ============================================================================
+
+Bool name_ok(Str n) { return str_len(n) > 0 && str_len(n) <= 64 && !str_contains(n, "\n"); }
+
+FieldPlain fpl(Str n, Str v) { return FieldPlain {.name = n, .value = secret_bytes(utf8(v))}; }
+
+// `device ssh new DIR NAME`: a key the quorum holds, under the relying-party
+// label "ssh:NAME".
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+pub Int ssh_new(Str dir, Str name) {
+    if (!name_ok(name)) { return dfail("a name of 1-64 characters"); }
+    Result(Opened, Str) ro = open_vault(dir);
+    return match ro { Err(m) => dfail(m), Ok(o) => ssh_new_in(dir, o, name) };
+}
+
+@requires(filesystem, network, device, declassify, clock, environment)
+Int ssh_new_in(Str dir, Opened o, Str name) {
+    Str rp = "ssh:" + name;
+    List(Int) nonce = random_bytes(16);
+    List(Int) cid = credential_id(o.u.real.cc, rp, nonce);
+    List(UInt(64)) tau = tweak_scalar(o.u.real.cc, rp, nonce);
+    if (!update_duress(dir, o.u.real, cid, bn_to_be(tau, 32), false)) { return dfail("cannot update the duress profile"); }
+    List(Int) q = credential_pubkey(o.vh.head.quorum.root_pubkey, tau);
+    Str line = ssh_pub_line(ecdsa_blob("nistp256", q), name);
+    List(FieldPlain) fs = [fpl("name", name), fpl("type", "ssh"), fpl("kind", "threshold"), fpl("rp", rp), fpl("cid", hex_encode(cid)), fpl("public", line)];
+    Int r = seal_publish(dir, o, name, fs);
+    if (r != 0) { return r; }
+    if (!index_put(dir, name, line)) { return dfail("cannot write " + ssh_index(dir)); }
+    println(line);
+    return 0;
+}
+
+// `device ssh import DIR NAME FILE`: an OpenSSH private key file. The PIN,
+// then (for a key with a passphrase: aes128/192/256-ctr under bcrypt) the
+// passphrase, on standard input.
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+pub Int ssh_import(Str dir, Str name, Str file) {
+    if (!name_ok(name)) { return dfail("a name of 1-64 characters"); }
+    if (!filesystem.exists(file)) { return dfail("no file " + file); }
+    Option(KeyFile) of = key_file_of(filesystem.read_all(file));
+    KeyFile k = of else { KeyFile {.cipher = "", .kdf = "", .kdf_opts = [], .pub_blob = [], .sealed = []} };
+    if (k.pub_blob.len() == 0) { return dfail("not an OpenSSH private key file"); }
+    if (k.cipher != "none" && (k.kdf != "bcrypt" || cipher_key_len(k.cipher) == 0)) { return dfail("the key is sealed with " + k.cipher + "/" + k.kdf + ", which Symbolon cannot open (aes256-ctr with bcrypt is ssh-keygen's default)"); }
+    Result(Opened, Str) ro = open_vault(dir);
+    Str phrase = if (k.cipher == "none") { "" } else { read_pin() };
+    if (k.cipher != "none" && str_len(phrase) == 0) { return dfail("the key has a passphrase: give it on the line after the PIN"); }
+    List(Int) section = if (k.cipher == "none") { k.sealed } else { opened_section(k, phrase) };
+    Option(SshPriv) op = priv_of_section(section, k.pub_blob);
+    return match op {
+        None => dfail(if (k.cipher == "none") { "the key file is damaged or not one Symbolon can read" } else { "wrong passphrase (or a damaged file)" }),
+        Some(p) => if (p.pub.kind == "rsa") { dfail("RSA keys cannot be imported yet; ed25519 and ECDSA keys can") } else { ssh_import_key(dir, ro, name, p) }
+    };
+}
+
+Int cipher_key_len(Str c) {
+    if (c == "aes256-ctr") { return 32; }
+    if (c == "aes192-ctr") { return 24; }
+    if (c == "aes128-ctr") { return 16; }
+    return 0;
+}
+
+// The decrypted section: key and counter from bcrypt_pbkdf over the
+// passphrase and the file's salt and rounds, then AES-CTR. [] when the
+// options are malformed. (bcrypt is not constant time; this runs once, on
+// import, on the principal's own machine: lib/bcrypt_pbkdf.resid.)
+List(Int) opened_section(KeyFile k, Str phrase) {
+    SshGot salt = ssh_str(ssh_rd(k.kdf_opts));
+    SshGot rounds = ssh_u32(salt.r);
+    Int r = ssh_be(rounds.v);
+    Int kl = cipher_key_len(k.cipher);
+    if (!ssh_ok(rounds.r) || !ssh_done(rounds.r) || r < 1 || r > 1024 || salt.v.len() == 0) { return []; }
+    List(Int) kiv = bcrypt_pbkdf(utf8(phrase), salt.v, r, kl + 16);
+    return if (kiv.len() == kl + 16) { aes_ctr(kiv[0..kl], kiv[kl..kl + 16], k.sealed) } else { [] };
+}
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+Int ssh_import_key(Str dir, Result(Opened, Str) ro, Str name, SshPriv p) {
+    Str comment = if (str_len(p.comment) > 0) { p.comment } else { name };
+    Str line = ssh_pub_line(p.pub.blob, comment);
+    List(FieldPlain) fs = [fpl("name", name), fpl("type", "ssh"), fpl("kind", "imported"), fpl("alg", p.pub.alg), fpl("public", line), fpl("comment", comment),
+                           FieldPlain {.name = "private", .value = p.secret}];
+    return match ro {
+        Err(m) => dfail(m),
+        Ok(o) => if (seal_publish(dir, o, name, fs) != 0) { 1 } else { if (index_put(dir, name, line)) { done_import(line) } else { dfail("cannot write " + ssh_index(dir)) } }
+    };
+}
+
+Int done_import(Str line) {
+    println(line);
+    eprintln("device: imported; the key file is still on disk: delete it once you have checked that the key works");
+    return 0;
+}
+
+// `device ssh delete DIR NAME`
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+pub Int ssh_delete(Str dir, Str name) {
+    Int r = vault_delete(dir, name, "");
+    if (r != 0) { return r; }
+    return if (write_index(dir, without_entry(read_index(dir), name, 0, []))) { 0 } else { dfail("cannot write " + ssh_index(dir)) };
+}
+
+// ============================================================================
+// Sign
+// ============================================================================
+
+Option(List(Secret(UInt(8)))) fval(List(FieldPlain) fs, Str n, Int i) {
+    if (i >= fs.len()) { return None; }
+    if (fs[i].name == n) { return Some(fs[i].value); }
+    return fval(fs, n, i + 1);
+}
+
+@requires(declassify)
+Str ftext(List(FieldPlain) fs, Str n) {
+    Option(List(Secret(UInt(8)))) v = fval(fs, n, 0);
+    return match v { None => "", Some(x) => text_of(reveal(x)) };
+}
+
+// `device ssh sign DIR NAME`: the PIN, then the data to sign in hex.
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+pub Int ssh_sign(Str dir, Str name) {
+    Result(Opened, Str) ro = open_vault(dir);
+    Str data_hex = read_pin();
+    if (!hex_ok(data_hex) || str_len(data_hex) == 0 || str_len(data_hex) > 524288) { return dfail("the data to sign, in hex, on the line after the PIN"); }
+    return match ro {
+        Err(m) => dfail(m),
+        Ok(o) => match item_by_id(o.st.items, item_id_of(o.p.vk, name), 0) {
+            None => dfail("no such key"),
+            Some(it) => sign_item(dir, o, it, cose_hex_decode(data_hex))
+        }
+    };
+}
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+Int sign_item(Str dir, Opened o, Item it, List(Int) data) {
+    Result(List(FieldPlain), SymbolonError) r = item_open(o.p.vk, o.p.vid, it);
+    return match r { Err(e) => dfail(err_text(e)), Ok(fs) => sign_fields(dir, o, fs, data) };
+}
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+Int sign_fields(Str dir, Opened o, List(FieldPlain) fs, List(Int) data) {
+    if (ftext(fs, "type") != "ssh") { return dfail("not an SSH key"); }
+    Str kind = ftext(fs, "kind");
+    if (kind == "threshold") {
+        return sign_with(dir, o.c, ftext(fs, "rp"), cose_hex_decode(ftext(fs, "cid")), sha256_bytes(data), o.pin, 1);
+    }
+    List(Secret(UInt(8))) none = [];
+    List(Secret(UInt(8))) k = fval(fs, "private", 0) else { none };
+    Str alg = ftext(fs, "alg");
+    List(Int) blob = sign_imported(alg, k, data);
+    if (blob.len() == 0) { return dfail("this key cannot sign (" + alg + ")"); }
+    println("signature " + hex_encode(blob));
+    return 0;
+}
+
+@requires(declassify)
+pub List(Int) sign_imported(Str alg, List(Secret(UInt(8))) k, List(Int) data) {
+    if (alg == "ssh-ed25519" && k.len() == 32) { return ed25519_sig_blob(ed25519g_sign(k, data)); }
+    if (alg == "ecdsa-sha2-nistp256" && k.len() == 32) { return ecdsa_sig_blob("nistp256", ecdsag_sign_raw(P256, Sha256, k, data)); }
+    if (alg == "ecdsa-sha2-nistp384" && k.len() == 48) { return ecdsa_sig_blob("nistp384", ecdsag_sign_raw(P384, Sha384, k, data)); }
+    return [];
+}

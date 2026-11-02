@@ -171,9 +171,9 @@ class _ItemPageState extends State<ItemPage> {
           ..sort((a, b) => int.parse(a.key.substring(7)).compareTo(int.parse(b.key.substring(7)))));
     return Scaffold(
       appBar: AppBar(title: Text(it.name), actions: [
-        if (fs != null) IconButton(key: const Key('item-move'), tooltip: 'Move', icon: const Icon(Icons.drive_file_move_outline), onPressed: move),
-        if (fs != null) IconButton(key: const Key('item-edit'), tooltip: 'Edit', icon: const Icon(Icons.edit), onPressed: edit),
-        if (fs != null) IconButton(key: const Key('item-delete'), tooltip: 'Delete', icon: const Icon(Icons.delete_outline), onPressed: delete),
+        if (fs != null && type.editable) IconButton(key: const Key('item-move'), tooltip: 'Move', icon: const Icon(Icons.drive_file_move_outline), onPressed: move),
+        if (fs != null && type.editable) IconButton(key: const Key('item-edit'), tooltip: 'Edit', icon: const Icon(Icons.edit), onPressed: edit),
+        if (fs != null && type.editable) IconButton(key: const Key('item-delete'), tooltip: 'Delete', icon: const Icon(Icons.delete_outline), onPressed: delete),
       ]),
       body: fs == null
           ? const Center(child: CircularProgressIndicator())

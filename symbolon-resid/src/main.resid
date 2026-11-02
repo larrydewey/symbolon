@@ -52,6 +52,8 @@
 //                                              organizations (SPEC 29); see src/agent/orgcli.resid
 //   symbolon device share me DIR               prints LOG-ID FINGERPRINT
 //   symbolon device share people DIR           "LOG-ID NAME-HEX FINGERPRINT me|-" per card at the relay
+//   symbolon ssh-agent DIR [SOCKET]            the SSH agent (SPEC 16.1) on a Unix socket
+//   symbolon device ssh new|import|list|sign|delete ...   SSH keys in the vault (src/agent/sshcli.resid)
 //   symbolon browser host [ORIGIN...]          the browser extension's native messaging host (SPEC 22.5);
 //                                              SYMBOLON_CONSENT is the consent window (the app)
 //   symbolon home init DIR HOST [HOST...] [--ports BASE] [--bind ADDR]   Symbolon Home: the box's CA, certificates, witnesses
@@ -85,6 +87,8 @@ import "agent/vaultitems.resid";
 import "agent/importers.resid";
 import "agent/sharecli.resid";
 import "browser/nmhost.resid";
+import "agent/sshcli.resid";
+import "ssh/agentd.resid";
 import "agent/orgcli.resid";
 import "agent/orgconsole.resid";
 import "agent/relaysrv.resid";
@@ -325,6 +329,12 @@ Int main() {
     if (a1 == "home" && a2 == "invite" && n == 5) { return home_invite(args.get(3), args.get(4)); }
     if (a1 == "device" && a2 == "pin" && n == 4) { return device_pin(args.get(3)); }
     // Started by the browser (native messaging); its own arguments follow.
+    if (a1 == "ssh-agent" && (n == 3 || n == 4)) { return ssh_agent(args.get(2), if (n == 4) { args.get(3) } else { "" }); }
+    if (a1 == "device" && a2 == "ssh" && args.get(3) == "new" && n == 6) { return ssh_new(args.get(4), args.get(5)); }
+    if (a1 == "device" && a2 == "ssh" && args.get(3) == "import" && n == 7) { return ssh_import(args.get(4), args.get(5), args.get(6)); }
+    if (a1 == "device" && a2 == "ssh" && args.get(3) == "list" && n == 5) { return ssh_list(args.get(4)); }
+    if (a1 == "device" && a2 == "ssh" && args.get(3) == "sign" && n == 6) { return ssh_sign(args.get(4), args.get(5)); }
+    if (a1 == "device" && a2 == "ssh" && args.get(3) == "delete" && n == 6) { return ssh_delete(args.get(4), args.get(5)); }
     if (a1 == "browser" && a2 == "host") { return browser_host([args.get(3), args.get(4)]); }
     if (a1 == "home" && a2 == "serve" && n == 4) { return home_serve(args.get(3), args.get(0)); }
     if (a1 == "home" && a2 == "pair-serve" && n == 4) { return home_pair_serve(args.get(3), args.get(0)); }

@@ -43,6 +43,16 @@ case "$1 $2" in
         echo "signature-der 3006020101020101"
         echo "aaaa" ;;
     esac ;;
+  "device ssh")
+    case "$3" in
+      list) printf '676974687562 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOxx github@laptop\n71756f72756d ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBNy quorum\n' ;;
+      *) [ "$PIN" = "2468" ] || { echo "device: wrong PIN" >&2; exit 1; }
+         case "$3" in
+           sign) echo "signature 0000000b7373682d6564323535313900000040aa" ;;
+           new) echo "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBNz $5" ;;
+           *) echo "ok" ;;
+         esac ;;
+    esac ;;
   "device vault")
     [ "$PIN" = "2468" ] || { echo "device: wrong PIN" >&2; exit 1; }
     [ -f "$D/offline" ] && case "$3" in list|show|get) echo "device: local copy: no log at the relay; showing vault version 2 as this device last verified it" >&2 ;; *) echo "device: no log at the relay" >&2; exit 1 ;; esac
