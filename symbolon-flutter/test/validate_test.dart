@@ -2,6 +2,7 @@ import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:flutter_test/flutter_test.dart';
+import 'package:symbolon_ui/card_face.dart';
 import 'package:symbolon_ui/favicons.dart';
 import 'package:symbolon_ui/validate.dart' as v;
 import 'package:symbolon_ui/vault_types.dart';
@@ -112,5 +113,16 @@ void main() {
     // A site without an icon: null, and not asked again soon.
     expect(await Favicons(dir).icon('http://127.0.0.1:1'), isNull);
     await dir.delete(recursive: true);
+  });
+
+  test('a card number is grouped as its network prints it, and masked to its last four', () {
+    expect(groupCardNumber('4111111111111111'), '4111 1111 1111 1111');
+    expect(groupCardNumber('378282246310005'), '3782 822463 10005');
+    expect(groupCardNumber('30569309025904'), '3056 930902 5904');
+    expect(groupCardNumber('6011111111111117'), '6011 1111 1111 1117');
+    expect(groupCardNumber('4111111111111111111'), '4111 1111 1111 1111 111');
+    expect(maskCardNumber('4111111111111234'), '•••• •••• •••• 1234');
+    expect(maskCardNumber('378282246310005'), '•••• •••••• •0005');
+    expect(maskCardNumber('1234'), '1234');
   });
 }

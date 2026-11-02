@@ -349,6 +349,10 @@ void main() {
     await settle(t);
     expect(find.text('4111111111111111'), findsOneWidget);
     expect(find.text('Card number · Visa'), findsOneWidget);
+    expect(find.text('•••• •••• •••• 1111'), findsOneWidget);
+    await t.tap(find.byKey(const Key('card-face')));
+    await t.pump();
+    expect(find.text('4111 1111 1111 1111'), findsOneWidget);
     expect(find.text('123'), findsNothing);
     expect(find.text('Rewards'), findsOneWidget);
     expect(find.text('R-42'), findsOneWidget);
@@ -380,6 +384,10 @@ void main() {
 
     await t.enterText(find.byKey(const Key('edit-number')), '4111 1111 1111 1111');
     await t.enterText(find.byKey(const Key('edit-expiry')), '8/2029');
+    await t.pump();
+    expect((t.widget(find.byKey(const Key('card-face-number'))) as Text).data, '4111 1111 1111 1111');
+    expect(find.descendant(of: find.byKey(const Key('card-face')), matching: find.text('08/29')), findsOneWidget);
+    await t.scrollUntilVisible(find.byKey(const Key('add-field')), 200, scrollable: find.byType(Scrollable).first);
     await t.tap(find.byKey(const Key('add-field')));
     await t.pump();
     await t.enterText(find.byKey(const Key('custom-label-0')), 'Bank phone');

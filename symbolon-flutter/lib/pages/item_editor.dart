@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import '../app.dart';
+import '../card_face.dart';
 import '../validate.dart' as v;
 import '../vault_types.dart';
 import '../widgets.dart';
@@ -265,6 +266,21 @@ class _ItemEditorState extends State<ItemEditor> {
       body: Form(
         key: form,
         child: PageBody(children: [
+          if (t.id == 'card')
+            Padding(
+              padding: const EdgeInsets.only(bottom: 16),
+              child: Center(
+                child: ListenableBuilder(
+                  listenable: Listenable.merge([values['number'], values['cardholder'], values['expiry']]),
+                  builder: (context, _) => CardFace(
+                    number: v.digitsOf(values['number']!.text),
+                    holder: values['cardholder']!.text.trim(),
+                    expiry: v.expiry(values['expiry']!.text) == null ? v.normalizeExpiry(values['expiry']!.text) : values['expiry']!.text.trim(),
+                    revealed: true,
+                  ),
+                ),
+              ),
+            ),
           Padding(
             padding: const EdgeInsets.only(bottom: 12),
             child: TextFormField(

@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import '../app.dart';
+import '../card_face.dart';
 import '../favicons.dart';
 import '../validate.dart' show cardBrand;
 import '../vault_types.dart';
@@ -192,6 +193,18 @@ class _ItemPageState extends State<ItemPage> {
                     Text(fs['folder']!.replaceAll('/', ' › '), key: const Key('item-folder-shown')),
                   ]),
                 ),
+              if (t.id == 'card' && (fs['number'] ?? '').isNotEmpty) ...[
+                const SizedBox(height: 16),
+                Center(
+                  child: CardFace(
+                    number: fs['number']!,
+                    holder: fs['cardholder'] ?? '',
+                    expiry: fs['expiry'] ?? '',
+                    revealed: shown.contains('card-face'),
+                    onTap: () => setState(() => shown.contains('card-face') ? shown.remove('card-face') : shown.add('card-face')),
+                  ),
+                ),
+              ],
               const SizedBox(height: 16),
               Card(
                 child: Column(children: [
