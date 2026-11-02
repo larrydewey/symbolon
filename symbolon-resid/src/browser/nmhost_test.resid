@@ -1,0 +1,182 @@
+// The native messaging host's framing, G14 checks, item checks and
+// replies (src/browser/nmhost.resid). The I/O (stdin, the consent window,
+// its connection) is exercised by tests/browser_e2e.sh with a real browser.
+
+import "nmhost.resid";
+import "json.resid";
+import "../vault/vault.resid";
+import "crypto.resid";
+import "word.resid";
+import "httpserv.resid";
+
+Str hx(List(Int) b) { return hex_encode(b); }
+Str txt(List(Int) b) { return http_text(b, 0, b.len()); }
+Str ks(List(Str) xs) { return str_join(xs, ","); }
+
+FrameAsk fr(Int id, Str o, List(Str) k) { return FrameAsk {.frame = id, .origin = o, .kinds = k}; }
+FieldPlain fp(Str n, Str v) { return FieldPlain {.name = n, .value = secret_bytes(utf8(v))}; }
+
+Chosen visa() {
+    return Chosen {.kind = "card", .fields = [fp("cardholder", "Ada Lovelace"), fp("number", "4111111111111111"), fp("expiry", "08/29"), fp("cvv", "123"), fp("pin", "9999")]};
+}
+Chosen login(Str origin) {
+    return Chosen {.kind = "login", .fields = [fp("origin", origin), fp("username", "ada@example.com"), fp("current", "pa\"ss\\w0rd"), fp("totp", "JBSWY3DP")]};
+}
+
+@requires(declassify)
+Str vtext(List(Secret(UInt(8))) v) { return txt(ints(declassify(secret_join(v), "test"))); }
+
+List(Int) ints(List(UInt(8)) b) { return ints_at(b, 0, ListBuf()); }
+List(Int) ints_at(List(UInt(8)) b, Int i, ListBuf(Int) acc) {
+    if (i >= b.len()) { return acc.finish(); }
+    return ints_at(b, i + 1, acc.push((Int)b[i]));
+}
+
+test "a message is framed with its length as four little-endian bytes" {
+    // struct.pack('<I', n) for n = 0, 2, 300, 70000
+    expect(hx(frame_of([]))).toEqual("00000000");
+    expect(hx(frame_of([123, 125]))).toEqual("020000007b7d");
+    List(Int) big = frame_of(utf8(str_repeat("x", 300)));
+    expect(hx(big[0..4])).toEqual("2c010000");
+    expect(big.len()).toEqual(304);
+    expect(frame_len([112, 17, 1, 0])).toEqual(70000);
+    expect(frame_len([1, 2, 3])).toEqual(-1);
+}
+
+test "only https origins, or http on loopback, may receive anything" {
+    expect(origin_ok("https://shop.example")).toBeTrue();
+    expect(origin_ok("https://shop.example:8443")).toBeTrue();
+    expect(origin_ok("http://localhost:3000")).toBeTrue();
+    expect(origin_ok("http://127.0.0.1")).toBeTrue();
+    expect(origin_ok("http://shop.example")).toBeFalse();
+    expect(origin_ok("https://shop.example/path")).toBeFalse();
+    expect(origin_ok("https://user@shop.example")).toBeFalse();
+    expect(origin_ok("https://Shop.example")).toBeFalse();
+    expect(origin_ok("https://shop.example:")).toBeFalse();
+    expect(origin_ok("file:///etc/passwd")).toBeFalse();
+    expect(origin_ok("null")).toBeFalse();
+    expect(origin_ok("")).toBeFalse();
+}
+
+test "a frame of the page's own origin may receive login and card fields" {
+    expect(ks(allowed_kinds("https://shop.example", fr(0, "https://shop.example", ["username", "current-password", "cc-number", "new-password", "cc-number"])))).toEqual("username,current-password,cc-number");
+}
+
+test "a pinned payment processor's frame may receive card fields only" {
+    expect(ks(allowed_kinds("https://shop.example", fr(3, "https://js.stripe.com", ["cc-number", "cc-exp", "cc-csc", "current-password", "username"])))).toEqual("cc-number,cc-exp,cc-csc");
+}
+
+test "any other frame receives nothing, however its origin is spelled" {
+    expect(allowed_kinds("https://shop.example", fr(4, "https://ads.example", ["cc-number", "current-password"])).len()).toEqual(0);
+    expect(allowed_kinds("https://shop.example", fr(4, "https://js.stripe.com.evil.example", ["cc-number"])).len()).toEqual(0);
+    expect(allowed_kinds("https://shop.example", fr(4, "https://evil-js.stripe.com", ["cc-number"])).len()).toEqual(0);
+    expect(allowed_kinds("https://shop.example", fr(4, "http://js.stripe.com", ["cc-number"])).len()).toEqual(0);
+    expect(allowed_kinds("https://shop.example", fr(4, "https://shop.example:444", ["current-password"])).len()).toEqual(0);
+}
+
+test "frames left with nothing are dropped, and the window offers cards when card fields were asked for" {
+    List(FrameAsk) fs = permitted("https://shop.example", [fr(0, "https://shop.example", ["email"]), fr(1, "https://ads.example", ["cc-number"]), fr(2, "https://js.stripe.com", ["cc-number"])], 0, ListBuf());
+    expect(fs.len()).toEqual(2);
+    expect(fs[0].frame).toEqual(0);
+    expect(fs[1].frame).toEqual(2);
+    expect(wanted_type(fs)).toEqual("card");
+    expect(wanted_type([fr(0, "https://shop.example", ["username", "current-password"])])).toEqual("login");
+}
+
+@requires(declassify)
+test "a card's fields map to the autocomplete kinds, the expiry split at its fixed positions" {
+    expect(vtext(value_for(visa(), "cc-name"))).toEqual("Ada Lovelace");
+    expect(vtext(value_for(visa(), "cc-number"))).toEqual("4111111111111111");
+    expect(vtext(value_for(visa(), "cc-exp"))).toEqual("08/29");
+    expect(vtext(value_for(visa(), "cc-exp-month"))).toEqual("08");
+    expect(vtext(value_for(visa(), "cc-exp-year"))).toEqual("2029");
+    expect(vtext(value_for(visa(), "cc-csc"))).toEqual("123");
+    expect(value_for(visa(), "current-password").len()).toEqual(0);
+    expect(value_for(visa(), "pin").len()).toEqual(0);
+}
+
+@requires(declassify)
+test "a login's fields map to username, email and current-password; nothing else leaves" {
+    expect(vtext(value_for(login("https://shop.example"), "username"))).toEqual("ada@example.com");
+    expect(vtext(value_for(login("https://shop.example"), "email"))).toEqual("ada@example.com");
+    expect(vtext(value_for(login("https://shop.example"), "current-password"))).toEqual("pa\"ss\\w0rd");
+    expect(value_for(login("https://shop.example"), "cc-number").len()).toEqual(0);
+    expect(value_for(login("https://shop.example"), "one-time-code").len()).toEqual(0);
+}
+
+@requires(declassify)
+test "a login goes only to its own origin, and only the type that was offered" {
+    expect(refusal("https://shop.example", "login", login("https://shop.example"))).toEqual("");
+    expect(refusal("https://evil.example", "login", login("https://shop.example"))).toEqual("the login is for another site");
+    expect(refusal("https://shop.example", "card", login("https://shop.example"))).toEqual("the chosen item is not a card");
+    expect(refusal("https://anywhere.example", "card", visa())).toEqual("");
+}
+
+@requires(declassify)
+test "the reply carries, per frame, only the kinds that frame asked for" {
+    List(FrameAsk) fs = [fr(0, "https://shop.example", ["cc-name"]), fr(2, "https://js.stripe.com", ["cc-number", "cc-exp", "cc-csc"])];
+    FillAsk a = FillAsk {.id = 7, .top = "https://shop.example", .frames = fs};
+    expect(answer(a, fs, "card", visa())).toEqual("{\"type\":\"fill\",\"id\":7,\"fills\":[{\"frame\":0,\"values\":{\"cc-name\":\"Ada Lovelace\"}},{\"frame\":2,\"values\":{\"cc-number\":\"4111111111111111\",\"cc-exp\":\"08/29\",\"cc-csc\":\"123\"}}]}");
+    FillAsk b = FillAsk {.id = 8, .top = "https://shop.example", .frames = [fr(0, "https://shop.example", ["username", "current-password"])]};
+    Str r = answer(b, b.frames, "login", login("https://shop.example"));
+    Option(Jv) j = json_parse(json_utf8(r));
+    Jv v = j else { JNull };
+    expect(jstr(jpath(v, ["type"], 0))).toEqual("fill");
+    expect(r).toEqual("{\"type\":\"fill\",\"id\":8,\"fills\":[{\"frame\":0,\"values\":{\"username\":\"ada@example.com\",\"current-password\":\"pa\\\"ss\\\\w0rd\"}}]}");
+    expect(answer(b, b.frames, "login", Chosen {.kind = "", .fields = []})).toEqual("{\"type\":\"cancel\",\"id\":8}");
+    expect(answer(FillAsk {.id = 9, .top = "https://evil.example", .frames = b.frames}, b.frames, "login", login("https://shop.example"))).toEqual("{\"type\":\"error\",\"id\":9,\"error\":\"the login is for another site\"}");
+}
+
+test "a fill request is read from the extension's JSON" {
+    Str m = "{\"type\":\"fill\",\"id\":5,\"top\":\"https://shop.example\",\"frames\":[{\"frame\":0,\"origin\":\"https://shop.example\",\"fields\":[\"username\",\"current-password\"]},{\"frame\":9,\"origin\":\"https://js.stripe.com\",\"fields\":[\"cc-number\"]}]}";
+    Option(Jv) j = json_parse(json_utf8(m));
+    Jv v = j else { JNull };
+    Option(FillAsk) oa = fill_ask_of(v);
+    FillAsk a = oa else { FillAsk {.id = -1, .top = "", .frames = []} };
+    expect(a.id).toEqual(5);
+    expect(a.top).toEqual("https://shop.example");
+    expect(a.frames.len()).toEqual(2);
+    expect(a.frames[1].frame).toEqual(9);
+    expect(a.frames[1].origin).toEqual("https://js.stripe.com");
+    expect(ks(a.frames[0].kinds)).toEqual("username,current-password");
+}
+
+@requires(declassify)
+test "the consent window's answer must open with the token" {
+    Str t = "00ff";
+    Str ok = t + "\nok card\nnumber " + hx(utf8("4111111111111111")) + "\nexpiry " + hx(utf8("08/29")) + "\nend\n";
+    Option(Chosen) c = chosen_of(utf8(ok), t);
+    Chosen v = c else { Chosen {.kind = "none", .fields = []} };
+    expect(v.kind).toEqual("card");
+    expect(vtext(value_for(v, "cc-number"))).toEqual("4111111111111111");
+    expect(vtext(value_for(v, "cc-exp-year"))).toEqual("2029");
+    expect(match chosen_of(utf8(ok), "00fe") { None => true, Some(_) => false }).toBeTrue();
+    expect(match chosen_of(utf8(ok), "") { None => true, Some(_) => false }).toBeTrue();
+    expect(match chosen_of(utf8(t + "\nok card\nnumber 41ZZ\nend\n"), t) { None => true, Some(_) => false }).toBeTrue();
+    expect(match chosen_of(utf8(t + "\nok card\nnumber 3431\n"), t) { None => true, Some(_) => false }).toBeTrue();
+    Chosen x = chosen_of(utf8(t + "\ncancel\n"), t) else { Chosen {.kind = "none", .fields = []} };
+    expect(x.kind).toEqual("");
+}
+
+test "the consent request names the page, the frames and the connection, and nothing secret" {
+    Str r = consent_request("https://shop.example", "card", [fr(2, "https://js.stripe.com", ["cc-number"])], 4321, "abcd");
+    expect(r).toEqual("{\"top\":\"https://shop.example\",\"want\":\"card\",\"port\":4321,\"token\":\"abcd\",\"frames\":[{\"origin\":\"https://js.stripe.com\",\"fields\":[\"cc-number\"]}]}");
+}
+
+test "only a browser extension may start the host; a program that runs it is refused" {
+    expect(caller_ok(["chrome-extension://kkhginlcfndkhicoihlaccmmahljipjp/", ""])).toBeTrue();
+    expect(caller_ok(["/home/u/.mozilla/native-messaging-hosts/dev.symbolon.browser.json", "browser@symbolon.dev"])).toBeTrue();
+    expect(caller_ok(["", ""])).toBeFalse();
+    expect(caller_ok(["https://bank.example", ""])).toBeFalse();
+    expect(caller_ok(["chrome-extension://x", ""])).toBeFalse();
+    expect(caller_ok(["/tmp/x.json", "evil@example"])).toBeFalse();
+}
+
+test "the window's connection must open with the token line" {
+    expect(opens_with(utf8("abcd\nok card\n"), "abcd")).toBeTrue();
+    expect(opens_with(utf8("abcd\n"), "abcd")).toBeTrue();
+    expect(opens_with(utf8("abcd"), "abcd")).toBeFalse();
+    expect(opens_with(utf8("abce\n"), "abcd")).toBeFalse();
+    expect(opens_with(utf8("abcdx\n"), "abcd")).toBeFalse();
+    expect(opens_with(utf8("\n"), "")).toBeFalse();
+}

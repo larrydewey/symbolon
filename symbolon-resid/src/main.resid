@@ -52,6 +52,8 @@
 //                                              organizations (SPEC 29); see src/agent/orgcli.resid
 //   symbolon device share me DIR               prints LOG-ID FINGERPRINT
 //   symbolon device share people DIR           "LOG-ID NAME-HEX FINGERPRINT me|-" per card at the relay
+//   symbolon browser host [ORIGIN...]          the browser extension's native messaging host (SPEC 22.5);
+//                                              SYMBOLON_CONSENT is the consent window (the app)
 //   symbolon home init DIR HOST [HOST...] [--ports BASE] [--bind ADDR]   Symbolon Home: the box's CA, certificates, witnesses
 //   symbolon home invite DIR NAME              a cosigner for NAME; prints the pairing link (QR)
 //   symbolon device pin DIR                    PIN and the new PIN on stdin; changes the PIN
@@ -82,6 +84,7 @@ import "agent/rotatecli.resid";
 import "agent/vaultitems.resid";
 import "agent/importers.resid";
 import "agent/sharecli.resid";
+import "browser/nmhost.resid";
 import "agent/orgcli.resid";
 import "agent/orgconsole.resid";
 import "agent/relaysrv.resid";
@@ -321,6 +324,8 @@ Int main() {
     if (a1 == "home" && a2 == "init" && n >= 5) { Int hp = positional(4); return home_init(args.get(3), arg_list(4, hp, ListBuf()), if (str_len(flag_arg("--ports", 1, hp)) > 0) { str_parse_int(flag_arg("--ports", 1, hp)) } else { home_default_base() }, bind_or_all(flag_arg("--bind", 1, hp))); }
     if (a1 == "home" && a2 == "invite" && n == 5) { return home_invite(args.get(3), args.get(4)); }
     if (a1 == "device" && a2 == "pin" && n == 4) { return device_pin(args.get(3)); }
+    // Started by the browser (native messaging); its own arguments follow.
+    if (a1 == "browser" && a2 == "host") { return browser_host([args.get(3), args.get(4)]); }
     if (a1 == "home" && a2 == "serve" && n == 4) { return home_serve(args.get(3), args.get(0)); }
     if (a1 == "home" && a2 == "pair-serve" && n == 4) { return home_pair_serve(args.get(3), args.get(0)); }
     if (a1 == "home" && a2 == "pair-child" && n == 5) { return home_pair_child(args.get(3), str_parse_int(args.get(4))); }

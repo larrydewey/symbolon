@@ -1405,8 +1405,33 @@ the platform routes it to third-party providers.
 No credential, code or attribute is released into a page without a gesture
 in agent-owned interface outside the page's DOM showing the origin (and
 frame origin) as the browser or OS reports it. No fill on in-page clicks;
-no fill into frames of another origin. The clipboard is avoided; where
-used, content is marked sensitive and cleared within 30 seconds.
+no fill into frames of another origin, except card fields into a pinned
+payment processor's frame (22.2.1). The clipboard is avoided; where used,
+content is marked sensitive and cleared within 30 seconds.
+
+#### 22.2.1 Payment processor frames
+
+Checkouts commonly put the card number, expiry and security code in a
+cross-origin iframe served by the payment processor (hosted fields), so
+that the merchant never handles the card. Refusing every cross-origin
+frame would make card fill impossible on most checkouts and push the
+principal to the clipboard, which is worse. The exception is narrow:
+
+- Only card fields (`cc-number`, `cc-exp`, `cc-exp-month`, `cc-exp-year`,
+  `cc-csc`, `cc-name`) may go into a frame of another origin, and only if
+  that frame's origin, as the browser reports it, is exactly one of the
+  pinned processor origins. No suffix or pattern matching. Login fields
+  never go into another origin's frame.
+- The pinned list ships with the agent and changes only with a release:
+  `https://js.stripe.com`, `https://assets.braintreegateway.com`,
+  `https://checkoutshopper-live.adyen.com` and its regional hosts (`-us`,
+  `-au`, `-apse`, `-in`), `https://web.squarecdn.com`. Each entry is
+  confirmed against the processor's documentation before a release.
+- The consent window names the page's origin and, separately, every
+  processor frame that will receive a field. The principal approves both
+  in one gesture.
+- The page's own frame may receive card fields too (a merchant that takes
+  cards directly). A frame of any other origin receives nothing.
 
 ### 22.3 Migration and credential exchange
 
@@ -1501,6 +1526,84 @@ provider's credential, never a private key.
 Local socket readable only by the principal's user, peer authenticated by
 process credentials; the agent shows which executable asks.
 
+### 22.5 Browser extension
+
+The extension holds nothing (no vault data, no PIN, no keys, no cache of
+values between fills) and runs no code in pages until the principal asks.
+Its parts:
+
+1. **Trigger.** The toolbar button or its shortcut (Ctrl+Shift+L). Both
+   belong to the browser's own interface, so a page cannot synthesize
+   them. Nothing is filled on page load or on a click inside the page.
+2. **Scan.** The extension injects its field finder into every frame of
+   the tab. Each frame reports the autocomplete kinds of its visible
+   fields (`username`, `email`, `current-password`, the card kinds of
+   22.2.1). Fields without an autocomplete token are classified by name,
+   label and position. Each frame is labelled with the origin the browser
+   reports for it (`webNavigation`). A frame whose own report disagrees
+   is dropped.
+3. **Request.** The extension sends the agent `{type: "fill", id, top,
+   frames: [{frame, origin, fields}]}` over native messaging (host
+   `dev.symbolon.browser`). The browser starts the agent for the
+   extension's ID only (`allowed_origins`, `allowed_extensions`). Messages
+   are a 32-bit little-endian length and UTF-8 JSON, at most 1 MiB. Any
+   program of the same user could run the host itself, so the host refuses
+   to start unless its first argument is an extension origin (Chromium) or
+   its second is the add-on ID (Firefox). Same-user code can fake those
+   arguments, so the consent window's caller line (item 5) is the real
+   check.
+4. **G14 check (agent).** The top origin must be `https://host[:port]` in
+   lower case, or `http://localhost` / `http://127.0.0.1`. Each frame is
+   cut to the kinds 22.2 and 22.2.1 allow, and frames left with nothing
+   are dropped. If no frame remains, the agent refuses without showing
+   anything.
+5. **Consent (agent-owned).** The agent opens the consent window, the
+   app run as `--fill-consent REQUEST`. The request file is mode 0600 in
+   `$XDG_RUNTIME_DIR` (the agent refuses if that is unset, rather than
+   use a shared `/tmp`). It holds no vault data, only the origins, the
+   field kinds, a loopback port the agent listens on for this one request,
+   and a 256-bit one-time token, which is kept out of argv. As it opens,
+   the window connects to the port and sends the token. The agent drops
+   any connection that does not send the token within 2 seconds and keeps
+   waiting, so a local process that connects first cannot block the
+   window. The window shows the page's origin, every processor frame, and
+   the program that started the host. It finds that program itself from
+   `/proc` (the owner of the listening socket, then that process's parent
+   executable), so a caller cannot choose what is shown, and it warns
+   when the program is not a browser. It takes the PIN and offers only
+   the matching items: logins whose stored origin equals the page's
+   origin, or cards. The principal chooses one. The window opens the item
+   with the agent and sends its fields on the same connection. It sends
+   only the fields its type fills: for a login the origin, username and
+   password; for a card the holder, number, expiry and code. It never
+   sends a card PIN, notes, custom fields or a TOTP seed. The agent waits
+   up to 5 minutes, then closes the connection. The window then marks the
+   request expired and sends nothing, so nothing goes to a port the agent
+   no longer holds.
+6. **Item check (agent).** The item's type must be the one offered. A
+   login's stored origin must equal the page's origin exactly. The values
+   are `Secret` in the agent from the moment the answer is parsed. The
+   socket buffer and the answer's text lines before that are plain
+   memory, not wiped. The values are declassified once, when the reply to
+   the browser is written, and only for the kinds each frame asked for. The reply is `{type: "fill", id,
+   fills: [{frame, values: {kind: value}}]}`, or `cancel`, or `error` with
+   a reason the button's tooltip shows.
+7. **Fill.** Before filling, the extension checks that the tab is still
+   at the same top origin. It targets each frame by the document it
+   scanned, where the browser reports document IDs (Chromium), so a frame
+   that navigated is not filled. Elsewhere it targets the frame ID, and
+   the origin check that follows still applies. Inside the frame it
+   checks `location.origin` against the approved origin once more. Values
+   are set the way typing sets them (native setter, `input` and `change`
+   events). Selects for month and year are matched by value or text.
+   Values are not kept after the call.
+
+Where the browser is not involved (Android apps, the system's autofill),
+the platform paths of 22.1 apply instead. The extension is for desktop
+browsers. A page can still read values once they are in its fields: the
+guarantees above are about which page gets them and whether the
+principal approved it, not about what the page then does.
+
 ---
 
 ## 23. Implementation requirements (Resid)
@@ -1579,7 +1682,7 @@ quotes, the attestation verifier, provenance records, and the `display`,
 | G11 | Duress profile and containment | 14 |
 | G12 | Cosigner receives only `m` and epoch | 12.2 |
 | G13 | DBSC, DPoP | 16 |
-| G14 | Consent outside the DOM | 22.2 |
+| G14 | Consent outside the DOM | 22.2, 22.5 |
 | G15 | Secret types, ct gate, secret mode, mlock | 23.3 |
 | G16 | Selective disclosure; verifier-constrained release | 17 |
 | G17 | Head exchange; witnesses | 20 |

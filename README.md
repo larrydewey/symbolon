@@ -36,6 +36,7 @@ the mobile app, the desktop app, Symbolon Home, organizations, and moving in.
 - [SPEC.md](SPEC.md) -- the specification, with its red-team audit in Appendix A.
 - [symbolon-resid](symbolon-resid) -- the agent and servers, in Resid.
 - [symbolon-flutter](symbolon-flutter) -- the app (Android, Linux).
+- [symbolon-extension](symbolon-extension) -- the browser extension (Chromium, Firefox); fills logins and cards through the agent.
 - [symbolon-home](symbolon-home) -- Symbolon Home's container build.
 - [website](website) -- the guide's pages, published by resid-book.
 

@@ -52,7 +52,17 @@ static void my_application_activate(GApplication* application) {
     gtk_window_set_title(window, "symbolon_ui");
   }
 
-  gtk_window_set_default_size(window, 1280, 720);
+  // The fill-consent window (SPEC 22.4) is small and kept above the browser.
+  gboolean consent = self->dart_entrypoint_arguments != nullptr &&
+                     self->dart_entrypoint_arguments[0] != nullptr &&
+                     g_strcmp0(self->dart_entrypoint_arguments[0], "--fill-consent") == 0;
+  if (consent) {
+    gtk_window_set_default_size(window, 460, 640);
+    gtk_window_set_keep_above(window, TRUE);
+    gtk_window_set_position(window, GTK_WIN_POS_CENTER);
+  } else {
+    gtk_window_set_default_size(window, 1280, 720);
+  }
 
   g_autoptr(FlDartProject) project = fl_dart_project_new();
   fl_dart_project_set_dart_entrypoint_arguments(

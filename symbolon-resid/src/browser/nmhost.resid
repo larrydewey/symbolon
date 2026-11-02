@@ -1,0 +1,498 @@
+// The browser extension's native messaging host (SPEC 22.5). The browser
+// starts `symbolon browser host` when the extension connects and talks to
+// it over stdin/stdout: each message is a 32-bit little-endian length and
+// that many bytes of UTF-8 JSON. The extension holds nothing; it reports
+// the form fields it found and the origins the browser gave it, and fills
+// what this host returns.
+//
+// A fill:
+//   1. The host checks the request against G14 (SPEC 22.2): the top origin
+//      is https (or a loopback http origin); a frame of the top origin may
+//      receive any field, a frame of a pinned payment processor (22.2.1)
+//      only card fields, any other frame nothing.
+//   2. It starts the agent-owned consent window (the app, run with
+//      --fill-consent REQUEST). The window connects back over loopback and
+//      sends a one-time token as it opens, shows the origins and the
+//      program that started this host, takes the PIN, lets the user choose
+//      an item and sends that item's fields on the same connection.
+//   3. It checks the item against the request (a login only for its own
+//      origin) and returns, per frame, the values for the fields asked for.
+// The values are Secret from the moment the answer is parsed until the
+// reply to the browser is written.
+
+import "../vault/vault.resid";
+import "json.resid";
+import "crypto.resid";
+import "word.resid";
+import "httpserv.resid";
+import "cose.resid";
+
+// ============================================================================
+// Framing
+// ============================================================================
+
+pub Int max_message() { return 1048576; }
+
+// Little-endian length then the body.
+pub List(Int) frame_of(List(Int) body) {
+    Int n = body.len();
+    return [n & 255, (n >> 8) & 255, (n >> 16) & 255, (n >> 24) & 255].concat(body);
+}
+
+// The length from four header bytes; -1 for a short header.
+pub Int frame_len(List(Int) h) {
+    if (h.len() != 4) { return -1; }
+    return h[0] | (h[1] << 8) | (h[2] << 16) | (h[3] << 24);
+}
+
+List(Int) read_n(Int n, ListBuf(Int) acc, Int got) {
+    if (got >= n) { return acc.finish(); }
+    Int b = resid_read_byte();
+    if (b < 0) { return acc.finish(); }
+    return read_n(n, acc.push(b), got + 1);
+}
+
+// The next message; None at the end of input or for a bad length.
+pub Option(List(Int)) read_message() {
+    Int n = frame_len(read_n(4, ListBuf(), 0));
+    if (n < 0 || n > max_message()) { return None; }
+    List(Int) b = read_n(n, ListBuf(), 0);
+    if (b.len() != n) { return None; }
+    return Some(b);
+}
+
+pub Bool write_message(Str json) { return print_bytes(frame_of(json_utf8(json))); }
+
+// ============================================================================
+// Origins and fields (G14)
+// ============================================================================
+
+// Payment processors whose card-field frames may be filled on another
+// site's checkout (SPEC 22.2.1). Exact origins; nothing is matched by suffix.
+pub List(Str) processor_origins() {
+    return ["https://js.stripe.com",
+            "https://assets.braintreegateway.com",
+            "https://checkoutshopper-live.adyen.com", "https://checkoutshopper-live-us.adyen.com",
+            "https://checkoutshopper-live-au.adyen.com", "https://checkoutshopper-live-apse.adyen.com",
+            "https://checkoutshopper-live-in.adyen.com",
+            "https://web.squarecdn.com"];
+}
+
+pub List(Str) login_kinds() { return ["username", "email", "current-password"]; }
+pub List(Str) card_kinds() { return ["cc-name", "cc-number", "cc-exp", "cc-exp-month", "cc-exp-year", "cc-csc"]; }
+
+Bool has(List(Str) xs, Str x, Int i) {
+    if (i >= xs.len()) { return false; }
+    if (xs[i] == x) { return true; }
+    return has(xs, x, i + 1);
+}
+
+Bool all_chars(Str s, Int i, Str allowed) {
+    if (i >= str_len(s)) { return true; }
+    if (!str_contains(allowed, str_slice(s, i, i + 1))) { return false; }
+    return all_chars(s, i + 1, allowed);
+}
+
+// host[:port] with a lowercase DNS name (or IPv4) and a decimal port.
+Bool host_port_ok(Str hp) {
+    List(Str) p = str_split(hp, ":");
+    if (p.len() > 2 || str_len(p[0]) == 0) { return false; }
+    if (!all_chars(p[0], 0, "abcdefghijklmnopqrstuvwxyz0123456789.-")) { return false; }
+    if (p.len() == 2 && (str_len(p[1]) == 0 || str_len(p[1]) > 5 || !all_chars(p[1], 0, "0123456789"))) { return false; }
+    return true;
+}
+
+// An origin a credential may be released to: https://host[:port], or http
+// on loopback (a developer's own server).
+pub Bool origin_ok(Str o) {
+    if (str_starts_with(o, "https://")) { return host_port_ok(str_slice(o, 8, str_len(o))); }
+    if (str_starts_with(o, "http://")) {
+        Str hp = str_slice(o, 7, str_len(o));
+        Str h = str_split(hp, ":")[0];
+        return host_port_ok(hp) && (h == "localhost" || h == "127.0.0.1");
+    }
+    return false;
+}
+
+// One frame of the request: the extension's frame id, the origin the
+// browser reported for it, and the autocomplete kinds of its fields.
+pub type FrameAsk = { Int frame; Str origin; List(Str) kinds; };
+
+// The kinds a frame may receive on a page of `top`.
+pub List(Str) allowed_kinds(Str top, FrameAsk f) {
+    List(Str) known = if (f.origin == top) { login_kinds().concat(card_kinds()) }
+                      else { if (has(processor_origins(), f.origin, 0)) { card_kinds() } else { [] } };
+    return keep_known(f.kinds, known, 0, []);
+}
+
+// The kinds of `ks` that are in `known`, each once, in order.
+List(Str) keep_known(List(Str) ks, List(Str) known, Int i, List(Str) acc) {
+    if (i >= ks.len()) { return acc; }
+    Bool take = has(known, ks[i], 0) && !has(acc, ks[i], 0);
+    return keep_known(ks, known, i + 1, if (take) { acc.concat([ks[i]]) } else { acc });
+}
+
+// The request with every frame cut to what G14 allows; frames left with
+// nothing are dropped.
+pub List(FrameAsk) permitted(Str top, List(FrameAsk) fs, Int i, ListBuf(FrameAsk) acc) {
+    if (i >= fs.len()) { return acc.finish(); }
+    List(Str) k = allowed_kinds(top, fs[i]);
+    return permitted(top, fs, i + 1, if (k.len() == 0) { acc } else { acc.push(FrameAsk {.frame = fs[i].frame, .origin = fs[i].origin, .kinds = k}) });
+}
+
+Bool any_card(List(FrameAsk) fs, Int i) {
+    if (i >= fs.len()) { return false; }
+    if (any_of(fs[i].kinds, card_kinds(), 0)) { return true; }
+    return any_card(fs, i + 1);
+}
+
+Bool any_of(List(Str) xs, List(Str) ys, Int i) {
+    if (i >= xs.len()) { return false; }
+    if (has(ys, xs[i], 0)) { return true; }
+    return any_of(xs, ys, i + 1);
+}
+
+// What the consent window offers: cards when a card field was asked for.
+pub Str wanted_type(List(FrameAsk) fs) { return if (any_card(fs, 0)) { "card" } else { "login" }; }
+
+// ============================================================================
+// The chosen item and its values
+// ============================================================================
+
+pub type Chosen = { Str kind; List(FieldPlain) fields; };
+pub type FillValue = { Str kind; List(Secret(UInt(8))) value; };
+pub type FrameFill = { Int frame; List(FillValue) values; };
+
+Option(List(Secret(UInt(8)))) field_of(List(FieldPlain) fs, Str n, Int i) {
+    if (i >= fs.len()) { return None; }
+    if (fs[i].name == n) { return Some(fs[i].value); }
+    return field_of(fs, n, i + 1);
+}
+
+List(Secret(UInt(8))) part(List(Secret(UInt(8))) v, Int a, Int b) {
+    if (v.len() < b) { return []; }
+    return v[a..b];
+}
+
+// The value of one autocomplete kind from the item; [] when it has none.
+// The expiry is stored as MM/YY (validate.dart normalizeExpiry), so its
+// parts are at fixed, public positions.
+pub List(Secret(UInt(8))) value_for(Chosen c, Str kind) {
+    List(Secret(UInt(8))) none = [];
+    List(Secret(UInt(8))) exp = field_of(c.fields, "expiry", 0) else { none };
+    Bool mmyy = exp.len() == 5;
+    if (c.kind == "login") {
+        if (kind == "username" || kind == "email") { return field_of(c.fields, "username", 0) else { none }; }
+        if (kind == "current-password") { return field_of(c.fields, "current", 0) else { none }; }
+        return none;
+    }
+    if (c.kind != "card") { return none; }
+    if (kind == "cc-name") { return field_of(c.fields, "cardholder", 0) else { none }; }
+    if (kind == "cc-number") { return field_of(c.fields, "number", 0) else { none }; }
+    if (kind == "cc-csc") { return field_of(c.fields, "cvv", 0) else { none }; }
+    if (kind == "cc-exp") { return if (mmyy) { exp } else { none }; }
+    if (kind == "cc-exp-month") { return if (mmyy) { part(exp, 0, 2) } else { none }; }
+    if (kind == "cc-exp-year") { return if (mmyy) { secret_bytes([50, 48]).concat(part(exp, 3, 5)) } else { none }; }
+    return none;
+}
+
+// The item's origin, public by construction (it decides where it may go).
+@requires(declassify)
+pub Str origin_of_item(Chosen c) {
+    List(Secret(UInt(8))) o = field_of(c.fields, "origin", 0) else { [] };
+    List(UInt(8)) b = declassify(secret_join(o), "a login's site origin: compared with the page's origin before release (SPEC 22.2)");
+    return http_text(ints8(b, 0, ListBuf()), 0, b.len());
+}
+
+List(Int) ints8(List(UInt(8)) b, Int i, ListBuf(Int) acc) {
+    if (i >= b.len()) { return acc.finish(); }
+    return ints8(b, i + 1, acc.push((Int)b[i]));
+}
+
+// Why the item may not go to this page, or "".
+@requires(declassify)
+pub Str refusal(Str top, Str want, Chosen c) {
+    if (c.kind != want) { return "the chosen item is not a " + want; }
+    if (c.kind == "login" && origin_of_item(c) != top) { return "the login is for another site"; }
+    return "";
+}
+
+List(FillValue) values_at(Chosen c, List(Str) ks, Int i, ListBuf(FillValue) acc) {
+    if (i >= ks.len()) { return acc.finish(); }
+    List(Secret(UInt(8))) v = value_for(c, ks[i]);
+    return values_at(c, ks, i + 1, if (v.len() == 0) { acc } else { acc.push(FillValue {.kind = ks[i], .value = v}) });
+}
+
+pub List(FrameFill) fills_of(Chosen c, List(FrameAsk) fs, Int i, ListBuf(FrameFill) acc) {
+    if (i >= fs.len()) { return acc.finish(); }
+    List(FillValue) vs = values_at(c, fs[i].kinds, 0, ListBuf());
+    return fills_of(c, fs, i + 1, if (vs.len() == 0) { acc } else { acc.push(FrameFill {.frame = fs[i].frame, .values = vs}) });
+}
+
+// ============================================================================
+// Requests and replies
+// ============================================================================
+
+pub type FillAsk = { Int id; Str top; List(FrameAsk) frames; };
+
+List(Jv) arr_of(Option(Jv) v) {
+    Jv x = v else { JNull };
+    return match x { JArr(a) => a, _ => [] };
+}
+
+List(Str) strs_of(List(Jv) xs, Int i, ListBuf(Str) acc) {
+    if (i >= xs.len()) { return acc.finish(); }
+    Jv x = xs[i];
+    return strs_of(xs, i + 1, match x { JStr(s) => acc.push(s), _ => acc });
+}
+
+List(FrameAsk) frames_of(List(Jv) xs, Int i, ListBuf(FrameAsk) acc) {
+    if (i >= xs.len()) { return acc.finish(); }
+    Jv f = xs[i];
+    List(Jv) ks = arr_of(jget(f, "fields"));
+    return frames_of(xs, i + 1, acc.push(FrameAsk {.frame = jint(jget(f, "frame")), .origin = jstr(jget(f, "origin")), .kinds = strs_of(ks, 0, ListBuf())}));
+}
+
+pub Option(FillAsk) fill_ask_of(Jv m) {
+    if (jstr(jget(m, "type")) != "fill") { return None; }
+    List(Jv) fs = arr_of(jget(m, "frames"));
+    return Some(FillAsk {.id = jint(jget(m, "id")), .top = jstr(jget(m, "top")), .frames = frames_of(fs, 0, ListBuf())});
+}
+
+pub Str error_reply(Int id, Str why) { return "{\"type\":\"error\",\"id\":" + f"{id}" + ",\"error\":" + json_quote(why) + "}"; }
+pub Str cancel_reply(Int id) { return "{\"type\":\"cancel\",\"id\":" + f"{id}" + "}"; }
+
+@requires(declassify)
+Str value_text(List(Secret(UInt(8))) v) {
+    List(UInt(8)) b = declassify(secret_join(v), "a vault value, into the browser for the page's own field after the G14 checks and the user's consent (SPEC 22.5)");
+    return http_text(ints8(b, 0, ListBuf()), 0, b.len());
+}
+
+@requires(declassify)
+StrBuf values_json(List(FillValue) vs, Int i, StrBuf acc) {
+    if (i >= vs.len()) { return acc; }
+    StrBuf a = if (i > 0) { acc.push(",") } else { acc };
+    return values_json(vs, i + 1, a.push(json_quote(vs[i].kind)).push(":").push(json_quote(value_text(vs[i].value))));
+}
+
+@requires(declassify)
+StrBuf fills_json(List(FrameFill) fs, Int i, StrBuf acc) {
+    if (i >= fs.len()) { return acc; }
+    StrBuf a = if (i > 0) { acc.push(",") } else { acc };
+    Int fr = fs[i].frame;
+    return fills_json(fs, i + 1, values_json(fs[i].values, 0, a.push("{\"frame\":" + f"{fr}" + ",\"values\":{")).push("}}"));
+}
+
+@requires(declassify)
+pub Str fill_reply(Int id, List(FrameFill) fs) {
+    return fills_json(fs, 0, StrBuf().push("{\"type\":\"fill\",\"id\":" + f"{id}" + ",\"fills\":[")).push("]}").finish();
+}
+
+// The request the consent window reads (nothing secret in it).
+pub Str consent_request(Str top, Str want, List(FrameAsk) fs, Int port, Str token) {
+    return "{\"top\":" + json_quote(top) + ",\"want\":" + json_quote(want) + ",\"port\":" + f"{port}" + ",\"token\":" + json_quote(token) + ",\"frames\":[" + frames_json(fs, 0, StrBuf()).finish() + "]}";
+}
+
+StrBuf frames_json(List(FrameAsk) fs, Int i, StrBuf acc) {
+    if (i >= fs.len()) { return acc; }
+    StrBuf a = if (i > 0) { acc.push(",") } else { acc };
+    return frames_json(fs, i + 1, a.push("{\"origin\":" + json_quote(fs[i].origin) + ",\"fields\":[" + str_join(quoted(fs[i].kinds, 0, ListBuf()), ",") + "]}"));
+}
+
+List(Str) quoted(List(Str) xs, Int i, ListBuf(Str) acc) {
+    if (i >= xs.len()) { return acc.finish(); }
+    return quoted(xs, i + 1, acc.push(json_quote(xs[i])));
+}
+
+// ============================================================================
+// The consent window's answer
+// ============================================================================
+
+// Lines, as the window sends them:
+//   TOKEN
+//   ok TYPE            (or "cancel")
+//   NAME HEX           one per field, the value's UTF-8 in hex (as `device vault show` prints)
+//   end
+// None when the token does not match or the answer is malformed; a Chosen
+// with kind "" for cancel.
+pub Option(Chosen) chosen_of(List(Int) b, Str token) {
+    List(Str) ls = str_split(http_text(b, 0, b.len()), "\n");
+    if (ls.len() < 3 || ls[0] != token || str_len(token) == 0) { return None; }
+    if (ls[1] == "cancel") { return Some(Chosen {.kind = "", .fields = []}); }
+    List(Str) h = str_split(ls[1], " ");
+    if (h.len() != 2 || h[0] != "ok") { return None; }
+    return fields_from(ls, 2, h[1], []);
+}
+
+Option(Chosen) fields_from(List(Str) ls, Int i, Str kind, List(FieldPlain) acc) {
+    if (i >= ls.len()) { return None; }
+    if (ls[i] == "end") { return Some(Chosen {.kind = kind, .fields = acc}); }
+    List(Str) p = str_split(ls[i], " ");
+    if (p.len() != 2 || str_len(p[1]) % 2 != 0 || !all_chars(p[1], 0, "0123456789abcdef")) { return None; }
+    return fields_from(ls, i + 1, kind, acc.concat([FieldPlain {.name = p[0], .value = secret_bytes(cose_hex_decode(p[1]))}]));
+}
+
+// ============================================================================
+// The consent window
+// ============================================================================
+
+// A path that survives both the script's single quotes and process.run's
+// split on spaces.
+Bool shell_safe(Str s) { return str_len(s) > 0 && !str_contains(s, "'") && !str_contains(s, "\n"); }
+Bool word_safe(Str s) { return shell_safe(s) && !str_contains(s, " "); }
+
+@requires(clock)
+Bool nap(Int ms) { _ = clock.sleep_ns(ms * 1000000); return true; }
+
+pub type Conn = { Int fd; List(Int) head; };
+
+Bool has_byte(List(Int) b, Int x, Int i) {
+    if (i >= b.len()) { return false; }
+    if (b[i] == x) { return true; }
+    return has_byte(b, x, i + 1);
+}
+
+@requires(network)
+List(Int) read_line_bytes(Int fd, List(Int) acc) {
+    if (acc.len() > 4096 || has_byte(acc, 10, 0)) { return acc; }
+    List(Int) chunk = resid_tcp_recv_some(fd, 4096);
+    if (chunk.len() == 0) { return acc; }
+    return read_line_bytes(fd, acc.concat(chunk));
+}
+
+// Whether the bytes open with the token line.
+pub Bool opens_with(List(Int) b, Str token) {
+    Str line = token + "\n";
+    return str_len(token) > 0 && b.len() >= str_len(line) && http_text(b, 0, str_len(line)) == line;
+}
+
+// The window's connection: the first one that sends the token within two
+// seconds of connecting; any other is dropped and waiting goes on, so a
+// local process that connects first cannot block the window (about
+// `tries` tenths of a second in all).
+@requires(network, clock)
+Conn accept_valid(Int lfd, Str token, Int tries) {
+    if (tries <= 0) { return Conn {.fd = -1, .head = []}; }
+    Int c = resid_tcp_accept_now(lfd);
+    if (c < 0) {
+        _ = nap(100);
+        return accept_valid(lfd, token, tries - 1);
+    }
+    _ = resid_tcp_deadline(c, 2000);
+    List(Int) h = read_line_bytes(c, []);
+    if (opens_with(h, token)) { return Conn {.fd = c, .head = h}; }
+    _ = resid_tcp_close(c);
+    return accept_valid(lfd, token, tries - 20);
+}
+
+@requires(network)
+List(Int) read_answer(Int fd, List(Int) acc) {
+    if (acc.len() > 262144) { return []; }
+    if (str_ends_with(http_text(acc, 0, acc.len()), "\nend\n") || str_ends_with(http_text(acc, 0, acc.len()), "\ncancel\n")) { return acc; }
+    List(Int) chunk = resid_tcp_recv_some(fd, 65536);
+    if (chunk.len() == 0) { return acc; }
+    return read_answer(fd, acc.concat(chunk));
+}
+
+// Shows the consent window and returns its answer: None if it could not be
+// shown or did not answer, a Chosen with kind "" if the user cancelled.
+@requires(filesystem, network, clock, process, environment)
+pub Option(Chosen) ask_consent(Str top, Str want, List(FrameAsk) fs) {
+    Str ui = environment.get("SYMBOLON_CONSENT");
+    // The per-user runtime directory (0700); never a shared /tmp.
+    Str rt = environment.get("XDG_RUNTIME_DIR");
+    if (!shell_safe(ui) || !word_safe(rt)) { return None; }
+    Int lfd = resid_tcp_listen_at("127.0.0.1", 0);
+    if (lfd < 0) { return None; }
+    Str token = hex_encode(random_bytes(32));
+    Str base = rt + "/symbolon-fill-" + hex_encode(random_bytes(8));
+    Str req = base + ".json";
+    Str sh = base + ".sh";
+    _ = filesystem.write_secret(req, json_utf8(consent_request(top, want, fs, resid_tcp_bound_port(lfd), token)));
+    // process.run splits on spaces and runs no shell: the window is started
+    // by a script, with stdin and stdout off the browser's pipe.
+    _ = filesystem.write_secret(sh, json_utf8("exec '" + ui + "' --fill-consent '" + req + "' </dev/null >/dev/null 2>&1\n"));
+    Int started = process.run("setsid -f sh " + sh);
+    if (started != 0) {
+        _ = process.run("rm -f " + req + " " + sh);
+        _ = resid_tcp_close(lfd);
+        return None;
+    }
+    // The window connects as it opens and proves the token at once; the
+    // person then has five minutes. If the host gives up, the connection
+    // closes and the window stops offering Fill: nothing is ever sent to a
+    // port this host no longer holds.
+    Conn cn = accept_valid(lfd, token, 600);
+    _ = resid_tcp_close(lfd);
+    _ = process.run("rm -f " + sh);
+    if (cn.fd < 0) { _ = process.run("rm -f " + req); return None; }
+    _ = resid_tcp_deadline(cn.fd, 300000);
+    List(Int) ans = read_answer(cn.fd, cn.head);
+    _ = resid_tcp_close(cn.fd);
+    _ = process.run("rm -f " + req);
+    return chosen_of(ans, token);
+}
+
+// ============================================================================
+// The host loop
+// ============================================================================
+
+@requires(filesystem, network, clock, process, environment, declassify)
+pub Str handle(List(Int) body) {
+    Option(Jv) om = json_parse(body);
+    return match om { None => error_reply(-1, "not JSON"), Some(m) => handle_msg(m) };
+}
+
+@requires(filesystem, network, clock, process, environment, declassify)
+Str handle_msg(Jv m) {
+    if (jstr(jget(m, "type")) == "hello") { return "{\"type\":\"hello\",\"version\":1}"; }
+    Option(FillAsk) oa = fill_ask_of(m);
+    return match oa { None => error_reply(jint(jget(m, "id")), "unknown request"), Some(a) => handle_fill(a) };
+}
+
+@requires(filesystem, network, clock, process, environment, declassify)
+Str handle_fill(FillAsk a) {
+    if (!origin_ok(a.top)) { return error_reply(a.id, "Symbolon fills only https pages"); }
+    List(FrameAsk) fs = permitted(a.top, a.frames, 0, ListBuf());
+    if (fs.len() == 0) { return error_reply(a.id, "no field on this page may be filled"); }
+    Str want = wanted_type(fs);
+    Option(Chosen) oc = ask_consent(a.top, want, fs);
+    return match oc { None => error_reply(a.id, "the Symbolon window did not answer"), Some(c) => answer(a, fs, want, c) };
+}
+
+// The reply for the user's choice, after the item is checked against the page.
+@requires(declassify)
+pub Str answer(FillAsk a, List(FrameAsk) fs, Str want, Chosen c) {
+    if (str_len(c.kind) == 0) { return cancel_reply(a.id); }
+    Str why = refusal(a.top, want, c);
+    if (str_len(why) > 0) { return error_reply(a.id, why); }
+    return fill_reply(a.id, fills_of(c, fs, 0, ListBuf()));
+}
+
+// One message per turn; the loop carries only a count (SPEC 22.5: the host
+// lives as long as the extension's connection).
+@requires(filesystem, network, clock, process, environment, declassify)
+pub Int host_loop(Int n) {
+    Option(List(Int)) ob = read_message();
+    Int r = match ob { None => 0, Some(b) => if (write_message(handle(b))) { 1 } else { 2 } };
+    if (r != 1) { return if (r == 0) { 0 } else { 1 }; }
+    return host_loop(n + 1);
+}
+
+// The browser passes the caller as the first argument: Chromium
+// "chrome-extension://ID/", Firefox the manifest path then the add-on ID.
+// The host manifest's allowed_origins / allowed_extensions limit what a
+// browser starts, but any program of the same user can run this host
+// itself; so a caller that is not an extension is refused here, and the
+// consent window shows the program that actually started the host (SPEC
+// 22.5 item 5), which a caller cannot choose.
+pub Bool caller_ok(List(Str) a) {
+    if (a.len() >= 1 && str_starts_with(a[0], "chrome-extension://") && str_ends_with(a[0], "/")) { return true; }
+    return a.len() >= 2 && a[1] == "browser@symbolon.dev";
+}
+
+@requires(filesystem, network, clock, process, environment, declassify)
+pub Int browser_host(List(Str) caller) {
+    if (!caller_ok(caller)) { eprintln("browser host: started by the browser for the Symbolon extension only"); return 2; }
+    return host_loop(0);
+}
