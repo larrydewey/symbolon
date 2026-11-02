@@ -258,6 +258,16 @@ class SymbolonCli {
   Future<CliResult> sshSign(String dir, String name, String dataHex, String pin) =>
       run(['device', 'ssh', 'sign', dir, name], input: [pin, dataHex], timeout: const Duration(minutes: 5));
 
+  // ─── Security keys (SPEC 9.4) ───────────────────────────────────────
+
+  /// "NAME-HEX" per enrolled key (no PIN).
+  Future<CliResult> keyList(String dir) => run(['device', 'key', 'list', dir], timeout: const Duration(minutes: 1));
+
+  /// Enrolls the present key (two touches).
+  Future<CliResult> keyAdd(String dir, String name, String pin) => run(['device', 'key', 'add', dir, name], input: [pin], timeout: const Duration(minutes: 3));
+
+  Future<CliResult> keyRemove(String dir, String name, String pin) => run(['device', 'key', 'remove', dir, name], input: [pin], timeout: const Duration(minutes: 3));
+
   // ─── Devices and recovery ───────────────────────────────────────────
 
   Future<CliResult> enroll(String dir, String newKeys, String pin, {String primes = ''}) =>

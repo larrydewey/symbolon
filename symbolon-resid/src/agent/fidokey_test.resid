@@ -1,0 +1,14 @@
+// The security-key list (src/agent/fidokey.resid): its file format.
+import "fidokey.resid";
+import "crypto.resid";
+
+test "the security-key file is read back as written, and malformed lines are skipped" {
+    SecKeys k = keys_of("salt 00ff\n6d61696e aa bbcc 0102\nnot a line\n6261636b7570 dd ee 03\n");
+    expect(hex_encode(k.salt)).toEqual("00ff");
+    expect(k.keys.len()).toEqual(2);
+    expect(k.keys[0].name).toEqual("main");
+    expect(hex_encode(k.keys[0].cred_point)).toEqual("bbcc");
+    expect(k.keys[1].name).toEqual("backup");
+    expect(keys_of("").keys.len()).toEqual(0);
+    expect(keys_of("salt zz\n").salt.len()).toEqual(0);
+}

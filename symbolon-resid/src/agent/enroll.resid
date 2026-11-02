@@ -27,6 +27,7 @@ import "common.resid";
 import "session.resid";
 import "cosignerd.resid";
 import "device.resid";
+import "fidokey.resid";
 import "duresscli.resid";
 import "serials.resid";
 import "word.resid";
@@ -374,9 +375,9 @@ Int joined(Str dir, DeviceConfig c, Unlocked u, Str pin, CgConfig ncfg, EnrollSe
     List(Secret(UInt(8))) k = unlock_key_for(c, u.st, true);
     List(Secret(UInt(8))) rp = encode_real(real) else { [] };
     // Which file held the real profile: the one this key opens.
-    Bool a_real = unlock(k, get_file(dir + "/blob_a"), []).kind == 1;
+    Bool a_real = unlock(k, read_blob(dir, "a", u.wrap), []).kind == 1;
     List(Int) blob = seal_blob(k, random_bytes(12), rp);
-    Bool ok = filesystem.write_bytes(dir + (if (a_real) { "/blob_a" } else { "/blob_b" }), blob)
+    Bool ok = write_blob(dir, if (a_real) { "a" } else { "b" }, blob, u.wrap)
         && store_share(dir, u.real.dek, ncfg) && store_dshare(dir, real, ncfg)
         && send_duress_key(dir, relay_ep(c), Local {.party = c.party, .cg = 0, .hpke_sk = device_hpke(u.real.dek).sk}, cos_remote(vh))
         && save_config(dir, with_log(c, eps_of(vh.head.policy.witnesses, 0, []), c.log_id, cur.next, c.peers));

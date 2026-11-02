@@ -26,6 +26,7 @@ import "../net/services.resid";
 import "state.resid";
 import "common.resid";
 import "../ssh/sshwire.resid";
+import "fidokey.resid";
 import "session.resid";
 import "cosignerd.resid";
 import "duresscli.resid";
@@ -95,19 +96,22 @@ List(UInt(8)) u8s_at(List(Int) b, Int i, ListBuf(UInt(8)) acc) {
 pub Unlocked unlock_dir(Str dir, DeviceConfig c, Str pin) {
     List(Secret(UInt(8))) st = stretch(c, pin_bytes(pin));
     Bool a_first = (random_bytes(1)[0] & 1) == 0;
+    // With security keys enrolled (SPEC 9.4) the profiles are sealed under
+    // W, which only a present, touched key gives back.
+    List(Secret(UInt(8))) w = if (keys_enrolled(dir)) { unwrap_key(dir) } else { [] };
     // The Keystore refuses no PIN (it has no auth value): an unlock key
     // that opens neither profile is the other key's, or a wrong PIN.
-    if (on_keystore(c)) { return with_stretched(ks_unlock_either(dir, c, st, a_first), st); }
+    if (on_keystore(c)) { return with_wrap(with_stretched(ks_unlock_either(dir, c, st, a_first, w), st), w); }
     List(Secret(UInt(8))) k = unlock_key_for(c, st, a_first);
-    if (k.len() == 0) { return Unlocked {.kind = 0, .real = RealProfile {.share = [], .cc = [], .vault_key = [], .dek = [], .duress_hpke_pub = []},
+    if (k.len() == 0) { return Unlocked {.kind = 0, .wrap = [], .real = RealProfile {.share = [], .cc = [], .vault_key = [], .dek = [], .duress_hpke_pub = []},
                                          .duress = DuressFull {.share = [], .subkey = [], .vault_key = [], .hpke_priv = [], .tweaks = []}, .st = []}; }
-    return with_stretched(unlock(k, get_file(dir + "/blob_a"), get_file(dir + "/blob_b")), st);
+    return with_wrap(with_stretched(unlock(k, read_blob(dir, "a", w), read_blob(dir, "b", w)), st), w);
 }
 
 @requires(declassify, provision, network, environment, device, filesystem)
-Unlocked ks_unlock_either(Str dir, DeviceConfig c, List(Secret(UInt(8))) st, Bool a_first) {
-    Unlocked u = unlock(unlock_key_for(c, st, a_first), get_file(dir + "/blob_a"), get_file(dir + "/blob_b"));
-    return if (u.kind != 0) { u } else { unlock(unlock_key_for(c, st, !a_first), get_file(dir + "/blob_a"), get_file(dir + "/blob_b")) };
+Unlocked ks_unlock_either(Str dir, DeviceConfig c, List(Secret(UInt(8))) st, Bool a_first, List(Secret(UInt(8))) w) {
+    Unlocked u = unlock(unlock_key_for(c, st, a_first), read_blob(dir, "a", w), read_blob(dir, "b", w));
+    return if (u.kind != 0) { u } else { unlock(unlock_key_for(c, st, !a_first), read_blob(dir, "a", w), read_blob(dir, "b", w)) };
 }
 
 // The DK's signature over `msg` (ECDSA P-256, SHA-256): the TPM key under
@@ -675,12 +679,12 @@ pub Int org_min_pin(Str dir) {
 @requires(filesystem, device, declassify, provision, network, environment)
 Int reseal_real(Str dir, DeviceConfig c, Unlocked u, List(Secret(UInt(8))) st, List(Secret(UInt(8))) nst) {
     List(Secret(UInt(8))) old_key = unlock_key_for(c, st, true);
-    Bool in_a = unlock(old_key, get_file(dir + "/blob_a"), []).kind == 1;
+    Bool in_a = unlock(old_key, read_blob(dir, "a", u.wrap), []).kind == 1;
     List(Secret(UInt(8))) rp = encode_real(u.real) else { [] };
     if (rp.len() == 0) { return dfail("cannot encode the profile"); }
     List(Int) blob = seal_blob(unlock_key_for(c, nst, true), random_bytes(12), rp);
     if (unlock(unlock_key_for(c, nst, true), blob, []).kind != 1) { return dfail("the profile does not open under the new PIN; nothing changed"); }
-    if (!filesystem.write_bytes(dir + (if (in_a) { "/blob_a" } else { "/blob_b" }), blob)) { return dfail("cannot write the profile"); }
+    if (!write_blob(dir, if (in_a) { "a" } else { "b" }, blob, u.wrap)) { return dfail("cannot write the profile"); }
     println("PIN changed");
     return 0;
 }

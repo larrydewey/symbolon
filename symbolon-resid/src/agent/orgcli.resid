@@ -284,7 +284,7 @@ pub Result(OrgCtx, Str) org_view(Str dir) {
     VerifiedHead vh = match rv { Err(e) => Err(err_text(e)), Ok(h) => Ok(h) }?;
     OrgState st = org_at(dir, c, vh)?;
     List(Secret(UInt(8))) none = [];
-    Unlocked u = Unlocked {.kind = 0, .real = RealProfile {.share = none, .cc = none, .vault_key = none, .dek = none, .duress_hpke_pub = []},
+    Unlocked u = Unlocked {.kind = 0, .wrap = [], .real = RealProfile {.share = none, .cc = none, .vault_key = none, .dek = none, .duress_hpke_pub = []},
                            .duress = DuressFull {.share = none, .subkey = none, .vault_key = none, .hpke_priv = none, .tweaks = []}, .st = none};
     return Ok(OrgCtx {.x = Ctx {.c = c, .u = u, .vh = vh, .pin = "", .ep = relay_at(dir, c)}, .st = st});
 }

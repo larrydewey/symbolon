@@ -6,6 +6,7 @@ import '../app.dart';
 import '../widgets.dart';
 import 'devices_page.dart';
 import 'hardware_page.dart';
+import 'keys_page.dart';
 import 'import_page.dart';
 import 'org_page.dart';
 import 'recovery_page.dart';
@@ -81,6 +82,14 @@ class MorePage extends StatelessWidget {
               await Navigator.of(context).push(MaterialPageRoute<void>(builder: (_) => SetupPage(app: app)));
               onSetupDone();
             },
+          ),
+          ListTile(
+            key: const Key('open-keys'),
+            leading: const Icon(Icons.usb),
+            title: const Text('Security keys'),
+            subtitle: const Text('Require a YubiKey or other FIDO2 key to open this device'),
+            trailing: const Icon(Icons.chevron_right),
+            onTap: () => open(SecurityKeysPage(app: app)),
           ),
           ListTile(
             key: const Key('open-hardware'),

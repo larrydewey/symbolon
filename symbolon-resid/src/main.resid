@@ -54,6 +54,7 @@
 //   symbolon device share people DIR           "LOG-ID NAME-HEX FINGERPRINT me|-" per card at the relay
 //   symbolon ssh-agent DIR [SOCKET]            the SSH agent (SPEC 16.1) on a Unix socket
 //   symbolon device ssh new|import|list|sign|delete ...   SSH keys in the vault (src/agent/sshcli.resid)
+//   symbolon device key add|list|remove DIR [NAME]   security keys as a second factor (SPEC 9.4)
 //   symbolon browser host [ORIGIN...]          the browser extension's native messaging host (SPEC 22.5);
 //                                              SYMBOLON_CONSENT is the consent window (the app)
 //   symbolon home init DIR HOST [HOST...] [--ports BASE] [--bind ADDR]   Symbolon Home: the box's CA, certificates, witnesses
@@ -89,6 +90,7 @@ import "agent/sharecli.resid";
 import "browser/nmhost.resid";
 import "agent/sshcli.resid";
 import "ssh/agentd.resid";
+import "agent/keycli.resid";
 import "agent/orgcli.resid";
 import "agent/orgconsole.resid";
 import "agent/relaysrv.resid";
@@ -335,6 +337,9 @@ Int main() {
     if (a1 == "device" && a2 == "ssh" && args.get(3) == "list" && n == 5) { return ssh_list(args.get(4)); }
     if (a1 == "device" && a2 == "ssh" && args.get(3) == "sign" && n == 6) { return ssh_sign(args.get(4), args.get(5)); }
     if (a1 == "device" && a2 == "ssh" && args.get(3) == "delete" && n == 6) { return ssh_delete(args.get(4), args.get(5)); }
+    if (a1 == "device" && a2 == "key" && args.get(3) == "add" && n == 6) { return key_add(args.get(4), args.get(5)); }
+    if (a1 == "device" && a2 == "key" && args.get(3) == "list" && n == 5) { return key_list(args.get(4)); }
+    if (a1 == "device" && a2 == "key" && args.get(3) == "remove" && n == 6) { return key_remove(args.get(4), args.get(5)); }
     if (a1 == "browser" && a2 == "host") { return browser_host([args.get(3), args.get(4)]); }
     if (a1 == "home" && a2 == "serve" && n == 4) { return home_serve(args.get(3), args.get(0)); }
     if (a1 == "home" && a2 == "pair-serve" && n == 4) { return home_pair_serve(args.get(3), args.get(0)); }

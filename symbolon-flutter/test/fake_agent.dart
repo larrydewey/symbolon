@@ -43,6 +43,15 @@ case "$1 $2" in
         echo "signature-der 3006020101020101"
         echo "aaaa" ;;
     esac ;;
+  "device key")
+    case "$3" in
+      list) [ -f "$D/keys" ] && cat "$D/keys" ;;
+      *) [ "$PIN" = "2468" ] || { echo "device: wrong PIN" >&2; exit 1; }
+         case "$3" in
+           add) printf '%s\n' "$(printf %s "$5" | xxd -p)" >> "$D/keys"; echo "security key $5 added" ;;
+           remove) grep -v "^$(printf %s "$5" | xxd -p)\$" "$D/keys" > "$D/keys.n"; mv "$D/keys.n" "$D/keys"; echo "removed" ;;
+         esac ;;
+    esac ;;
   "device ssh")
     case "$3" in
       list) printf '676974687562 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOxx github@laptop\n71756f72756d ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBNy quorum\n' ;;

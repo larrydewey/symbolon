@@ -18,6 +18,7 @@ import "state.resid";
 import "common.resid";
 import "session.resid";
 import "device.resid";
+import "fidokey.resid";
 import "enroll.resid";
 import "serials.resid";
 import "../threshold/threshold.resid";
@@ -270,7 +271,7 @@ Int release_then(Str dir, DeviceConfig c, Unlocked u, KitKeys kit, VerifiedHead 
 @requires(filesystem, network, device, declassify, clock, provision, environment)
 Int reshare_as_kit(Str dir, DeviceConfig c, Unlocked u0, KitSecrets s, List(UInt(64)) xk, VerifiedHead vh, Quorum pre, Party oldkit, Party cos, Str pin, Str primes_file, Cursor cur) {
     // The recovered chain code and vault key replace this device's own.
-    Unlocked u = Unlocked {.kind = 1, .duress = u0.duress, .st = u0.st, .real = RealProfile {.share = u0.real.share, .cc = s.cc, .vault_key = s.vault_rk, .dek = u0.real.dek, .duress_hpke_pub = u0.real.duress_hpke_pub}};
+    Unlocked u = Unlocked {.kind = 1, .duress = u0.duress, .st = u0.st, .wrap = u0.wrap, .real = RealProfile {.share = u0.real.share, .cc = s.cc, .vault_key = s.vault_rk, .dek = u0.real.dek, .duress_hpke_pub = u0.real.duress_hpke_pub}};
     Quorum q = vh.head.quorum;
     List(Party) np = q.parties;
     Int kit_old = pos1(pre.parties, oldkit.id, 0);
@@ -304,8 +305,8 @@ Int sealed_after(Str dir, DeviceConfig c, Unlocked u, Str pin, Quorum pre, Int r
     if (r != 0) { return r; }
     List(Secret(UInt(8))) k = unlock_key_for(c, u.st, true);
     List(Secret(UInt(8))) rp = encode_real(u.real) else { [] };
-    Bool a_real = unlock(k, get_file(dir + "/blob_a"), []).kind == 1;
-    if (!filesystem.write_bytes(dir + (if (a_real) { "/blob_a" } else { "/blob_b" }), seal_blob(k, random_bytes(12), rp))) { return dfail("cannot reseal the profile"); }
+    Bool a_real = unlock(k, read_blob(dir, "a", u.wrap), []).kind == 1;
+    if (!write_blob(dir, if (a_real) { "a" } else { "b" }, seal_blob(k, random_bytes(12), rp), u.wrap)) { return dfail("cannot reseal the profile"); }
     println("recovered: this device holds a share of the recovered quorum");
     Result(VerifiedHead, SymbolonError) rv0 = verified_log(relay_ep(c), c.log_id);
     _ = match rv0 { Ok(v) => send_duress_key(dir, relay_ep(c), Local {.party = c.party, .cg = 0, .hpke_sk = device_hpke(u.real.dek).sk}, cos_remote(v)), Err(_) => false };

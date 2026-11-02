@@ -1,0 +1,229 @@
+// Security keys as a second factor (SPEC 9.4): a FIDO2 key (a YubiKey or
+// any CTAP2 key with hmac-secret) that must be present and touched to open
+// this device's profiles.
+//
+//   symbolon device key add DIR NAME      PIN on stdin; touch the key twice
+//   symbolon device key list DIR          "NAME-HEX" per key, no PIN
+//   symbolon device key remove DIR NAME   PIN on stdin; touch any enrolled key
+//
+// With a key enrolled, blob_a and blob_b are sealed again under a random
+// wrap key W (blob_a.k, blob_b.k; AES-256-GCM). W is kept once per key in
+// DIR/security-keys, sealed under that key's hmac-secret output for this
+// device's salt: one credential per key (made on the key, not stored on
+// it), so a backup key is a second line. Opening the profiles asks the
+// key (getAssertion, all credentials allowed, a touch), checks the
+// assertion's signature with the credential's public key, and unseals W.
+//
+// The key is reached through SYMBOLON_FIDO_SOCKET when set (a Unix socket
+// speaking length-prefixed CTAP2 messages: tests, and any bridge), else the
+// first USB FIDO key (lib/dev/fido.resid).
+
+import "../duress/duress.resid";
+import "../vault/vault.resid";
+import "state.resid";
+import "common.resid";
+import "ctap2.resid";
+import "cborv.resid";
+import "crypto.resid";
+import "word.resid";
+import "aesgcmg.resid";
+import "hash.resid";
+import "cose.resid";
+import "httpserv.resid";
+
+// ============================================================================
+// Transport
+// ============================================================================
+
+List(Int) u32be(Int n) { return [(n >> 24) & 255, (n >> 16) & 255, (n >> 8) & 255, n & 255]; }
+
+@requires(network)
+List(Int) recv_n(Int fd, Int n, List(Int) acc) {
+    if (acc.len() >= n) { return acc; }
+    List(Int) c = resid_unix_recv_some(fd, n - acc.len());
+    if (c.len() == 0) { return acc; }
+    return recv_n(fd, n, acc.concat(c));
+}
+
+// One CTAP2 exchange (command byte and CBOR in; status and CBOR out); []
+// when no key answers.
+@requires(network, environment)
+pub List(Int) fido_exchange(List(Int) cmd) {
+    Str sock = environment.get("SYMBOLON_FIDO_SOCKET");
+    if (str_len(sock) == 0) { return usb_exchange(cmd); }
+    Int fd = resid_unix_connect(sock);
+    if (fd < 0) { return []; }
+    _ = resid_unix_deadline(fd, 60000);
+    Bool sent = resid_unix_send(fd, u32be(cmd.len()).concat(cmd));
+    List(Int) h = if (sent) { recv_n(fd, 4, []) } else { [] };
+    Int n = if (h.len() == 4) { (h[0] << 24) | (h[1] << 16) | (h[2] << 8) | h[3] } else { -1 };
+    List(Int) r = if (n >= 1 && n <= 8192) { recv_n(fd, n, []) } else { [] };
+    _ = resid_unix_close(fd);
+    return if (r.len() == n) { r } else { [] };
+}
+
+// USB keys need the Resid device module for FIDO HID (lib/dev/fido.resid).
+List(Int) usb_exchange(List(Int) cmd) { return []; }
+
+// ============================================================================
+// The enrolled keys
+// ============================================================================
+
+// One line per key: NAME-HEX CRED-ID-HEX CRED-POINT-HEX SEALED-W-HEX; a
+// first line "salt HEX".
+pub type SecKey = { Str name; List(Int) cred_id; List(Int) cred_point; List(Int) sealed; };
+pub type SecKeys = { List(Int) salt; List(SecKey) keys; };
+
+pub Str keys_file(Str dir) { return dir + "/security-keys"; }
+
+Bool hexy(Str s) { return str_len(s) % 2 == 0 && str_len(s) > 0 && all_hex(s, 0); }
+Bool all_hex(Str s, Int i) {
+    if (i >= str_len(s)) { return true; }
+    if (!str_contains("0123456789abcdef", str_slice(s, i, i + 1))) { return false; }
+    return all_hex(s, i + 1);
+}
+
+pub SecKeys keys_of(Str text) {
+    List(Str) ls = str_split(text, "\n");
+    List(Str) h = str_split(str_trim(if (ls.len() > 0) { ls[0] } else { "" }), " ");
+    List(Int) salt = if (h.len() == 2 && h[0] == "salt" && hexy(h[1])) { cose_hex_decode(h[1]) } else { [] };
+    return SecKeys {.salt = salt, .keys = key_lines(ls, 1, [])};
+}
+
+List(SecKey) key_lines(List(Str) ls, Int i, List(SecKey) acc) {
+    if (i >= ls.len()) { return acc; }
+    List(Str) p = str_split(str_trim(ls[i]), " ");
+    Bool ok = p.len() == 4 && hexy(p[0]) && hexy(p[1]) && hexy(p[2]) && hexy(p[3]);
+    return key_lines(ls, i + 1, if (ok) { acc.concat([SecKey {.name = http_text(cose_hex_decode(p[0]), 0, str_len(p[0]) / 2), .cred_id = cose_hex_decode(p[1]), .cred_point = cose_hex_decode(p[2]), .sealed = cose_hex_decode(p[3])}]) } else { acc });
+}
+
+Str keys_text(SecKeys k, Int i, Str acc) {
+    if (i >= k.keys.len()) { return acc; }
+    SecKey x = k.keys[i];
+    return keys_text(k, i + 1, acc + hex_encode(utf8(x.name)) + " " + hex_encode(x.cred_id) + " " + hex_encode(x.cred_point) + " " + hex_encode(x.sealed) + "\n");
+}
+
+@requires(filesystem)
+pub SecKeys read_keys(Str dir) {
+    Str f = keys_file(dir);
+    return if (filesystem.exists(f)) { keys_of(filesystem.read_all(f)) } else { SecKeys {.salt = [], .keys = []} };
+}
+
+@requires(filesystem)
+pub Bool write_keys(Str dir, SecKeys k) {
+    if (k.keys.len() == 0) { return filesystem.write_all(keys_file(dir), ""); }
+    return filesystem.write_all(keys_file(dir), "salt " + hex_encode(k.salt) + "\n" + keys_text(k, 0, ""));
+}
+
+@requires(filesystem)
+pub Bool keys_enrolled(Str dir) { return read_keys(dir).keys.len() > 0; }
+
+// ============================================================================
+// Sealing W
+// ============================================================================
+
+Str rp_id() { return "symbolon.unlock"; }
+
+List(Int) wrap_aad(List(Int) cred_id) { return utf8("symbolon v1 security key wrap").concat(cred_id); }
+
+// W sealed under the key's output: iv || AES-256-GCM.
+@requires(declassify)
+pub List(Int) seal_w(List(Secret(UInt(8))) out, List(Int) cred_id, List(Secret(UInt(8))) w, List(Int) iv) {
+    List(Secret(UInt(8))) k = hk(out, "symbolon v1 security key " + hex_encode(cred_id), 32);
+    List(Secret(UInt(8))) ct = aes_gcmg_seal(k, iv, w, wrap_aad(cred_id));
+    return iv.concat(reveal(ct));
+}
+
+@requires(declassify)
+Option(List(Secret(UInt(8)))) open_w(List(Secret(UInt(8))) out, SecKey x) {
+    if (x.sealed.len() < 12 + 16) { return None; }
+    List(Secret(UInt(8))) k = hk(out, "symbolon v1 security key " + hex_encode(x.cred_id), 32);
+    return aes_gcmg_decrypt(k, x.sealed[0..12], x.sealed[12..x.sealed.len()], wrap_aad(x.cred_id));
+}
+
+// ============================================================================
+// Talking to the key
+// ============================================================================
+
+pub type Touch = { Bool ok; Str why; List(Int) cred_id; List(Secret(UInt(8))) out; };
+
+Touch no_touch(Str why) { return Touch {.ok = false, .why = why, .cred_id = [], .out = []}; }
+
+// The key's hmac-secret output for `salt` with one of `creds` (whichever
+// the present key holds), after its assertion checks out.
+@requires(network, environment, declassify)
+pub Touch touch_key(List(SecKey) creds, List(Int) salt) {
+    Resp ka = resp_of(fido_exchange(req_key_agreement()));
+    if (ka.status != 0) { return no_touch(if (ka.status == -1) { "no security key answers" } else { ctap_status_text(ka.status) }); }
+    Pp2 k = pp2_shared(random_bytes(32), key_agreement_of(ka.body));
+    if (k.aes_key.len() == 0) { return no_touch("the key's answer is malformed"); }
+    return touch_each(creds, 0, salt, k);
+}
+
+// A non-resident credential is only known to the key that made it: ask for
+// each until one answers (a key that does not hold it says so at once).
+@requires(network, environment, declassify)
+Touch touch_each(List(SecKey) creds, Int i, List(Int) salt, Pp2 k) {
+    if (i >= creds.len()) { return no_touch("none of the enrolled security keys is present"); }
+    SecKey c = creds[i];
+    List(Int) cdh = random_bytes(32);
+    Resp r = resp_of(fido_exchange(req_hmac_assertion(cdh, rp_id(), c.cred_id, k, salt, random_bytes(16))));
+    if (r.status == 46) { return touch_each(creds, i + 1, salt, k); }
+    Got g = hmac_output_of(r, rp_id(), c.cred_id, c.cred_point, cdh, k);
+    if (!g.ok) { return no_touch(g.why); }
+    return Touch {.ok = true, .why = "", .cred_id = c.cred_id, .out = secret_bytes(g.output)};
+}
+
+// W from the present key, or [] with the reason printed.
+@requires(filesystem, network, environment, declassify)
+pub List(Secret(UInt(8))) unwrap_key(Str dir) {
+    SecKeys ks = read_keys(dir);
+    if (ks.keys.len() == 0) { return []; }
+    eprintln("device: touch your security key");
+    Touch t = touch_key(ks.keys, ks.salt);
+    if (!t.ok) { eprintln("device: " + t.why); return []; }
+    SecKey x = key_with(ks.keys, t.cred_id, 0) else { SecKey {.name = "", .cred_id = [], .cred_point = [], .sealed = []} };
+    Option(List(Secret(UInt(8)))) w = open_w(t.out, x);
+    return w else { [] };
+}
+
+Option(SecKey) key_with(List(SecKey) ks, List(Int) id, Int i) {
+    if (i >= ks.len()) { return None; }
+    if (hex_encode(ks[i].cred_id) == hex_encode(id)) { return Some(ks[i]); }
+    return key_with(ks, id, i + 1);
+}
+
+// ============================================================================
+// The profile files
+// ============================================================================
+
+List(Int) bw_aad(Str which) { return utf8("symbolon v1 wrapped profile " + which); }
+
+// A profile file's blob: blob_X under W when security keys are enrolled
+// (blob_X.k), else blob_X. Resid writes but does not delete files: an
+// emptied file counts as absent.
+@requires(filesystem)
+Bool present(Str f) { return filesystem.exists(f) && get_file(f).len() > 0; }
+
+@requires(filesystem, declassify)
+pub List(Int) read_blob(Str dir, Str which, List(Secret(UInt(8))) w) {
+    Str k = dir + "/blob_" + which + ".k";
+    if (!present(k)) { return get_file(dir + "/blob_" + which); }
+    if (w.len() != 32) { return []; }
+    List(Int) b = get_file(k);
+    if (b.len() < 28) { return []; }
+    Option(List(Secret(UInt(8)))) p = aes_gcmg_decrypt(w, b[0..12], b[12..b.len()], bw_aad(which));
+    return match p { None => [], Some(x) => reveal(x) };
+}
+
+// Writes blob_X under W (and empties blob_X), or plain (and empties
+// blob_X.k) when `w` is [].
+@requires(filesystem, declassify)
+pub Bool write_blob(Str dir, Str which, List(Int) blob, List(Secret(UInt(8))) w) {
+    Str plain = dir + "/blob_" + which;
+    Str k = plain + ".k";
+    if (w.len() != 32) { return filesystem.write_bytes(plain, blob) && (!filesystem.exists(k) || filesystem.write_bytes(k, [])); }
+    List(Int) iv = random_bytes(12);
+    List(Int) sealed = iv.concat(reveal(aes_gcmg_seal(w, iv, secret_bytes(blob), bw_aad(which))));
+    return filesystem.write_bytes(k, sealed) && filesystem.write_bytes(plain, []);
+}

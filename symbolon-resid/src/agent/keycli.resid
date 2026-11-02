@@ -1,0 +1,99 @@
+// `symbolon device key add|list|remove` (SPEC 9.4): security keys that
+// must be present to open this device's profiles. See fidokey.resid.
+
+import "../duress/duress.resid";
+import "../vault/vault.resid";
+import "state.resid";
+import "common.resid";
+import "device.resid";
+import "fidokey.resid";
+import "ctap2.resid";
+import "crypto.resid";
+import "word.resid";
+
+DeviceConfig return_cfg_none() {
+    return DeviceConfig {.relay_host = "", .relay_port = 0, .ca = "", .witnesses = [], .unprotected = true, .argon_m_kib = 0, .argon_t = 0, .salt = [],
+        .tpm_dk = 0, .tpm_unlock_a = 0, .tpm_unlock_b = 0, .party = [], .dk_pub = [], .hpke_pub = [], .log_id = [], .mbox_next = 0, .peers = []};
+}
+
+Option(SecKey) named(List(SecKey) ks, Str n, Int i) {
+    if (i >= ks.len()) { return None; }
+    if (ks[i].name == n) { return Some(ks[i]); }
+    return named(ks, n, i + 1);
+}
+
+List(SecKey) without_named(List(SecKey) ks, Str n, Int i, List(SecKey) acc) {
+    if (i >= ks.len()) { return acc; }
+    return without_named(ks, n, i + 1, if (ks[i].name == n) { acc } else { acc.concat([ks[i]]) });
+}
+
+// `device key list DIR`
+@requires(filesystem)
+pub Int key_list(Str dir) { return print_names(read_keys(dir).keys, 0); }
+
+Int print_names(List(SecKey) ks, Int i) {
+    if (i >= ks.len()) { return 0; }
+    println(hex_encode(utf8(ks[i].name)));
+    return print_names(ks, i + 1);
+}
+
+// `device key add DIR NAME`: the PIN; then the key is touched to make its
+// credential and again to give its hmac-secret output.
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+pub Int key_add(Str dir, Str name) {
+    if (str_len(name) == 0 || str_len(name) > 64 || str_contains(name, "\n")) { return dfail("a name of 1-64 characters"); }
+    Option(DeviceConfig) oc = load_config(dir);
+    DeviceConfig c = oc else { return_cfg_none() };
+    if (c.log_id.len() == 0) { return dfail("not set up (device new, device init)"); }
+    SecKeys ks = read_keys(dir);
+    if (match named(ks.keys, name, 0) { None => false, Some(_) => true }) { return dfail("a key named " + name + " is already enrolled"); }
+    Unlocked u = unlock_dir(dir, c, read_pin());
+    if (u.kind != 1) { return dfail("wrong PIN"); }
+    if (ks.keys.len() > 0 && u.wrap.len() != 32) { return dfail("an enrolled key must be present to add another"); }
+    Resp ir = resp_of(fido_exchange(req_get_info()));
+    if (ir.status != 0) { return dfail(if (ir.status == -1) { "no security key answers" } else { ctap_status_text(ir.status) }); }
+    Info info = info_of(ir.body);
+    if (!info.hmac_secret || !info.protocol2) { return dfail("this key lacks hmac-secret or PIN protocol 2 (a FIDO2.1 key is needed)"); }
+    eprintln("device: touch the new security key");
+    Made m = made_of(resp_of(fido_exchange(req_make_credential(random_bytes(32), "symbolon.unlock", c.party, "symbolon device"))), "symbolon.unlock");
+    if (!m.ok) { return dfail(m.why); }
+    List(Int) salt = if (ks.salt.len() == 32) { ks.salt } else { random_bytes(32) };
+    SecKey fresh = SecKey {.name = name, .cred_id = m.cred_id, .cred_point = m.cred_point, .sealed = []};
+    eprintln("device: touch it once more");
+    Touch t = touch_key([fresh], salt);
+    if (!t.ok) { return dfail(t.why); }
+    List(Secret(UInt(8))) w = if (u.wrap.len() == 32) { u.wrap } else { secret_bytes(random_bytes(32)) };
+    SecKey sealed = SecKey {.name = name, .cred_id = m.cred_id, .cred_point = m.cred_point, .sealed = seal_w(t.out, m.cred_id, w, random_bytes(12))};
+    // The key list first: if the profiles were sealed and the list not
+    // written, nothing could open them.
+    if (!write_keys(dir, SecKeys {.salt = salt, .keys = ks.keys.concat([sealed])})) { return dfail("cannot write " + keys_file(dir)); }
+    if (ks.keys.len() == 0) {
+        List(Int) a = read_blob(dir, "a", []);
+        List(Int) b = read_blob(dir, "b", []);
+        if (!write_blob(dir, "a", a, w) || !write_blob(dir, "b", b, w)) { return dfail("cannot seal the profiles"); }
+    }
+    println("security key " + name + " added; this device now opens only with it (or another enrolled key) present");
+    return 0;
+}
+
+// `device key remove DIR NAME`: the PIN and a touch of any enrolled key.
+// Removing the last key returns the profiles to PIN only.
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+pub Int key_remove(Str dir, Str name) {
+    Option(DeviceConfig) oc = load_config(dir);
+    DeviceConfig c = oc else { return_cfg_none() };
+    if (c.log_id.len() == 0) { return dfail("not set up (device new, device init)"); }
+    SecKeys ks = read_keys(dir);
+    if (match named(ks.keys, name, 0) { None => true, Some(_) => false }) { return dfail("no key named " + name); }
+    Unlocked u = unlock_dir(dir, c, read_pin());
+    if (u.kind != 1 || u.wrap.len() != 32) { return dfail("wrong PIN, or no enrolled key present"); }
+    List(SecKey) rest = without_named(ks.keys, name, 0, []);
+    if (rest.len() == 0) {
+        List(Int) a = read_blob(dir, "a", u.wrap);
+        List(Int) b = read_blob(dir, "b", u.wrap);
+        if (!write_blob(dir, "a", a, []) || !write_blob(dir, "b", b, [])) { return dfail("cannot unseal the profiles"); }
+    }
+    if (!write_keys(dir, SecKeys {.salt = ks.salt, .keys = rest})) { return dfail("cannot write " + keys_file(dir)); }
+    println("security key " + name + " removed" + if (rest.len() == 0) { "; this device opens with the PIN alone" } else { "" });
+    return 0;
+}

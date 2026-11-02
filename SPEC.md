@@ -542,6 +542,45 @@ so the pattern of writes does not reveal whether a duress profile exists
 On lock, auto-lock (RECOMMENDED 15 minutes idle), session lock or suspend,
 the agent MUST wipe `unlock_key`, the share and every derived secret.
 
+### 9.4 Security keys as a second factor
+
+A principal can require a FIDO2 security key (a YubiKey or any CTAP 2.1
+key with `hmac-secret` and PIN/UV auth protocol 2) to be present and
+touched, besides the PIN, before a device opens its profiles
+(`device key add|list|remove`).
+
+- **Enrollment.** The key makes a non-resident ES256 credential for the
+  relying-party label `symbolon.unlock` (one touch), then gives its
+  `hmac-secret` output O for a 32-byte salt the device chose (a second
+  touch). The salt is the same for every key of a device; O differs per
+  credential.
+- **Sealing.** With the first key, the device draws a random 32-byte wrap
+  key W and seals `blob_a` and `blob_b` (Section 9.1) again under W with
+  AES-256-GCM (`blob_a.k`, `blob_b.k`); the plain files are emptied. Each
+  enrolled key keeps W sealed under HKDF(O) with AES-256-GCM in
+  `security-keys`, beside its credential ID and public key, so a backup
+  key is a second entry. The list is written before the profiles are
+  sealed, so an interruption cannot leave profiles no entry opens.
+- **Opening.** The device asks the present key for its `hmac-secret`
+  output (getAssertion with user presence, the salt encrypted under the
+  protocol-2 shared secret) for each enrolled credential until one is
+  held. It checks the assertion's signature with that credential's public
+  key and the relying party, and unseals W. Without a key, without a touch,
+  or with a wrong signature, nothing opens; the PIN still goes through
+  Section 9.1 as before, and the TPM's or Keystore's limits on PIN
+  attempts are unchanged. Both profiles are under W, so the duress PIN
+  needs the key too: a coerced principal hands over the key with the PIN,
+  and the duress profile behaves as in Section 9.2.
+- **Removal** needs the PIN and any enrolled key. Removing the last key
+  unseals the profiles and returns the device to the PIN alone.
+- **Transport.** USB keys over CTAPHID (the Resid device module for FIDO
+  HID); `SYMBOLON_FIDO_SOCKET` names a Unix socket speaking length-prefixed
+  CTAP2 messages instead (tests, bridges).
+
+A security key adds a factor to one device; it does not hold a share and
+is not a quorum party (Section 10). It cannot run the threshold protocol,
+and its own credentials cannot be exported.
+
 ---
 
 ## 10. Threshold passkeys

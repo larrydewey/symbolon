@@ -140,13 +140,16 @@ pub Option(List(Secret(UInt(8)))) encode_duress(DuressFull d) {
 // is empty). A sum type cannot carry secrets, so both records are present.
 // `st` is the stretched PIN that opened it (the device key's TPM authValue),
 // kept so that one operation stretches the PIN once (empty when unknown).
-pub type Unlocked = { Int kind; RealProfile real; DuressFull duress; List(Secret(UInt(8))) st; };
+// wrap: the key the profile files are sealed under when security keys are
+// enrolled (SPEC 9.4), [] otherwise.
+pub type Unlocked = { Int kind; RealProfile real; DuressFull duress; List(Secret(UInt(8))) st; List(Secret(UInt(8))) wrap; };
 
-pub Unlocked with_stretched(Unlocked u, List(Secret(UInt(8))) st) { return Unlocked {.kind = u.kind, .real = u.real, .duress = u.duress, .st = st}; }
+pub Unlocked with_stretched(Unlocked u, List(Secret(UInt(8))) st) { return Unlocked {.kind = u.kind, .real = u.real, .duress = u.duress, .st = st, .wrap = u.wrap}; }
+pub Unlocked with_wrap(Unlocked u, List(Secret(UInt(8))) w) { return Unlocked {.kind = u.kind, .real = u.real, .duress = u.duress, .st = u.st, .wrap = w}; }
 
 RealProfile real_none() { return RealProfile {.share = [], .cc = [], .vault_key = [], .dek = [], .duress_hpke_pub = []}; }
 DuressFull duress_none() { return DuressFull {.share = [], .subkey = [], .vault_key = [], .hpke_priv = [], .tweaks = []}; }
-Unlocked locked() { return Unlocked {.kind = 0, .real = real_none(), .duress = duress_none(), .st = []}; }
+Unlocked locked() { return Unlocked {.kind = 0, .real = real_none(), .duress = duress_none(), .st = [], .wrap = []}; }
 
 List(Int) pub_bytes(List(UInt(8)) bs, Int i, ListBuf(Int) acc) {
     if (i >= bs.len()) { return acc.finish(); }
@@ -176,7 +179,7 @@ pub Unlocked decode_profile(List(Secret(UInt(8))) p) {
     Int kind = byte_at(p, 0);
     if (kind == 1) {
         Bool has = byte_at(p, 129) == 1;
-        return Unlocked {.kind = 1, .duress = duress_none(), .st = [], .real = RealProfile {
+        return Unlocked {.kind = 1, .duress = duress_none(), .st = [], .wrap = [], .real = RealProfile {
             .share = provisioned_key(p[1..33], "a key from the device's sealed profile, drawn by random_secret at setup"), .cc = provisioned_key(p[33..65], "a key from the device's sealed profile, drawn by random_secret at setup"),
             .vault_key = provisioned_key(p[65..97], "a key from the device's sealed profile, drawn by random_secret at setup"), .dek = provisioned_key(p[97..129], "a key from the device's sealed profile, drawn by random_secret at setup"),
             .duress_hpke_pub = if (has) { bytes_at(p, 130, 65) } else { [] }}};
@@ -184,7 +187,7 @@ pub Unlocked decode_profile(List(Secret(UInt(8))) p) {
     if (kind == 2) {
         Int n = byte_at(p, 129);
         if (n > max_subset()) { return locked(); }
-        return Unlocked {.kind = 2, .real = real_none(), .st = [], .duress = DuressFull {
+        return Unlocked {.kind = 2, .real = real_none(), .st = [], .wrap = [], .duress = DuressFull {
             .share = provisioned_key(p[1..33], "a key from the device's sealed profile, drawn by random_secret at setup"), .subkey = provisioned_key(p[33..65], "a key from the device's sealed profile, drawn by random_secret at setup"),
             .vault_key = provisioned_key(p[65..97], "a key from the device's sealed profile, drawn by random_secret at setup"), .hpke_priv = provisioned_key(p[97..129], "a key from the device's sealed profile, drawn by random_secret at setup"),
             .tweaks = read_tweaks(p, 130, n, ListBuf())}};
