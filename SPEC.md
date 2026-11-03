@@ -1017,14 +1017,18 @@ connections by `SO_PEERCRED`, and opens it close-on-exec (Resid
   revoking a device (Section 11) revokes its part of every SSH key, with
   no change at any server.
 - *Imported* (`device ssh import`): an existing OpenSSH private key
-  (`ssh-ed25519`, `ecdsa-sha2-nistp256` or `ecdsa-sha2-nistp384`),
-  unencrypted or protected by a passphrase (bcrypt-pbkdf with
+  (`ssh-ed25519`, `ecdsa-sha2-nistp256`, `ecdsa-sha2-nistp384`, or RSA of
+  2048 to 4096 bits signing `rsa-sha2-256`/`rsa-sha2-512`; a request for a
+  SHA-1 `ssh-rsa` signature is refused), unencrypted or protected by a
+  passphrase (bcrypt-pbkdf with
   aes128/192/256-ctr, ssh-keygen's default; bcrypt is not constant time,
   and runs once, at import). Its private part is sealed in the vault like
   any secret field and is opened only inside the process that signs
   (`device ssh sign`), as `Secret` bytes. The file is not removed; the
-  principal is told to delete it. Not yet: RSA keys (signing needs a
-  constant-time big-number layer in Resid).
+  principal is told to delete it. RSA signing is constant time in the
+  private key (Resid `lib/rsasign.resid`: CRT without a secret division, a
+  Montgomery ladder, the signature checked with the public key before it
+  is released).
 
 The public keys, with their names, are also written to `DIR/ssh-keys`, so
 `REQUEST_IDENTITIES` is answered without the PIN.

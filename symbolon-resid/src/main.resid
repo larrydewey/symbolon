@@ -335,7 +335,7 @@ Int main() {
     if (a1 == "device" && a2 == "ssh" && args.get(3) == "new" && n == 6) { return ssh_new(args.get(4), args.get(5)); }
     if (a1 == "device" && a2 == "ssh" && args.get(3) == "import" && n == 7) { return ssh_import(args.get(4), args.get(5), args.get(6)); }
     if (a1 == "device" && a2 == "ssh" && args.get(3) == "list" && n == 5) { return ssh_list(args.get(4)); }
-    if (a1 == "device" && a2 == "ssh" && args.get(3) == "sign" && n == 6) { return ssh_sign(args.get(4), args.get(5)); }
+    if (a1 == "device" && a2 == "ssh" && args.get(3) == "sign" && (n == 6 || n == 7)) { return ssh_sign(args.get(4), args.get(5), if (n == 7) { args.get(6) } else { "" }); }
     if (a1 == "device" && a2 == "ssh" && args.get(3) == "delete" && n == 6) { return ssh_delete(args.get(4), args.get(5)); }
     if (a1 == "device" && a2 == "key" && args.get(3) == "add" && n == 6) { return key_add(args.get(4), args.get(5)); }
     if (a1 == "device" && a2 == "key" && args.get(3) == "list" && n == 5) { return key_list(args.get(4)); }

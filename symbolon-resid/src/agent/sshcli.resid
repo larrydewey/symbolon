@@ -31,6 +31,7 @@ import "ecdsa.resid";
 import "ed25519g.resid";
 import "hash.resid";
 import "bcrypt_pbkdf.resid";
+import "rsasign.resid";
 
 // ============================================================================
 // The public index
@@ -136,7 +137,7 @@ pub Int ssh_import(Str dir, Str name, Str file) {
     Option(SshPriv) op = priv_of_section(section, k.pub_blob);
     return match op {
         None => dfail(if (k.cipher == "none") { "the key file is damaged or not one Symbolon can read" } else { "wrong passphrase (or a damaged file)" }),
-        Some(p) => if (p.pub.kind == "rsa") { dfail("RSA keys cannot be imported yet; ed25519 and ECDSA keys can") } else { ssh_import_key(dir, ro, name, p) }
+        Some(p) => if (p.pub.kind == "rsa" && (p.pub.n.len() < 256 || p.pub.n.len() > 512)) { dfail("RSA keys of 2048 to 4096 bits can be imported") } else { ssh_import_key(dir, ro, name, p) }
     };
 }
 
@@ -165,8 +166,11 @@ List(Int) opened_section(KeyFile k, Str phrase) {
 Int ssh_import_key(Str dir, Result(Opened, Str) ro, Str name, SshPriv p) {
     Str comment = if (str_len(p.comment) > 0) { p.comment } else { name };
     Str line = ssh_pub_line(p.pub.blob, comment);
-    List(FieldPlain) fs = [fpl("name", name), fpl("type", "ssh"), fpl("kind", "imported"), fpl("alg", p.pub.alg), fpl("public", line), fpl("comment", comment),
-                           FieldPlain {.name = "private", .value = p.secret}];
+    List(FieldPlain) base = [fpl("name", name), fpl("type", "ssh"), fpl("kind", "imported"), fpl("alg", p.pub.alg), fpl("public", line), fpl("comment", comment)];
+    // An RSA key keeps d, p, q and q^-1 mod p (CRT signing, lib/rsasign.resid).
+    List(FieldPlain) fs = if (p.pub.kind == "rsa") {
+        base.concat([FieldPlain {.name = "rsa_d", .value = p.d}, FieldPlain {.name = "rsa_p", .value = p.p}, FieldPlain {.name = "rsa_q", .value = p.q}, FieldPlain {.name = "rsa_iqmp", .value = p.iqmp}])
+    } else { base.concat([FieldPlain {.name = "private", .value = p.secret}]) };
     return match ro {
         Err(m) => dfail(m),
         Ok(o) => if (seal_publish(dir, o, name, fs) != 0) { 1 } else { if (index_put(dir, name, line)) { done_import(line) } else { dfail("cannot write " + ssh_index(dir)) } }
@@ -203,9 +207,11 @@ Str ftext(List(FieldPlain) fs, Str n) {
     return match v { None => "", Some(x) => text_of(reveal(x)) };
 }
 
-// `device ssh sign DIR NAME`: the PIN, then the data to sign in hex.
+// `device ssh sign DIR NAME [rsa-sha2-256|rsa-sha2-512]`: the PIN, then the
+// data to sign in hex. The algorithm is the one the client asked for (an
+// RSA key; SHA-1 ssh-rsa signatures are refused).
 @requires(filesystem, network, device, declassify, clock, provision, environment)
-pub Int ssh_sign(Str dir, Str name) {
+pub Int ssh_sign(Str dir, Str name, Str rsa_alg) {
     Result(Opened, Str) ro = open_vault(dir);
     Str data_hex = read_pin();
     if (!hex_ok(data_hex) || str_len(data_hex) == 0 || str_len(data_hex) > 524288) { return dfail("the data to sign, in hex, on the line after the PIN"); }
@@ -213,19 +219,19 @@ pub Int ssh_sign(Str dir, Str name) {
         Err(m) => dfail(m),
         Ok(o) => match item_by_id(o.st.items, item_id_of(o.p.vk, name), 0) {
             None => dfail("no such key"),
-            Some(it) => sign_item(dir, o, it, cose_hex_decode(data_hex))
+            Some(it) => sign_item(dir, o, it, cose_hex_decode(data_hex), rsa_alg)
         }
     };
 }
 
 @requires(filesystem, network, device, declassify, clock, provision, environment)
-Int sign_item(Str dir, Opened o, Item it, List(Int) data) {
+Int sign_item(Str dir, Opened o, Item it, List(Int) data, Str rsa_alg) {
     Result(List(FieldPlain), SymbolonError) r = item_open(o.p.vk, o.p.vid, it);
-    return match r { Err(e) => dfail(err_text(e)), Ok(fs) => sign_fields(dir, o, fs, data) };
+    return match r { Err(e) => dfail(err_text(e)), Ok(fs) => sign_fields(dir, o, fs, data, rsa_alg) };
 }
 
 @requires(filesystem, network, device, declassify, clock, provision, environment)
-Int sign_fields(Str dir, Opened o, List(FieldPlain) fs, List(Int) data) {
+Int sign_fields(Str dir, Opened o, List(FieldPlain) fs, List(Int) data, Str rsa_alg) {
     if (ftext(fs, "type") != "ssh") { return dfail("not an SSH key"); }
     Str kind = ftext(fs, "kind");
     if (kind == "threshold") {
@@ -234,10 +240,23 @@ Int sign_fields(Str dir, Opened o, List(FieldPlain) fs, List(Int) data) {
     List(Secret(UInt(8))) none = [];
     List(Secret(UInt(8))) k = fval(fs, "private", 0) else { none };
     Str alg = ftext(fs, "alg");
-    List(Int) blob = sign_imported(alg, k, data);
+    List(Int) blob = if (alg == "ssh-rsa") { sign_rsa(fs, rsa_alg, data) } else { sign_imported(alg, k, data) };
     if (blob.len() == 0) { return dfail("this key cannot sign (" + alg + ")"); }
     println("signature " + hex_encode(blob));
     return 0;
+}
+
+// rsa-sha2-256 or rsa-sha2-512 (RFC 8332) with the key's CRT parts.
+@requires(declassify)
+List(Int) sign_rsa(List(FieldPlain) fs, Str rsa_alg, List(Int) data) {
+    if (rsa_alg != "rsa-sha2-256" && rsa_alg != "rsa-sha2-512") { return []; }
+    Option(List(Int)) ob = ssh_blob_of_line(ftext(fs, "public"));
+    Option(SshPub) ok = pub_of_blob(ob else { [] });
+    SshPub k = ok else { no_pub() };
+    List(Secret(UInt(8))) none = [];
+    List(Int) sig = rsa_pkcs1_sign(if (rsa_alg == "rsa-sha2-256") { Sha256 } else { Sha512 }, k.n, k.e,
+        fval(fs, "rsa_d", 0) else { none }, fval(fs, "rsa_p", 0) else { none }, fval(fs, "rsa_q", 0) else { none }, fval(fs, "rsa_iqmp", 0) else { none }, data);
+    return if (sig.len() == 0) { [] } else { rsa_sig_blob(rsa_alg, sig) };
 }
 
 @requires(declassify)

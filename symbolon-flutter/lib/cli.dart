@@ -255,8 +255,9 @@ class SymbolonCli {
   Future<CliResult> sshDelete(String dir, String name, String pin) => run(['device', 'ssh', 'delete', dir, name], input: [pin], timeout: const Duration(minutes: 5));
 
   /// Prints "signature BLOB-HEX" for [dataHex].
-  Future<CliResult> sshSign(String dir, String name, String dataHex, String pin) =>
-      run(['device', 'ssh', 'sign', dir, name], input: [pin, dataHex], timeout: const Duration(minutes: 5));
+  /// [alg]: rsa-sha2-256 or rsa-sha2-512 for an RSA key.
+  Future<CliResult> sshSign(String dir, String name, String dataHex, String pin, {String alg = ''}) =>
+      run(['device', 'ssh', 'sign', dir, name, if (alg.isNotEmpty) alg], input: [pin, dataHex], timeout: const Duration(minutes: 5));
 
   // ─── Security keys (SPEC 9.4) ───────────────────────────────────────
 

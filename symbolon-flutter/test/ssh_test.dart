@@ -77,6 +77,17 @@ void main() {
     expect(input, contains('2468\n0a0b'));
   });
 
+  testWidgets('an RSA key is signed with the algorithm the agent names', (t) async {
+    final w = await open(t, auth.replaceAll('"data":"0a0b"', '"data":"0a0b","alg":"rsa-sha2-512"'));
+    await t.enterText(find.byKey(const Key('sc-pin')), '2468');
+    await t.tap(find.byKey(const Key('sc-sign')));
+    await t.pump();
+    await settle(t);
+    expect(w.link.sent, hasLength(1));
+    final args = (await t.runAsync(() => agent.argsLog.readAsString()))!;
+    expect(args, contains('device ssh sign ${agent.dir.path}/dev github rsa-sha2-512'));
+  });
+
   testWidgets('a git signature, a forwarded request and unknown data are worded and warned', (t) async {
     await open(t, auth.replaceAll('{"kind":"auth","user":"git"}', '{"kind":"sshsig","namespace":"git"}'));
     expect(find.text('Sign a git commit or tag'), findsOneWidget);

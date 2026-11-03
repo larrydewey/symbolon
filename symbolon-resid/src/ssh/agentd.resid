@@ -69,14 +69,25 @@ pub Str refused(AgentSession s, List(Int) key, Signed w) {
 // The consent request
 // ============================================================================
 
-pub Str consent_json(SshEntry e, Signed w, AgentSession s, Int pid, List(Int) data, Str sock, Str token) {
+// The RSA signature algorithm a request's flags ask for (RFC 8332): ""
+// for an EC or Ed25519 key, "refused" for SHA-1 ssh-rsa.
+pub Str rsa_alg_of(List(Int) key, Int flags) {
+    Option(SshPub) ok = pub_of_blob(key);
+    SshPub k = ok else { no_pub() };
+    if (k.kind != "rsa") { return ""; }
+    if ((flags & flag_rsa_sha2_512()) != 0) { return "rsa-sha2-512"; }
+    if ((flags & flag_rsa_sha2_256()) != 0) { return "rsa-sha2-256"; }
+    return "refused";
+}
+
+pub Str consent_json(SshEntry e, Signed w, AgentSession s, Int pid, List(Int) data, Str sock, Str token, Str rsa_alg) {
     Str what = if (w.kind == "auth") { "{\"kind\":\"auth\",\"user\":" + json_quote(w.user) + "}" }
                else { if (w.kind == "sshsig") { "{\"kind\":\"sshsig\",\"namespace\":" + json_quote(w.namespace) + "}" } else { "{\"kind\":\"unknown\"}" } };
     Str host = if (s.bound) { "{\"key\":" + json_quote(base64_encode(s.host_key)) + ",\"fingerprint\":" + json_quote(ssh_fingerprint(s.host_key)) + ",\"forwarding\":" + (if (s.forwarding) { "true" } else { "false" }) + "}" } else { "null" };
     Option(List(Int)) ob = ssh_blob_of_line(e.line);
     List(Int) blob = ob else { [] };
     return "{\"key\":" + json_quote(e.name) + ",\"fingerprint\":" + json_quote(ssh_fingerprint(blob)) + ",\"what\":" + what + ",\"host\":" + host
-        + ",\"pid\":" + f"{pid}" + ",\"data\":" + json_quote(hex_encode(data)) + ",\"socket\":" + json_quote(sock) + ",\"token\":" + json_quote(token) + "}";
+        + ",\"pid\":" + f"{pid}" + ",\"data\":" + json_quote(hex_encode(data)) + ",\"alg\":" + json_quote(rsa_alg) + ",\"socket\":" + json_quote(sock) + ",\"token\":" + json_quote(token) + "}";
 }
 
 Bool shell_safe(Str s) { return str_len(s) > 0 && !str_contains(s, "'") && !str_contains(s, "\n"); }
@@ -119,7 +130,7 @@ Int accept_token(Int l, Str token, Int tries) {
 
 // The signature the window sends ("ok HEX\n"), [] for cancel or nothing.
 @requires(filesystem, network, clock, process, environment)
-pub List(Int) ask_window(SshEntry e, Signed w, AgentSession s, Int pid, List(Int) data, Str rt) {
+pub List(Int) ask_window(SshEntry e, Signed w, AgentSession s, Int pid, List(Int) data, Str rt, Str rsa_alg) {
     Str ui = environment.get("SYMBOLON_CONSENT");
     if (!shell_safe(ui) || !word_safe(rt)) { return []; }
     Str base = rt + "/symbolon/sign-" + hex_encode(random_bytes(8));
@@ -129,7 +140,7 @@ pub List(Int) ask_window(SshEntry e, Signed w, AgentSession s, Int pid, List(Int
     Str token = hex_encode(random_bytes(32));
     Str req = base + ".json";
     Str sh = base + ".sh";
-    _ = filesystem.write_secret(req, json_utf8(consent_json(e, w, s, pid, data, sock, token)));
+    _ = filesystem.write_secret(req, json_utf8(consent_json(e, w, s, pid, data, sock, token, rsa_alg)));
     _ = filesystem.write_secret(sh, json_utf8("exec '" + ui + "' --ssh-consent '" + req + "' </dev/null >/dev/null 2>&1\n"));
     Int started = process.run("setsid -f sh " + sh);
     Int c = if (started == 0) { accept_token(l, token, 600) } else { -1 };
@@ -188,7 +199,9 @@ List(Int) sign_reply(Str dir, Str rt, Int pid, AgentSession s, List(Int) body) {
     if (str_len(e.name) == 0) { return failure(); }
     Signed w = signed_of(r.data);
     if (str_len(refused(s, r.key, w)) > 0) { return failure(); }
-    List(Int) sig = ask_window(e, w, s, pid, r.data, rt);
+    Str alg = rsa_alg_of(r.key, r.flags);
+    if (alg == "refused") { return failure(); }
+    List(Int) sig = ask_window(e, w, s, pid, r.data, rt, alg);
     if (sig.len() == 0 || !verifies(r.key, r.data, sig)) { return failure(); }
     return agent_msg(msg_sign_response(), sstring(sig));
 }

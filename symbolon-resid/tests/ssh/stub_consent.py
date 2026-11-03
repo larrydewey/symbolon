@@ -18,7 +18,8 @@ if mode == "cancel":
     s.sendall(b"cancel\n")
 else:
     data = req["data"] if mode == "sign" else os.urandom(32).hex()
-    r = subprocess.run([os.environ["SYMBOLON_BIN"], "device", "ssh", "sign", os.environ["SYMBOLON_DIR"], req["key"]],
+    alg = [req["alg"]] if req.get("alg") else []
+    r = subprocess.run([os.environ["SYMBOLON_BIN"], "device", "ssh", "sign", os.environ["SYMBOLON_DIR"], req["key"]] + alg,
                        input=f"2468\n{data}\n", capture_output=True, text=True)
     sig = [l.split()[1] for l in r.stdout.splitlines() if l.startswith("signature ")]
     s.sendall(("ok " + (sig[0] if sig else "") + "\n").encode())

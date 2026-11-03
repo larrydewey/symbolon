@@ -20,12 +20,13 @@ import 'widgets.dart';
 
 class SshRequest {
   final String key, fingerprint, data, socket, token;
+  final String alg;                 // rsa-sha2-256 or rsa-sha2-512 for an RSA key, else ''
   final String what;                // auth, sshsig or unknown
   final String user, namespace;
   final String hostKey, hostFingerprint;    // "" when the session is not bound
   final bool forwarding;
   final int pid;
-  const SshRequest({required this.key, required this.fingerprint, required this.data, required this.socket, required this.token, required this.what,
+  const SshRequest({required this.key, required this.fingerprint, required this.data, required this.socket, required this.token, required this.what, this.alg = '',
       this.user = '', this.namespace = '', this.hostKey = '', this.hostFingerprint = '', this.forwarding = false, this.pid = 0});
 
   static SshRequest? parse(String text) {
@@ -35,7 +36,7 @@ class SshRequest {
       final h = j['host'] as Map<String, dynamic>?;
       return SshRequest(
         key: j['key'] as String, fingerprint: j['fingerprint'] as String, data: j['data'] as String, socket: j['socket'] as String, token: j['token'] as String,
-        what: w['kind'] as String, user: (w['user'] as String?) ?? '', namespace: (w['namespace'] as String?) ?? '',
+        what: w['kind'] as String, alg: (j['alg'] as String?) ?? '', user: (w['user'] as String?) ?? '', namespace: (w['namespace'] as String?) ?? '',
         hostKey: (h?['key'] as String?) ?? '', hostFingerprint: (h?['fingerprint'] as String?) ?? '', forwarding: h?['forwarding'] == true,
         pid: (j['pid'] as int?) ?? 0,
       );
@@ -224,7 +225,7 @@ class _SshConsentPageState extends State<SshConsentPage> {
       busy = true;
       error = null;
     });
-    final res = await cli.sshSign(a.settings.deviceDir, r.key, r.data, pin.text);
+    final res = await cli.sshSign(a.settings.deviceDir, r.key, r.data, pin.text, alg: r.alg);
     pin.clear();
     if (!mounted) return;
     final sig = res.lines.where((l) => l.startsWith('signature ')).map((l) => l.substring(10).trim()).firstOrNull;

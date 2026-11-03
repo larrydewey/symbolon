@@ -5,7 +5,7 @@
 # on a Unix socket with a stand-in for the consent window
 # (tests/ssh/stub_consent.py), driven by OpenSSH itself:
 #   a passphrase-protected key opens only with its passphrase;
-#   ssh-add -L lists the four keys without the PIN;
+#   ssh-add -L lists the five keys (an RSA-3072 key among them) without the PIN;
 #   ssh-keygen -Y sign makes git signatures with each, ssh-keygen -Y verify
 #   accepts them;
 #   ssh logs in to a real sshd with each key, and the window was shown the
@@ -68,6 +68,8 @@ ssh-keygen -q -t ed25519 -N '' -C ed@test -f "$W/k_ed" || fail "ssh-keygen ed255
 ssh-keygen -q -t ecdsa -b 256 -N '' -C p256@test -f "$W/k_p256" || fail "ssh-keygen ecdsa"
 printf '2468\n' | run 300 "$BIN" device ssh import "$W/dev" ed "$W/k_ed" > "$W/imp_ed.log" 2>&1 || fail "import ed25519: $(cat "$W/imp_ed.log")"
 printf '2468\n' | run 300 "$BIN" device ssh import "$W/dev" p256 "$W/k_p256" > "$W/imp_p256.log" 2>&1 || fail "import ecdsa: $(cat "$W/imp_p256.log")"
+ssh-keygen -q -t rsa -b 3072 -N '' -C rsa@test -f "$W/k_rsa" || fail "ssh-keygen rsa"
+printf '2468\n' | run 300 "$BIN" device ssh import "$W/dev" rsa "$W/k_rsa" > "$W/imp_rsa.log" 2>&1 || fail "import rsa: $(cat "$W/imp_rsa.log")"
 printf '2468\n' | run 300 "$BIN" device ssh new "$W/dev" quorum > "$W/new.log" 2>&1 || fail "ssh new: $(cat "$W/new.log")"
 grep "^ecdsa-sha2-nistp256 " "$W/new.log" > "$W/k_quorum.pub"
 grep -q '^ecdsa-sha2-nistp256 ' "$W/k_quorum.pub" || fail "threshold key line: $(cat "$W/new.log")"
@@ -80,7 +82,7 @@ grep -q "passphrase" "$W/imp_enc.log" || fail "passphrase message: $(cat "$W/imp
 printf '2468\nwrong phrase\n' | run 300 "$BIN" device ssh import "$W/dev" enc "$W/k_enc" > "$W/imp_enc.log" 2>&1 && fail "imported with a wrong passphrase"
 grep -q "wrong passphrase" "$W/imp_enc.log" || fail "wrong passphrase message: $(cat "$W/imp_enc.log")"
 printf '2468\nsecret phrase\n' | run 300 "$BIN" device ssh import "$W/dev" enc "$W/k_enc" > "$W/imp_enc.log" 2>&1 || fail "import with the passphrase: $(cat "$W/imp_enc.log")"
-echo "keys: ed25519 and ECDSA imported, an ECDSA P-384 key opened with its passphrase (bcrypt, aes256-ctr), a threshold key made"
+echo "keys: ed25519 and ECDSA imported, an ECDSA P-384 key opened with its passphrase (bcrypt, aes256-ctr), an RSA-3072 key, a threshold key made"
 
 # --- agent -------------------------------------------------------------
 export XDG_RUNTIME_DIR="$W/run"; mkdir -m 700 "$W/run"
@@ -93,15 +95,15 @@ for _ in $(seq 100); do [ -S "$SOCK" ] && break; sleep 0.1; done
 [ "$(stat -c %a "$W/run/symbolon")" = 700 ] && [ "$(stat -c %a "$SOCK")" = 600 ] || fail "socket modes"
 export SSH_AUTH_SOCK="$SOCK"
 ssh-add -L > "$W/listed" || fail "ssh-add -L"
-[ "$(wc -l < "$W/listed")" -eq 4 ] || fail "listed: $(cat "$W/listed")"
-for k in ed p256 quorum enc; do grep -qF "$(cut -d' ' -f2 "$W/k_$k.pub")" "$W/listed" || fail "$k not listed"; done
+[ "$(wc -l < "$W/listed")" -eq 5 ] || fail "listed: $(cat "$W/listed")"
+for k in ed p256 quorum enc rsa; do grep -qF "$(cut -d' ' -f2 "$W/k_$k.pub")" "$W/listed" || fail "$k not listed"; done
 ssh-add "$W/k_other" > "$W/add.log" 2>&1 && fail "ssh-add added a key"
-[ "$(ssh-add -L | wc -l)" -eq 4 ] || fail "the list changed after ssh-add"
-echo "agent: four keys listed without the PIN; ssh-add refused"
+[ "$(ssh-add -L | wc -l)" -eq 5 ] || fail "the list changed after ssh-add"
+echo "agent: five keys listed without the PIN; ssh-add refused"
 
 # --- git signatures ------------------------------------------------------
 echo "a commit" > "$W/msg"
-for k in ed p256 quorum enc; do
+for k in ed p256 quorum enc rsa; do
     rm -f "$W/msg.sig"
     run 600 ssh-keygen -Y sign -f "$W/k_$k.pub" -n git "$W/msg" > "$W/sig_$k.log" 2>&1 || fail "sign with $k: $(cat "$W/sig_$k.log") $(tail -3 "$W/agent.log")"
     echo "me $(cut -d' ' -f1,2 "$W/k_$k.pub")" > "$W/allowed_$k"
@@ -121,7 +123,7 @@ echo "refused: cancel, and a signature over other data (checked by the agent)"
 # --- a real sshd ---------------------------------------------------------
 SSHD_PORT=$(port)
 ssh-keygen -q -t ed25519 -N '' -f "$W/host_key"
-cat "$W/k_ed.pub" "$W/k_p256.pub" "$W/k_quorum.pub" "$W/k_enc.pub" > "$W/authorized_keys"; chmod 600 "$W/authorized_keys"
+cat "$W/k_ed.pub" "$W/k_p256.pub" "$W/k_quorum.pub" "$W/k_enc.pub" "$W/k_rsa.pub" > "$W/authorized_keys"; chmod 600 "$W/authorized_keys"
 cat > "$W/sshd_config" <<CFG
 Port $SSHD_PORT
 ListenAddress 127.0.0.1
@@ -137,7 +139,7 @@ CFG
 "$(command -v sshd)" -D -e -f "$W/sshd_config" > "$W/sshd.log" 2>&1 & PIDS+=($!)
 wait_port "$SSHD_PORT" || fail "sshd did not start: $(cat "$W/sshd.log")"
 HOSTFP=$(ssh-keygen -l -E sha256 -f "$W/host_key.pub" | cut -d' ' -f2)
-for k in ed p256 quorum enc; do
+for k in ed p256 quorum enc rsa; do
     OUT=$(run 600 ssh -F none -p "$SSHD_PORT" -i "$W/k_$k.pub" -o IdentitiesOnly=yes -o IdentityAgent="$SOCK" -o UserKnownHostsFile="$W/known_hosts" \
         -o StrictHostKeyChecking=accept-new -o BatchMode=yes "$(id -un)@127.0.0.1" echo logged-in-$k 2> "$W/ssh_$k.log")
     [ "$OUT" = "logged-in-$k" ] || fail "ssh with $k: $(tail -3 "$W/ssh_$k.log") $(tail -3 "$W/sshd.log")"
