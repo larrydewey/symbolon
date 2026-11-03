@@ -573,9 +573,11 @@ touched, besides the PIN, before a device opens its profiles
   and the duress profile behaves as in Section 9.2.
 - **Removal** needs the PIN and any enrolled key. Removing the last key
   unseals the profiles and returns the device to the PIN alone.
-- **Transport.** USB keys over CTAPHID (the Resid device module for FIDO
-  HID); `SYMBOLON_FIDO_SOCKET` names a Unix socket speaking length-prefixed
-  CTAP2 messages instead (tests, bridges).
+- **Transport.** USB keys over CTAPHID, through Resid's isolated device
+  host (`lib/dev/fido.resid`): the host writes only to a hidraw node whose
+  report descriptor declares the FIDO usage page, and waits up to 45 s for
+  a touch. `SYMBOLON_FIDO_SOCKET` names a Unix socket speaking
+  length-prefixed CTAP2 messages instead (tests, bridges).
 
 A security key adds a factor to one device; it does not hold a share and
 is not a quorum party (Section 10). It cannot run the threshold protocol,

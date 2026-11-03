@@ -29,6 +29,7 @@ import "word.resid";
 import "aesgcmg.resid";
 import "hash.resid";
 import "cose.resid";
+import "dev/fido.resid";
 import "httpserv.resid";
 
 // ============================================================================
@@ -47,7 +48,7 @@ List(Int) recv_n(Int fd, Int n, List(Int) acc) {
 
 // One CTAP2 exchange (command byte and CBOR in; status and CBOR out); []
 // when no key answers.
-@requires(network, environment)
+@requires(network, environment, device)
 pub List(Int) fido_exchange(List(Int) cmd) {
     Str sock = environment.get("SYMBOLON_FIDO_SOCKET");
     if (str_len(sock) == 0) { return usb_exchange(cmd); }
@@ -62,8 +63,13 @@ pub List(Int) fido_exchange(List(Int) cmd) {
     return if (r.len() == n) { r } else { [] };
 }
 
-// USB keys need the Resid device module for FIDO HID (lib/dev/fido.resid).
-List(Int) usb_exchange(List(Int) cmd) { return []; }
+// The first USB FIDO key, through the Resid device host (lib/dev/fido.resid:
+// CTAPHID on the hidraw node whose report descriptor is FIDO's).
+@requires(device)
+List(Int) usb_exchange(List(Int) cmd) {
+    Result(List(Int), Str) r = fido_ctap2(cmd);
+    return match r { Ok(b) => b, Err(_) => [] };
+}
 
 // ============================================================================
 // The enrolled keys
@@ -151,7 +157,7 @@ Touch no_touch(Str why) { return Touch {.ok = false, .why = why, .cred_id = [], 
 
 // The key's hmac-secret output for `salt` with one of `creds` (whichever
 // the present key holds), after its assertion checks out.
-@requires(network, environment, declassify)
+@requires(network, environment, declassify, device)
 pub Touch touch_key(List(SecKey) creds, List(Int) salt) {
     Resp ka = resp_of(fido_exchange(req_key_agreement()));
     if (ka.status != 0) { return no_touch(if (ka.status == -1) { "no security key answers" } else { ctap_status_text(ka.status) }); }
@@ -162,7 +168,7 @@ pub Touch touch_key(List(SecKey) creds, List(Int) salt) {
 
 // A non-resident credential is only known to the key that made it: ask for
 // each until one answers (a key that does not hold it says so at once).
-@requires(network, environment, declassify)
+@requires(network, environment, declassify, device)
 Touch touch_each(List(SecKey) creds, Int i, List(Int) salt, Pp2 k) {
     if (i >= creds.len()) { return no_touch("none of the enrolled security keys is present"); }
     SecKey c = creds[i];
@@ -175,7 +181,7 @@ Touch touch_each(List(SecKey) creds, Int i, List(Int) salt, Pp2 k) {
 }
 
 // W from the present key, or [] with the reason printed.
-@requires(filesystem, network, environment, declassify)
+@requires(filesystem, network, environment, declassify, device)
 pub List(Secret(UInt(8))) unwrap_key(Str dir) {
     SecKeys ks = read_keys(dir);
     if (ks.keys.len() == 0) { return []; }
