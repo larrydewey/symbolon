@@ -112,10 +112,20 @@ List(Int) read_line_from(Int fd, List(Int) acc, Int cap) {
 
 // The window's connection: the first that sends "TOKEN\n" within two
 // seconds of connecting (others are dropped); about `tries` tenths of a
-// second in all.
+// second in all. What came after the token line in the same read (a
+// window that answers at once) is kept as the start of the answer.
+pub type TokenConn = { Int fd; List(Int) rest; };
+
+// Does `h` open with the token line? (Not only equal to it: the answer may
+// follow in the same read.)
+pub Bool opens_with_token(List(Int) h, Str token) {
+    Str line = token + "\n";
+    return str_len(token) > 0 && h.len() >= str_len(line) && http_text(h, 0, str_len(line)) == line;
+}
+
 @requires(network, clock)
-Int accept_token(Int l, Str token, Int tries) {
-    if (tries <= 0) { return -1; }
+TokenConn accept_token(Int l, Str token, Int tries) {
+    if (tries <= 0) { return TokenConn {.fd = -1, .rest = []}; }
     Int c = resid_unix_accept_now(l);
     if (c < 0) {
         _ = nap(100);
@@ -123,7 +133,8 @@ Int accept_token(Int l, Str token, Int tries) {
     }
     _ = resid_unix_deadline(c, 2000);
     List(Int) h = read_line_from(c, [], 4096);
-    if (http_text(h, 0, h.len()) == token + "\n") { return c; }
+    Int n = str_len(token) + 1;
+    if (opens_with_token(h, token)) { return TokenConn {.fd = c, .rest = h[n..h.len()]}; }
     _ = resid_unix_close(c);
     return accept_token(l, token, tries - 20);
 }
@@ -143,13 +154,13 @@ pub List(Int) ask_window(SshEntry e, Signed w, AgentSession s, Int pid, List(Int
     _ = filesystem.write_secret(req, json_utf8(consent_json(e, w, s, pid, data, sock, token, rsa_alg)));
     _ = filesystem.write_secret(sh, json_utf8("exec '" + ui + "' --ssh-consent '" + req + "' </dev/null >/dev/null 2>&1\n"));
     Int started = process.run("setsid -f sh " + sh);
-    Int c = if (started == 0) { accept_token(l, token, 600) } else { -1 };
+    TokenConn tc = if (started == 0) { accept_token(l, token, 600) } else { TokenConn {.fd = -1, .rest = []} };
     _ = process.run("rm -f " + sh);
     _ = resid_unix_close(l);
-    if (c < 0) { _ = process.run("rm -f " + req); return []; }
-    _ = resid_unix_deadline(c, 300000);
-    List(Int) ans = read_line_from(c, [], 262144);
-    _ = resid_unix_close(c);
+    if (tc.fd < 0) { _ = process.run("rm -f " + req); return []; }
+    _ = resid_unix_deadline(tc.fd, 300000);
+    List(Int) ans = read_line_from(tc.fd, tc.rest, 262144);
+    _ = resid_unix_close(tc.fd);
     _ = process.run("rm -f " + req);
     Str t = str_trim(http_text(ans, 0, ans.len()));
     if (!str_starts_with(t, "ok ")) { return []; }
