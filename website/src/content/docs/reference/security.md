@@ -25,6 +25,15 @@ Appendix A.
 - **A malicious password-manager server**, of the kind published in 2025
   and 2026: vault items are sealed per item under a signed head, and rollback
   is refused.
+- **A web page tricking you into a fill.** The browser extension fills only
+  after you approve in a Symbolon window outside the page, showing the
+  origin your browser reports; logins go only to their own site, card fields
+  only to the page and a short list of payment processors' frames.
+- **A program misusing your SSH keys.** Every signature asks first, naming
+  the program, what is signed and the server, whose host key is checked;
+  the agent answers only your own user and verifies each signature.
+- **A stolen device and a known PIN**, with a security key enrolled: the
+  device does not open without the key and a touch.
 
 ## Relied on
 
@@ -47,6 +56,7 @@ at once, never give it.
 
 ## Not built yet
 
+- Security keys on Android.
 - Removing a device from an identity by re-sharing without it.
 - Moving an identity to another relay.
 - An iOS app.

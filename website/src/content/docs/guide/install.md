@@ -12,6 +12,7 @@ Each [release](https://github.com/larrydewey/symbolon/releases) has:
 | `symbolon-<version>.apk` | the Android app, with the agent inside (arm64 phones, x86_64 emulators) |
 | `symbolon-<version>-linux-x86_64` | the agent and every server in one static binary, for PCs |
 | `symbolon-<version>-linux-aarch64` | the same, for ARM boards and NAS boxes |
+| `symbolon-extension-<version>.zip` | the [browser extension](/symbolon/guide/browser/) and its `install.sh` |
 | `SHA256SUMS` | checksums: `sha256sum -c SHA256SUMS` |
 
 The APK is signed with a debug key: install it by side-loading (allow
@@ -30,7 +31,7 @@ symbolon device status ~/.symbolon     # "not set up" until you set it up
 ## Build from source
 
 The agent is written in [Resid](https://github.com/larrydewey/Resid) and
-needs Resid v0.5.2 or later beside this repository:
+needs Resid v0.6.0 or later beside this repository:
 
 ```sh
 git clone https://github.com/larrydewey/Resid.git

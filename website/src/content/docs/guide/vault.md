@@ -12,9 +12,19 @@ not older than one it has seen.
 ## What it holds
 
 Logins (site, username, password, one-time codes), cards, identities, notes,
-bank accounts, Wi-Fi networks and secrets, each with its own fields, plus
-custom fields and folders. An item's type is itself sealed, so the relay
-sees only that you have some number of items.
+bank accounts, Wi-Fi networks, secrets and [SSH keys](/symbolon/guide/ssh/),
+each with its own fields, plus custom fields and folders. An item's type is
+itself sealed, so the relay sees only that you have some number of items.
+
+A card is drawn as the card itself, in its network's colours, with the
+number laid out as the network prints it and masked to its last four digits
+until you tap it; the editor shows it as you type.
+
+## In the browser
+
+The [browser extension](/symbolon/guide/browser/) fills logins and cards
+into web pages, each fill approved in a Symbolon window the page cannot
+reach.
 
 ## Offline
 

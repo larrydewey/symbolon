@@ -44,6 +44,20 @@ With Symbolon Home you don't type the setup by hand: the app's setup (or
 the pairing link) does it. Every command is listed in the
 [reference](/symbolon/reference/).
 
+## The browser, SSH and security keys
+
+On the desktop, Symbolon also fills logins and cards in your browser with
+the [browser extension](/symbolon/guide/browser/), runs an
+[SSH agent](/symbolon/guide/ssh/) for `ssh` and git, and can require a
+[security key](/symbolon/guide/security-keys/) such as a YubiKey, besides
+your PIN, to open the device:
+
+```sh
+printf '%s\n' "$PIN" | symbolon device key add ~/.symbolon yubikey   # touch it twice
+printf '%s\n' "$PIN" | symbolon device ssh new ~/.symbolon github
+SYMBOLON_CONSENT=/path/to/symbolon_ui symbolon ssh-agent ~/.symbolon
+```
+
 ## Running the servers
 
 The same binary is every server: `symbolon relay serve`, `symbolon witness

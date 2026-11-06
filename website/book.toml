@@ -28,6 +28,9 @@ nav = [
     "group|Everyday",
     "page|guide/vault",
     "page|guide/sharing",
+    "page|guide/browser",
+    "page|guide/ssh",
+    "page|guide/security-keys",
     "page|guide/recovery",
     "page|guide/migration",
 

@@ -43,6 +43,31 @@ Each takes a last `--share ID` to work in a shared folder.
 | `device vault import DIR FILE [--format F] [--dry-run]` | from another password manager |
 | `device rotate DIR NAME BUNDLE REPOSITORY` | changes a login's password at the site |
 
+## SSH keys
+
+| Command | Does |
+|---|---|
+| `ssh-agent DIR [SOCKET]` | the SSH agent (`SYMBOLON_CONSENT` names the app, which shows each request) |
+| `device ssh new DIR NAME` | a key held by your quorum; prints its public line |
+| `device ssh import DIR NAME FILE` | an OpenSSH private key (PIN, then any passphrase, on stdin) |
+| `device ssh list DIR` | the keys' public lines (no PIN) |
+| `device ssh sign DIR NAME [rsa-sha2-256\|rsa-sha2-512]` | signs (PIN, then the data in hex, on stdin) |
+| `device ssh delete DIR NAME` | removes a key |
+
+## Security keys
+
+| Command | Does |
+|---|---|
+| `device key add DIR NAME` | enrolls the plugged-in FIDO2 key (two touches) |
+| `device key list DIR` | the enrolled keys (no PIN) |
+| `device key remove DIR NAME` | removes one (a touch of any enrolled key); the last returns the device to the PIN alone |
+
+## The browser extension
+
+| Command | Does |
+|---|---|
+| `browser host` | the extension's native messaging host, started by the browser (`install.sh` registers it; `SYMBOLON_CONSENT` names the app) |
+
 ## Sharing
 
 | Command | Does |
