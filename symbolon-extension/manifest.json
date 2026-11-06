@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Symbolon",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Fill logins and cards from Symbolon. The extension holds nothing: each fill is approved in the Symbolon window, outside the page.",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA1dTMWuZyZIczUbP2WP4UgMLow5N4XEPq2bxBUOJ1XORzaJ3iNnalpsL9t9430If5aBRlqEBbR6m+DZvoCeyjzOFAyjdNlc1SA6GIF4HOCdQbQGpPghtZNr5KnSgyGXPB1u7wDM8+YPF0nFA9gqFFjxObsMhIemzdbF67XeDarLsYJTMrpyxAxZGGezz2WFgYLmIALRQkxiPFjm0oUwXWQyN8llRy5QMu0LHpN3I6LWPFqvDDsH15GgOUUi91jUHmkv8NRRLF720EutMZUVl+vq4rY3nqmRbr1W7Oe3gUNegbQzc4OQ2vOPSzAlNSyMbR2fI48xTpoHjg2GLpK4U2mwIDAQAB",
   "permissions": ["nativeMessaging", "scripting", "webNavigation", "activeTab"],
