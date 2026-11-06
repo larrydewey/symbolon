@@ -81,6 +81,53 @@ class SymbolonCli {
     return CliResult(code, await out.timeout(grace, onTimeout: () => ''), await err.timeout(grace, onTimeout: () => ''));
   }
 
+  /// As [run], with each line of standard output and standard error passed
+  /// to [onLine] as it comes (a long command that reports as it goes).
+  Future<CliResult> runLive(List<String> args, void Function(String line) onLine,
+      {List<String> input = const [], Duration timeout = const Duration(minutes: 30)}) async {
+    final Process p;
+    try {
+      p = await Process.start(binary, args, environment: env);
+    } on ProcessException catch (e) {
+      return CliResult(127, '', 'cannot run $binary: ${e.message}');
+    }
+    final out = StringBuffer(), err = StringBuffer();
+    final o = p.stdout.transform(utf8.decoder).transform(const LineSplitter()).listen((l) {
+      out.writeln(l);
+      onLine(l);
+    }).asFuture<void>();
+    final e = p.stderr.transform(utf8.decoder).transform(const LineSplitter()).listen((l) {
+      err.writeln(l);
+      onLine(l);
+    }).asFuture<void>();
+    for (final l in input) {
+      p.stdin.writeln(l);
+    }
+    await p.stdin.close();
+    final code = await p.exitCode.timeout(timeout, onTimeout: () {
+      p.kill();
+      return 124;
+    });
+    const grace = Duration(seconds: 2);
+    await o.timeout(grace, onTimeout: () {});
+    await e.timeout(grace, onTimeout: () {});
+    return CliResult(code, out.toString(), err.toString());
+  }
+
+  // ─── Adding a device by QR code (SPEC 11.5) ─────────────────────────
+
+  /// On a new device: makes it and joins the identity of the device that
+  /// scans its code. The "link symbolon://link?..." line comes first: the
+  /// QR's content; [hosts] are this device's network addresses in it.
+  Future<CliResult> linkNew(String dir, List<String> hosts, String pin, String duressPin, void Function(String line) onLine,
+          {bool unprotected = false, bool keystore = false}) =>
+      runLive(['device', 'link-new', dir, if (hosts.isNotEmpty) ...['--host', hosts.join(',')], if (unprotected) '--unprotected', if (keystore && !unprotected) '--keystore'],
+          onLine, input: [pin, duressPin], timeout: const Duration(minutes: 40));
+
+  /// On a device with the identity: adds the device whose code [link] is.
+  Future<CliResult> linkAdd(String dir, String link, String pin) =>
+      run(['device', 'link-add', dir, link], input: [pin], timeout: const Duration(minutes: 30));
+
   // ─── Device ─────────────────────────────────────────────────────────
 
   Future<CliResult> deviceNew(String dir, String relayHost, int relayPort, String pin, String duressPin,

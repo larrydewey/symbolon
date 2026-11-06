@@ -43,6 +43,18 @@ case "$1 $2" in
         echo "signature-der 3006020101020101"
         echo "aaaa" ;;
     esac ;;
+  "device link-new")
+    [ "$PIN" = "2468" ] || { echo "device: a PIN of at least 4 characters" >&2; exit 1; }
+    echo "link symbolon://link?a=$5&p=40123&s=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    echo "device: waiting for the other device to scan the code"
+    sleep 1.5
+    [ -f "$D/link-fail" ] && { echo "device: no device answered the code" >&2; exit 1; }
+    echo "device: making this device against 192.168.1.9:47101"
+    echo "device: joining the identity (a few minutes)"
+    echo "joined" ;;
+  "device link-add")
+    [ "$PIN" = "2468" ] || { echo "device: wrong PIN" >&2; exit 1; }
+    echo "device: adding the new device to the identity (a few minutes)" ;;
   "device key")
     case "$3" in
       list) [ -f "$D/keys" ] && cat "$D/keys" ;;

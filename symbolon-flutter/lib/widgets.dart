@@ -49,6 +49,9 @@ String friendlyError(CliResult r) {
     return 'The cosigner did not answer. It may be offline or refusing (for example during a duress window).';
   }
   if (l.contains('cannot connect') || l.contains('no log at the relay') || l.contains('relay refused')) return 'Cannot reach the relay. Check the network connection.';
+  if (l.contains('no device answered the code')) return 'Your other device did not scan the code in time. Try again, with both devices on the same network.';
+  if (l.contains('cannot reach the new device')) return 'Cannot reach the new device. Both devices must be on the same network, and its code still showing.';
+  if (l.contains("did not answer with this code's key")) return "The device at that address did not show this code. Scan the new device's code again.";
   if (l.contains('not set up')) return 'This device is not set up yet: open Setup.';
   if (l.contains('not for this relying party')) return 'This passkey belongs to another site.';
   if (l.contains('no such item')) return 'There is no item with that name.';

@@ -88,7 +88,7 @@ pub Int device_enroll(Str dir, Str keys_hex, Str primes_file) {
 }
 
 @requires(filesystem, network, device, declassify, clock, provision, environment)
-Int enroll_unlocked(Str dir, DeviceConfig c, PartyKeys nk, Str pin, Str primes_file) {
+pub Int enroll_unlocked(Str dir, DeviceConfig c, PartyKeys nk, Str pin, Str primes_file) {
     Unlocked u = unlock_dir(dir, c, pin);
     if (u.kind != 1) { return dfail("wrong PIN"); }
     Result(VerifiedHead, SymbolonError) rv = verified_log(relay_ep(c), c.log_id);
@@ -263,7 +263,7 @@ pub Int device_join(Str dir, Str keys_hex, Str primes_file) {
 }
 
 @requires(filesystem, network, device, declassify, clock, provision, environment)
-Int join_unlocked(Str dir, DeviceConfig c, PartyKeys xk, Str pin, Str primes_file) {
+pub Int join_unlocked(Str dir, DeviceConfig c, PartyKeys xk, Str pin, Str primes_file) {
     Unlocked u = unlock_dir(dir, c, pin);
     if (u.kind != 1) { return dfail("wrong PIN"); }
     Local me = Local {.party = c.party, .cg = 0, .hpke_sk = device_hpke(u.real.dek).sk};

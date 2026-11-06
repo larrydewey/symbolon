@@ -132,9 +132,16 @@ pub Result(List(Int), Str) dk_sign(DeviceConfig c, RealProfile p, List(Secret(UI
 @requires(filesystem, device, declassify, provision, network, environment)
 pub Int device_new(Str dir, Str host, Int port, Bool unprotected, Bool keystore, Bool fast, Str ca) {
     if (filesystem.exists(dir + "/config.cbor")) { return dfail("already set up"); }
-    _ = filesystem.create_dir(dir + "/log");
     Str pin = read_pin();
     Str dpin = read_pin();
+    return device_new_pins(dir, host, port, unprotected, keystore, fast, ca, pin, dpin);
+}
+
+// device new with the PIN and duress PIN already read (device link-new).
+@requires(filesystem, device, declassify, provision, network, environment)
+pub Int device_new_pins(Str dir, Str host, Int port, Bool unprotected, Bool keystore, Bool fast, Str ca, Str pin, Str dpin) {
+    if (filesystem.exists(dir + "/config.cbor")) { return dfail("already set up"); }
+    _ = filesystem.create_dir(dir + "/log");
     if (str_len(pin) < 4) { return dfail("a PIN of at least 4 characters"); }
     if (dpin == pin) { return dfail("the duress PIN must differ from the PIN"); }
     List(Int) salt = random_bytes(16);

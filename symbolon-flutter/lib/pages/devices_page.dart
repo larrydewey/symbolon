@@ -1,11 +1,13 @@
+import 'dart:io';
+
 import 'package:flutter/material.dart';
 
 import '../app.dart';
-import '../validate.dart' as v;
 import '../widgets.dart';
+import 'scan_page.dart';
 
-/// Adding a device to the identity (enroll here, join on the new one) and
-/// removing this device's TPM keys.
+/// Adding a device to the identity by scanning the code it shows (SPEC
+/// 11.5), and removing this device's TPM keys.
 class DevicesPage extends StatefulWidget {
   final App app;
   const DevicesPage({super.key, required this.app});
@@ -15,31 +17,39 @@ class DevicesPage extends StatefulWidget {
 }
 
 class _DevicesPageState extends State<DevicesPage> {
-  final newKeys = TextEditingController();
-  final enrollerKeys = TextEditingController();
-
+  final linkText = TextEditingController();
   App get app => widget.app;
 
   @override
   void dispose() {
-    newKeys.dispose();
-    enrollerKeys.dispose();
+    linkText.dispose();
     super.dispose();
   }
 
-  Future<void> enroll() async {
-    if (v.hex(newKeys.text) != null) return toast(context, "Paste the new device's keys (hex) first.");
-    final r = await app.withPin(context, (p) => runTask(context, 'Adding the new device', () => app.cli.enroll(app.dir, newKeys.text.trim(), p),
-        detail: 'Your identity is re-shared to include it; every passkey keeps its public key.', usually: '2-5 minutes'),
-        note: 'Start "Join" on the new device first.');
-    if (r != null && r.ok && mounted) await showOutput(context, 'Device added', r.out.trim());
+  static bool isLink(String t) => t.trim().startsWith('symbolon://link?') && t.contains('&s=');
+
+  Future<void> scan() async {
+    final text = await Navigator.of(context).push<String>(MaterialPageRoute(
+        builder: (_) => const ScanPage(accepts: isLink, title: "Scan the new device's code",
+            hint: 'Point the camera at the code the new device shows (Join from your other device).', wrong: "That is not a new device's code.")));
+    if (text == null || !mounted) return;
+    linkText.text = text;
+    await add();
   }
 
-  Future<void> join() async {
-    if (v.hex(enrollerKeys.text) != null) return toast(context, "Paste the other device's keys (hex) first.");
-    final r = await app.withPin(context, (p) => runTask(context, 'Waiting for the other device', () => app.cli.join(app.dir, enrollerKeys.text.trim(), p),
-        detail: 'Now start "Add a device" on the device that already has your identity.', usually: '2-5 minutes'));
-    if (r != null && r.ok && mounted) await showOutput(context, 'Joined', r.out.trim());
+  // Adds the device whose code this is (SPEC 11.5): the two devices meet on
+  // the local network, then the identity is re-shared to include it.
+  Future<void> add() async {
+    FocusScope.of(context).unfocus();
+    final link = linkText.text.trim();
+    if (!isLink(link)) return toast(context, "Scan the new device's code, or paste its link (symbolon://link?…).");
+    final r = await app.withPin(context, (p) => runTask(context, 'Adding the new device', () => app.cli.linkAdd(app.dir, link, p),
+        detail: 'The new device sets itself up from this one, then your identity is re-shared to include it. Keep both devices on and on this network.',
+        usually: '3-6 minutes'));
+    if (r == null || !mounted) return;
+    if (!r.ok) return toast(context, friendlyError(r));
+    linkText.clear();
+    await showOutput(context, 'Device added', 'The new device is part of your identity: it has your vault and passkeys.');
   }
 
   Future<void> forget() async {
@@ -64,13 +74,15 @@ class _DevicesPageState extends State<DevicesPage> {
     return Scaffold(
       appBar: AppBar(title: const Text('Devices')),
       body: PageBody(children: [
-        Section('Add a device', subtitle: 'On this device, which has your identity.', children: [
-          Field(newKeys, "The new device's keys", hint: 'shown when it was created', action: TextInputAction.done, check: v.hex),
-          WideButton('Add a device', icon: Icons.add, onPressed: enroll),
-        ]),
-        Section('Join an identity', subtitle: 'On the new device.', children: [
-          Field(enrollerKeys, "The other device's keys", action: TextInputAction.done, check: v.hex),
-          WideButton('Join', icon: Icons.login, tonal: true, onPressed: join),
+        Section('Add a device', subtitle: 'A new phone or computer joins your identity: the same vault, the same passkeys.', children: [
+          const Text('On the new device, start setup and choose Join from your other device. It shows a code; scan it here.'),
+          const SizedBox(height: 12),
+          if (Platform.isAndroid || Platform.isIOS) ...[
+            WideButton("Scan the new device's code", key: const Key('add-scan'), icon: Icons.qr_code_scanner, onPressed: scan),
+            const SizedBox(height: 12),
+          ],
+          Field(linkText, 'Or paste its link', hint: 'symbolon://link?…', url: true, fieldKey: const Key('add-link'), action: TextInputAction.done),
+          WideButton('Add the device', key: const Key('add-device'), icon: Icons.add, tonal: true, onPressed: add),
         ]),
         Section('TPM', children: [
           OutlinedButton.icon(onPressed: forget, icon: const Icon(Icons.delete_forever, color: Colors.red), label: const Text("Remove this device's TPM keys")),

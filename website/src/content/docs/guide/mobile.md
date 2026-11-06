@@ -59,7 +59,7 @@ a recovery someone started), **Passkeys**, **Vault** and **More**.
 ## Devices and recovery
 
 - **More › Devices** adds a device to your identity or removes one. See
-  [Moving in](/symbolon/guide/migration/#a-new-phone).
+  [Moving in](/symbolon/guide/migration/#a-new-phone-or-computer).
 - **More › Recovery** recovers with your kit on a new device, or stops a
   recovery someone else started. See [Recovery](/symbolon/guide/recovery/).
 

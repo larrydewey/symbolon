@@ -1,0 +1,309 @@
+// Adding a device by QR code (SPEC 11.5): the new device shows a code, a
+// device that already has the identity scans it, and the two exchange what
+// enrollment needs over the local network; then the re-share of SPEC 11.1
+// runs as `device enroll` / `device join` would.
+//
+//   symbolon device link-new DIR [--host H[,H...]] [--unprotected|--keystore] [--fast-kdf] [--primes FILE]
+//       on the new device; the PIN and duress PIN on stdin. Listens on
+//       every interface and prints "link symbolon://link?a=HOSTS&p=PORT&s=SECRET"
+//       (the QR's content; HOSTS from --host, the app's network addresses),
+//       waits for the other device, makes this device against the relay it
+//       names (device new), answers with this device's keys, and joins.
+//   symbolon device link-add DIR LINK [--primes FILE]
+//       on a device that has the identity; the PIN on stdin. Reaches the new
+//       device at one of the link's addresses, sends the relay, its CA and
+//       this device's keys, takes the new device's keys and enrolls it.
+//
+// The exchange, one TCP connection, text lines:
+//   offer   SYMBOLON-LINK 1 / relay HOST PORT / ca HEX / keys HEX / mac HEX / end
+//   accept  keys HEX / mac HEX / end
+// Each mac is HMAC-SHA256 under the link's 32-byte secret, which travels
+// only in the QR code: over "symbolon v1 link offer\n" and the offer's
+// lines, and over "symbolon v1 link accept\n", the offer's mac and the
+// accept's lines. Nothing in the exchange is secret (a relay address, a
+// certificate, public keys); the macs make sure each side takes the other's
+// keys and not those of whoever else is on the network. A connection whose
+// mac does not check is dropped and the new device keeps waiting, for at
+// most ten minutes and twenty tries.
+
+import "../types.resid";
+import "../core/log.resid";
+import "../net/proto.resid";
+import "state.resid";
+import "common.resid";
+import "device.resid";
+import "enroll.resid";
+import "crypto.resid";
+import "hash.resid";
+import "httpserv.resid";
+import "cose.resid";
+import "word.resid";
+
+// ============================================================================
+// Links and messages (pure)
+// ============================================================================
+
+pub type Link = { List(Str) hosts; Int port; List(Int) secret; };
+
+Str b64u(List(Int) b) { return str_replace(str_replace(str_replace(base64_encode(b), "+", "-"), "/", "_"), "=", ""); }
+
+List(Int) unb64u(Str s) {
+    Str t = str_replace(str_replace(s, "-", "+"), "_", "/");
+    Int pad = (4 - str_len(t) % 4) % 4;
+    return base64_decode(t + str_repeat("=", pad));
+}
+
+pub Str link_text(List(Str) hosts, Int port, List(Int) secret) {
+    return "symbolon://link?a=" + str_join(hosts, ",") + "&p=" + f"{port}" + "&s=" + b64u(secret);
+}
+
+Str query_at(List(Str) kv, Str k, Int i) {
+    if (i >= kv.len()) { return ""; }
+    List(Str) p = str_split(kv[i], "=");
+    if (p.len() == 2 && p[0] == k) { return p[1]; }
+    return query_at(kv, k, i + 1);
+}
+
+Bool host_ok(Str h) {
+    if (str_len(h) == 0 || str_len(h) > 253) { return false; }
+    return chars_ok(h, 0);
+}
+Bool chars_ok(Str s, Int i) {
+    if (i >= str_len(s)) { return true; }
+    if (!str_contains("abcdefghijklmnopqrstuvwxyz0123456789.-:ABCDEFGHIJKLMNOPQRSTUVWXYZ", str_slice(s, i, i + 1))) { return false; }
+    return chars_ok(s, i + 1);
+}
+Bool hosts_ok(List(Str) hs, Int i) {
+    if (i >= hs.len()) { return true; }
+    if (!host_ok(hs[i])) { return false; }
+    return hosts_ok(hs, i + 1);
+}
+
+/// The link in a scanned code, or None.
+pub Option(Link) link_of(Str text) {
+    Str t = str_trim(text);
+    if (!str_starts_with(t, "symbolon://link?")) { return None; }
+    List(Str) kv = str_split(str_slice(t, 16, str_len(t)), "&");
+    List(Str) hosts = str_split(query_at(kv, "a", 0), ",");
+    Str ps = query_at(kv, "p", 0);
+    Int port = if (str_len(ps) > 0 && str_len(ps) <= 5 && str_is_int(ps)) { str_parse_int(ps) } else { -1 };
+    List(Int) secret = unb64u(query_at(kv, "s", 0));
+    if (hosts.len() == 0 || hosts.len() > 8 || !hosts_ok(hosts, 0) || port < 1 || port > 65535 || secret.len() != 32) { return None; }
+    return Some(Link {.hosts = hosts, .port = port, .secret = secret});
+}
+
+pub type Offer = { Str relay_host; Int relay_port; Str ca; List(Int) keys; Str mac; };
+
+pub Str offer_body(Str host, Int port, Str ca, List(Int) keys) {
+    return "SYMBOLON-LINK 1\nrelay " + host + " " + f"{port}" + "\nca " + (if (str_len(ca) == 0) { "-" } else { hex_encode(utf8(ca)) }) + "\nkeys " + hex_encode(keys) + "\n";
+}
+
+pub Str offer_mac(List(Int) secret, Str body) { return hex_encode(hmac_bytes(Sha256, secret, utf8("symbolon v1 link offer\n" + body))); }
+
+pub Str offer_text(List(Int) secret, Str host, Int port, Str ca, List(Int) keys) {
+    Str body = offer_body(host, port, ca, keys);
+    return body + "mac " + offer_mac(secret, body) + "\nend\n";
+}
+
+pub Str accept_body(List(Int) keys) { return "keys " + hex_encode(keys) + "\n"; }
+
+pub Str accept_mac(List(Int) secret, Str omac, Str body) { return hex_encode(hmac_bytes(Sha256, secret, utf8("symbolon v1 link accept\n" + omac + "\n" + body))); }
+
+pub Str accept_text(List(Int) secret, Str omac, List(Int) keys) {
+    Str body = accept_body(keys);
+    return body + "mac " + accept_mac(secret, omac, body) + "\nend\n";
+}
+
+Bool hexy(Str s) { return str_len(s) % 2 == 0 && hex_chars(s, 0); }
+Bool hex_chars(Str s, Int i) {
+    if (i >= str_len(s)) { return true; }
+    if (!str_contains("0123456789abcdef", str_slice(s, i, i + 1))) { return false; }
+    return hex_chars(s, i + 1);
+}
+
+// Constant-time comparison of two macs (hex of the same length).
+Bool same_mac(Str a, Str b) {
+    if (str_len(a) != str_len(b)) { return false; }
+    List(Int) x = utf8(a);
+    List(Int) y = utf8(b);
+    return diff_at(x, y, 0, 0) == 0;
+}
+Int diff_at(List(Int) x, List(Int) y, Int i, Int acc) {
+    if (i >= x.len()) { return acc; }
+    return diff_at(x, y, i + 1, acc | (x[i] ^ y[i]));
+}
+
+/// The offer in `text` if its mac checks under `secret`.
+pub Option(Offer) offer_of(Str text, List(Int) secret) {
+    List(Str) ls = str_split(text, "\n");
+    if (ls.len() < 6 || ls[0] != "SYMBOLON-LINK 1" || ls[5] != "end") { return None; }
+    List(Str) r = str_split(ls[1], " ");
+    List(Str) c = str_split(ls[2], " ");
+    List(Str) k = str_split(ls[3], " ");
+    List(Str) m = str_split(ls[4], " ");
+    if (r.len() != 3 || r[0] != "relay" || !host_ok(r[1]) || !str_is_int(r[2]) || c.len() != 2 || c[0] != "ca" || k.len() != 2 || k[0] != "keys" || !hexy(k[1]) || m.len() != 2 || m[0] != "mac") { return None; }
+    if (c[1] != "-" && !hexy(c[1])) { return None; }
+    Int port = str_parse_int(r[2]);
+    Str ca = if (c[1] == "-") { "" } else { http_text(cose_hex_decode(c[1]), 0, str_len(c[1]) / 2) };
+    Str body = ls[0] + "\n" + ls[1] + "\n" + ls[2] + "\n" + ls[3] + "\n";
+    if (port < 1 || port > 65535 || !same_mac(m[1], offer_mac(secret, body))) { return None; }
+    return Some(Offer {.relay_host = r[1], .relay_port = port, .ca = ca, .keys = cose_hex_decode(k[1]), .mac = m[1]});
+}
+
+/// The new device's keys in an accept whose mac checks, or [].
+pub List(Int) accept_keys(Str text, List(Int) secret, Str omac) {
+    List(Str) ls = str_split(text, "\n");
+    if (ls.len() < 3 || ls[2] != "end") { return []; }
+    List(Str) k = str_split(ls[0], " ");
+    List(Str) m = str_split(ls[1], " ");
+    if (k.len() != 2 || k[0] != "keys" || !hexy(k[1]) || m.len() != 2 || m[0] != "mac") { return []; }
+    return if (same_mac(m[1], accept_mac(secret, omac, ls[0] + "\n"))) { cose_hex_decode(k[1]) } else { [] };
+}
+
+// ============================================================================
+// The connection
+// ============================================================================
+
+Bool ends_with_end(List(Int) b) { return str_ends_with(http_text(b, 0, b.len()), "\nend\n"); }
+
+@requires(network)
+List(Int) read_until_end(Int fd, List(Int) acc) {
+    if (acc.len() > 65536 || ends_with_end(acc)) { return acc; }
+    List(Int) c = resid_tcp_recv_some(fd, 16384);
+    if (c.len() == 0) { return acc; }
+    return read_until_end(fd, acc.concat(c));
+}
+
+@requires(clock)
+Bool nap(Int ms) { _ = clock.sleep_ns(ms * 1000000); return true; }
+
+// The first connection whose offer checks: its fd and the offer, or fd -1
+// after `tries` tenths of a second or `bad` failed offers.
+pub type Took = { Int fd; Offer o; };
+
+Offer no_offer() { return Offer {.relay_host = "", .relay_port = 0, .ca = "", .keys = [], .mac = ""}; }
+
+@requires(network, clock)
+Took take_offer(Int lfd, List(Int) secret, Int tries, Int bad) {
+    if (tries <= 0 || bad >= 20) { return Took {.fd = -1, .o = no_offer()}; }
+    Int c = resid_tcp_accept_now(lfd);
+    if (c < 0) {
+        _ = nap(100);
+        return take_offer(lfd, secret, tries - 1, bad);
+    }
+    _ = resid_tcp_deadline(c, 10000);
+    List(Int) b = read_until_end(c, []);
+    Option(Offer) oo = offer_of(http_text(b, 0, b.len()), secret);
+    return match oo {
+        None => drop_and_retry(lfd, c, secret, tries, bad),
+        Some(o) => Took {.fd = c, .o = o}
+    };
+}
+
+@requires(network, clock)
+Took drop_and_retry(Int lfd, Int c, List(Int) secret, Int tries, Int bad) {
+    _ = resid_tcp_close(c);
+    eprintln("device: a connection without this code's key was refused");
+    return take_offer(lfd, secret, tries - 1, bad + 1);
+}
+
+// ============================================================================
+// device link-new
+// ============================================================================
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+pub Int link_new(Str dir, Str hosts, Bool unprotected, Bool keystore, Bool fast, Str primes_file) {
+    // A device made by an earlier try that never joined is used again (its
+    // PIN must open it); one that has an identity is not touched.
+    Option(DeviceConfig) prev = load_config(dir);
+    DeviceConfig pc = prev else { return_cfg() };
+    Bool made = filesystem.exists(dir + "/config.cbor");
+    if (made && (pc.party.len() == 0 || pc.log_id.len() > 0)) { return dfail("already set up"); }
+    Str pin = read_pin();
+    Str dpin = read_pin();
+    if (str_len(pin) < 4) { return dfail("a PIN of at least 4 characters"); }
+    if (dpin == pin) { return dfail("the duress PIN must differ from the PIN"); }
+    if (made && unlock_dir(dir, pc, pin).kind != 1) { return dfail("wrong PIN (this device was made by an earlier try: use the PIN chosen then)"); }
+    List(Str) hs = if (str_len(hosts) == 0) { [] } else { str_split(hosts, ",") };
+    if (!hosts_ok(hs, 0)) { return dfail("--host takes addresses separated by commas"); }
+    Int lfd = resid_tcp_listen_at("0.0.0.0", 0);
+    if (lfd < 0) { return dfail("cannot listen for the other device"); }
+    List(Int) secret = random_bytes(32);
+    println("link " + link_text(if (hs.len() == 0) { ["-"] } else { hs }, resid_tcp_bound_port(lfd), secret));
+    println("device: waiting for the other device to scan the code");
+    Took t = take_offer(lfd, secret, 6000, 0);
+    _ = resid_tcp_close(lfd);
+    if (t.fd < 0) { return dfail("no device answered the code"); }
+    Option(PartyKeys) ok = keys_of_cbor(t.o.keys);
+    PartyKeys xk = ok else { PartyKeys {.party = [], .auth_key = [], .hpke_key = []} };
+    if (xk.party.len() == 0) { _ = resid_tcp_close(t.fd); return dfail("the other device's keys are malformed"); }
+    if (made && (pc.relay_host != t.o.relay_host || pc.relay_port != t.o.relay_port)) {
+        _ = resid_tcp_close(t.fd);
+        return dfail("this device was made for another relay by an earlier try");
+    }
+    println(if (made) { "device: using this device, made by an earlier try, against " } else { "device: making this device against " } + t.o.relay_host + f":{t.o.relay_port}");
+    Int r = if (made) { 0 } else { device_new_pins(dir, t.o.relay_host, t.o.relay_port, unprotected, keystore, fast, t.o.ca, pin, dpin) };
+    if (r != 0) { _ = resid_tcp_close(t.fd); return r; }
+    Option(DeviceConfig) oc = load_config(dir);
+    DeviceConfig c = oc else { return_cfg() };
+    List(Int) mine = cbor_of_keys(PartyKeys {.party = c.party, .auth_key = c.dk_pub, .hpke_key = c.hpke_pub});
+    Bool sent = resid_tcp_send_bin(t.fd, utf8(accept_text(secret, t.o.mac, mine)));
+    _ = resid_tcp_close(t.fd);
+    if (!sent) { return dfail("cannot answer the other device"); }
+    println("device: joining the identity (a few minutes)");
+    return join_unlocked(dir, c, xk, pin, primes_file);
+}
+
+DeviceConfig return_cfg() {
+    return DeviceConfig {.relay_host = "", .relay_port = 0, .ca = "", .witnesses = [], .unprotected = true, .argon_m_kib = 0, .argon_t = 0, .salt = [],
+        .tpm_dk = 0, .tpm_unlock_a = 0, .tpm_unlock_b = 0, .party = [], .dk_pub = [], .hpke_pub = [], .log_id = [], .mbox_next = 0, .peers = []};
+}
+
+// ============================================================================
+// device link-add
+// ============================================================================
+
+@requires(network)
+Int connect_any(List(Str) hs, Int port, Int i) {
+    if (i >= hs.len()) { return -1; }
+    Int fd = resid_tcp_connect(hs[i], port);
+    if (fd >= 0) { return fd; }
+    return connect_any(hs, port, i + 1);
+}
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+pub Int link_add(Str dir, Str text, Str primes_file) {
+    Option(Link) ol = link_of(text);
+    Link l = ol else { Link {.hosts = [], .port = 0, .secret = []} };
+    if (l.port == 0) { return dfail("that is not a Symbolon device code (it starts with symbolon://link?)"); }
+    Option(DeviceConfig) oc = load_config(dir);
+    DeviceConfig c = oc else { return_cfg() };
+    if (c.log_id.len() == 0) { return dfail("this device has no identity to add a device to"); }
+    Str pin = read_pin();
+    // The PIN first: a wrong one stops here, before the other device acts.
+    Unlocked u = unlock_dir(dir, c, pin);
+    if (u.kind != 1) { return dfail("wrong PIN"); }
+    Int fd = connect_any(l.hosts, l.port, 0);
+    if (fd < 0) { return dfail("cannot reach the new device: is it on the same network, with its code still showing?"); }
+    _ = resid_tcp_deadline(fd, 600000);
+    List(Int) mine = cbor_of_keys(PartyKeys {.party = c.party, .auth_key = c.dk_pub, .hpke_key = c.hpke_pub});
+    Str offer = offer_text(l.secret, c.relay_host, c.relay_port, c.ca, mine);
+    Str omac = offer_mac(l.secret, offer_body(c.relay_host, c.relay_port, c.ca, mine));
+    if (!resid_tcp_send_bin(fd, utf8(offer))) { _ = resid_tcp_close(fd); return dfail("cannot reach the new device"); }
+    println("device: waiting for the new device to set itself up");
+    List(Int) b = read_until_end(fd, []);
+    _ = resid_tcp_close(fd);
+    List(Int) theirs = accept_keys(http_text(b, 0, b.len()), l.secret, omac);
+    if (theirs.len() == 0) { return dfail("the new device did not answer with this code's key"); }
+    Option(PartyKeys) ok = keys_of_cbor(theirs);
+    return match ok {
+        None => dfail("the new device's keys are malformed"),
+        Some(nk) => added(dir, c, nk, pin, primes_file)
+    };
+}
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+Int added(Str dir, DeviceConfig c, PartyKeys nk, Str pin, Str primes_file) {
+    println("device: adding the new device to the identity (a few minutes)");
+    return enroll_unlocked(dir, c, nk, pin, primes_file);
+}

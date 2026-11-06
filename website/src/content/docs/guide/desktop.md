@@ -40,6 +40,11 @@ printf '%s\n' "$PIN" | symbolon device vault list ~/.symbolon --long
 printf '%s\n%s\n' "$PIN" "$NEW_PIN" | symbolon device pin ~/.symbolon
 ```
 
+If you already use Symbolon on your phone, this computer joins that
+identity by code: **Set up this device › Join from your other device** shows
+a QR code, and the phone scans it under **More › Devices › Add a device**
+(see [A new phone or computer](/symbolon/guide/migration/#a-new-phone-or-computer)).
+
 With Symbolon Home you don't type the setup by hand: the app's setup (or
 the pairing link) does it. Every command is listed in the
 [reference](/symbolon/reference/).

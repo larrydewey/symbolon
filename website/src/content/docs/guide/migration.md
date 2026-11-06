@@ -44,21 +44,31 @@ export: export it again unencrypted.
 it can read every password in it. Once you have checked your vault, you can
 close the old account.
 
-## A new phone
+## A new phone or computer
 
-A new device joins your identity from one you already have. Your key is
-re-shared to include it: the parties make new shares of the same key, so
-every passkey keeps its public key and no site needs to be told.
+A new device joins your identity from one you already have, by a code:
+nothing to type or copy. Your key is re-shared to include it: the parties
+make new shares of the same key, so every passkey keeps its public key and
+no site needs to be told.
 
-1. On the **new** device: install the app, then **More › Devices › Join**.
-   It shows its keys as a code.
-2. On a device that **has** your identity: **More › Devices › Add a device**,
-   and give it the new device's code.
-3. Wait while the two devices and the cosigner re-share. The new device then
-   has your vault and your passkeys.
+1. On the **new** device: install the app, open **Set up this device** and
+   choose **Join from your other device**. Pick a PIN for it. It shows a QR
+   code.
+2. On a device that **has** your identity: **More › Devices › Add a device ›
+   Scan the new device's code** (on a computer without a camera, paste the
+   link the new device can copy).
+3. Wait a few minutes with both devices on and on the same network. The new
+   device learns your relay from the other one, makes its keys and joins;
+   then it has your vault and your passkeys.
 
-On the command line, `symbolon device join DIR ENROLLER-KEYS` on the new
-device and `symbolon device enroll DIR NEW-KEYS` on the old one.
+The code carries a one-time key: only the device that scanned it can answer,
+so another machine on the network cannot slip in.
+
+On the command line, `symbolon device link-new DIR --host ADDRESS` on the
+new device prints the code's link, and `symbolon device link-add DIR LINK`
+on the old one adds it. (`device join` and `device enroll`, with the two
+devices' keys copied by hand, still work where the devices cannot reach each
+other.)
 
 **Retiring the old phone**: **More › Devices › Remove this device's keys**
 (`symbolon device forget DIR`) deletes its keys from its TPM or Keystore, so

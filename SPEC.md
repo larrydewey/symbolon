@@ -758,6 +758,35 @@ A lost device is removed by any `policy[1]` other devices; the remaining
 parties re-share. If fewer than `t` parties remain, the principal is in
 recovery (Section 13).
 
+### 11.5 Adding a device by code
+
+The new device N shows a QR code; a device X of the identity scans it.
+Nothing is typed or copied, and N needs no setting beforehand:
+
+1. N listens on every interface on a free port, draws a 32-byte secret
+   `s`, and shows `symbolon://link?a=ADDRESSES&p=PORT&s=BASE64URL(s)`, its
+   network addresses as its platform reports them.
+2. X, with the PIN given (a wrong one stops here, before N acts), connects
+   to one of the addresses and sends an *offer*: its relay's host and port,
+   the relay's CA certificate and X's party keys, with
+   `HMAC-SHA256(s, "symbolon v1 link offer\n" || offer)`.
+3. N accepts the first connection whose offer's mac checks; any other is
+   closed and N keeps waiting (at most ten minutes and twenty refusals).
+   N makes its keys against the relay the offer names (as `device new`,
+   with the PIN chosen on N), and answers with its party keys and
+   `HMAC-SHA256(s, "symbolon v1 link accept\n" || offer mac || accept)`.
+4. X checks the answer's mac and enrolls N (Section 11.1, steps 3-4) as
+   `device enroll` would; N joins as `device join` would.
+
+The secret travels only in the QR code, seen by the principal; it
+authenticates the exchange, which carries nothing secret (a relay address,
+a certificate, public keys). This is step 2 of Section 11.1 with a code
+that carries a key for the whole exchange rather than `H(DK_N)` alone. N
+and X must reach each other on a local network; otherwise
+`device enroll` and `device join` with the keys exchanged by hand remain.
+A device N made by an earlier attempt that never joined is used again,
+with its PIN.
+
 ---
 
 ## 12. The cosigner

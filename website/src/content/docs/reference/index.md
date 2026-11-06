@@ -16,7 +16,8 @@ from the command line; values that may hold any text are printed as hex.
 | `device status DIR` | the identity, its devices and anything pending |
 | `device pin DIR` | changes the PIN (PIN, new PIN on stdin) |
 | `device forget DIR` | deletes the device's keys from its TPM or Keystore |
-| `device enroll DIR NEW-KEYS` / `device join DIR ENROLLER-KEYS` | adds a device (on the old one / the new one) |
+| `device link-new DIR [--host ADDR,…]` / `device link-add DIR LINK` | adds a device by code: the new one shows it, the old one scans it |
+| `device enroll DIR NEW-KEYS` / `device join DIR ENROLLER-KEYS` | adds a device with keys copied by hand (on the old one / the new one) |
 | `device recover DIR KIT LOG-ID` | starts a recovery with the kit |
 | `device veto DIR` | stops a pending event, such as a recovery |
 

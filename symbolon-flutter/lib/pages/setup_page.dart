@@ -10,6 +10,7 @@ import '../home_link.dart';
 import '../validate.dart' as v;
 import '../widgets.dart';
 import 'hardware_page.dart';
+import 'join_page.dart';
 import 'scan_page.dart';
 
 /// Setting up this device, as a guided flow: where the services are, a PIN,
@@ -268,6 +269,13 @@ class _SetupPageState extends State<SetupPage> {
       Field(homeLinkText, 'Or paste the link', hint: 'symbolon://pair?…', url: true, fieldKey: const Key('home-link'), action: TextInputAction.done,
           check: v.optional((s) => HomeLink.parse(s) == null ? 'Not a Symbolon Home link' : null)),
       WideButton('Connect', key: const Key('join-home'), icon: Icons.link, tonal: true, onPressed: joinHome),
+      const SizedBox(height: 16),
+      Section('Already use Symbolon?', subtitle: 'On your phone or another computer: this device joins that identity, with the same vault and passkeys.', children: [
+        WideButton('Join from your other device', key: const Key('join-identity'), icon: Icons.devices, tonal: true, onPressed: () async {
+          final joined = await Navigator.of(context).push<bool>(MaterialPageRoute(builder: (_) => JoinPage(app: app)));
+          if (joined == true && mounted) Navigator.of(context).pop();
+        }),
+      ]),
       const SizedBox(height: 8),
       TextButton(onPressed: () => setState(() => otherWays = !otherWays), child: Text(otherWays ? 'Hide other ways' : 'Other ways to connect')),
       if (otherWays) ...[
