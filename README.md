@@ -22,9 +22,11 @@ access carry much of the design's enforcement.
 
 ## Status
 
-v0.1.3: the agent, relay, witnesses and cosigner, Symbolon Home (a
+v0.2.0: the agent, relay, witnesses and cosigner, Symbolon Home (a
 self-hosted box for a household) and organizations for companies, with an
-Android and Linux app. See the
+Android and Linux app, a browser extension for logins and cards, an SSH
+agent, and security keys (YubiKey and other FIDO2 keys) as a second factor.
+See the
 [releases](https://github.com/larrydewey/symbolon/releases).
 
 The guide, for people using it and for those running it, is at
