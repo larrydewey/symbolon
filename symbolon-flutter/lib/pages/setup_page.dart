@@ -224,7 +224,7 @@ class _SetupPageState extends State<SetupPage> {
         detail: dp == null
             ? 'This device and your Symbolon Home box make your key together. It is real work for the phone: keep the app open.'
             : 'This device and the cosigner generate a key together, and the witnesses record the result.',
-        usually: dp == null ? '5-20 minutes' : '1-3 minutes');
+        usually: dp == null ? '1-4 minutes' : '1-2 minutes');
     if (!r.ok || !mounted) return;
     if (bio.supported && bio.biometric && useBio) await Bio.enroll(p);
     if (!mounted) return;

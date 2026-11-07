@@ -50,11 +50,11 @@ case "$1 $2" in
     sleep 1.5
     [ -f "$D/link-fail" ] && { echo "device: no device answered the code" >&2; exit 1; }
     echo "device: making this device against 192.168.1.9:47101"
-    echo "device: joining the identity (a few minutes)"
+    echo "device: joining the identity (usually 1 to 3 minutes)"
     echo "joined" ;;
   "device link-add")
     [ "$PIN" = "2468" ] || { echo "device: wrong PIN" >&2; exit 1; }
-    echo "device: adding the new device to the identity (a few minutes)" ;;
+    echo "device: adding the new device to the identity (usually 1 to 3 minutes)" ;;
   "device key")
     case "$3" in
       list) [ -f "$D/keys" ] && cat "$D/keys" ;;

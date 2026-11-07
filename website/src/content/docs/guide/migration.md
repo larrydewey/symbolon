@@ -57,7 +57,7 @@ no site needs to be told.
 2. On a device that **has** your identity: **More › Devices › Add a device ›
    Scan the new device's code** (on a computer without a camera, paste the
    link the new device can copy).
-3. Wait a few minutes with both devices on and on the same network. The new
+3. Wait one to three minutes with both devices on and on the same network. The new
    device learns your relay from the other one, makes its keys and joins;
    then it has your vault and your passkeys.
 

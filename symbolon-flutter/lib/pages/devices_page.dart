@@ -45,7 +45,7 @@ class _DevicesPageState extends State<DevicesPage> {
     if (!isLink(link)) return toast(context, "Scan the new device's code, or paste its link (symbolon://link?…).");
     final r = await app.withPin(context, (p) => runTask(context, 'Adding the new device', () => app.cli.linkAdd(app.dir, link, p),
         detail: 'The new device sets itself up from this one, then your identity is re-shared to include it. Keep both devices on and on this network.',
-        usually: '3-6 minutes'));
+        usually: '1-3 minutes'));
     if (r == null || !mounted) return;
     if (!r.ok) return toast(context, friendlyError(r));
     linkText.clear();

@@ -54,7 +54,7 @@ class _RecoveryPageState extends State<RecoveryPage> {
     final seed = await askSecret(context, title: 'Recovery kit', label: 'Kit (the old one)', numeric: false);
     if (seed == null || !mounted) return;
     if (v.hex(seed) != null) return toast(context, 'The kit is hex digits (0-9, a-f), as you wrote it down.');
-    final r = await app.withPin(context, (p) => runTask(context, 'Finishing recovery', () => app.cli.recoverFinish(app.dir, seed.trim(), p), usually: '2-5 minutes'));
+    final r = await app.withPin(context, (p) => runTask(context, 'Finishing recovery', () => app.cli.recoverFinish(app.dir, seed.trim(), p), usually: '1-3 minutes'));
     if (r != null && r.ok && mounted) await showOutput(context, 'Recovered', r.out.trim());
   }
 

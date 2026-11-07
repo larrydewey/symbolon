@@ -75,7 +75,7 @@ class _JoinPageState extends State<JoinPage> {
   String said(String line) {
     final l = line.startsWith('device: ') ? line.substring(8) : line;
     if (l.startsWith('making this device') || l.startsWith('using this device')) return 'Your other device answered. Setting this device up…';
-    if (l.startsWith('joining the identity')) return 'Joining your identity. This takes a few minutes; keep both devices on.';
+    if (l.startsWith('joining the identity')) return 'Joining your identity. This usually takes 1 to 3 minutes; keep both devices on.';
     if (l.startsWith('waiting for the enrolling device')) return 'Waiting for your other device to add this one…';
     if (l.startsWith('a connection without')) return 'Something else on the network tried to answer; it was refused.';
     return '';

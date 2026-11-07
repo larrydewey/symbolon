@@ -250,7 +250,7 @@ pub Int link_new(Str dir, Str hosts, Bool unprotected, Bool keystore, Bool fast,
     Bool sent = resid_tcp_send_bin(t.fd, utf8(accept_text(secret, t.o.mac, mine)));
     _ = resid_tcp_close(t.fd);
     if (!sent) { return dfail("cannot answer the other device"); }
-    println("device: joining the identity (a few minutes)");
+    println("device: joining the identity (usually 1 to 3 minutes)");
     return join_unlocked(dir, c, xk, pin, primes_file);
 }
 
@@ -304,6 +304,6 @@ pub Int link_add(Str dir, Str text, Str primes_file) {
 
 @requires(filesystem, network, device, declassify, clock, provision, environment)
 Int added(Str dir, DeviceConfig c, PartyKeys nk, Str pin, Str primes_file) {
-    println("device: adding the new device to the identity (a few minutes)");
+    println("device: adding the new device to the identity (usually 1 to 3 minutes)");
     return enroll_unlocked(dir, c, nk, pin, primes_file);
 }

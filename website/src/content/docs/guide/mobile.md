@@ -30,7 +30,7 @@ The first start shows a short tour (skip it, or find it later under
 2. **Choose a PIN**, and a **duress PIN** if you want one (it must differ).
    On a phone with a fingerprint reader, let it unlock Symbolon.
 3. **Wait while the phone and the box make your key.** This is real work
-   for a phone: a few minutes, with the app kept open.
+   for a phone: one to four minutes, with the app kept open.
 4. **Write down the recovery kit.** It is shown once. With it you can get
    your identity back after losing every device.
 

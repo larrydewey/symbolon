@@ -66,7 +66,7 @@ symbolon home serve ~/home-box
 
 **More › Set up this device**, then **Scan the code**. Choose a PIN (and, on
 a phone with a fingerprint reader, let it unlock Symbolon), and wait while
-the phone and the box make the key together: a few minutes, with the app
+the phone and the box make the key together: one to four minutes, with the app
 kept open. Then write down the recovery kit. See [Mobile app](/symbolon/guide/mobile/).
 
 ## Network
