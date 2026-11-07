@@ -40,7 +40,11 @@ On a sign-in page or a checkout, press the extension's toolbar button or
 - the program that asked (your browser; a warning in red if it is not one).
 
 Type your PIN and choose the login or card. The fields fill as if you had
-typed them. A login is offered only on the exact site it was saved for.
+typed them. A login is offered on the site it was saved for and on that
+site's subdomains: one saved for `proton.me` also fills at
+`account.proton.me`. Never the other way: a login saved for
+`login.example.com` is not offered at `example.com` or at
+`mail.example.com`.
 
 Nothing fills when you click inside a page, and nothing fills on its own
 when a page loads: a page cannot trick you into approving something by

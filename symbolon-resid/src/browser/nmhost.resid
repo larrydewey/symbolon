@@ -209,11 +209,33 @@ List(Int) ints8(List(UInt(8)) b, Int i, ListBuf(Int) acc) {
     return ints8(b, i + 1, acc.push((Int)b[i]));
 }
 
+// Whether a login saved for `saved` may fill the page at `top` (SPEC 22.5
+// step 6): the same origin, or a page on a subdomain of the saved host with
+// the same scheme and port. A leading "www." of the saved host is dropped
+// first, so a login saved at www.example.com also fills at example.com and
+// its subdomains. Never upward or sideways: a login saved for
+// login.example.com fills neither example.com nor mail.example.com. A saved
+// host with no dot, or an IP address, matches only itself.
+pub Bool site_covers(Str saved, Str top) {
+    if (saved == top) { return true; }
+    if (!origin_ok(saved) || !origin_ok(top)) { return false; }
+    List(Str) a = str_split(saved, "://");
+    List(Str) b = str_split(top, "://");
+    if (a[0] != b[0]) { return false; }
+    List(Str) ha = str_split(a[1], ":");
+    List(Str) hb = str_split(b[1], ":");
+    if (ha.len() != hb.len()) { return false; }
+    if (ha.len() == 2 && ha[1] != hb[1]) { return false; }
+    Str s = if (str_starts_with(ha[0], "www.")) { str_slice(ha[0], 4, str_len(ha[0])) } else { ha[0] };
+    if (!str_contains(s, ".") || all_chars(s, 0, "0123456789.")) { return false; }
+    return hb[0] == s || str_ends_with(hb[0], "." + s);
+}
+
 // Why the item may not go to this page, or "".
 @requires(declassify)
 pub Str refusal(Str top, Str want, Chosen c) {
     if (c.kind != want) { return "the chosen item is not a " + want; }
-    if (c.kind == "login" && origin_of_item(c) != top) { return "the login is for another site"; }
+    if (c.kind == "login" && !site_covers(origin_of_item(c), top)) { return "the login is for another site"; }
     return "";
 }
 

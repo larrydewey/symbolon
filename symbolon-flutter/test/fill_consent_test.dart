@@ -147,6 +147,21 @@ void main() {
     expect(w.closed, [true]);
   });
 
+  test('a login saved for a site is offered on its subdomains, never on its parent or siblings', () {
+    expect(siteCovers('https://proton.me', 'https://account.proton.me'), isTrue);
+    expect(siteCovers('https://www.github.com', 'https://github.com'), isTrue);
+    expect(siteCovers('https://www.github.com', 'https://gist.github.com'), isTrue);
+    expect(siteCovers('https://shop.example:8443', 'https://pay.shop.example:8443'), isTrue);
+    expect(siteCovers('https://login.example.com', 'https://example.com'), isFalse);
+    expect(siteCovers('https://login.example.com', 'https://mail.example.com'), isFalse);
+    expect(siteCovers('https://proton.me', 'https://notproton.me'), isFalse);
+    expect(siteCovers('https://proton.me', 'https://proton.me.evil.example'), isFalse);
+    expect(siteCovers('https://shop.example', 'https://pay.shop.example:8443'), isFalse);
+    expect(siteCovers('https://2.3.4', 'https://1.2.3.4'), isFalse);
+    expect(siteCovers('https://www.com', 'https://evil.com'), isFalse);
+    expect(siteCovers('', 'https://shop.example'), isFalse);
+  });
+
   test('the answer carries only the fields of the type, never a card PIN or notes', () {
     expect(fillAnswer('card', {'number': '4111', 'pin': '9999', 'notes': 'x', 'cvv': '1', 'type': 'card'}), 'ok card\nnumber ${hexOf('4111')}\ncvv ${hexOf('1')}\nend\n');
     expect(fillAnswer('login', {'current': 'p', 'totp': 'K', 'origin': 'https://a.example'}), 'ok login\norigin ${hexOf('https://a.example')}\ncurrent ${hexOf('p')}\nend\n');

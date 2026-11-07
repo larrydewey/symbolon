@@ -127,6 +127,27 @@ test "the reply carries, per frame, only the kinds that frame asked for" {
     expect(answer(FillAsk {.id = 9, .top = "https://evil.example", .frames = b.frames}, b.frames, "login", login("https://shop.example"))).toEqual("{\"type\":\"error\",\"id\":9,\"error\":\"the login is for another site\"}");
 }
 
+@requires(declassify)
+test "a login saved for a site also fills its subdomains, never its parent or siblings" {
+    expect(site_covers("https://proton.me", "https://account.proton.me")).toBeTrue();
+    expect(site_covers("https://proton.me", "https://a.b.proton.me")).toBeTrue();
+    expect(site_covers("https://www.github.com", "https://github.com")).toBeTrue();
+    expect(site_covers("https://www.github.com", "https://gist.github.com")).toBeTrue();
+    expect(site_covers("https://shop.example:8443", "https://pay.shop.example:8443")).toBeTrue();
+    expect(site_covers("https://login.example.com", "https://example.com")).toBeFalse();
+    expect(site_covers("https://login.example.com", "https://mail.example.com")).toBeFalse();
+    expect(site_covers("https://proton.me", "https://notproton.me")).toBeFalse();
+    expect(site_covers("https://proton.me", "https://proton.me.evil.example")).toBeFalse();
+    expect(site_covers("https://shop.example", "https://pay.shop.example:8443")).toBeFalse();
+    expect(site_covers("https://shop.example:8443", "https://pay.shop.example")).toBeFalse();
+    expect(site_covers("https://2.3.4", "https://1.2.3.4")).toBeFalse();
+    expect(site_covers("http://localhost:3000", "http://localhost:3000")).toBeTrue();
+    expect(site_covers("https://www.com", "https://evil.com")).toBeFalse();
+    expect(site_covers("", "https://shop.example")).toBeFalse();
+    expect(refusal("https://account.proton.me", "login", login("https://proton.me"))).toEqual("");
+    expect(refusal("https://proton.me", "login", login("https://account.proton.me"))).toEqual("the login is for another site");
+}
+
 test "a fill request is read from the extension's JSON" {
     Str m = "{\"type\":\"fill\",\"id\":5,\"top\":\"https://shop.example\",\"frames\":[{\"frame\":0,\"origin\":\"https://shop.example\",\"fields\":[\"username\",\"current-password\"]},{\"frame\":9,\"origin\":\"https://js.stripe.com\",\"fields\":[\"cc-number\"]}]}";
     Option(Jv) j = json_parse(json_utf8(m));

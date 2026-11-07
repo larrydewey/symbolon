@@ -1715,8 +1715,8 @@ Its parts:
    `/proc` (the owner of the listening socket, then that process's parent
    executable), so a caller cannot choose what is shown, and it warns
    when the program is not a browser. It takes the PIN and offers only
-   the matching items: logins whose stored origin equals the page's
-   origin, or cards. The principal chooses one. The window opens the item
+   the matching items: logins whose stored site covers the page (step 6),
+   or cards. The principal chooses one. The window opens the item
    with the agent and sends its fields on the same connection. It sends
    only the fields its type fills: for a login the origin, username and
    password; for a card the holder, number, expiry and code. It never
@@ -1725,7 +1725,14 @@ Its parts:
    request expired and sends nothing, so nothing goes to a port the agent
    no longer holds.
 6. **Item check (agent).** The item's type must be the one offered. A
-   login's stored origin must equal the page's origin exactly. The values
+   login's stored origin must cover the page's origin: the same origin,
+   or a subdomain of the stored host with the same scheme and port, after
+   a leading `www.` of the stored host is dropped. A login saved for
+   `proton.me` fills at `account.proton.me`; one saved for
+   `login.example.com` fills neither `example.com` nor `mail.example.com`.
+   A stored host without a dot, or an IP address, covers only itself.
+   Frames still follow 22.2: only frames of the page's own origin (or a
+   pinned processor's, for cards) receive anything. The values
    are `Secret` in the agent from the moment the answer is parsed. The
    socket buffer and the answer's text lines before that are plain
    memory, not wiped. The values are declassified once, when the reply to

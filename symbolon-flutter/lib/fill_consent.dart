@@ -25,6 +25,21 @@ const _sent = {
   'card': ['cardholder', 'number', 'expiry', 'cvv'],
 };
 
+/// Whether a login saved for [saved] may fill the page at [top], as the
+/// agent decides (SPEC 22.5 step 6): the same origin, or a subdomain of the
+/// saved host with the same scheme and port; a leading "www." of the saved
+/// host is dropped first. A saved host with no dot, or an IP address,
+/// matches only itself.
+bool siteCovers(String saved, String top) {
+  if (saved == top) return true;
+  final a = Uri.tryParse(saved), b = Uri.tryParse(top);
+  if (a == null || b == null || a.scheme != b.scheme || a.port != b.port) return false;
+  if (a.hasPort != b.hasPort || a.path.isNotEmpty || b.path.isNotEmpty) return false;
+  final s = a.host.startsWith('www.') ? a.host.substring(4) : a.host;
+  if (!s.contains('.') || RegExp(r'^[0-9.]+$').hasMatch(s)) return false;
+  return b.host == s || b.host.endsWith('.$s');
+}
+
 class FillRequest {
   final String top;
   final String want;            // "login" or "card"
@@ -214,7 +229,7 @@ class _FillConsentPageState extends State<FillConsentPage> {
   bool _fits(VaultItem it) {
     final r = rq!;
     if (it.type != r.want) return false;
-    return r.want == 'card' || it.detail == r.top;
+    return r.want == 'card' || siteCovers(it.detail, r.top);
   }
 
   Future<void> unlock() async {
