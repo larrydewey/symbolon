@@ -469,6 +469,17 @@ Each agent and the cosigner store the highest head they have verified per
 log. A lower sequence, or the same sequence with another digest, is a fork
 (Section 20.4).
 
+An agent also keeps the events it has verified (`logcache/`). To verify a
+log again it asks the relay only for the events after those it keeps, and
+verifies the whole log, kept and new events alike, as above: the copy
+saves round trips, never checks. A relay that serves fewer events than the
+copy holds cannot roll the log back. If the kept and new events do not
+verify together, the agent fetches the whole log again and keeps that copy
+only if it verifies. While the rest of the log is fetched, the agent asks
+the witnesses that the kept log names for the current witness time, all at
+once. It uses their answer only if the verified log still names exactly
+those witnesses; otherwise it asks the log's witnesses again.
+
 ---
 
 ## 9. Local unlock and duress

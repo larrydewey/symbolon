@@ -150,7 +150,7 @@ Result(Dev, Str) unlocked_dev(Str dir) {
 
 @requires(filesystem, network, clock(readonly), declassify)
 Result(Ctx, Str) online(Str dir, Dev d) {
-    Result(VerifiedHead, SymbolonError) rv = verified_log(relay_ep(d.c), d.c.log_id);
+    Result(VerifiedHead, SymbolonError) rv = verified_log_dir(dir, relay_ep(d.c), d.c.log_id);
     return match rv { Err(e) => Err(err_text(e)), Ok(vh) => Ok(Ctx {.c = d.c, .u = d.u, .vh = vh, .pin = d.pin, .ep = relay_at(dir, d.c)}) };
 }
 

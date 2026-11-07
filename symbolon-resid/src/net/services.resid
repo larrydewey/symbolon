@@ -291,8 +291,16 @@ pub Bool log_put(Endpoint e, List(Int) l, UInt(64) seq, List(Int) event) {
 
 @requires(network, clock(readonly), declassify)
 pub Option(List(Int)) log_get(Endpoint e, List(Int) l, UInt(64) seq) {
-    HttpOut o = http_call_ep(e, "GET", "/log/" + hex_encode(l) + "/" + f"{seq}", []);
+    HttpOut o = log_get_out(e, l, seq);
     return if (o.status == 200) { Some(o.body) } else { None };
+}
+
+// The relay's whole answer for one event: 404 says the log has no event
+// at `seq`; anything but 200 or 404 (0 when nothing answered) says nothing
+// about the log.
+@requires(network, clock(readonly), declassify)
+pub HttpOut log_get_out(Endpoint e, List(Int) l, UInt(64) seq) {
+    return http_call_ep(e, "GET", "/log/" + hex_encode(l) + "/" + f"{seq}", []);
 }
 
 @requires(network, clock(readonly), declassify)

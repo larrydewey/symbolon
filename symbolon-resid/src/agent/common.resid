@@ -118,6 +118,84 @@ pub List(SignedEvent) fetch_log(Endpoint relay, List(Int) l, UInt(64) seq, List(
     };
 }
 
+// The raw events of log `l` from `seq` until the first gap, as the relay
+// returned them (for the local copy below), and whether the relay itself
+// said where the log ends (a 404 for the next event). A fetch cut short by
+// a dead link or a refusal has `ended` false: the copy then says nothing
+// about whether the log has moved on.
+pub type Fetched = { List(List(Int)) evs; Bool ended; };
+
+@requires(network, clock(readonly), declassify)
+Fetched fetch_raw(Endpoint relay, List(Int) l, UInt(64) seq, List(List(Int)) acc) {
+    HttpOut o = log_get_out(relay, l, seq);
+    if (o.status != 200) { return Fetched {.evs = acc, .ended = o.status == 404}; }
+    return match event_of_cbor(o.body) {
+        None => Fetched {.evs = acc, .ended = false},
+        Some(se) => match signed_of(se) { None => Fetched {.evs = acc, .ended = false}, Some(_) => fetch_raw(relay, l, seq + 1, acc.concat([o.body])) }
+    };
+}
+
+List(SignedEvent) events_of_raw(List(List(Int)) rs, Int i, List(SignedEvent) acc) {
+    if (i >= rs.len()) { return acc; }
+    Option(StoredEvent) se = event_of_cbor(rs[i]);
+    Option(SignedEvent) e = match se { None => None, Some(x) => signed_of(x) };
+    return match e { None => acc, Some(x) => events_of_raw(rs, i + 1, acc.concat([x])) };
+}
+
+// This device's copy of a log's events it has verified, from 0 until the
+// first missing one.
+@requires(filesystem)
+List(List(Int)) cached_raw(Str cd, Int seq, List(List(Int)) acc) {
+    Str f = cd + "/" + f"{seq}";
+    if (!filesystem.exists(f)) { return acc; }
+    List(Int) b = filesystem.read_bytes(f);
+    return if (b.len() == 0) { acc } else { cached_raw(cd, seq + 1, acc.concat([b])) };
+}
+
+@requires(filesystem)
+Bool cache_from(Str cd, List(List(Int)) rs, Int i) {
+    if (i >= rs.len()) { return true; }
+    if (!filesystem.write_bytes(cd + "/" + f"{i}", rs[i])) { return false; }
+    return cache_from(cd, rs, i + 1);
+}
+
+// The log verified now, as verified_log, fetching from the relay only the
+// events after those this device has already verified (DIR/logcache/<log>/):
+// a log only grows, and every event, kept or new, is verified again here,
+// so the copy saves round trips, not checks. A relay that serves fewer
+// events than the copy holds cannot roll the log back. If the copy and the
+// relay's events do not verify together, the whole log is fetched again.
+@requires(filesystem, network, clock(readonly), declassify)
+pub Result(VerifiedHead, SymbolonError) verified_log_dir(Str dir, Endpoint relay, List(Int) l) {
+    Str cd = dir + "/logcache/" + hex_encode(l);
+    List(List(Int)) kept = cached_raw(cd, 0, []);
+    // The witnesses the kept log names are asked while the rest of the log
+    // is fetched; their answer is used only if the log still names them.
+    List(WitnessRef) ws0 = policy_of_e0(events_of_raw(kept, 0, [])).witnesses;
+    List(Int) nonce = random_bytes(32);
+    Result(Int, RegionError) early = spawn (network, clock(readonly), declassify) { return if (ws0.len() == 0) { 0 } else { witness_now(ws0, relay.ca, nonce) }; };
+    Fetched got = fetch_raw(relay, l, (UInt(64))kept.len(), kept);
+    List(List(Int)) all = got.evs;
+    Int now0 = match early { Ok(t) => t, Err(_) => 0 };
+    // The kept copy alone proves nothing current: unless the relay said
+    // where the log ends, it is as if the log could not be fetched.
+    if (!got.ended) { return Err(ErrInvalidLog("no log at the relay")); }
+    Result(VerifiedHead, SymbolonError) r = verified_events_now(l, events_of_raw(all, 0, []), relay.ca, ws0, now0);
+    if (match r { Ok(_) => true, Err(_) => false }) {
+        _ = filesystem.create_dir(dir + "/logcache");
+        _ = filesystem.create_dir(cd);
+        _ = cache_from(cd, all, kept.len());
+        return r;
+    }
+    if (kept.len() == 0) { return r; }
+    Fetched fr = fetch_raw(relay, l, (UInt(64))0, []);
+    List(List(Int)) fresh = fr.evs;
+    if (!fr.ended) { return Err(ErrInvalidLog("no log at the relay")); }
+    Result(VerifiedHead, SymbolonError) r2 = verified_events(l, events_of_raw(fresh, 0, []), relay.ca, "");
+    if (match r2 { Ok(_) => true, Err(_) => false }) { _ = cache_from(cd, fresh, 0); }
+    return r2;
+}
+
 // The median witness time of the last event: the `now` a freshly fetched
 // log is verified at.
 pub Int last_time(List(SignedEvent) es, Policy pol) {
@@ -145,6 +223,27 @@ pub Result(VerifiedHead, SymbolonError) verified_log(Endpoint relay, List(Int) l
 // the box at the address its devices use.
 @requires(network, clock(readonly), declassify)
 pub Result(VerifiedHead, SymbolonError) verified_log_at(Endpoint relay, List(Int) l, Str here) { return verified_events(l, fetch_log(relay, l, 0, []), relay.ca, here); }
+
+Bool same_witnesses(List(WitnessRef) a, List(WitnessRef) b, Int i) {
+    if (a.len() != b.len()) { return false; }
+    if (i >= a.len()) { return true; }
+    if (a[i].url != b[i].url || hex_encode(a[i].key) != hex_encode(b[i].key)) { return false; }
+    return same_witnesses(a, b, i + 1);
+}
+
+// As verified_events, with a witness time `now0` already asked of the
+// witnesses `ws0`: used when the log's policy still names exactly those
+// witnesses and they answered, else the witnesses are asked now.
+@requires(network, clock(readonly), declassify)
+Result(VerifiedHead, SymbolonError) verified_events_now(List(Int) l, List(SignedEvent) es, Str ca, List(WitnessRef) ws0, Int now0) {
+    if (es.len() == 0) { return Err(ErrInvalidLog("no log at the relay")); }
+    Int t = last_time(es, policy_of_e0(es));
+    Result(VerifiedHead, SymbolonError) v0 = il_verify(l, es, t, lambda(p) { false });
+    return match v0 {
+        Err(e) => Err(e),
+        Ok(vh) => il_verify(l, es, at_least(if (now0 > 0 && same_witnesses(vh.head.policy.witnesses, ws0, 0)) { now0 } else { witness_now(vh.head.policy.witnesses, ca, random_bytes(32)) }, t), lambda(p) { false })
+    };
+}
 
 // The events of log `l`, however they were fetched, verified now; `ca`
 // as Endpoint.ca for the witnesses.
@@ -176,9 +275,33 @@ Int at_least(Int a, Int b) { return if (a > b) { a } else { b }; }
 // majority answer.
 @requires(network, clock(readonly), declassify)
 pub Int witness_now(List(WitnessRef) ws, Str ca, List(Int) nonce) {
-    List(Int) ts = sort(witness_times(ws, ca, nonce, 0, []));
+    List(Int) ts = sort(witness_times_par(ws, ca, nonce));
     if (ts.len() * 2 <= ws.len()) { return 0; }
     return ts[(ts.len() - 1) / 2];
+}
+
+// The first three witnesses asked at once, each in its own region (a
+// region bound to a name runs while this goes on and is waited for where
+// it is used); any others after. Over a slow link this is one round of
+// connections instead of three.
+@requires(network, clock(readonly), declassify)
+List(Int) witness_times_par(List(WitnessRef) ws, Str ca, List(Int) nonce) {
+    Result(Option(Int), RegionError) a = spawn (network, clock(readonly), declassify) { return time_of(ws, 0, ca, nonce); };
+    Result(Option(Int), RegionError) b = spawn (network, clock(readonly), declassify) { return time_of(ws, 1, ca, nonce); };
+    Result(Option(Int), RegionError) c = spawn (network, clock(readonly), declassify) { return time_of(ws, 2, ca, nonce); };
+    List(Int) rest = witness_times(ws, ca, nonce, 3, []);
+    return got(a).concat(got(b)).concat(got(c)).concat(rest);
+}
+
+List(Int) got(Result(Option(Int), RegionError) r) {
+    return match r { Err(_) => [], Ok(o) => match o { None => [], Some(t) => [t] } };
+}
+
+@requires(network, clock(readonly), declassify)
+Option(Int) time_of(List(WitnessRef) ws, Int i, Str ca, List(Int) nonce) {
+    if (i >= ws.len()) { return None; }
+    Option(Endpoint) oe = endpoint_of_url(ws[i].url, ca);
+    return match oe { None => None, Some(e) => time_from(e, ws[i].key, nonce) };
 }
 
 @requires(network, clock(readonly), declassify)

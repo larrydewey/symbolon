@@ -440,7 +440,7 @@ pub Int device_register(Str dir, Str rp, Bool in_subset) {
 @requires(filesystem, network, device, declassify, clock)
 Int register_with(Str dir, DeviceConfig c, Str rp, Unlocked u, Bool in_subset) {
     if (u.kind != 1) { return dfail("wrong PIN"); }
-    Result(VerifiedHead, SymbolonError) v = verified_log(relay_ep(c), c.log_id);
+    Result(VerifiedHead, SymbolonError) v = verified_log_dir(dir, relay_ep(c), c.log_id);
     return match v {
         Err(e) => dfail(err_text(e)),
         Ok(vh) => print_credential(dir, u, rp, vh.head.quorum.root_pubkey, random_bytes(16), in_subset)
@@ -479,7 +479,7 @@ pub Int sign_with(Str dir, DeviceConfig c, Str rp, List(Int) cid, List(Int) m, S
     if (u.kind != 1) { return dfail("wrong PIN"); }
     Option(List(Int)) nonce = credential_nonce(u.real.cc, rp, cid);
     Option(CgConfig) cg = load_share(dir, u.real.dek);
-    Result(VerifiedHead, SymbolonError) v = verified_log(relay_ep(c), c.log_id);
+    Result(VerifiedHead, SymbolonError) v = verified_log_dir(dir, relay_ep(c), c.log_id);
     return match nonce {
         None => dfail("that credential ID is not for this relying party (A-12)"),
         Some(n) => match cg {
@@ -503,7 +503,7 @@ Int duress_sign(Str dir, DeviceConfig c, Unlocked u, List(Int) cid, List(Int) m,
     Option(List(Secret(UInt(8)))) tau = subset_tweak(DuressFull {.share = u.duress.share, .subkey = u.duress.subkey, .vault_key = u.duress.vault_key,
                                                                 .hpke_priv = u.duress.hpke_priv, .tweaks = duress_tweaks(dir, u.duress)}, cid, 0);
     Option(CgConfig) cg = load_dshare(dir, u.duress.hpke_priv);
-    Result(VerifiedHead, SymbolonError) v = verified_log(relay_ep(c), c.log_id);
+    Result(VerifiedHead, SymbolonError) v = verified_log_dir(dir, relay_ep(c), c.log_id);
     return match tau {
         None => dfail("that credential ID is not for this relying party (A-12)"),
         Some(t) => match cg {

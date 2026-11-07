@@ -63,9 +63,13 @@ pub Int kept_version(Str path) {
 // The vault as the relay holds it, accepted against the verified log; an
 // empty vault when there is none yet and none was ever accepted.
 @requires(filesystem, network, clock(readonly), declassify)
-pub Result(VaultState, Str) fetch_vault(Str dir, DeviceConfig c, VerifiedHead vh) {
+pub Result(VaultState, Str) fetch_vault(Str dir, DeviceConfig c, VerifiedHead vh) { return vault_from(dir, c, vh, blob_get(relay_ep(c), vault_blob(c.log_id))); }
+
+// The vault in `b` (as the relay gave it, perhaps fetched ahead), accepted
+// against the verified log.
+@requires(filesystem, declassify)
+pub Result(VaultState, Str) vault_from(Str dir, DeviceConfig c, VerifiedHead vh, Option(List(Int)) b) {
     List(Int) vid = vault_id_of(c.log_id);
-    Option(List(Int)) b = blob_get(relay_ep(c), vault_blob(c.log_id));
     Int seen = accepted_version(dir);
     return match b {
         None => if (seen == 0) { Ok(empty_state(vid, c.log_id)) } else { Err("the relay has no vault, but this device accepted version " + f"{seen}") },
@@ -84,15 +88,25 @@ pub Result(Opened, Str) open_vault(Str dir) {
     Option(DeviceConfig) oc = load_config(dir);
     DeviceConfig c = oc else { return_none() };
     if (c.log_id.len() == 0) { return Err("not set up (device new, device init)"); }
+    // The log and the vault are fetched while the PIN is checked.
+    Result(Result(VerifiedHead, SymbolonError), RegionError) pl = spawn (filesystem, network, clock(readonly), declassify) { return verified_log_dir(dir, relay_ep(c), c.log_id); };
+    Result(Option(List(Int)), RegionError) pb = spawn (network, clock(readonly), declassify) { return blob_get(relay_ep(c), vault_blob(c.log_id)); };
     Str pin = read_pin();
     Unlocked u = unlock_dir(dir, c, pin);
     if (u.kind != 1) { return Err("wrong PIN"); }
-    Result(VerifiedHead, SymbolonError) rv = verified_log(relay_ep(c), c.log_id);
+    Result(VerifiedHead, SymbolonError) rv = region_log(pl);
     return match rv {
         Err(e) => Err(err_text(e)),
-        Ok(vh) => match fetch_vault(dir, c, vh) { Err(m) => Err(m), Ok(st) => Ok(Opened {.c = c, .u = u, .vh = vh, .st = st, .pin = pin, .p = own_place(c, u), .ep = relay_ep(c)}) }
+        Ok(vh) => match vault_from(dir, c, vh, region_blob(pb)) { Err(m) => Err(m), Ok(st) => Ok(Opened {.c = c, .u = u, .vh = vh, .st = st, .pin = pin, .p = own_place(c, u), .ep = relay_ep(c)}) }
     };
 }
+
+// What a region that verified the log or fetched the vault gave back; a
+// region that failed counts as the relay not answering.
+pub Result(VerifiedHead, SymbolonError) region_log(Result(Result(VerifiedHead, SymbolonError), RegionError) r) {
+    return match r { Ok(v) => v, Err(e) => Err(ErrInvalidLog("cannot verify the log: " + e.message)) };
+}
+pub Option(List(Int)) region_blob(Result(Option(List(Int)), RegionError) r) { return match r { Ok(b) => b, Err(_) => None }; }
 
 DeviceConfig return_none() {
     return DeviceConfig {.relay_host = "", .relay_port = 0, .ca = "", .witnesses = [], .unprotected = true, .argon_m_kib = 0, .argon_t = 0, .salt = [],
@@ -200,12 +214,14 @@ pub Result(View, Str) open_view(Str dir) {
     Option(DeviceConfig) oc = load_config(dir);
     DeviceConfig c = oc else { return_none() };
     if (c.log_id.len() == 0) { return Err("not set up (device new, device init)"); }
+    Result(Result(VerifiedHead, SymbolonError), RegionError) pl = spawn (filesystem, network, clock(readonly), declassify) { return verified_log_dir(dir, relay_ep(c), c.log_id); };
+    Result(Option(List(Int)), RegionError) pb = spawn (network, clock(readonly), declassify) { return blob_get(relay_ep(c), vault_blob(c.log_id)); };
     Unlocked u = unlock_dir(dir, c, read_pin());
     if (u.kind != 1) { return Err("wrong PIN"); }
     List(Secret(UInt(8))) vk = u.real.vault_key;
     List(Int) vid = vault_id_of(c.log_id);
-    Result(VerifiedHead, SymbolonError) rv = verified_log(relay_ep(c), c.log_id);
-    Result(VaultState, Str) rs = match rv { Err(e) => Err(err_text(e)), Ok(vh) => fetch_vault(dir, c, vh) };
+    Result(VerifiedHead, SymbolonError) rv = region_log(pl);
+    Result(VaultState, Str) rs = match rv { Err(e) => Err(err_text(e)), Ok(vh) => vault_from(dir, c, vh, region_blob(pb)) };
     return match rs {
         Ok(st) => online_view(dir, vk, vid, st),
         Err(m) => match kept_copy(dir, vk) {

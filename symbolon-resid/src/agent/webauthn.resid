@@ -66,7 +66,7 @@ pub Int device_wa_register(Str dir, Str rp, Bool uv, Bool in_subset) {
 @requires(filesystem, network, device, declassify, clock)
 Int wa_register_with(Str dir, DeviceConfig c, Str rp, Unlocked u, Bool uv, Bool in_subset) {
     if (u.kind != 1) { return dfail("wrong PIN"); }
-    Result(VerifiedHead, SymbolonError) v = verified_log(relay_ep(c), c.log_id);
+    Result(VerifiedHead, SymbolonError) v = verified_log_dir(dir, relay_ep(c), c.log_id);
     List(Int) nonce = random_bytes(16);
     return match v {
         Err(e) => dfail(err_text(e)),
