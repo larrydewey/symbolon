@@ -45,4 +45,7 @@ the mobile app, the desktop app, Symbolon Home, organizations, and moving in.
 
 ## License
 
-MIT; see [LICENSE](LICENSE).
+MIT; see [LICENSE](LICENSE). The Android app includes [ZXing](https://github.com/zxing/zxing)'s
+core library, under the Apache License 2.0: its license and notice are in
+[symbolon-flutter/android/app/src/main/assets/third_party/zxing](symbolon-flutter/android/app/src/main/assets/third_party/zxing),
+and in the APK under `assets/third_party/zxing/`.
