@@ -58,4 +58,6 @@ dependencies {
     implementation("androidx.credentials:credentials:1.5.0")
     // Fingerprint or face unlock (the PIN kept under a key it opens).
     implementation("androidx.biometric:biometric:1.1.0")
+    // The QR decoder (Apache-2.0, no dependencies), with the platform camera: QrScanner.kt.
+    implementation("com.google.zxing:core:3.5.3")
 }

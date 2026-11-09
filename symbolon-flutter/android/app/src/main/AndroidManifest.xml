@@ -1,6 +1,9 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <!-- The agent talks to the relay, witnesses and cosigner. -->
     <uses-permission android:name="android.permission.INTERNET"/>
+    <!-- The QR scanner (QrScanner.kt); optional, as a code can also be pasted. -->
+    <uses-permission android:name="android.permission.CAMERA"/>
+    <uses-feature android:name="android.hardware.camera" android:required="false"/>
     <application
         android:label="Symbolon"
         android:extractNativeLibs="true"

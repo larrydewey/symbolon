@@ -22,13 +22,21 @@ import io.flutter.plugin.common.MethodChannel
 // libraries to a directory it lets the app execute from (the app's data
 // directory is not executable). The Dart side runs it as a subprocess.
 class MainActivity : FlutterFragmentActivity() {
+    private var scanner: QrScanner? = null
+
     override fun onResume() {
         super.onResume()
         KeystoreServer.inFront(this)
     }
 
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        scanner?.onPermission(requestCode, grantResults.firstOrNull() == android.content.pm.PackageManager.PERMISSION_GRANTED)
+    }
+
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
+        scanner = QrScanner(this, flutterEngine)
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "symbolon/platform").setMethodCallHandler { call, result ->
             if (Biometric.handle(this, call, result)) return@setMethodCallHandler
             when (call.method) {
