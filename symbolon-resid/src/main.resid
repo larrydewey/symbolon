@@ -28,7 +28,7 @@
 //   symbolon device vault put DIR NAME         PIN then the secret on stdin
 //   symbolon device vault get DIR NAME         PIN on stdin; prints the secret
 //   symbolon device vault list DIR [--kinds|--long]  PIN on stdin; prints the names (--kinds: TYPE NAME;
-//                                              --long: TYPE NAME-HEX DETAIL-HEX FOLDER-HEX); offline, this device's copy
+//                                              --long: TYPE NAME-HEX DETAIL-HEX FOLDER-HEX [APPS-HEX]); offline, this device's copy
 //   symbolon device vault show DIR NAME        PIN on stdin; prints "FIELD VALUE-HEX" per field
 //   symbolon device vault code DIR NAME        PIN on stdin; prints "code CODE PERIOD LEFT", the
 //                                              item's current one-time code (its key never leaves)

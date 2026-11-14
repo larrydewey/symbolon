@@ -1802,13 +1802,18 @@ interface that shows, as the platform reports it, where it goes.
      package and `android:apk-key-hash`, item 6), when the principal linked
      it to that app in Symbolon (item 8), or when its stored site names
      that app in Digital Asset Links: the site's
-     `https://HOST/.well-known/assetlinks.json`, fetched by the agent
-     directly from the stored host over TLS, without redirects and at most
+     `https://HOST/.well-known/assetlinks.json`, fetched by Symbolon
+     directly from that host over TLS, without redirects and at most
      128 KiB, lists `delegate_permission/common.get_login_creds` for an
      `android_app` target with that package and certificate fingerprint.
-     The file is untrusted input; a fetch that fails or does not list the
-     app means no link. A result is cached for at most 24 hours. No
-     third-party lookup service is asked.
+     Only the sites the app itself claims (its manifest's
+     `asset_statements`) are looked up, never every site in the vault,
+     which would tell the network what the vault holds. The file is
+     untrusted input; a fetch that fails or does not list the app means
+     no link. A result is cached for at most 24 hours. No third-party
+     lookup service is asked. The app, not the agent, does this: it is the
+     app that learns the requester's package and certificate from the
+     platform, so the agent could only repeat the app's word.
 
    No other login is offered: there is no search and no manual choice of
    an item for an app or page that matches none, since that choice is how
@@ -1832,9 +1837,11 @@ interface that shows, as the platform reports it, where it goes.
 6. **Saving.** After an app commits a form with a password, the system
    may ask the principal to save it, in the system's own prompt. Saving
    opens the fill screen with the requester (item 2) and writes only once
-   the principal confirms and the device opens: a new login, or a new
-   version of a matching one with the previous value kept (22.3,
-   Coexist). A login saved in a privileged browser records the page's
+   the principal confirms and the device opens: a new login, or, when
+   the principal chooses one, a new version of a matching login with its
+   previous password kept as a hidden field (22.3, Coexist). No login is
+   chosen for update by default, so another account's password is never
+   replaced without a tap. A login saved in a privileged browser records the page's
    origin. One saved in any other app records the app's package and
    `android:apk-key-hash`, and fills only in that app. A save releases
    nothing, so it needs no match; an unconfirmed save is dropped.

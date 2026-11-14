@@ -4,6 +4,7 @@ import '../app.dart';
 import '../brand.dart';
 import '../cli.dart';
 import '../widgets.dart';
+import 'autofill_card.dart';
 import 'hardware_page.dart';
 import 'provider_card.dart';
 import 'recovery_page.dart';
@@ -157,6 +158,7 @@ class _HomePageState extends State<HomePage> {
           ]),
           const SizedBox(height: 16),
           const ProviderCard(onlyWhenOff: true),
+          const AutofillCard(onlyWhenOff: true),
           Section('This device', children: [
             ListTile(
               contentPadding: EdgeInsets.zero,

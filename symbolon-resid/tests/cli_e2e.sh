@@ -216,6 +216,11 @@ grep -q "^current $(hx pw-1)$" "$W/fillshow.log" && grep -q "^username $(hx alic
 grep -q '^otp \(3[0-9]\)\{6\}$' "$W/fillshow.log" || fail "fill show gave no code: $(cat "$W/fillshow.log")"
 grep -q '^totp ' "$W/fillshow.log" && fail "fill show gave the one-time code key"
 printf '2468\n' | run 300 "$BIN" device vault show "$W/dev" ex | grep -q '^totp ' || fail "plain show lost the key (the editor needs it)"
+# A login's linked apps (SPEC 22.6 item 8) are a fifth column of list --long,
+# and a fill's show does not give them.
+printf '2468\norigin %s\nusername %s\ncurrent %s\napps %s\n' "$(hx https://ex.example)" "$(hx alice)" "$(hx pw-1)" "$(hx "com.example.app abab")" | run 300 "$BIN" device vault set "$W/dev" ex login > /dev/null 2>&1 || fail "vault set with apps"
+printf '2468\n' | run 300 "$BIN" device vault list "$W/dev" --long | grep -q "^login $(hx ex) $(hx https://ex.example) - $(hx "com.example.app abab")$" || fail "list --long without the apps column"
+printf '2468\n' | run 300 "$BIN" device vault list "$W/dev" --long | awk -v ex="$(hx ex)" 'NF != 4 && $2 != ex {bad = 1} END {exit bad}' || fail "an item with no apps grew a column"
 printf '2468\n' | run 300 "$BIN" device vault delete "$W/dev" ex > "$W/otpdel.log" 2>&1 || fail "vault delete ex: $(cat "$W/otpdel.log")"
 echo "one-time code: $GOT, as computed apart; a card has none"
 printf '2468\nexpiry %s\n' "$(hx 12/30)" | run 300 "$BIN" device vault set "$W/dev" nonum card > "$W/bad1.log" 2>&1 && fail "a card without a number was stored"

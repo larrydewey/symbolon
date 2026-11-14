@@ -10,6 +10,7 @@ import '../app.dart';
 import '../biometric.dart';
 import '../validate.dart' as v;
 import '../widgets.dart';
+import 'autofill_card.dart';
 
 class SettingsPage extends StatefulWidget {
   final App app;
@@ -81,6 +82,7 @@ class _SettingsPageState extends State<SettingsPage> {
               onChanged: setBio,
             ),
           ]),
+        const AutofillCard(),
         Section('Stay unlocked', subtitle: 'After you enter your PIN, the app keeps it in memory for a while so that you are not asked for every action. '
             'It always locks when you leave the app.', children: [
           RadioGroup<int>(

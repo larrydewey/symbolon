@@ -1,6 +1,7 @@
 package dev.symbolon.symbolon_ui
 
 import android.content.ComponentName
+import android.content.Intent
 import android.os.Build
 import android.os.CancellationSignal
 import androidx.credentials.CreateCredentialResponse
@@ -42,6 +43,16 @@ class MainActivity : FlutterFragmentActivity() {
             when (call.method) {
                 "paths" -> result.success(platformPaths(this))
                 "keystore" -> result.success(KeystoreServer.info(this))
+                // Android autofill (SPEC 22.6): whether Symbolon is the service,
+                // the system page to choose it, and the apps a login may be linked to.
+                "autofillEnabled" -> result.success(Build.VERSION.SDK_INT >= 26 &&
+                    getSystemService(android.view.autofill.AutofillManager::class.java)?.hasEnabledAutofillServices() == true)
+                "openAutofillSettings" -> {
+                    startActivity(Intent(android.provider.Settings.ACTION_REQUEST_SET_AUTOFILL_SERVICE).setData(android.net.Uri.parse("package:$packageName")))
+                    result.success(true)
+                }
+                "installedApps" -> if (Build.VERSION.SDK_INT < 26) result.success(emptyList<Any>())
+                    else Thread { val a = AutofillCore.installedApps(this); runOnUiThread { result.success(a) } }.start()
                 // A secret for the clipboard, marked sensitive: Android 13+
                 // then keeps it out of the copy preview and the keyboard's
                 // clipboard suggestions. False before 13 (the Dart side copies).

@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:flutter/material.dart';
 
@@ -8,6 +9,7 @@ import '../favicons.dart';
 import '../validate.dart' show cardBrand;
 import '../vault_types.dart';
 import '../widgets.dart';
+import 'app_link.dart';
 import 'item_editor.dart';
 import 'sharing_page.dart' show SharedFolder;
 import 'vault_page.dart' show TypeAvatar;
@@ -29,7 +31,9 @@ class ItemPage extends StatefulWidget {
   final Set<String> names;
   final Set<String> folders;
   final String share;                  // the shared folder it is in, "" for the own vault
-  const ItemPage({super.key, required this.app, required this.item, required this.offline, required this.names, this.folders = const {}, this.share = ''});
+  /// The installed apps a login may be linked to (Android); given in tests.
+  final Future<List<InstalledApp>> Function()? apps;
+  const ItemPage({super.key, required this.app, required this.item, required this.offline, required this.names, this.folders = const {}, this.share = '', this.apps});
 
   @override
   State<ItemPage> createState() => _ItemPageState();
@@ -215,9 +219,62 @@ class _ItemPageState extends State<ItemPage> {
               if (t.id == 'login') ...[
                 const SizedBox(height: 8),
                 WideButton('Change password at the site…', icon: Icons.autorenew, tonal: true, onPressed: rotate),
+                if (Platform.isAndroid || widget.apps != null) _appsCard(appLinksOf(fs['apps'] ?? '')),
               ],
             ]),
     );
+  }
+
+  // The apps this login fills in (SPEC 22.6 item 8), each removable, and
+  // "Use in an app" to link one: chosen here, never from an app's request.
+  Widget _appsCard(List<(String, String)> links) {
+    final t = Theme.of(context).textTheme;
+    return Card(
+      key: const Key('item-apps'),
+      margin: const EdgeInsets.only(top: 16),
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+          Text('Apps', style: t.titleMedium),
+          const SizedBox(height: 4),
+          Text(links.isEmpty ? 'This login fills in apps only when its site says they may, or once you link an app here.'
+              : 'This login also fills in these apps, after you unlock.', style: t.bodySmall),
+          for (final (pkg, cert) in links)
+            ListTile(
+              key: Key('item-app-$pkg'),
+              contentPadding: EdgeInsets.zero,
+              leading: const Icon(Icons.apps),
+              title: Text(pkg),
+              subtitle: Text('Publisher key ${spacedCert(cert.length > 16 ? cert.substring(0, 16) : cert)}…'),
+              trailing: IconButton(key: Key('item-app-remove-$pkg'), tooltip: 'Stop filling in this app', icon: const Icon(Icons.link_off),
+                  onPressed: () => _setApps([for (final l in links) if (l.$1 != pkg || l.$2 != cert) l], 'No longer fills in $pkg')),
+            ),
+          const SizedBox(height: 8),
+          WideButton('Use in an app…', key: const Key('item-app-add'), icon: Icons.add_link, tonal: true, onPressed: () async {
+            if (widget.offline) return toast(context, 'Changes need a connection to your relay.');
+            final a = await Navigator.of(context).push<InstalledApp>(MaterialPageRoute(builder: (_) => AppPickerPage(login: widget.item.name, apps: widget.apps ?? installedApps)));
+            if (a == null || a.certs.isEmpty || !mounted) return;
+            await _setApps([...links.where((l) => l.$1 != a.package), (a.package, a.certs.first)], '${widget.item.name} now fills in ${a.label}');
+          }),
+        ]),
+      ),
+    );
+  }
+
+  // The login again, with its apps changed and every other field as it was.
+  Future<void> _setApps(List<(String, String)> links, String done) async {
+    if (widget.offline) return toast(context, 'Changes need a connection to your relay.');
+    final f = {...?fields}..remove('type')..remove('name');
+    if (links.isEmpty) {
+      f.remove('apps');
+    } else {
+      f['apps'] = appLinksText(links);
+    }
+    final r = await app.withPin(context, (p) => runTask(context, 'Saving ${widget.item.name}', () => app.cli.vaultSet(app.dir, widget.item.name, 'login', f, p, share: widget.share), usually: 'a few seconds'));
+    if (r != null && r.ok && mounted) {
+      setState(() => fields = {...?fields, 'apps': appLinksText(links)});
+      toast(context, done);
+    }
   }
 
   static String _brand(String n) {
