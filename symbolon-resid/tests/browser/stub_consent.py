@@ -2,7 +2,8 @@
 # A stand-in for the app's consent window (--fill-consent REQUEST) in
 # tests/browser_e2e.sh: it reads the request, records it, and answers with
 # the item named by STUB_ANSWER (card, login, other-login, cancel, wrong-token,
-# silent) over the host's loopback connection.
+# silent, slow: a login after STUB_DELAY seconds) over the host's loopback
+# connection.
 import json, os, socket, sys, time
 
 assert sys.argv[1] == "--fill-consent"
@@ -10,6 +11,9 @@ req = json.load(open(sys.argv[2]))
 with open(os.environ["STUB_LOG"], "a") as f:
     f.write(json.dumps(req) + "\n")
 mode = os.environ.get("STUB_ANSWER", "card")
+if mode == "slow":
+    time.sleep(float(os.environ.get("STUB_DELAY", "4")))
+    mode = "login"
 if mode == "silent":
     sys.exit(0)
 

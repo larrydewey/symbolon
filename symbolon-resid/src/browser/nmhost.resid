@@ -478,8 +478,33 @@ Str handle_fill(FillAsk a) {
     List(FrameAsk) fs = permitted(a.top, a.frames, 0, ListBuf());
     if (fs.len() == 0) { return error_reply(a.id, "no field on this page may be filled"); }
     Str want = wanted_type(fs);
+    // One pending fill at a time (SPEC 22.7 item 3): a request that arrives
+    // while another waits is refused, not queued, so one gesture cannot
+    // approve two requests.
+    // Without a runtime directory there is no lock, and no window either:
+    // ask_consent refuses first.
+    Str lock = fill_lock();
+    if (str_len(lock) > 0 && !take_lock(lock)) { return error_reply(a.id, "another fill is waiting for an answer: finish or cancel it first"); }
     Option(Chosen) oc = ask_consent(a.top, want, fs);
+    if (str_len(lock) > 0) { _ = process.run("rmdir " + lock); }
     return match oc { None => error_reply(a.id, "the Symbolon window did not answer"), Some(c) => answer(a, fs, want, c) };
+}
+
+// The lock is a directory in the per-user runtime directory: mkdir makes it
+// or fails, atomically, across every host this user runs. One left by a host
+// that died is older than any fill can last (5 minutes), and is cleared.
+@requires(environment)
+pub Str fill_lock() {
+    Str rt = environment.get("XDG_RUNTIME_DIR");
+    return if (word_safe(rt) && str_len(rt) > 0) { rt + "/symbolon-fill.lock" } else { "" };
+}
+
+@requires(process)
+pub Bool take_lock(Str lock) {
+    if (str_len(lock) == 0) { return false; }
+    if (process.run("mkdir " + lock) == 0) { return true; }
+    _ = process.run("find " + lock + " -maxdepth 0 -mmin +6 -exec rmdir {} ;");
+    return process.run("mkdir " + lock) == 0;
 }
 
 // The reply for the user's choice, after the item is checked against the page.

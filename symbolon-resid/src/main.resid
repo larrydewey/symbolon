@@ -59,6 +59,9 @@
 //   symbolon device link-new DIR [--host H,...] [...]   a new device: shows a code (QR) for an existing one (SPEC 11.5)
 //   symbolon device link-add DIR LINK          adds the device whose code was scanned
 //   symbolon device key add|list|remove DIR [NAME]   security keys as a second factor (SPEC 9.4)
+//   symbolon device key fills DIR keys|any       PIN on stdin; whether fills need a security key (SPEC 22.7)
+//       With SYMBOLON_FILL set (the fill window's request), vault list, show and code are a fill:
+//       refused under "keys" with no key enrolled, and a key's touch signs over the request.
 //   symbolon browser host [ORIGIN...]          the browser extension's native messaging host (SPEC 22.5);
 //                                              SYMBOLON_CONSENT is the consent window (the app)
 //   symbolon home init DIR HOST [HOST...] [--ports BASE] [--bind ADDR]   Symbolon Home: the box's CA, certificates, witnesses
@@ -347,6 +350,7 @@ Int main() {
     if (a1 == "device" && a2 == "key" && args.get(3) == "add" && n == 6) { return key_add(args.get(4), args.get(5)); }
     if (a1 == "device" && a2 == "key" && args.get(3) == "list" && n == 5) { return key_list(args.get(4)); }
     if (a1 == "device" && a2 == "key" && args.get(3) == "remove" && n == 6) { return key_remove(args.get(4), args.get(5)); }
+    if (a1 == "device" && a2 == "key" && args.get(3) == "fills" && n == 6) { return key_fills(args.get(4), args.get(5)); }
     if (a1 == "browser" && a2 == "host") { return browser_host([args.get(3), args.get(4)]); }
     if (a1 == "home" && a2 == "serve" && n == 4) { return home_serve(args.get(3), args.get(0)); }
     if (a1 == "home" && a2 == "pair-serve" && n == 4) { return home_pair_serve(args.get(3), args.get(0)); }
@@ -368,6 +372,10 @@ Int main() {
     if (a1 == "device" && a2 == "vault" && args.get(3) == "put" && n == 6) { return vault_put(args.get(4), args.get(5)); }
     if (a1 == "device" && a2 == "vault" && args.get(3) == "get" && n == 6) { return vault_get(args.get(4), args.get(5)); }
     // `--share ID` comes last: the folder the vault command works in.
+    if (a1 == "device" && a2 == "vault" && n >= 5 && (args.get(3) == "list" || args.get(3) == "show" || args.get(3) == "code")) {
+        Str no = fill_refusal(args.get(4));
+        if (str_len(no) > 0) { return dfail(no); }
+    }
     Str share = if (n >= 6 && args.get(n - 2) == "--share") { args.get(n - 1) } else { "" };
     Int ns = if (str_len(share) > 0) { n - 2 } else { n };
     if (a1 == "device" && a2 == "rotate" && (ns == 7 || ns == 8)) { return device_rotate(args.get(3), args.get(4), args.get(5), args.get(6), if (ns == 8) { args.get(7) } else { "chromium" }, share); }

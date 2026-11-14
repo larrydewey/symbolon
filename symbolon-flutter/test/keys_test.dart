@@ -66,4 +66,25 @@ void main() {
     expect(find.byKey(const Key('key-spare')), findsOneWidget);
     app.session.lock();
   });
+
+  testWidgets('fills can be set to need a security key (SPEC 22.7), with the PIN', (t) async {
+    t.view.devicePixelRatio = 2;
+    t.view.physicalSize = const Size(460, 1000) * 2;
+    addTearDown(t.view.reset);
+    final app = App(settings);
+    await t.pumpWidget(MaterialApp(home: SecurityKeysPage(app: app)));
+    await settle(t);
+    expect((t.widget(find.byKey(const Key('fills-need-key'))) as SwitchListTile).value, isFalse);
+    await t.tap(find.byKey(const Key('fills-need-key')));
+    await t.pumpAndSettle();
+    await t.enterText(find.byKey(const Key('secret-field')), '2468');
+    await t.tap(find.byKey(const Key('secret-ok')));
+    await t.pump();
+    await settle(t);
+    final args = (await t.runAsync(() => agent.argsLog.readAsString()))!;
+    expect(args, contains('device key fills ${agent.dir.path}/dev keys'));
+    expect((t.widget(find.byKey(const Key('fills-need-key'))) as SwitchListTile).value, isTrue);
+    expect(find.text('No key is enrolled, so this device fills nothing until one is.'), findsOneWidget);
+    app.session.lock();
+  });
 }

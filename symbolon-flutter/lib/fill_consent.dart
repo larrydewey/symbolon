@@ -65,6 +65,14 @@ class FillRequest {
 
   /// Frames of another origin (a payment processor's card fields).
   List<String> get otherOrigins => {for (final f in frames) if (f.origin != top) f.origin}.toList();
+
+  /// The request the agent's opening is bound to (SPEC 22.7 item 4): the
+  /// requester and the field kinds, sorted, never the token or the port.
+  String get fillText {
+    final origins = {for (final f in frames) f.origin}.toList()..sort();
+    final kinds = {for (final f in frames) ...f.fields}.toList()..sort();
+    return 'fill $want $top ${origins.join(',')} ${kinds.join(',')}';
+  }
 }
 
 /// What follows the token line (sent when the window opened): "cancel" or
@@ -217,7 +225,9 @@ class _FillConsentPageState extends State<FillConsentPage> {
   }
 
   FillRequest? get rq => widget.request;
-  SymbolonCli get cli => SymbolonCli(widget.settings.binary, env: widget.settings.agentEnv);
+  // Every agent run is for this fill: SYMBOLON_FILL makes the agent apply the
+  // device's fill policy and bind a security key's touch to the request.
+  SymbolonCli get cli => SymbolonCli(widget.settings.binary, env: {...widget.settings.agentEnv, if (widget.request != null) 'SYMBOLON_FILL': widget.request!.fillText});
   String get dir => widget.settings.deviceDir;
 
   @override

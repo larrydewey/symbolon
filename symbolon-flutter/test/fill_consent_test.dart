@@ -78,6 +78,14 @@ void main() {
     await t.pump();
     await settle(t);
     expect(w.link.sent, ['ok card\nnumber ${hexOf('4111111111111111')}\ncvv ${hexOf('123')}\nend\n']);
+    // Each agent run was a fill, bound to the request: the requester and the
+    // kinds, sorted, without the token (SPEC 22.7 item 4).
+    final runs = (await t.runAsync(() => File('${agent.dir.path}/fill.log').readAsLines()))!;
+    expect(runs, isNotEmpty);
+    for (final r in runs) {
+      expect(r, endsWith('fill card https://shop.example https://js.stripe.com,https://shop.example cc-csc,cc-name,cc-number'));
+      expect(r, isNot(contains('abc')));
+    }
     expect(w.closed, [true]);
     final args = (await t.runAsync(() => agent.argsLog.readAsString()))!;
     expect(args, contains('device vault show ${agent.dir.path}/dev visa'));

@@ -17,6 +17,7 @@ class FakeAgent {
     await File(a.path).writeAsString(r'''#!/bin/bash
 D="$(dirname "$0")"
 echo "$*" >> "$D/args.log"
+[ -n "${SYMBOLON_FILL:-}" ] && echo "$3 $SYMBOLON_FILL" >> "$D/fill.log"
 IN=$(cat)
 printf '%s\n--\n' "$IN" >> "$D/stdin.log"
 PIN=$(printf '%s\n' "$IN" | head -1)
@@ -67,6 +68,7 @@ case "$1 $2" in
       *) [ "$PIN" = "2468" ] || { echo "device: wrong PIN" >&2; exit 1; }
          case "$3" in
            add) printf '%s\n' "$(printf %s "$5" | od -v -An -tx1 | tr -d ' \n')" >> "$D/keys"; echo "security key $5 added" ;;
+           fills) mkdir -p "$4"; [ "$5" = keys ] && echo keys > "$4/fill-policy" || echo any > "$4/fill-policy"; echo "fills need a security key; none is enrolled, so this device fills nothing until one is" ;;
            remove) grep -v "^$(printf %s "$5" | od -v -An -tx1 | tr -d ' \n')\$" "$D/keys" > "$D/keys.n"; mv "$D/keys.n" "$D/keys"; echo "removed" ;;
          esac ;;
     esac ;;

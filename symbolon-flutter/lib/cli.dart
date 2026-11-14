@@ -321,6 +321,11 @@ class SymbolonCli {
 
   Future<CliResult> keyRemove(String dir, String name, String pin) => run(['device', 'key', 'remove', dir, name], input: [pin], timeout: const Duration(minutes: 3));
 
+  /// Whether this device fills only with a security key ("keys") or not
+  /// ("any"), SPEC 22.7 item 2. The PIN, and a touch if a key is enrolled.
+  Future<CliResult> keyFills(String dir, bool needKey, String pin) =>
+      run(['device', 'key', 'fills', dir, needKey ? 'keys' : 'any'], input: [pin], timeout: const Duration(minutes: 3));
+
   // ─── Devices and recovery ───────────────────────────────────────────
 
   Future<CliResult> enroll(String dir, String newKeys, String pin, {String primes = ''}) =>
