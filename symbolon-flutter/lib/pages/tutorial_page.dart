@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
 
+import '../brand.dart';
+
 /// How Symbolon works, in a few pages: shown on first start, skippable, and
 /// again from More › How Symbolon works.
 class TutorialPage extends StatefulWidget {
@@ -14,7 +16,7 @@ class _TutorialPageState extends State<TutorialPage> {
   int at = 0;
 
   static const steps = [
-    (Icons.fingerprint, 'Welcome to Symbolon',
+    (null, 'Welcome to Symbolon',
         'Symbolon keeps your identity, your passkeys and your passwords safe, without trusting any single device or company with your keys.'),
     (Icons.call_split, 'Your key is split',
         'Your signing key never exists in one place. This device holds one share and a cosigner holds another, and both must take part '
@@ -73,11 +75,19 @@ class _TutorialPageState extends State<TutorialPage> {
                   controller: pages,
                   onPageChanged: (i) => setState(() => at = i),
                   children: [
-                    for (final s in steps)
+                    for (final (i, s) in steps.indexed)
                       SingleChildScrollView(
                         padding: const EdgeInsets.symmetric(horizontal: 32, vertical: 24),
                         child: Column(children: [
-                          CircleAvatar(radius: 56, backgroundColor: cs.primaryContainer, child: Icon(s.$1, size: 56, color: cs.onPrimaryContainer)),
+                          // Each picture settles in as its page comes into view.
+                          AnimatedScale(
+                            scale: i == at ? 1 : 0.85,
+                            duration: const Duration(milliseconds: 350),
+                            curve: Curves.easeOutBack,
+                            child: s.$1 == null
+                                ? const SymbolonBadge(size: 112)
+                                : CircleAvatar(radius: 56, backgroundColor: cs.primaryContainer, child: Icon(s.$1, size: 56, color: cs.onPrimaryContainer)),
+                          ),
                           const SizedBox(height: 32),
                           Text(s.$2, style: t.headlineSmall, textAlign: TextAlign.center),
                           const SizedBox(height: 16),

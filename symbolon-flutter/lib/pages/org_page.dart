@@ -1,10 +1,14 @@
+import 'dart:io';
+
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
 
 import '../app.dart';
+import '../links.dart';
+import '../qr_view.dart';
 import '../managed.dart';
 import '../vault_types.dart' show unhex;
 import '../widgets.dart';
+import 'scan_page.dart';
 
 /// The organization as `org show` prints it.
 class OrgInfo {
@@ -116,6 +120,8 @@ class _OrgPageState extends State<OrgPage> {
   final orgC = TextEditingController();
   final founderC = TextEditingController();
   final codeC = TextEditingController();
+  final linkC = TextEditingController();
+  OrgInvite? invited;    // a pasted or scanned invite, filling the fields
 
   App get app => widget.app;
 
@@ -123,6 +129,17 @@ class _OrgPageState extends State<OrgPage> {
   void initState() {
     super.initState();
     WidgetsBinding.instance.addPostFrameCallback((_) => load());
+    linkC.addListener(() {
+      if (OrgInvite.parse(linkC.text)?.link != invited?.link) takeInvite(linkC.text);
+    });
+  }
+
+  @override
+  void dispose() {
+    for (final c in [orgC, founderC, codeC, linkC]) {
+      c.dispose();
+    }
+    super.dispose();
   }
 
   Future<void> load() async {
@@ -143,6 +160,26 @@ class _OrgPageState extends State<OrgPage> {
       if (founderC.text.isEmpty) founderC.text = m.founder;
       if (codeC.text.isEmpty) codeC.text = m.inviteCode;
     });
+  }
+
+  // A pasted or scanned invite fills the three fields.
+  void takeInvite(String text) {
+    final i = OrgInvite.parse(text);
+    setState(() {
+      invited = i;
+      if (i != null) {
+        orgC.text = i.org;
+        founderC.text = i.founder;
+        codeC.text = i.code;
+      }
+    });
+  }
+
+  Future<void> scanInvite() async {
+    final text = await Navigator.of(context).push<String>(MaterialPageRoute(
+        builder: (_) => const ScanPage(accepts: OrgInvite.isLink, title: 'Scan your invite', hint: 'Point the camera at the invite your company gave you.', wrong: 'That is not an organization invite.')));
+    if (text == null || !mounted) return;
+    linkC.text = text;   // the listener takes it
   }
 
   Future<void> join() async {
@@ -187,17 +224,35 @@ class _OrgPageState extends State<OrgPage> {
       return;
     }
     final code = r.lines.isEmpty ? '' : r.lines.last.split(' ').first;
+    // The org id and the founder, from this device's enrolment (dir/org), so
+    // the invite is one link: nothing for the person to type.
+    final ref = (await File('${app.dir}/org').readAsString().catchError((_) => '')).trim().split(RegExp(r'\s+'));
+    final link = ref.length == 2 ? OrgInvite(ref[0], ref[1], code).link : null;
+    if (!mounted) return;
     await showDialog<void>(
       context: context,
       builder: (ctx) => AlertDialog(
-        title: const Text('Invite code'),
-        content: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
-          const Text('Give this code to the person through the company (work e-mail or device management). It works once, for 14 days.'),
-          const SizedBox(height: 12),
-          SelectableText(code, key: const Key('org-invite-code'), style: const TextStyle(fontFamily: 'monospace')),
-        ]),
+        title: Text('Invite for ${name.text.trim()}'),
+        content: SingleChildScrollView(
+          child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+            Text(link == null
+                ? 'Give this code to the person through the company (work e-mail or device management). It works once, for 14 days.'
+                : 'Send the link through the company (work e-mail or device management), or let them scan the code. It works once, for 14 days.'),
+            if (link != null) ...[
+              const SizedBox(height: 16),
+              Center(child: QrView(link, key: const Key('org-invite-qr'), size: 220)),
+              const SizedBox(height: 8),
+              FilledButton.tonalIcon(key: const Key('org-invite-copy'), icon: const Icon(Icons.link), label: const Text('Copy the invite link'),
+                  onPressed: () => copyText(ctx, 'Invite link', link, secret: true)),
+              const SizedBox(height: 12),
+              Text('The code alone, for device management:', style: Theme.of(ctx).textTheme.bodySmall),
+            ] else
+              const SizedBox(height: 12),
+            SelectableText(code, key: const Key('org-invite-code'), style: const TextStyle(fontFamily: 'monospace')),
+          ]),
+        ),
         actions: [
-          TextButton(onPressed: () => Clipboard.setData(ClipboardData(text: code)), child: const Text('Copy')),
+          if (link == null) TextButton(onPressed: () => copyText(ctx, 'Invite code', code, secret: true), child: const Text('Copy')),
           FilledButton(onPressed: () => Navigator.of(ctx).pop(), child: const Text('Done')),
         ],
       ),
@@ -261,12 +316,40 @@ class _OrgPageState extends State<OrgPage> {
           else if (problem != null)
             Section('Organization', children: [Text(problem!, key: const Key('org-problem')), WideButton('Try again', icon: Icons.refresh, onPressed: load)])
           else if (o == null)
-            Section('Join your organization', children: [
-              Text(managed.hasOrg ? 'Your company set up this device for its organization. Check the code and join.'
-                  : 'Your company gives you its organization id, its founder\'s id and an invite code.'),
-              TextField(key: const Key('org-id'), controller: orgC, decoration: const InputDecoration(labelText: 'Organization id')),
-              TextField(key: const Key('org-founder'), controller: founderC, decoration: const InputDecoration(labelText: 'Founder')),
-              TextField(key: const Key('org-code'), controller: codeC, decoration: const InputDecoration(labelText: 'Invite code')),
+            Section('Join your organization', subtitle: 'Only if your company runs Symbolon for its people. Your own vault stays yours.', children: [
+              Text(managed.hasOrg ? 'Your company set up this device for its organization. Check and join.'
+                  : 'Your company sends you an invite: a link, or a code to scan.'),
+              const SizedBox(height: 12),
+              if (!managed.hasOrg) ...[
+                if (Platform.isAndroid || Platform.isIOS) ...[
+                  WideButton('Scan the invite', key: const Key('org-scan'), icon: Icons.qr_code_scanner, onPressed: scanInvite),
+                  const SizedBox(height: 12),
+                ],
+                Field(linkC, Platform.isAndroid || Platform.isIOS ? 'Or paste the invite link' : 'Paste the invite link', hint: 'symbolon://org?…', url: true,
+                    fieldKey: const Key('org-link'), action: TextInputAction.done,
+                    check: (s) => s.trim().isEmpty || OrgInvite.isLink(s) ? null : 'Not an invite link'),
+                if (invited != null)
+                  const ListTile(
+                    key: Key('org-invite-read'),
+                    contentPadding: EdgeInsets.zero,
+                    leading: Icon(Icons.check_circle, color: Colors.green),
+                    title: Text('Invite read'),
+                    subtitle: Text('Join to answer it. An administrator adds you at the next sync.'),
+                  ),
+              ],
+              ExpansionTile(
+                key: const Key('org-manual'),
+                tilePadding: EdgeInsets.zero,
+                shape: const Border(),
+                initiallyExpanded: managed.hasOrg,
+                title: const Text('The details'),
+                subtitle: const Text('Organization id, founder and invite code'),
+                children: [
+                  Field(orgC, 'Organization id', fieldKey: const Key('org-id'), hint: '32 characters'),
+                  Field(founderC, 'Founder', fieldKey: const Key('org-founder'), hint: '64 characters'),
+                  Field(codeC, 'Invite code', fieldKey: const Key('org-code'), hint: '32 characters', action: TextInputAction.done),
+                ],
+              ),
               const SizedBox(height: 12),
               WideButton('Join', key: const Key('org-join'), icon: Icons.business, onPressed: join),
             ])

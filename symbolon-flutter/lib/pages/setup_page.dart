@@ -1,12 +1,17 @@
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import '../app.dart';
 import '../biometric.dart';
 import '../hardware.dart';
 import '../home_link.dart';
+import '../links.dart';
+import '../recovery_sheet.dart';
+import '../cli.dart';
 import '../validate.dart' as v;
 import '../widgets.dart';
 import 'hardware_page.dart';
@@ -54,8 +59,9 @@ class _SetupPageState extends State<SetupPage> {
   bool get unprotected => !hasHardware || !useTpm;
 
   // 3. The kit.
-  String? kit;
-  bool keptKit = false;
+  RecoverySheet? sheet;   // the kit, with the identity log it recovers
+  bool checking = false;  // the sheet hidden, two of its groups asked back
+  bool keptKit = false;   // checked: setup may close
 
   App get app => widget.app;
 
@@ -84,7 +90,7 @@ class _SetupPageState extends State<SetupPage> {
     super.dispose();
   }
 
-  void fail(String m) => ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(m), backgroundColor: Colors.red.shade700));
+  void fail(String m) => ScaffoldMessenger.of(context).showSnackBar(errorBar(m));
 
   String get demoBase => demoUrl.text.trim().replaceAll(RegExp(r'/+$'), '');
 
@@ -229,11 +235,16 @@ class _SetupPageState extends State<SetupPage> {
     if (bio.supported && bio.biometric && useBio) await Bio.enroll(p);
     if (!mounted) return;
     app.session.remember(p);
+    HapticFeedback.heavyImpact();
     pin.clear();
     pin2.clear();
     duressPin.clear();
+    // The identity log goes on the sheet with the kit: recovery needs both.
+    final log = DeviceStatus.parse(await app.cli.status(app.dir))?.log;
+    if (!mounted) return;
     setState(() {
-      kit = r.lines.where((l) => l.startsWith('RECOVERY KIT')).map((l) => l.split(': ').last).firstOrNull;
+      final kit = r.lines.where((l) => l.startsWith('RECOVERY KIT')).map((l) => l.split(': ').last.trim().toLowerCase()).firstOrNull;
+      sheet = kit == null ? null : RecoverySheet(log ?? '', kit);
       step = 2;
     });
   }
@@ -266,7 +277,7 @@ class _SetupPageState extends State<SetupPage> {
         WideButton('Scan the code', key: const Key('scan-home'), icon: Icons.qr_code_scanner, onPressed: scanHome),
         const SizedBox(height: 12),
       ],
-      Field(homeLinkText, 'Or paste the link', hint: 'symbolon://pair?…', url: true, fieldKey: const Key('home-link'), action: TextInputAction.done,
+      Field(homeLinkText, Platform.isAndroid || Platform.isIOS ? 'Or paste the link' : 'Paste the link', hint: 'symbolon://pair?…', url: true, fieldKey: const Key('home-link'), action: TextInputAction.done,
           check: v.optional((s) => HomeLink.parse(s) == null ? 'Not a Symbolon Home link' : null)),
       WideButton('Connect', key: const Key('join-home'), icon: Icons.link, tonal: true, onPressed: joinHome),
       const SizedBox(height: 16),
@@ -279,7 +290,9 @@ class _SetupPageState extends State<SetupPage> {
       const SizedBox(height: 8),
       TextButton(onPressed: () => setState(() => otherWays = !otherWays), child: Text(otherWays ? 'Hide other ways' : 'Other ways to connect')),
       if (otherWays) ...[
-      Section('Demo stack', subtitle: 'From tools/demo.sh --lan on a computer on this network.', children: [
+      // The demo stack is for developing Symbolon: not in release builds.
+      if (!kReleaseMode)
+      Section('Demo stack', subtitle: 'For developers: tools/demo.sh --lan on a computer on this network.', children: [
         Field(demoUrl, 'Demo address', hint: 'http://192.168.1.20:47000', url: true, fieldKey: const Key('demo-url'), action: TextInputAction.done, check: v.serviceUrl),
         WideButton('Connect', key: const Key('join-demo'), icon: Icons.wifi, onPressed: fetchDemo),
       ]),
@@ -327,7 +340,7 @@ class _SetupPageState extends State<SetupPage> {
           ),
         ),
       const SizedBox(height: 12),
-      Field(pin, 'PIN', obscure: true, numeric: true, fieldKey: const Key('pin'), check: (s) => v.pin(s, min: minPin)),
+      Field(pin, 'PIN', helper: 'At least $minPin digits', obscure: true, numeric: true, fieldKey: const Key('pin'), check: (s) => v.pin(s, min: minPin)),
       Field(pin2, 'PIN again', obscure: true, numeric: true, fieldKey: const Key('pin2'), action: TextInputAction.done, check: (s) => s == pin.text ? null : 'The PINs differ'),
       ExpansionTile(
         tilePadding: EdgeInsets.zero,
@@ -404,27 +417,50 @@ class _SetupPageState extends State<SetupPage> {
 
   Widget kitStep() {
     final t = Theme.of(context).textTheme;
+    final sh = sheet;
+    if (sh != null && checking) {
+      return SheetCheck(
+        sheet: sh,
+        onBack: () => setState(() => checking = false),
+        onChecked: () {
+          setState(() => keptKit = true);
+          // Once rebuilt, so the page's guard lets it close.
+          WidgetsBinding.instance.addPostFrameCallback((_) => mounted ? Navigator.of(context).pop() : null);
+        },
+      );
+    }
     return Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
-      Text('Step 3 of 3 · Recovery kit', style: t.labelLarge),
-      const SizedBox(height: 4),
-      Text('Your identity is ready', key: const Key('setup-done'), style: t.headlineSmall),
-      const SizedBox(height: 12),
-      const Text('Write down your recovery kit now and keep it somewhere safe. With it you can recover your identity '
-          'if you lose every device. It is shown only this once.'),
+      Text('Step 3 of 3 · Recovery sheet', style: t.labelLarge),
       const SizedBox(height: 16),
-      if (kit != null)
-        Card(
-          color: Colors.amber.shade100,
-          child: Padding(padding: const EdgeInsets.all(12), child: Theme(data: ThemeData.light(), child: HexValue('Recovery kit', kit!, secret: true))),
+      Center(
+        child: TweenAnimationBuilder<double>(
+          tween: Tween(begin: 0, end: 1),
+          duration: const Duration(milliseconds: 600),
+          curve: Curves.elasticOut,
+          builder: (_, v, child) => Transform.scale(scale: v, child: child),
+          child: CircleAvatar(radius: 36, backgroundColor: Colors.green.withValues(alpha: 0.15), child: const Icon(Icons.check_rounded, size: 44, color: Colors.green)),
         ),
-      CheckboxListTile(
-        key: const Key('kept-kit'),
-        contentPadding: EdgeInsets.zero,
-        value: keptKit,
-        onChanged: (v) => setState(() => keptKit = v ?? false),
-        title: const Text('I have written it down'),
       ),
-      WideButton('Done', key: const Key('setup-finish'), onPressed: keptKit ? () => Navigator.of(context).pop() : null),
+      const SizedBox(height: 16),
+      Text('Your identity is ready', key: const Key('setup-done'), style: t.headlineSmall, textAlign: TextAlign.center),
+      const SizedBox(height: 12),
+      const Text('Write down your recovery sheet now, or print it, and keep it somewhere safe and private. If you lose every '
+          'device, it gets your identity back. It is shown only this once.'),
+      const SizedBox(height: 16),
+      if (sh != null) ...[
+        RecoverySheetCard(sh),
+        const SizedBox(height: 8),
+        WideButton('Save it to print', key: const Key('sheet-save'), icon: Icons.print_outlined, tonal: true, onPressed: () => saveSheet(context, sh)),
+        const SizedBox(height: 12),
+        WideButton('I have written it down', key: const Key('kept-kit'), icon: Icons.arrow_forward, onPressed: () => setState(() => checking = true)),
+      ] else ...[
+        const Text('The agent did not show a recovery kit. Set up recovery again from More › Recovery.', style: TextStyle(color: Colors.orange)),
+        const SizedBox(height: 12),
+        WideButton('Done', key: const Key('setup-finish'), onPressed: () {
+          setState(() => keptKit = true);
+          WidgetsBinding.instance.addPostFrameCallback((_) => mounted ? Navigator.of(context).pop() : null);
+        }),
+      ],
     ]);
   }
 }

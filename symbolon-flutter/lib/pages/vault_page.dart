@@ -15,7 +15,10 @@ import 'item_page.dart';
 class VaultPage extends StatefulWidget {
   final App app;
   final String share;
-  const VaultPage({super.key, required this.app, this.share = ''});
+  /// Whether the page is in view: coming into view locked, it asks to unlock
+  /// at once (the fingerprint, or the PIN) instead of waiting for a tap.
+  final bool active;
+  const VaultPage({super.key, required this.app, this.share = '', this.active = false});
 
   @override
   State<VaultPage> createState() => _VaultPageState();
@@ -37,6 +40,17 @@ class _VaultPageState extends State<VaultPage> {
     super.initState();
     app.session.addListener(_session);
     query.addListener(() => setState(() {}));
+    if (widget.active) WidgetsBinding.instance.addPostFrameCallback((_) => _autoOpen());
+  }
+
+  @override
+  void didUpdateWidget(VaultPage old) {
+    super.didUpdateWidget(old);
+    if (widget.active && !old.active) WidgetsBinding.instance.addPostFrameCallback((_) => _autoOpen());
+  }
+
+  void _autoOpen() {
+    if (mounted && items == null && !loading && !app.session.unlocked) open();
   }
 
   @override
@@ -124,6 +138,22 @@ class _VaultPageState extends State<VaultPage> {
     setState(() => _keep([...?items?.where((x) => x.name != it.name && x.name != change.saved?.name), ?change.saved]));
   }
 
+  /// What a row's copy button copies, by type: the field and its label.
+  static const _quick = {'login': ('current', 'Password'), 'wifi': ('password', 'Wi-Fi password'), 'card': ('number', 'Card number')};
+
+  /// Copies a login's or a Wi-Fi network's password, or a card's number,
+  /// without opening the item.
+  Future<void> quickCopy(VaultItem it) async {
+    final (field, label) = _quick[it.type]!;
+    final r = await app.withPin(context, (p) => app.cli.vaultShow(app.dir, it.name, p, share: share));
+    if (r == null || !mounted) return;
+    if (!r.ok) return toast(context, friendlyError(r));
+    final line = r.lines.where((l) => l.startsWith('$field ')).firstOrNull;
+    final value = line == null ? '' : unhex(line.substring(field.length + 1).trim());
+    if (value.isEmpty) return toast(context, '${it.name} has no ${label.toLowerCase()}.');
+    if (mounted) await copyText(context, label, value, secret: true);
+  }
+
   @override
   Widget build(BuildContext context) {
     final all = items;
@@ -194,11 +224,18 @@ class _VaultPageState extends State<VaultPage> {
                         Text(it.folder.replaceAll('/', ' › '), style: Theme.of(context).textTheme.bodySmall),
                       ]),
                   ]),
-                  trailing: const Icon(Icons.chevron_right),
+                  trailing: _quick.containsKey(it.type)
+                      ? IconButton(
+                          key: Key('quick-copy-${it.name}'),
+                          tooltip: 'Copy ${_quick[it.type]!.$2.toLowerCase()}',
+                          icon: const Icon(Icons.copy_outlined),
+                          onPressed: () => quickCopy(it),
+                        )
+                      : const Icon(Icons.chevron_right),
                   onTap: () => show(it),
                 ),
               ),
-            const SizedBox(height: 72),
+            const SizedBox(height: 96),   // room under the floating button, at large text too
           ],
         ]),
       ),

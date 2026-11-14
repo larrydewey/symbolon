@@ -40,7 +40,7 @@ class _SettingsPageState extends State<SettingsPage> {
     if (!on) {
       await Bio.forget();
     } else {
-      final pin = await askSecret(context, note: 'Your PIN, once, to keep it for fingerprint unlock.');
+      final pin = await askSecret(context, note: 'Your PIN, once, to keep it for fingerprint unlock.', action: 'Continue');
       if (pin == null || !mounted) return;
       final r = await runTask(context, 'Checking your PIN', () => widget.app.cli.vaultList(widget.app.dir, pin), usually: 'a few seconds');
       if (!r.ok) return;
@@ -71,7 +71,7 @@ class _SettingsPageState extends State<SettingsPage> {
       appBar: AppBar(title: const Text('Settings')),
       body: PageBody(children: [
         if (bio.supported && bio.biometric)
-          Section('Fingerprint unlock', children: [
+          Section('Fingerprint or face', children: [
             SwitchListTile(
               key: const Key('bio-unlock'),
               contentPadding: EdgeInsets.zero,
@@ -109,16 +109,29 @@ class _SettingsPageState extends State<SettingsPage> {
             },
           ),
         ]),
-        Section('Agent', children: [
-          Field(binary, 'symbolon binary', fieldKey: const Key('binary'), check: (s) => v.required(s, 'The agent')),
-          Field(deviceDir, 'Device directory', fieldKey: const Key('device-dir'), check: (s) => v.required(s, 'The device directory')),
-          Field(chromium, 'Chromium (password changes)', action: TextInputAction.done),
-          WideButton('Save', key: const Key('save-settings'), onPressed: () async {
-            if (binary.text.trim().isEmpty || deviceDir.text.trim().isEmpty) return toast(context, 'The agent and the device directory are required.');
-            await widget.app.settings.update(binary: binary.text.trim(), deviceDir: deviceDir.text.trim(), chromium: chromium.text.trim());
-            if (context.mounted) toast(context, 'Saved');
-          }),
-        ]),
+        // On Android the agent is the app's own library, set at every start:
+        // nothing here to change.
+        if (!Platform.isAndroid)
+          Card(
+            margin: const EdgeInsets.only(bottom: 16),
+            child: ExpansionTile(
+              key: const Key('advanced'),
+              shape: const Border(),
+              title: const Text('Advanced'),
+              subtitle: const Text('Where the agent and this device\'s files are'),
+              childrenPadding: const EdgeInsets.fromLTRB(16, 4, 16, 16),
+              children: [
+                Field(binary, 'symbolon binary', fieldKey: const Key('binary'), check: (s) => v.required(s, 'The agent')),
+                Field(deviceDir, 'Device directory', fieldKey: const Key('device-dir'), check: (s) => v.required(s, 'The device directory')),
+                Field(chromium, 'Chromium (password changes)', action: TextInputAction.done),
+                WideButton('Save', key: const Key('save-settings'), onPressed: () async {
+                  if (binary.text.trim().isEmpty || deviceDir.text.trim().isEmpty) return toast(context, 'The agent and the device directory are required.');
+                  await widget.app.settings.update(binary: binary.text.trim(), deviceDir: deviceDir.text.trim(), chromium: chromium.text.trim());
+                  if (context.mounted) toast(context, 'Saved');
+                }),
+              ],
+            ),
+          ),
         if (kDebugMode && Platform.isAndroid) _SystemPasskeyTest(dir: widget.app.settings.file.parent.path),
         Section('What this app stores', subtitle: widget.app.settings.file.path, children: const [
           Text('The settings above and the public part of your passkeys. Your PIN and secrets are never stored by the app: they go '

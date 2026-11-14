@@ -21,6 +21,12 @@ IN=$(cat)
 printf '%s\n--\n' "$IN" >> "$D/stdin.log"
 PIN=$(printf '%s\n' "$IN" | head -1)
 case "$1 $2" in
+  "device new")
+    echo "device: a new device at $3"
+    echo "00aa11bb22cc33dd" ;;
+  "device init")
+    echo "identity created"
+    echo "RECOVERY KIT: 9f3a1c0e7b2d4f68a1c3e5079b2d4f6810e2c4a6" ;;
   "device status")
     echo "party 00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
     echo "profile TPM"
@@ -60,8 +66,8 @@ case "$1 $2" in
       list) [ -f "$D/keys" ] && cat "$D/keys" ;;
       *) [ "$PIN" = "2468" ] || { echo "device: wrong PIN" >&2; exit 1; }
          case "$3" in
-           add) printf '%s\n' "$(printf %s "$5" | xxd -p)" >> "$D/keys"; echo "security key $5 added" ;;
-           remove) grep -v "^$(printf %s "$5" | xxd -p)\$" "$D/keys" > "$D/keys.n"; mv "$D/keys.n" "$D/keys"; echo "removed" ;;
+           add) printf '%s\n' "$(printf %s "$5" | od -An -tx1 | tr -d ' \n')" >> "$D/keys"; echo "security key $5 added" ;;
+           remove) grep -v "^$(printf %s "$5" | od -An -tx1 | tr -d ' \n')\$" "$D/keys" > "$D/keys.n"; mv "$D/keys.n" "$D/keys"; echo "removed" ;;
          esac ;;
     esac ;;
   "device ssh")
@@ -111,14 +117,14 @@ case "$1 $2" in
     O=0123456789abcdef0123456789abcdef
     case "$3" in
       show)
-        [ -f "$D/org" ] || { echo "device: this device is in no organization (org join)" >&2; exit 1; }
+        [ -f "$D/org-role" ] || { echo "device: this device is in no organization (org join)" >&2; exit 1; }
         printf 'org %s 41636d65
 version 3 gov 2
 role %s
 policy min_pin_len=6
 recovery on 2/2 delay 259200
 recovery-request 00112233445566778899aabbccddeeff %s 1800000000
-' "$O" "$(cat "$D/org")" "$B"; exit 0 ;;
+' "$O" "$(cat "$D/org-role")" "$B"; exit 0 ;;
       members) printf '%s 416c696365 - owner -
 %s 426f62 626f624061636d652e6578616d706c65 member -
 ' "$A" "$B"; exit 0 ;;
@@ -127,7 +133,7 @@ recovery-request 00112233445566778899aabbccddeeff %s 1800000000
     esac
     [ "$PIN" = "2468" ] || { echo "device: wrong PIN" >&2; exit 1; }
     case "$3" in
-      join) echo owner > "$D/org"; echo "$5 41636d65 member" ;;
+      join) mkdir -p "$4"; echo "$5 $6" > "$4/org"; echo owner > "$D/org-role"; echo "$5 41636d65 member" ;;
       invite) echo "fedcba9876543210fedcba9876543210 11112222333344445555666677778888" ;;
       sync) echo "joined $B 626f62" ;;
       approve) echo "done" ;;

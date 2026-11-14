@@ -48,6 +48,15 @@ phone. To try it without a public site:
 Debug builds also have More > Settings > Developer: system passkeys, which
 asks Android for a passkey as an app would.
 
+## The icon
+
+The launcher icon, its themed (monochrome) layer and the splash screen are
+made from one drawing of the mark, a token broken in two:
+
+    tools/icon/make_icons.py                 # rewrites android/app/src/main/res
+
+The app draws the same mark itself (lib/brand.dart).
+
 ## Tests
 
     flutter test                             # unit and widget tests, and one
@@ -55,5 +64,10 @@ asks Android for a passkey as an app would.
     flutter test integration_test/phone_demo_test.dart -d <device> \
       --dart-define=DEMO_URL=http://<address>:47000   # the phone flow, with
                                              # tools/demo.sh --lan running
+
+A screenshot tour of every screen, in light, dark and large text, for
+reviewing how the app looks (off in a plain `flutter test`):
+
+    flutter test test/ux --dart-define=UX_OUT=/tmp/ux
 
 The Android build needs a JDK of 17 or 21 (`flutter config --jdk-dir`).

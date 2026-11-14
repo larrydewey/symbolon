@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'package:flutter/material.dart';
 
 import '../provider.dart';
@@ -49,7 +51,8 @@ class _ProviderCardState extends State<ProviderCard> with WidgetsBindingObserver
       case null:
         return const SizedBox.shrink();
       case ProviderState.unsupported:
-        if (widget.onlyWhenOff) return const SizedBox.shrink();
+        // On a computer, sites reach Symbolon through the browser extension.
+        if (widget.onlyWhenOff || !Platform.isAndroid) return const SizedBox.shrink();
         return const Section('Sign in to sites with Symbolon', children: [
           Text('Using Symbolon passkeys in other apps and browsers, and from a computer\'s QR code, needs Android 14 or later.'),
         ]);

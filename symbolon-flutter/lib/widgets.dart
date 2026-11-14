@@ -2,6 +2,7 @@
 // plain-language errors, and display of long hex values.
 
 import 'dart:async';
+import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -9,32 +10,56 @@ import 'package:flutter/services.dart';
 import 'cli.dart';
 
 /// Asks for the PIN (or another secret) in a dialog. The text is obscured
-/// and lives only in the dialog's controller; null when cancelled.
-Future<String?> askSecret(BuildContext context, {String title = 'Enter your PIN', String label = 'PIN', String? note, bool numeric = true}) {
+/// (the eye shows it) and lives only in the dialog's controller; null when
+/// cancelled.
+Future<String?> askSecret(BuildContext context, {String title = 'Enter your PIN', String label = 'PIN', String? note, bool numeric = true, String action = 'Unlock'}) {
   final c = TextEditingController();
+  var shown = false;
   return showDialog<String>(
     context: context,
-    builder: (ctx) => AlertDialog(
-      title: Text(title),
-      content: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
-        if (note != null) Padding(padding: const EdgeInsets.only(bottom: 12), child: Text(note)),
-        TextField(
-          key: const Key('secret-field'),
-          controller: c,
-          obscureText: true,
-          autofocus: true,
-          keyboardType: numeric ? TextInputType.number : TextInputType.visiblePassword,
-          autocorrect: false,
-          enableSuggestions: false,
-          enableIMEPersonalizedLearning: false,
-          decoration: InputDecoration(labelText: label, border: const OutlineInputBorder()),
-          onSubmitted: (v) => Navigator.of(ctx).pop(v),
-        ),
-      ]),
-      actions: [
-        TextButton(onPressed: () => Navigator.of(ctx).pop(), child: const Text('Cancel')),
-        FilledButton(key: const Key('secret-ok'), onPressed: () => Navigator.of(ctx).pop(c.text), child: const Text('OK')),
-      ],
+    builder: (ctx) => StatefulBuilder(
+      builder: (ctx, set) {
+        final cs = Theme.of(ctx).colorScheme;
+        void ok() {
+          if (c.text.isNotEmpty) Navigator.of(ctx).pop(c.text);
+        }
+        return AlertDialog(
+          icon: Icon(Icons.lock_outline, color: cs.primary),
+          title: Text(title),
+          insetPadding: const EdgeInsets.symmetric(horizontal: 24, vertical: 24),
+          content: SizedBox(
+            width: 360,
+            child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+              if (note != null) Padding(padding: const EdgeInsets.only(bottom: 16), child: Text(note, textAlign: TextAlign.center)),
+              TextField(
+                key: const Key('secret-field'),
+                controller: c,
+                obscureText: !shown,
+                autofocus: true,
+                keyboardType: numeric ? TextInputType.number : TextInputType.visiblePassword,
+                autocorrect: false,
+                enableSuggestions: false,
+                enableIMEPersonalizedLearning: false,
+                style: numeric ? const TextStyle(fontSize: 22, letterSpacing: 6) : null,
+                decoration: InputDecoration(
+                  labelText: label,
+                  border: const OutlineInputBorder(),
+                  suffixIcon: IconButton(
+                    tooltip: shown ? 'Hide' : 'Show',
+                    icon: Icon(shown ? Icons.visibility_off : Icons.visibility),
+                    onPressed: () => set(() => shown = !shown),
+                  ),
+                ),
+                onSubmitted: (_) => ok(),
+              ),
+            ]),
+          ),
+          actions: [
+            TextButton(onPressed: () => Navigator.of(ctx).pop(), child: const Text('Cancel')),
+            FilledButton(key: const Key('secret-ok'), onPressed: ok, child: Text(action)),
+          ],
+        );
+      },
     ),
   );
 }
@@ -77,10 +102,23 @@ Future<CliResult> runTask(BuildContext context, String title, Future<CliResult> 
     nav.pop();
   }
   if (!r.ok) {
-    messenger.showSnackBar(SnackBar(content: Text(friendlyError(r)), backgroundColor: Colors.red.shade700, duration: const Duration(seconds: 6)));
+    messenger.showSnackBar(errorBar(friendlyError(r)));
+  } else {
+    HapticFeedback.lightImpact();
   }
   return r;
 }
+
+/// A snack bar for something that failed: an icon, and long enough to read.
+SnackBar errorBar(String m) => SnackBar(
+      content: Row(children: [
+        const Icon(Icons.error_outline, color: Colors.white),
+        const SizedBox(width: 12),
+        Expanded(child: Text(m, style: const TextStyle(color: Colors.white))),
+      ]),
+      backgroundColor: Colors.red.shade700,
+      duration: const Duration(seconds: 6),
+    );
 
 class _Progress extends StatefulWidget {
   final String title;
@@ -131,6 +169,39 @@ class _ProgressState extends State<_Progress> {
 
 void toast(BuildContext context, String m) => ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(m)));
 
+/// How long a copied secret stays on the clipboard.
+const clipboardKeep = Duration(seconds: 60);
+Timer? _clearClipboard;
+
+/// Copies [value] and says so. A [secret] is marked sensitive (Android 13+
+/// keeps it out of the clipboard preview and the keyboard's suggestions) and
+/// is cleared after [clipboardKeep], unless something else was copied since.
+Future<void> copyText(BuildContext context, String label, String value, {bool secret = false}) async {
+  HapticFeedback.selectionClick();
+  var marked = false;
+  if (secret && Platform.isAndroid) {
+    try {
+      marked = await const MethodChannel('symbolon/platform').invokeMethod<bool>('copySensitive', value) ?? false;
+    } on PlatformException {
+      marked = false;
+    } on MissingPluginException {
+      marked = false;
+    }
+  }
+  if (!marked) await Clipboard.setData(ClipboardData(text: value));
+  if (!context.mounted) return;
+  if (!secret) return toast(context, '$label copied');
+  _clearClipboard?.cancel();
+  // Not under flutter test, whose fake clock would see the timer outlive the test.
+  if (!Platform.environment.containsKey('FLUTTER_TEST')) {
+    _clearClipboard = Timer(clipboardKeep, () async {
+      final now = await Clipboard.getData(Clipboard.kTextPlain);
+      if (now?.text == value) await Clipboard.setData(const ClipboardData(text: ''));
+    });
+  }
+  toast(context, '$label copied. It is cleared from the clipboard in a minute.');
+}
+
 /// A long hex value, shortened to its ends, with a copy button; tap it to
 /// see all of it.
 class HexValue extends StatelessWidget {
@@ -172,10 +243,7 @@ class HexValue extends StatelessWidget {
     );
   }
 
-  void _copy(BuildContext context) {
-    Clipboard.setData(ClipboardData(text: value));
-    toast(context, '$label copied');
-  }
+  void _copy(BuildContext context) => copyText(context, label, value, secret: secret);
 }
 
 /// A card with a title.
@@ -211,6 +279,7 @@ class Field extends StatelessWidget {
   final TextEditingController controller;
   final String label;
   final String? hint;
+  final String? helper;   // shown under the field until there is something to say about the text
   final bool obscure;
   final bool numeric;
   final bool url;
@@ -218,7 +287,7 @@ class Field extends StatelessWidget {
   final TextInputAction action;
   final String? Function(String)? check;   // what is wrong with the text, checked as it is typed and by Form.validate
   const Field(this.controller, this.label,
-      {super.key, this.hint, this.obscure = false, this.numeric = false, this.url = false, this.fieldKey, this.action = TextInputAction.next, this.check});
+      {super.key, this.hint, this.helper, this.obscure = false, this.numeric = false, this.url = false, this.fieldKey, this.action = TextInputAction.next, this.check});
 
   @override
   Widget build(BuildContext context) {
@@ -240,7 +309,7 @@ class Field extends StatelessWidget {
         textCapitalization: TextCapitalization.none,
         smartDashesType: SmartDashesType.disabled,
         smartQuotesType: SmartQuotesType.disabled,
-        decoration: InputDecoration(labelText: label, hintText: hint, border: const OutlineInputBorder()),
+        decoration: InputDecoration(labelText: label, hintText: hint, helperText: helper, border: const OutlineInputBorder()),
       ),
     );
   }
@@ -365,3 +434,4 @@ Future<void> showOutput(BuildContext context, String title, String text) {
     ),
   );
 }
+

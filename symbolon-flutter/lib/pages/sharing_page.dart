@@ -208,7 +208,7 @@ class _SharingPageState extends State<SharingPage> {
                   ),
               ]),
             ),
-          const SizedBox(height: 72),
+          const SizedBox(height: 96),   // room under the floating button, at large text too
         ]),
       ),
     );
@@ -240,7 +240,7 @@ class SharedFolderPage extends StatelessWidget {
           ),
         ],
       ),
-      body: VaultPage(app: app, share: folder.id),
+      body: VaultPage(app: app, share: folder.id, active: true),
     );
   }
 }

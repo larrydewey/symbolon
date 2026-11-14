@@ -1,5 +1,4 @@
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
 
 import '../app.dart';
 import '../card_face.dart';
@@ -61,10 +60,7 @@ class _ItemPageState extends State<ItemPage> {
         });
   }
 
-  void copy(String label, String value) {
-    Clipboard.setData(ClipboardData(text: value));
-    toast(context, '$label copied. Clear your clipboard when you are done.');
-  }
+  void copy(String label, String value, {bool secret = false}) => copyText(context, label, value, secret: secret);
 
   Future<void> edit() async {
     if (widget.offline) return toast(context, 'Changes need a connection to your relay.');
@@ -170,7 +166,8 @@ class _ItemPageState extends State<ItemPage> {
         : (fs.entries.where((e) => CustomField.isCustom(e.key)).map((e) => MapEntry(e.key, CustomField.decode(e.value))).toList()
           ..sort((a, b) => int.parse(a.key.substring(7)).compareTo(int.parse(b.key.substring(7)))));
     return Scaffold(
-      appBar: AppBar(title: Text(it.name), actions: [
+      // The name is the heading below; the bar names the kind of item.
+      appBar: AppBar(title: Text(t.label), actions: [
         if (fs != null && type.editable) IconButton(key: const Key('item-move'), tooltip: 'Move', icon: const Icon(Icons.drive_file_move_outline), onPressed: move),
         if (fs != null && type.editable) IconButton(key: const Key('item-edit'), tooltip: 'Edit', icon: const Icon(Icons.edit), onPressed: edit),
         if (fs != null && type.editable) IconButton(key: const Key('item-delete'), tooltip: 'Delete', icon: const Icon(Icons.delete_outline), onPressed: delete),
@@ -182,7 +179,6 @@ class _ItemPageState extends State<ItemPage> {
                 t.id == 'login' ? SiteIcon(favicons: app.favicons, origin: fs['origin'] ?? '', fallback: TypeAvatar(t)) : TypeAvatar(t),
                 const SizedBox(width: 12),
                 Expanded(child: Text(it.name, style: Theme.of(context).textTheme.titleLarge)),
-                KindTag(t.label, t.color),
               ]),
               if ((fs['folder'] ?? '').isNotEmpty)
                 Padding(
@@ -227,12 +223,14 @@ class _ItemPageState extends State<ItemPage> {
   }
 
   Widget _row(String key, String label, String value, bool hidden, {bool multiline = false}) {
+    // A card number is masked like a hidden field, as on the card face.
+    if (key == 'number') hidden = true;
     final masked = hidden && !shown.contains(key);
     return ListTile(
       key: Key('field-$key'),
       title: Text(label, style: Theme.of(context).textTheme.labelMedium),
-      subtitle: SelectableText(masked ? '•' * 10 : value,
-          style: TextStyle(fontFamily: hidden || key == 'number' ? 'monospace' : null, fontSize: 16), maxLines: multiline ? null : 3),
+      subtitle: SelectableText(masked ? (key == 'number' && value.length > 4 ? '•••• ${value.substring(value.length - 4)}' : '•' * 10) : value,
+          style: TextStyle(fontFamily: hidden ? 'monospace' : null, fontSize: 16), minLines: 1, maxLines: multiline ? null : 3),
       trailing: Row(mainAxisSize: MainAxisSize.min, children: [
         if (hidden)
           IconButton(
@@ -240,7 +238,7 @@ class _ItemPageState extends State<ItemPage> {
             icon: Icon(masked ? Icons.visibility : Icons.visibility_off),
             onPressed: () => setState(() => masked ? shown.add(key) : shown.remove(key)),
           ),
-        IconButton(tooltip: 'Copy', icon: const Icon(Icons.copy, size: 20), onPressed: () => copy(label, value)),
+        IconButton(tooltip: 'Copy', icon: const Icon(Icons.copy, size: 20), onPressed: () => copy(label, value, secret: hidden || key == 'number')),
       ]),
     );
   }

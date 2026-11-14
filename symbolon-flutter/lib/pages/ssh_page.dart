@@ -111,7 +111,7 @@ class _SshPageState extends State<SshPage> {
     if (_taken(n)) return toast(context, 'You already have a key named $n');
     // A key with a passphrase: asked for once the agent says so.
     final encrypted = _hasPassphrase(path);
-    final phrase = encrypted ? await askSecret(context, title: 'The key\'s passphrase', label: 'Passphrase', numeric: false) : '';
+    final phrase = encrypted ? await askSecret(context, title: 'The key\'s passphrase', label: 'Passphrase', numeric: false, action: 'Import') : '';
     if (phrase == null || !mounted) return;
     final r = await app.withPin(context, (p) => runTask(context, 'Importing $n', () => app.cli.sshImport(app.dir, n, path, p, passphrase: phrase), usually: 'a few seconds'));
     if (r == null || !mounted) return;

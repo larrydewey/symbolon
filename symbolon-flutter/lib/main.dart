@@ -6,6 +6,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import 'app.dart';
+import 'brand.dart';
 import 'fill_consent.dart';
 import 'ssh_consent.dart';
 import 'pages/home_page.dart';
@@ -59,12 +60,11 @@ class _SymbolonAppState extends State<SymbolonApp> {
 
   @override
   Widget build(BuildContext context) {
-    const seed = Colors.indigo;
     return MaterialApp(
       title: 'Symbolon',
       debugShowCheckedModeBanner: false,
-      theme: ThemeData(colorSchemeSeed: seed, useMaterial3: true),
-      darkTheme: ThemeData(colorSchemeSeed: seed, brightness: Brightness.dark, useMaterial3: true),
+      theme: Brand.theme(Brightness.light),
+      darkTheme: Brand.theme(Brightness.dark),
       home: Shell(app: app),
     );
   }
@@ -130,8 +130,10 @@ class _ShellState extends State<Shell> with WidgetsBindingObserver {
     final app = widget.app;
     final pages = [
       HomePage(key: ValueKey('home$refresh'), app: app, go: go),
-      PasskeysPage(app: app),
-      VaultPage(key: ValueKey('vault${app.dir}'), app: app),
+      // Their own messengers: a message lifts the tab's Add button instead
+      // of covering it.
+      ScaffoldMessenger(child: PasskeysPage(app: app)),
+      ScaffoldMessenger(child: VaultPage(key: ValueKey('vault${app.dir}'), app: app, active: index == 2)),
       MorePage(app: app, onSetupDone: () => go(0)),
     ];
     final lock = app.session.unlocked
@@ -147,7 +149,7 @@ class _ShellState extends State<Shell> with WidgetsBindingObserver {
             labelType: NavigationRailLabelType.all,
             leading: Padding(
               padding: const EdgeInsets.symmetric(vertical: 12),
-              child: Column(children: [Icon(Icons.fingerprint, size: 36, color: Theme.of(context).colorScheme.primary), const SizedBox(height: 8), lock]),
+              child: Column(children: [const SymbolonMark(size: 40), const SizedBox(height: 8), lock]),
             ),
             destinations: [for (final t in tabs) NavigationRailDestination(icon: Icon(t.$1), selectedIcon: Icon(t.$2), label: Text(t.$3))],
             onDestinationSelected: go,
@@ -158,7 +160,13 @@ class _ShellState extends State<Shell> with WidgetsBindingObserver {
       );
     }
     return Scaffold(
-      appBar: AppBar(title: Text(tabs[index].$3), actions: [lock]),
+      appBar: AppBar(
+        // Home carries the name and the mark; the other tabs their own name.
+        title: index == 0
+            ? const Row(mainAxisSize: MainAxisSize.min, children: [SymbolonMark(size: 28), SizedBox(width: 10), Text('Symbolon')])
+            : Text(tabs[index].$3),
+        actions: [lock],
+      ),
       body: body,
       bottomNavigationBar: NavigationBar(
         selectedIndex: index,

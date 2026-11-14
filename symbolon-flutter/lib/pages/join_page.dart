@@ -31,7 +31,10 @@ class JoinPage extends StatefulWidget {
   final App app;
   /// Finds this device's addresses; replaced in tests.
   final Future<List<String>> Function() addresses;
-  const JoinPage({super.key, required this.app, this.addresses = localAddresses});
+  /// Finds the key store protecting this device (which sets the shortest
+  /// PIN); replaced in tests, which must not depend on the machine's TPM.
+  final Future<HardwareState> Function({bool keystore}) hardware;
+  const JoinPage({super.key, required this.app, this.addresses = localAddresses, this.hardware = detectHardware});
 
   @override
   State<JoinPage> createState() => _JoinPageState();
@@ -56,7 +59,7 @@ class _JoinPageState extends State<JoinPage> {
   @override
   void initState() {
     super.initState();
-    detectHardware(keystore: app.settings.keystoreAvailable).then((h) {
+    widget.hardware(keystore: app.settings.keystoreAvailable).then((h) {
       if (mounted) setState(() => hardware = h);
     });
   }
@@ -69,7 +72,7 @@ class _JoinPageState extends State<JoinPage> {
     super.dispose();
   }
 
-  void fail(String m) => toast(context, m);
+  void fail(String m) => ScaffoldMessenger.of(context).showSnackBar(errorBar(m));
 
   // What the agent reports, in words for the page.
   String said(String line) {
@@ -147,8 +150,8 @@ class _JoinPageState extends State<JoinPage> {
             const Text('This device will join the identity you already use on your phone or another computer: '
                 'the same vault, the same passkeys. It gets its own PIN.'),
             const SizedBox(height: 16),
-            Field(pin, 'PIN', obscure: true, numeric: true, fieldKey: const Key('join-pin')),
-            Field(pin2, 'The same PIN again', obscure: true, numeric: true, fieldKey: const Key('join-pin2')),
+            Field(pin, 'PIN', helper: hardware == null ? null : 'At least $minPin digits', obscure: true, numeric: true, fieldKey: const Key('join-pin'), check: (s) => hardware == null ? null : v.pin(s, min: minPin)),
+            Field(pin2, 'The same PIN again', obscure: true, numeric: true, fieldKey: const Key('join-pin2'), check: (s) => s == pin.text ? null : 'The PINs differ'),
             Field(duressPin, 'Duress PIN (optional)', obscure: true, numeric: true, fieldKey: const Key('join-duress'), action: TextInputAction.done),
             WideButton('Show the code', key: const Key('join-start'), icon: Icons.qr_code_2, onPressed: hardware == null ? null : start),
           ],
@@ -175,7 +178,14 @@ class _JoinPageState extends State<JoinPage> {
               ),
             ],
             if (stage == _Stage.joining) const Center(child: Padding(padding: EdgeInsets.all(24), child: CircularProgressIndicator())),
-            Text(status, key: const Key('join-status'), textAlign: TextAlign.center),
+            Row(mainAxisAlignment: MainAxisAlignment.center, children: [
+              // The joining stage has its large spinner above.
+              if (stage == _Stage.code) ...[
+                const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2)),
+                const SizedBox(width: 12),
+              ],
+              Flexible(child: Text(status, key: const Key('join-status'), textAlign: TextAlign.center)),
+            ]),
           ],
           if (stage == _Stage.done) ...[
             const Icon(Icons.check_circle, size: 56, color: Colors.green),

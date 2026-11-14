@@ -10,7 +10,9 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:integration_test/integration_test.dart';
+import 'package:symbolon_ui/links.dart';
 import 'package:symbolon_ui/main.dart';
+import 'package:symbolon_ui/recovery_sheet.dart';
 
 const demoUrl = String.fromEnvironment('DEMO_URL');
 
@@ -29,6 +31,19 @@ void main() {
   }
 
   // Taps a button after closing the keyboard, clear of snack bars, in view.
+  // The recovery sheet's check: the two groups it asks for, read off the
+  // sheet as a person would from their paper.
+  Future<void> answerSheetCheck(WidgetTester t) async {
+    final sheet = (t.widget(find.byType(SheetCheck)) as SheetCheck).sheet;
+    for (final k in ['check-1', 'check-2']) {
+      final label = (t.widget(find.byKey(Key(k))) as TextField).decoration!.labelText!;
+      final m = RegExp(r'^Group (\d+) of \d+ of the (identity log|recovery kit)$').firstMatch(label)!;
+      final groups = groupsOf(m.group(2) == 'identity log' ? sheet.log : sheet.kit);
+      await t.enterText(find.byKey(Key(k)), groups[int.parse(m.group(1)!) - 1]);
+      await t.pump();
+    }
+  }
+
   Future<void> press(WidgetTester t, Key k) async {
     FocusManager.instance.primaryFocus?.unfocus();
     await t.pump(const Duration(milliseconds: 600));
@@ -70,6 +85,7 @@ void main() {
     await waitFor(t, find.byKey(const Key('setup-done')), limit: const Duration(minutes: 15));
 
     await press(t, const Key('kept-kit'));
+    await answerSheetCheck(t);
     await press(t, const Key('setup-finish'));
     await waitFor(t, find.text('Your identity is verified'), limit: const Duration(minutes: 2));
     // A phone with the Android Keystore (Android 9+) uses it by default.

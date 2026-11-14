@@ -2,8 +2,11 @@ import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:symbolon_ui/links.dart';
 import 'package:symbolon_ui/main.dart';
+import 'package:symbolon_ui/qr_view.dart';
 import 'package:symbolon_ui/settings.dart';
 import 'package:symbolon_ui/cli.dart';
 import 'package:symbolon_ui/widgets.dart';
@@ -160,9 +163,8 @@ void main() {
   testWidgets('vault items show their kind and can be searched and filtered', (t) async {
     await start(t);
     await t.tap(find.text('Vault').last);
-    await t.pump(const Duration(milliseconds: 300));
-    await t.tap(find.byKey(const Key('open-vault')));
-    await t.pump(const Duration(milliseconds: 300));
+    await t.pump(const Duration(milliseconds: 300));   // the tab asks for the PIN by itself,
+    await t.pump(const Duration(milliseconds: 300));   // a frame later
     await pin(t, '2468');
     expect(find.descendant(of: find.byKey(const Key('item-mail')), matching: find.text('Login')), findsOneWidget);
     expect(find.descendant(of: find.byKey(const Key('item-mail')), matching: find.text('mail.example.com')), findsOneWidget);
@@ -189,9 +191,8 @@ void main() {
   testWidgets('vault folders: items show theirs, and the picker shows one folder and those inside it', (t) async {
     await start(t);
     await t.tap(find.text('Vault').last);
-    await t.pump(const Duration(milliseconds: 300));
-    await t.tap(find.byKey(const Key('open-vault')));
-    await t.pump(const Duration(milliseconds: 300));
+    await t.pump(const Duration(milliseconds: 300));   // the tab asks for the PIN by itself,
+    await t.pump(const Duration(milliseconds: 300));   // a frame later
     await pin(t, '2468');
     expect(find.descendant(of: find.byKey(const Key('item-mail')), matching: find.text('Work › Email')), findsOneWidget);
     Future<void> choose(String key) async {
@@ -266,9 +267,8 @@ void main() {
   testWidgets('an item moves from the vault to a shared folder', (t) async {
     await start(t);
     await t.tap(find.text('Vault').last);
-    await t.pump(const Duration(milliseconds: 300));
-    await t.tap(find.byKey(const Key('open-vault')));
-    await t.pump(const Duration(milliseconds: 300));
+    await t.pump(const Duration(milliseconds: 300));   // the tab asks for the PIN by itself,
+    await t.pump(const Duration(milliseconds: 300));   // a frame later
     await pin(t, '2468');
     await t.tap(find.byKey(const Key('item-mail')));
     await t.pump(const Duration(milliseconds: 300));
@@ -329,9 +329,8 @@ void main() {
 
   Future<void> openVault(WidgetTester t) async {
     await t.tap(find.text('Vault').last);
-    await t.pump(const Duration(milliseconds: 300));
-    await t.tap(find.byKey(const Key('open-vault')));
-    await t.pump(const Duration(milliseconds: 300));
+    await t.pump(const Duration(milliseconds: 300));   // the tab asks for the PIN by itself,
+    await t.pump(const Duration(milliseconds: 300));   // a frame later
     await pin(t, '2468');
   }
 
@@ -340,6 +339,169 @@ void main() {
     await t.pumpAndSettle();
   }
 
+  testWidgets('a login\'s password and a card\'s number copy from the list, without opening the item', (t) async {
+    settings.siteIcons = false;
+    String? copied;
+    t.binding.defaultBinaryMessenger.setMockMethodCallHandler(SystemChannels.platform, (c) async {
+      if (c.method == 'Clipboard.setData') copied = (c.arguments as Map)['text'] as String?;
+      return null;
+    });
+    addTearDown(() => t.binding.defaultBinaryMessenger.setMockMethodCallHandler(SystemChannels.platform, null));
+    await start(t);
+    await openVault(t);
+    await t.tap(find.byKey(const Key('quick-copy-mail')));
+    await settle(t);
+    expect(copied, 'hunter2');
+    expect(find.textContaining('Password copied'), findsOneWidget);
+    expect(find.text('alice'), findsNothing);   // the item page, with the username, did not open
+    await t.tap(find.byKey(const Key('quick-copy-visa')));
+    await settle(t);
+    expect(copied, '4111111111111111');
+    expect(find.byKey(const Key('quick-copy-bank')), findsNothing);
+    await lock(t);
+  });
+
+  testWidgets('choosing the Vault tab asks to unlock at once; cancelling leaves the Unlock button', (t) async {
+    await start(t);
+    await t.tap(find.text('Vault').last);
+    await t.pump(const Duration(milliseconds: 300));
+    await t.pump(const Duration(milliseconds: 300));
+    expect(find.byKey(const Key('secret-field')), findsOneWidget);
+    await t.tap(find.text('Cancel'));
+    await t.pumpAndSettle();
+    expect(find.byKey(const Key('open-vault')), findsOneWidget);
+    // Back to the tab later: asked again.
+    await t.tap(find.text('Home').last);
+    await t.pump(const Duration(milliseconds: 300));
+    await t.tap(find.text('Vault').last);
+    await t.pump(const Duration(milliseconds: 300));
+    await t.pump(const Duration(milliseconds: 300));
+    await pin(t, '2468');
+    expect(find.byKey(const Key('item-mail')), findsOneWidget);
+    await lock(t);
+  });
+
+  testWidgets('a new login can take a generated password, shown so it can be checked', (t) async {
+    await start(t);
+    await openVault(t);
+    await t.tap(find.byKey(const Key('vault-add')));
+    await t.pumpAndSettle();
+    await t.tap(find.byKey(const Key('add-login')));
+    await t.pumpAndSettle();
+    await t.tap(find.byKey(const Key('generate-current')));
+    await t.pump();
+    final made = (t.widget(find.byKey(const Key('edit-current'))) as TextFormField).controller!.text;
+    expect(made, hasLength(20));
+    expect(made, matches(RegExp(r'[a-z]')));
+    expect(made, matches(RegExp(r'[A-Z]')));
+    expect(made, matches(RegExp(r'[2-9]')));
+    expect(find.text(made), findsOneWidget);   // revealed
+    // Generating again over a password asks first.
+    await t.tap(find.byKey(const Key('generate-current')));
+    await t.pumpAndSettle();
+    expect(find.text('Replace the password?'), findsOneWidget);
+    await t.tap(find.text('Cancel'));
+    await t.pumpAndSettle();
+    expect((t.widget(find.byKey(const Key('edit-current'))) as TextFormField).controller!.text, made);
+    await t.pageBack();
+    await t.pumpAndSettle();
+    await lock(t);
+  });
+
+  testWidgets('a pending change opens Recovery, which leads with stopping it', (t) async {
+    await start(t);
+    await t.tap(find.byKey(const Key('review-recovery')));
+    await t.pump(const Duration(milliseconds: 500));
+    await settle(t);
+    expect(find.text('Recovery'), findsWidgets);
+    expect(find.byKey(const Key('recovery-pending')), findsOneWidget);
+    expect(find.text('Stop this recovery'), findsOneWidget);
+    expect(t.getTopLeft(find.byKey(const Key('recovery-pending'))).dy, lessThan(t.getTopLeft(find.text('Recover on a new device')).dy));
+  });
+
+  testWidgets('setup ends with the recovery sheet, checked from paper with the sheet out of sight', (t) async {
+    await start(t);
+    await t.tap(find.text('More').last);
+    await t.pumpAndSettle();
+    await t.scrollUntilVisible(find.text('Set up this device'), 200, scrollable: find.byType(Scrollable).hitTestable().first);
+    await t.drag(find.byType(Scrollable).hitTestable().first, const Offset(0, -300));
+    await t.pumpAndSettle();
+    await t.tap(find.text('Set up this device'));
+    await t.pumpAndSettle();
+    await t.tap(find.text('Other ways to connect'));
+    await t.pumpAndSettle();
+    await t.ensureVisible(find.text('Enter the details by hand'));
+    await t.pumpAndSettle();
+    await t.tap(find.text('Enter the details by hand'));
+    await t.pumpAndSettle();
+    final list = find.ancestor(of: find.text('Hide manual setup'), matching: find.byType(Scrollable)).first;
+    for (final (label, value) in [
+      ('Relay host', 'relay.example.org'),
+      ('Relay port', '47000'),
+      ("Cosigner's keys", 'ab' * 40),
+      for (var i = 1; i <= 3; i++) ('Witness $i', 'w$i.example.org:4700$i:${'cd' * 32}'),
+    ]) {
+      final f = find.widgetWithText(TextFormField, label);
+      await t.scrollUntilVisible(f, 100, scrollable: list);
+      await t.enterText(f, value);
+    }
+    await t.scrollUntilVisible(find.widgetWithText(FilledButton, 'Next'), 100, scrollable: list);
+    await t.ensureVisible(find.widgetWithText(FilledButton, 'Next'));
+    await t.pumpAndSettle();
+    await t.tap(find.widgetWithText(FilledButton, 'Next'));
+    await t.pump();
+    await settle(t);
+    await t.enterText(find.byKey(const Key('pin')), '246813');
+    await t.enterText(find.byKey(const Key('pin2')), '246813');
+    await t.ensureVisible(find.byKey(const Key('create')));
+    await t.pumpAndSettle();
+    await t.tap(find.byKey(const Key('create')));
+    await t.pump();
+    for (var i = 0; i < 3; i++) {
+      await settle(t);
+    }
+    // Both values, in full: the identity log from device status, the kit from init.
+    expect(find.byKey(const Key('setup-done')), findsOneWidget);
+    const kit = '9f3a1c0e7b2d4f68a1c3e5079b2d4f6810e2c4a6', log = 'fa8f008b293b5457ef989520c8bbcbc959a09c0a8619b1d190f78271bf6b5795';
+    expect(find.text('9f3a'), findsOneWidget);
+    expect(find.text('fa8f'), findsOneWidget);
+    await t.ensureVisible(find.byKey(const Key('kept-kit')));
+    await t.pumpAndSettle();
+    await t.tap(find.byKey(const Key('kept-kit')));
+    await t.pumpAndSettle();
+    expect(find.byKey(const Key('kit-card')), findsNothing);   // out of sight
+    String answer(String k, {bool wrong = false}) {
+      final label = (t.widget(find.byKey(Key(k))) as TextField).decoration!.labelText!;
+      final m = RegExp(r'^Group (\d+) of \d+ of the (identity log|recovery kit)$').firstMatch(label)!;
+      final g = groupsOf(m.group(2) == 'identity log' ? log : kit)[int.parse(m.group(1)!) - 1];
+      return wrong ? (g == '0000' ? '1111' : '0000') : g;
+    }
+    await t.enterText(find.byKey(const Key('check-1')), answer('check-1'));
+    await t.enterText(find.byKey(const Key('check-2')), answer('check-2', wrong: true));
+    await t.tap(find.byKey(const Key('setup-finish')));
+    await t.pump();
+    expect(find.text('Does not match: check this group on your paper'), findsOneWidget);
+    expect(find.byKey(const Key('setup-finish')), findsOneWidget);   // still here
+    await t.enterText(find.byKey(const Key('check-2')), answer('check-2'));
+    await t.tap(find.byKey(const Key('setup-finish')));
+    await t.pumpAndSettle();
+    expect(find.byKey(const Key('check-1')), findsNothing);   // setup closed
+  });
+
+  testWidgets('recovery takes the identity log and the kit from a sheet\'s link, spaces and all', (t) async {
+    await start(t);
+    await t.tap(find.byKey(const Key('review-recovery')));
+    await t.pump(const Duration(milliseconds: 500));
+    await settle(t);
+    await t.enterText(find.byKey(const Key('recover-log')), 'fa8f 008b 293b 5457 ef98 9520 c8bb cbc9 59a0 9c0a 8619 b1d1 90f7 8271 bf6b 5795');
+    await t.enterText(find.byKey(const Key('recover-kit')), '9F3A 1C0E');
+    await t.ensureVisible(find.byKey(const Key('recover-start')));
+    await t.tap(find.byKey(const Key('recover-start')));
+    await t.pump();
+    await settle(t);
+    expect(agent.argsLog.readAsStringSync(), contains('9f3a1c0e fa8f008b293b5457ef989520c8bbcbc959a09c0a8619b1d190f78271bf6b5795'));
+  });
+
   testWidgets('a card shows its fields: hidden ones masked, custom fields labelled', (t) async {
     settings.siteIcons = false;
     await start(t);
@@ -347,6 +509,11 @@ void main() {
     await t.tap(find.byKey(const Key('item-visa')));
     await t.pump(const Duration(milliseconds: 500));
     await settle(t);
+    // The number is masked in its field as on the card face, until shown.
+    expect(find.text('4111111111111111'), findsNothing);
+    expect(find.text('•••• 1111'), findsOneWidget);
+    await t.tap(find.descendant(of: find.byKey(const Key('field-number')), matching: find.byTooltip('Show')));
+    await t.pump();
     expect(find.text('4111111111111111'), findsOneWidget);
     expect(find.text('Card number · Visa'), findsOneWidget);
     expect(find.text('•••• •••• •••• 1111'), findsOneWidget);
@@ -427,9 +594,10 @@ void main() {
     await t.pump(const Duration(milliseconds: 300));
     await settle(t);
     expect(find.byKey(const Key('org-join')), findsOneWidget);
-    await t.enterText(find.byKey(const Key('org-id')), '0123456789abcdef0123456789abcdef');
-    await t.enterText(find.byKey(const Key('org-founder')), 'a' * 64);
-    await t.enterText(find.byKey(const Key('org-code')), 'fedcba9876543210fedcba9876543210');
+    // The invite is one link: pasting it fills in the three values.
+    await t.enterText(find.byKey(const Key('org-link')), 'symbolon://org?o=0123456789abcdef0123456789abcdef&f=${'a' * 64}&c=fedcba9876543210fedcba9876543210');
+    await t.pump();
+    expect(find.byKey(const Key('org-invite-read')), findsOneWidget);
     await t.tap(find.byKey(const Key('org-join')));
     await t.pump();
     await settle(t);
@@ -452,6 +620,9 @@ void main() {
     await settle(t);
     expect(find.byKey(const Key('org-invite-code')), findsOneWidget);
     expect(find.text('fedcba9876543210fedcba9876543210'), findsOneWidget);
+    // With the org id and founder from this device's enrolment: a link and its QR code.
+    expect((t.widget(find.byKey(const Key('org-invite-qr'))) as QrView).data,
+        'symbolon://org?o=0123456789abcdef0123456789abcdef&f=${'a' * 64}&c=fedcba9876543210fedcba9876543210');
     expect(agent.argsLog.readAsStringSync(), contains('device org invite ${settings.deviceDir} erin@acme.example Erin'));
     await t.tap(find.text('Done'));
     await t.pumpAndSettle();
