@@ -8,7 +8,8 @@ RC="${RESIDC:-$HOME/git/larry/resid/build/boot/residc}"
 BIN=target/symbolon
 [ -x "$BIN" ] || { tools/depmap.sh > /dev/null; "$RC" src/main.resid -o "$BIN" --profile debug --verify-lib-dev -depmap target/deps.map > /dev/null; }
 W="$(mktemp -d)"
-trap 'kill $RP $WP 2>/dev/null; rm -rf "$W"' EXIT
+# The servers' forked children outlive their parents: stop everything under $W.
+trap 'kill $RP $WP 2>/dev/null; pkill -f -- "$W/" 2>/dev/null; rm -rf "$W"' EXIT
 port() { python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])'; }
 RPORT=$(port); WPORT=$(port)
 KEY=$("$BIN" witness keygen "$W/wkey")
