@@ -182,6 +182,48 @@ Int show_fields(List(FieldPlain) fs, Str t, Int i) {
     return show_fields(fs, t, i + 1);
 }
 
+// `symbolon device vault code DIR NAME`: the PIN on standard input; prints
+// "code CODE PERIOD LEFT", the item's current one-time code (SPEC 18.7),
+// its period and the seconds it has left. Offline, from this device's copy.
+// The key stays in the core; only the code is printed.
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+pub Int vault_code(Str dir, Str name, Str share) {
+    Result(View, Str) rv = view_place(dir, share);
+    return match rv {
+        Err(m) => dfail(m),
+        Ok(v) => match item_by_id(v.st.items, item_id_of(v.vk, name), 0) {
+            None => dfail("no such item"),
+            Some(it) => code_item(v, it, clock_now_seconds())
+        }
+    };
+}
+
+@requires(declassify)
+Int code_item(View v, Item it, Int now) {
+    Result(List(FieldPlain), SymbolonError) r = item_open(v.vk, v.vid, it);
+    return match r {
+        Err(e) => dfail(err_text(e)),
+        Ok(fs) => code_of_field(field_secret(fs, "totp", 0), now)
+    };
+}
+
+@requires(declassify)
+Int code_of_field(List(Secret(UInt(8))) f, Int now) {
+    if (f.len() == 0) { return dfail("this item has no one-time code key"); }
+    Result(TotpSpec, Str) sp = totp_spec(f);
+    return match sp {
+        Err(m) => dfail(m),
+        Ok(t) => print_code(totp_code(t.seed, now, t.step, t.digits, t.sha1), t.digits, t.step, now)
+    };
+}
+
+Int print_code(Int code, Int digits, Int step, Int now) {
+    println("code " + zero_pad(f"{code}", digits) + " " + f"{step}" + " " + f"{step - now % step}");
+    return 0;
+}
+
+Str zero_pad(Str s, Int width) { return if (str_len(s) >= width) { s } else { zero_pad("0" + s, width) }; }
+
 // `symbolon device vault delete DIR NAME`: the PIN on standard input.
 @requires(filesystem, network, device, declassify, clock, provision, environment)
 pub Int vault_delete(Str dir, Str name, Str share) {

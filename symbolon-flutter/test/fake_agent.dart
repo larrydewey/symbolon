@@ -66,8 +66,8 @@ case "$1 $2" in
       list) [ -f "$D/keys" ] && cat "$D/keys" ;;
       *) [ "$PIN" = "2468" ] || { echo "device: wrong PIN" >&2; exit 1; }
          case "$3" in
-           add) printf '%s\n' "$(printf %s "$5" | od -An -tx1 | tr -d ' \n')" >> "$D/keys"; echo "security key $5 added" ;;
-           remove) grep -v "^$(printf %s "$5" | od -An -tx1 | tr -d ' \n')\$" "$D/keys" > "$D/keys.n"; mv "$D/keys.n" "$D/keys"; echo "removed" ;;
+           add) printf '%s\n' "$(printf %s "$5" | od -v -An -tx1 | tr -d ' \n')" >> "$D/keys"; echo "security key $5 added" ;;
+           remove) grep -v "^$(printf %s "$5" | od -v -An -tx1 | tr -d ' \n')\$" "$D/keys" > "$D/keys.n"; mv "$D/keys.n" "$D/keys"; echo "removed" ;;
          esac ;;
     esac ;;
   "device ssh")
@@ -89,10 +89,13 @@ case "$1 $2" in
         --kinds) printf 'login mail\nsecret bank\n' ;;
         *) printf 'mail\nbank\n' ;; esac ;;
       show) case "$5" in
-        mail) printf 'type 6c6f67696e\nname 6d61696c\norigin 68747470733a2f2f6d61696c2e6578616d706c652e636f6d\nusername 616c696365\ncurrent 68756e74657232\n' ;;
+        mail) printf 'type 6c6f67696e\nname 6d61696c\norigin 68747470733a2f2f6d61696c2e6578616d706c652e636f6d\nusername 616c696365\ncurrent 68756e74657232\ntotp %s\n' "$(printf %s GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ | od -v -An -tx1 | tr -d ' \n')" ;;
         visa) printf 'type 63617264\nname 76697361\nnumber 34313131313131313131313131313131\ncvv 313233\ncustom_1 526577617264731f301f522d3432\n' ;;
         *) printf 'type 736563726574\nname 62616e6b\nsecret 733363726574\n' ;; esac ;;
       get) echo "hunter2" ;;
+      code) case "$5" in
+        mail) echo "code 287082 30 12" ;;
+        *) echo "device: this item has no one-time code key" >&2; exit 1 ;; esac ;;
       *) echo "vault version 2, 2 items" ;;
     esac ;;
   "device share")

@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 
 import '../app.dart';
@@ -204,6 +206,7 @@ class _ItemPageState extends State<ItemPage> {
               const SizedBox(height: 16),
               Card(
                 child: Column(children: [
+                  if ((fs['totp'] ?? '').isNotEmpty) OneTimeCode(app: app, item: it.name, share: widget.share),
                   for (final f in known) _row(f.name, f.name == 'number' ? '${f.label}${_brand(fs[f.name]!)}' : f.label, fs[f.name]!, f.hidden, multiline: f.input == Input.multiline),
                   for (final c in custom) _row(c.key, c.value.label, c.value.value, c.value.hidden, multiline: !c.value.hidden && c.value.value.contains('\n')),
                   if (known.isEmpty && custom.isEmpty) const ListTile(title: Text('No fields')),
@@ -240,6 +243,105 @@ class _ItemPageState extends State<ItemPage> {
           ),
         IconButton(tooltip: 'Copy', icon: const Icon(Icons.copy, size: 20), onPressed: () => copy(label, value, secret: hidden || key == 'number')),
       ]),
+    );
+  }
+}
+
+
+/// An item's current one-time code, from the agent (its key never comes
+/// here), with the seconds it has left. While it is on screen, the next
+/// code is fetched when this one runs out.
+class OneTimeCode extends StatefulWidget {
+  final App app;
+  final String item;
+  final String share;
+  const OneTimeCode({super.key, required this.app, required this.item, this.share = ''});
+
+  @override
+  State<OneTimeCode> createState() => _OneTimeCodeState();
+}
+
+class _OneTimeCodeState extends State<OneTimeCode> {
+  String? code;
+  String? problem;
+  int period = 30, left = 0;
+  bool fetching = false;
+  Timer? tick;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) => fetch());
+  }
+
+  @override
+  void dispose() {
+    tick?.cancel();
+    super.dispose();
+  }
+
+  Future<void> fetch() async {
+    if (fetching || !mounted) return;
+    setState(() => fetching = true);
+    final a = widget.app;
+    final r = await a.withPin(context, (p) => a.cli.vaultCode(a.dir, widget.item, p, share: widget.share));
+    if (!mounted) return;
+    final f = r == null || !r.ok ? null : r.lines.where((l) => l.startsWith('code ')).map((l) => l.split(' ')).where((p) => p.length == 4).firstOrNull;
+    setState(() {
+      fetching = false;
+      if (f == null) {
+        code = null;
+        problem = r == null ? 'Unlock to see the code.' : (r.ok ? 'No code.' : friendlyError(r));
+        return;
+      }
+      code = f[1];
+      period = int.tryParse(f[2]) ?? 30;
+      left = int.tryParse(f[3]) ?? 0;
+      problem = null;
+    });
+    tick?.cancel();
+    if (code != null) {
+      tick = Timer.periodic(const Duration(seconds: 1), (_) {
+        if (!mounted) return;
+        if (left <= 1) {
+          tick?.cancel();
+          fetch();
+        } else {
+          setState(() => left--);
+        }
+      });
+    }
+  }
+
+  /// "287082" as "287 082", easier to read off and type.
+  static String spaced(String c) => c.length < 6 ? c : '${c.substring(0, c.length ~/ 2)} ${c.substring(c.length ~/ 2)}';
+
+  @override
+  Widget build(BuildContext context) {
+    final t = Theme.of(context).textTheme;
+    final c = code;
+    return ListTile(
+      key: const Key('field-code'),
+      title: Text('One-time code', style: t.labelMedium),
+      subtitle: c == null
+          ? Text(problem ?? 'Getting the code…')
+          : Text(spaced(c), key: const Key('code-value'), style: t.headlineSmall?.copyWith(fontFamily: 'monospace', letterSpacing: 2)),
+      trailing: c == null
+          ? (fetching ? const SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2)) : IconButton(tooltip: 'Try again', icon: const Icon(Icons.refresh), onPressed: fetch))
+          : Row(mainAxisSize: MainAxisSize.min, children: [
+              Semantics(
+                label: '$left seconds left',
+                child: SizedBox(
+                  width: 28,
+                  height: 28,
+                  child: Stack(alignment: Alignment.center, children: [
+                    CircularProgressIndicator(value: left / period, strokeWidth: 3, color: left <= 5 ? Colors.orange : null),
+                    Text('$left', key: const Key('code-left'), style: t.labelSmall),
+                  ]),
+                ),
+              ),
+              IconButton(tooltip: 'Copy', icon: const Icon(Icons.copy, size: 20), onPressed: () => copyText(context, 'Code', c, secret: true)),
+            ]),
     );
   }
 }

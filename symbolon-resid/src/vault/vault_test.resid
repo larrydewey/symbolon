@@ -161,3 +161,44 @@ test "RFC 6238 SHA-1 vector at t=59 and t=1111111109" {
     expect(totp_code(seed, 59, 30, 8, true)).toEqual(94287082);
     expect(totp_code(seed, 1111111109, 30, 8, true)).toEqual(7081804);
 }
+
+// The stored field as sites and imports give it (SPEC 18.7). RFC 6238's
+// SHA-1 key "12345678901234567890" is GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ.
+@requires(declassify)
+Int code_of(Str field, Int t) {
+    Result(TotpSpec, Str) r = totp_spec(secret_bytes(utf8(field)));
+    return match r { Err(_) => -1, Ok(s) => totp_code(s.seed, t, s.step, s.digits, s.sha1) };
+}
+
+@requires(declassify)
+Str spec_err(Str field) {
+    Result(TotpSpec, Str) r = totp_spec(secret_bytes(utf8(field)));
+    return match r { Err(m) => m, Ok(_) => "" };
+}
+
+@requires(declassify)
+test "a bare base32 key: any case, spaces and dashes, 6 digits every 30 s" {
+    expect(code_of("GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ", 59)).toEqual(287082);
+    expect(code_of("  gezd gnbv gy3t qojq-gezd gnbv gy3t qojq \n", 59)).toEqual(287082);
+    expect(code_of("GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ====", 1111111109)).toEqual(81804);
+}
+
+@requires(declassify)
+test "an otpauth link: secret, digits, period and algorithm" {
+    expect(code_of("otpauth://totp/Example:alice@example.com?secret=GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ&issuer=Example&digits=8", 59)).toEqual(94287082);
+    expect(code_of("OTPAUTH://TOTP/x?digits=8&secret=GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ&algorithm=SHA1&period=30", 1111111109)).toEqual(7081804);
+    // SHA-256 with RFC 6238's 32-byte key, in base32.
+    expect(code_of("otpauth://totp/x?secret=GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQGEZA&algorithm=SHA256&digits=8", 59)).toEqual(46119246);
+    // A 60-second period: t=59 is still step 0, t=60 is step 1.
+    expect(code_of("otpauth://totp/x?secret=GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ&period=60", 59)).toEqual(code_of("otpauth://totp/x?secret=GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ&period=60", 0));
+}
+
+@requires(declassify)
+test "keys and links it cannot use are refused with a reason" {
+    expect(spec_err("otpauth://hotp/x?secret=GEZDGNBVGY3TQOJQ&counter=1")).toEqual("counter-based (HOTP) one-time codes are not supported");
+    expect(spec_err("not base32!")).toEqual("the key is not base32 (A-Z, 2-7)");
+    expect(spec_err("GEZDGNBV")).toEqual("the key is too short (under 80 bits)");
+    expect(spec_err("otpauth://totp/x?issuer=a")).toEqual("the link has no secret");
+    expect(spec_err("otpauth://totp/x?secret=GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ&digits=4")).toEqual("codes of 6 to 8 digits are supported");
+    expect(spec_err("otpauth://totp/x?secret=GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ&algorithm=SHA512")).toEqual("the code's algorithm is not SHA-1 or SHA-256");
+}

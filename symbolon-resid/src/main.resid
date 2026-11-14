@@ -30,6 +30,8 @@
 //   symbolon device vault list DIR [--kinds|--long]  PIN on stdin; prints the names (--kinds: TYPE NAME;
 //                                              --long: TYPE NAME-HEX DETAIL-HEX FOLDER-HEX); offline, this device's copy
 //   symbolon device vault show DIR NAME        PIN on stdin; prints "FIELD VALUE-HEX" per field
+//   symbolon device vault code DIR NAME        PIN on stdin; prints "code CODE PERIOD LEFT", the
+//                                              item's current one-time code (its key never leaves)
 //   symbolon device vault set DIR NAME TYPE    PIN, then "FIELD VALUE-HEX" lines, on stdin (card, identity,
 //                                              note, bank, wifi, secret, login)
 //   symbolon device vault delete DIR NAME      PIN on stdin
@@ -37,7 +39,7 @@
 //                                              PIN on stdin (not with --dry-run): another password
 //                                              manager's export, as one new vault version
 //   symbolon device vault move DIR NAME TO     PIN on stdin; to the own vault (TO "own") or the shared folder TO
-//       list, show, set, delete, import and move take a last `--share ID`: in (from) that shared folder
+//       list, show, code, set, delete, import and move take a last `--share ID`: in (from) that shared folder
 //   symbolon device share new DIR NAME         PIN on stdin; a shared folder (SPEC 19); prints its ID
 //   symbolon device share list DIR             PIN on stdin; "ID NAME-HEX owner|member PEOPLE" per folder
 //                                              ("ID - waiting WHY-HEX": no key for this device yet)
@@ -376,6 +378,7 @@ Int main() {
     if (a1 == "device" && a2 == "webauthn" && args.get(3) == "register" && n >= 6) { return device_wa_register(args.get(4), args.get(5), has_flag("--uv", 6), has_flag("--duress", 6)); }
     if (a1 == "device" && a2 == "webauthn" && args.get(3) == "assert" && n >= 8) { return device_wa_assert(args.get(4), args.get(5), args.get(6), args.get(7), has_flag("--uv", 8)); }
     if (a1 == "device" && a2 == "vault" && args.get(3) == "show" && ns == 6) { return vault_show(args.get(4), args.get(5), share); }
+    if (a1 == "device" && a2 == "vault" && args.get(3) == "code" && ns == 6) { return vault_code(args.get(4), args.get(5), share); }
     if (a1 == "device" && a2 == "vault" && args.get(3) == "set" && ns == 7) { return vault_set(args.get(4), args.get(5), args.get(6), share); }
     if (a1 == "device" && a2 == "vault" && args.get(3) == "delete" && ns == 6) { return vault_delete(args.get(4), args.get(5), share); }
     if (a1 == "device" && a2 == "vault" && args.get(3) == "import" && n >= 6) {

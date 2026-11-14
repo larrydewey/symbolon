@@ -177,6 +177,11 @@ class SymbolonCli {
   Future<CliResult> vaultShow(String dir, String name, String pin, {String share = ''}) =>
       run(['device', 'vault', 'show', dir, name, ..._in(share)], input: [pin], timeout: const Duration(minutes: 5));
 
+  /// The item's current one-time code: "code CODE PERIOD LEFT". The key
+  /// stays in the agent (SPEC 18.7).
+  Future<CliResult> vaultCode(String dir, String name, String pin, {String share = ''}) =>
+      run(['device', 'vault', 'code', dir, name, ..._in(share)], input: [pin], timeout: const Duration(minutes: 5));
+
   /// Stores an item of [type] with [fields] (field name to text); replaces
   /// one of the same name.
   Future<CliResult> vaultSet(String dir, String name, String type, Map<String, String> fields, String pin, {String share = ''}) => run(['device', 'vault', 'set', dir, name, type, ..._in(share)],
