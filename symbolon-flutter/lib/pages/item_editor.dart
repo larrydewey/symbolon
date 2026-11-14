@@ -1,4 +1,7 @@
+import 'dart:math';
+
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import '../app.dart';
 import '../card_face.dart';
@@ -131,6 +134,34 @@ class _ItemEditorState extends State<ItemEditor> {
         _ => TextInputType.visiblePassword,
       };
 
+  // The fields that take a made-up password: a login's and a Wi-Fi network's.
+  static const _generated = {('login', 'current'), ('wifi', 'password')};
+
+  /// A strong password, shown so it can be checked, in place of what the
+  /// field held.
+  Future<void> _generate(String field) async {
+    final c = values[field]!;
+    if (c.text.isNotEmpty) {
+      final sure = await showDialog<bool>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: const Text('Replace the password?'),
+          content: const Text('The new one is kept here when you save. Change it at the site too, or it will stop working there.'),
+          actions: [
+            TextButton(onPressed: () => Navigator.of(ctx).pop(false), child: const Text('Cancel')),
+            FilledButton(onPressed: () => Navigator.of(ctx).pop(true), child: const Text('Replace')),
+          ],
+        ),
+      );
+      if (sure != true || !mounted) return;
+    }
+    HapticFeedback.selectionClick();
+    setState(() {
+      c.text = strongPassword();
+      revealed.add(field);
+    });
+  }
+
   Widget _field(FieldSpec f) {
     final c = values[f.name]!;
     final hide = f.hidden && !revealed.contains(f.name);
@@ -157,10 +188,20 @@ class _ItemEditorState extends State<ItemEditor> {
           helperText: brand.isEmpty ? null : brand,
           border: const OutlineInputBorder(),
           suffixIcon: f.hidden
-              ? IconButton(
-                  icon: Icon(hide ? Icons.visibility : Icons.visibility_off),
-                  onPressed: () => setState(() => hide ? revealed.add(f.name) : revealed.remove(f.name)),
-                )
+              ? Row(mainAxisSize: MainAxisSize.min, children: [
+                  if (_generated.contains((widget.type.id, f.name)))
+                    IconButton(
+                      key: Key('generate-${f.name}'),
+                      tooltip: 'Generate a strong password',
+                      icon: const Icon(Icons.auto_awesome_outlined),
+                      onPressed: () => _generate(f.name),
+                    ),
+                  IconButton(
+                    tooltip: hide ? 'Show' : 'Hide',
+                    icon: Icon(hide ? Icons.visibility : Icons.visibility_off),
+                    onPressed: () => setState(() => hide ? revealed.add(f.name) : revealed.remove(f.name)),
+                  ),
+                ])
               : null,
         ),
       ),
@@ -319,4 +360,15 @@ class _ItemEditorState extends State<ItemEditor> {
       ),
     );
   }
+}
+
+/// A random password of [length] from letters, digits and symbols, with at
+/// least one of each, and none of the characters easily confused (0O, 1lI).
+String strongPassword({int length = 20}) {
+  const lower = 'abcdefghijkmnopqrstuvwxyz', upper = 'ABCDEFGHJKLMNPQRSTUVWXYZ', digits = '23456789', symbols = '-_.!@#%^*+=?';
+  const all = lower + upper + digits + symbols;
+  final r = Random.secure();
+  String pick(String from) => from[r.nextInt(from.length)];
+  final out = [pick(lower), pick(upper), pick(digits), pick(symbols), for (var i = 4; i < length; i++) pick(all)]..shuffle(r);
+  return out.join();
 }

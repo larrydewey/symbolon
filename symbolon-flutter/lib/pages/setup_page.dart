@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
@@ -85,7 +86,7 @@ class _SetupPageState extends State<SetupPage> {
     super.dispose();
   }
 
-  void fail(String m) => ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(m), backgroundColor: Colors.red.shade700));
+  void fail(String m) => ScaffoldMessenger.of(context).showSnackBar(errorBar(m));
 
   String get demoBase => demoUrl.text.trim().replaceAll(RegExp(r'/+$'), '');
 
@@ -268,7 +269,7 @@ class _SetupPageState extends State<SetupPage> {
         WideButton('Scan the code', key: const Key('scan-home'), icon: Icons.qr_code_scanner, onPressed: scanHome),
         const SizedBox(height: 12),
       ],
-      Field(homeLinkText, 'Or paste the link', hint: 'symbolon://pair?…', url: true, fieldKey: const Key('home-link'), action: TextInputAction.done,
+      Field(homeLinkText, Platform.isAndroid || Platform.isIOS ? 'Or paste the link' : 'Paste the link', hint: 'symbolon://pair?…', url: true, fieldKey: const Key('home-link'), action: TextInputAction.done,
           check: v.optional((s) => HomeLink.parse(s) == null ? 'Not a Symbolon Home link' : null)),
       WideButton('Connect', key: const Key('join-home'), icon: Icons.link, tonal: true, onPressed: joinHome),
       const SizedBox(height: 16),
@@ -281,7 +282,9 @@ class _SetupPageState extends State<SetupPage> {
       const SizedBox(height: 8),
       TextButton(onPressed: () => setState(() => otherWays = !otherWays), child: Text(otherWays ? 'Hide other ways' : 'Other ways to connect')),
       if (otherWays) ...[
-      Section('Demo stack', subtitle: 'From tools/demo.sh --lan on a computer on this network.', children: [
+      // The demo stack is for developing Symbolon: not in release builds.
+      if (!kReleaseMode)
+      Section('Demo stack', subtitle: 'For developers: tools/demo.sh --lan on a computer on this network.', children: [
         Field(demoUrl, 'Demo address', hint: 'http://192.168.1.20:47000', url: true, fieldKey: const Key('demo-url'), action: TextInputAction.done, check: v.serviceUrl),
         WideButton('Connect', key: const Key('join-demo'), icon: Icons.wifi, onPressed: fetchDemo),
       ]),
@@ -329,7 +332,7 @@ class _SetupPageState extends State<SetupPage> {
           ),
         ),
       const SizedBox(height: 12),
-      Field(pin, 'PIN', obscure: true, numeric: true, fieldKey: const Key('pin'), check: (s) => v.pin(s, min: minPin)),
+      Field(pin, 'PIN', helper: 'At least $minPin digits', obscure: true, numeric: true, fieldKey: const Key('pin'), check: (s) => v.pin(s, min: minPin)),
       Field(pin2, 'PIN again', obscure: true, numeric: true, fieldKey: const Key('pin2'), action: TextInputAction.done, check: (s) => s == pin.text ? null : 'The PINs differ'),
       ExpansionTile(
         tilePadding: EdgeInsets.zero,
@@ -424,11 +427,7 @@ class _SetupPageState extends State<SetupPage> {
       const Text('Write down your recovery kit now and keep it somewhere safe. With it you can recover your identity '
           'if you lose every device. It is shown only this once.'),
       const SizedBox(height: 16),
-      if (kit != null)
-        Card(
-          color: Colors.amber.shade100,
-          child: Padding(padding: const EdgeInsets.all(12), child: Theme(data: ThemeData.light(), child: HexValue('Recovery kit', kit!, secret: true))),
-        ),
+      if (kit != null) KitCard(kit!),
       CheckboxListTile(
         key: const Key('kept-kit'),
         contentPadding: EdgeInsets.zero,

@@ -240,7 +240,7 @@ class SharedFolderPage extends StatelessWidget {
           ),
         ],
       ),
-      body: VaultPage(app: app, share: folder.id),
+      body: VaultPage(app: app, share: folder.id, active: true),
     );
   }
 }

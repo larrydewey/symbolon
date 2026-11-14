@@ -65,4 +65,9 @@ The app draws the same mark itself (lib/brand.dart).
       --dart-define=DEMO_URL=http://<address>:47000   # the phone flow, with
                                              # tools/demo.sh --lan running
 
+A screenshot tour of every screen, in light, dark and large text, for
+reviewing how the app looks (off in a plain `flutter test`):
+
+    flutter test test/ux --dart-define=UX_OUT=/tmp/ux
+
 The Android build needs a JDK of 17 or 21 (`flutter config --jdk-dir`).

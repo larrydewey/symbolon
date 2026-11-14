@@ -8,6 +8,7 @@
 // answer opens with the request's one-time token). The host checks the
 // item against the page again before anything reaches the browser.
 
+import 'brand.dart';
 import 'dart:convert';
 import 'dart:io';
 
@@ -170,12 +171,11 @@ class FillConsentApp extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    const seed = Colors.indigo;
     return MaterialApp(
       title: 'Symbolon: fill request',
       debugShowCheckedModeBanner: false,
-      theme: ThemeData(colorSchemeSeed: seed, useMaterial3: true),
-      darkTheme: ThemeData(colorSchemeSeed: seed, brightness: Brightness.dark, useMaterial3: true),
+      theme: Brand.theme(Brightness.light),
+      darkTheme: Brand.theme(Brightness.dark),
       home: FillConsentPage(settings: settings, request: request, link: link, done: done),
     );
   }

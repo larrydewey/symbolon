@@ -10,32 +10,56 @@ import 'package:flutter/services.dart';
 import 'cli.dart';
 
 /// Asks for the PIN (or another secret) in a dialog. The text is obscured
-/// and lives only in the dialog's controller; null when cancelled.
-Future<String?> askSecret(BuildContext context, {String title = 'Enter your PIN', String label = 'PIN', String? note, bool numeric = true}) {
+/// (the eye shows it) and lives only in the dialog's controller; null when
+/// cancelled.
+Future<String?> askSecret(BuildContext context, {String title = 'Enter your PIN', String label = 'PIN', String? note, bool numeric = true, String action = 'Unlock'}) {
   final c = TextEditingController();
+  var shown = false;
   return showDialog<String>(
     context: context,
-    builder: (ctx) => AlertDialog(
-      title: Text(title),
-      content: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
-        if (note != null) Padding(padding: const EdgeInsets.only(bottom: 12), child: Text(note)),
-        TextField(
-          key: const Key('secret-field'),
-          controller: c,
-          obscureText: true,
-          autofocus: true,
-          keyboardType: numeric ? TextInputType.number : TextInputType.visiblePassword,
-          autocorrect: false,
-          enableSuggestions: false,
-          enableIMEPersonalizedLearning: false,
-          decoration: InputDecoration(labelText: label, border: const OutlineInputBorder()),
-          onSubmitted: (v) => Navigator.of(ctx).pop(v),
-        ),
-      ]),
-      actions: [
-        TextButton(onPressed: () => Navigator.of(ctx).pop(), child: const Text('Cancel')),
-        FilledButton(key: const Key('secret-ok'), onPressed: () => Navigator.of(ctx).pop(c.text), child: const Text('OK')),
-      ],
+    builder: (ctx) => StatefulBuilder(
+      builder: (ctx, set) {
+        final cs = Theme.of(ctx).colorScheme;
+        void ok() {
+          if (c.text.isNotEmpty) Navigator.of(ctx).pop(c.text);
+        }
+        return AlertDialog(
+          icon: Icon(Icons.lock_outline, color: cs.primary),
+          title: Text(title),
+          insetPadding: const EdgeInsets.symmetric(horizontal: 24, vertical: 24),
+          content: SizedBox(
+            width: 360,
+            child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+              if (note != null) Padding(padding: const EdgeInsets.only(bottom: 16), child: Text(note, textAlign: TextAlign.center)),
+              TextField(
+                key: const Key('secret-field'),
+                controller: c,
+                obscureText: !shown,
+                autofocus: true,
+                keyboardType: numeric ? TextInputType.number : TextInputType.visiblePassword,
+                autocorrect: false,
+                enableSuggestions: false,
+                enableIMEPersonalizedLearning: false,
+                style: numeric ? const TextStyle(fontSize: 22, letterSpacing: 6) : null,
+                decoration: InputDecoration(
+                  labelText: label,
+                  border: const OutlineInputBorder(),
+                  suffixIcon: IconButton(
+                    tooltip: shown ? 'Hide' : 'Show',
+                    icon: Icon(shown ? Icons.visibility_off : Icons.visibility),
+                    onPressed: () => set(() => shown = !shown),
+                  ),
+                ),
+                onSubmitted: (_) => ok(),
+              ),
+            ]),
+          ),
+          actions: [
+            TextButton(onPressed: () => Navigator.of(ctx).pop(), child: const Text('Cancel')),
+            FilledButton(key: const Key('secret-ok'), onPressed: ok, child: Text(action)),
+          ],
+        );
+      },
     ),
   );
 }
@@ -87,7 +111,11 @@ Future<CliResult> runTask(BuildContext context, String title, Future<CliResult> 
 
 /// A snack bar for something that failed: an icon, and long enough to read.
 SnackBar errorBar(String m) => SnackBar(
-      content: Row(children: [const Icon(Icons.error_outline, color: Colors.white), const SizedBox(width: 12), Expanded(child: Text(m))]),
+      content: Row(children: [
+        const Icon(Icons.error_outline, color: Colors.white),
+        const SizedBox(width: 12),
+        Expanded(child: Text(m, style: const TextStyle(color: Colors.white))),
+      ]),
       backgroundColor: Colors.red.shade700,
       duration: const Duration(seconds: 6),
     );
@@ -251,6 +279,7 @@ class Field extends StatelessWidget {
   final TextEditingController controller;
   final String label;
   final String? hint;
+  final String? helper;   // shown under the field until there is something to say about the text
   final bool obscure;
   final bool numeric;
   final bool url;
@@ -258,7 +287,7 @@ class Field extends StatelessWidget {
   final TextInputAction action;
   final String? Function(String)? check;   // what is wrong with the text, checked as it is typed and by Form.validate
   const Field(this.controller, this.label,
-      {super.key, this.hint, this.obscure = false, this.numeric = false, this.url = false, this.fieldKey, this.action = TextInputAction.next, this.check});
+      {super.key, this.hint, this.helper, this.obscure = false, this.numeric = false, this.url = false, this.fieldKey, this.action = TextInputAction.next, this.check});
 
   @override
   Widget build(BuildContext context) {
@@ -280,7 +309,7 @@ class Field extends StatelessWidget {
         textCapitalization: TextCapitalization.none,
         smartDashesType: SmartDashesType.disabled,
         smartQuotesType: SmartQuotesType.disabled,
-        decoration: InputDecoration(labelText: label, hintText: hint, border: const OutlineInputBorder()),
+        decoration: InputDecoration(labelText: label, hintText: hint, helperText: helper, border: const OutlineInputBorder()),
       ),
     );
   }
@@ -404,4 +433,43 @@ Future<void> showOutput(BuildContext context, String title, String text) {
       actions: [FilledButton(onPressed: () => Navigator.of(ctx).pop(), child: const Text('Close'))],
     ),
   );
+}
+
+/// A recovery kit to write down: in full, in groups of four, large and on
+/// paper colours in either theme, numbered so a line is not skipped.
+class KitCard extends StatelessWidget {
+  final String kit;
+  final String label;
+  const KitCard(this.kit, {super.key, this.label = 'Recovery kit'});
+
+  static List<String> groups(String kit) => [for (var i = 0; i < kit.length; i += 4) kit.substring(i, i + 4 > kit.length ? kit.length : i + 4)];
+
+  @override
+  Widget build(BuildContext context) {
+    const ink = Color(0xFF3E2C00);
+    final g = groups(kit);
+    final mono = Theme.of(context).textTheme.titleLarge?.copyWith(fontFamily: 'monospace', color: ink, letterSpacing: 1, height: 1.6);
+    return Card(
+      key: const Key('kit-card'),
+      color: const Color(0xFFFFF0C2),
+      margin: const EdgeInsets.only(bottom: 8),
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(16, 12, 8, 16),
+        child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+          Row(children: [
+            Expanded(child: Text(label, style: Theme.of(context).textTheme.labelLarge?.copyWith(color: ink))),
+            IconButton(tooltip: 'Copy', icon: const Icon(Icons.copy, size: 20, color: ink), onPressed: () => copyText(context, label, kit, secret: true)),
+          ]),
+          // One semantic label, so a screen reader reads it as one value.
+          Semantics(
+            label: '$label: ${g.join(' ')}',
+            excludeSemantics: true,
+            child: Wrap(spacing: 16, runSpacing: 0, children: [for (final x in g) Text(x, style: mono)]),
+          ),
+          const SizedBox(height: 8),
+          Text('${kit.length} characters, in ${g.length} groups of four', style: Theme.of(context).textTheme.bodySmall?.copyWith(color: ink)),
+        ]),
+      ),
+    );
+  }
 }

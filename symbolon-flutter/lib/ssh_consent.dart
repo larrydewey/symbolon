@@ -6,6 +6,7 @@
 // per-request Unix socket after the request's one-time token. The agent
 // checks the signature against the key before the client gets it.
 
+import 'brand.dart';
 import 'dart:convert';
 import 'dart:io';
 
@@ -169,12 +170,11 @@ class SshConsentApp extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    const seed = Colors.indigo;
     return MaterialApp(
       title: 'Symbolon: SSH signature',
       debugShowCheckedModeBanner: false,
-      theme: ThemeData(colorSchemeSeed: seed, useMaterial3: true),
-      darkTheme: ThemeData(colorSchemeSeed: seed, brightness: Brightness.dark, useMaterial3: true),
+      theme: Brand.theme(Brightness.light),
+      darkTheme: Brand.theme(Brightness.dark),
       home: SshConsentPage(app: this),
     );
   }
@@ -282,9 +282,13 @@ class _SshConsentPageState extends State<SshConsentPage> {
               if (r.hostFingerprint.isNotEmpty)
                 ListTile(
                   key: const Key('sc-host'),
-                  leading: const Icon(Icons.dns_outlined),
+                  // A server ssh has not met before: the moment a stranger in the
+                  // middle would show up, so it is marked.
+                  leading: Icon(names.isEmpty ? Icons.gpp_maybe_outlined : Icons.dns_outlined, color: names.isEmpty ? Colors.orange : null),
                   title: Text(names.isEmpty ? 'A server not in your known_hosts' : names.join(', ')),
-                  subtitle: Text('Server key ${r.hostFingerprint}'),
+                  subtitle: Text(names.isEmpty
+                      ? 'First connection to this server, or its key changed. Check the key before you sign: ${r.hostFingerprint}'
+                      : 'Server key ${r.hostFingerprint}'),
                 ),
               if (r.what == 'auth' && r.hostFingerprint.isEmpty)
                 const ListTile(key: Key('sc-unbound'), leading: Icon(Icons.help_outline), title: Text('Server not identified'), subtitle: Text('This SSH client did not tell the agent which server it is talking to.')),

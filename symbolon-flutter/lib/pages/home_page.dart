@@ -6,6 +6,7 @@ import '../cli.dart';
 import '../widgets.dart';
 import 'hardware_page.dart';
 import 'provider_card.dart';
+import 'recovery_page.dart';
 import 'setup_page.dart';
 import 'tutorial_page.dart';
 
@@ -75,6 +76,15 @@ class _HomePageState extends State<HomePage> {
                 label: const Text('How Symbolon works'),
                 onPressed: () => Navigator.of(context).push(MaterialPageRoute<void>(fullscreenDialog: true, builder: (_) => const TutorialPage())),
               ),
+              TextButton.icon(
+                key: const Key('welcome-recover'),
+                icon: const Icon(Icons.healing),
+                label: const Text('Lost every device? Recover with your kit'),
+                onPressed: () async {
+                  await Navigator.of(context).push(MaterialPageRoute<void>(builder: (_) => RecoveryPage(app: widget.app)));
+                  refresh();
+                },
+              ),
             ]),
           ),
         if (s != null && s.log == null)
@@ -121,7 +131,7 @@ class _HomePageState extends State<HomePage> {
             Card(
               key: const Key('pending-change'),
               margin: const EdgeInsets.only(bottom: 16),
-              color: Colors.orange.withValues(alpha: 0.16),
+              color: Color.alphaBlend(Colors.orange.withValues(alpha: 0.18), Theme.of(context).colorScheme.surfaceContainerLow),
               child: Padding(
                 padding: const EdgeInsets.all(16),
                 child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
@@ -133,12 +143,15 @@ class _HomePageState extends State<HomePage> {
                   const SizedBox(height: 8),
                   const Text('A delayed event (a recovery?) is waiting to take effect. If you did not start it, veto it now.'),
                   const SizedBox(height: 12),
-                  WideButton('Review in Recovery', tonal: true, onPressed: () => widget.go(3)),
+                  WideButton('Review in Recovery', key: const Key('review-recovery'), tonal: true, onPressed: () async {
+                    await Navigator.of(context).push(MaterialPageRoute<void>(builder: (_) => RecoveryPage(app: widget.app)));
+                    refresh();
+                  }),
                 ]),
               ),
             ),
           Row(children: [
-            Expanded(child: _Action(Icons.key, 'Passkeys', '${widget.app.settings.credentials.length} here', () => widget.go(1))),
+            Expanded(child: _Action(Icons.key, 'Passkeys', _count(widget.app.settings.credentials.length), () => widget.go(1))),
             const SizedBox(width: 12),
             Expanded(child: _Action(Icons.lock, 'Vault', 'Passwords, notes', () => widget.go(2))),
           ]),
@@ -163,6 +176,8 @@ class _HomePageState extends State<HomePage> {
     );
   }
 }
+
+String _count(int n) => n == 0 ? 'None yet' : (n == 1 ? '1 on this device' : '$n on this device');
 
 class _Action extends StatelessWidget {
   final IconData icon;

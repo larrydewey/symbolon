@@ -223,12 +223,14 @@ class _ItemPageState extends State<ItemPage> {
   }
 
   Widget _row(String key, String label, String value, bool hidden, {bool multiline = false}) {
+    // A card number is masked like a hidden field, as on the card face.
+    if (key == 'number') hidden = true;
     final masked = hidden && !shown.contains(key);
     return ListTile(
       key: Key('field-$key'),
       title: Text(label, style: Theme.of(context).textTheme.labelMedium),
-      subtitle: SelectableText(masked ? '•' * 10 : value,
-          style: TextStyle(fontFamily: hidden || key == 'number' ? 'monospace' : null, fontSize: 16), maxLines: multiline ? null : 3),
+      subtitle: SelectableText(masked ? (key == 'number' && value.length > 4 ? '•••• ${value.substring(value.length - 4)}' : '•' * 10) : value,
+          style: TextStyle(fontFamily: hidden ? 'monospace' : null, fontSize: 16), minLines: 1, maxLines: multiline ? null : 3),
       trailing: Row(mainAxisSize: MainAxisSize.min, children: [
         if (hidden)
           IconButton(

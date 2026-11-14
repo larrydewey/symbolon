@@ -21,6 +21,12 @@ IN=$(cat)
 printf '%s\n--\n' "$IN" >> "$D/stdin.log"
 PIN=$(printf '%s\n' "$IN" | head -1)
 case "$1 $2" in
+  "device new")
+    echo "device: a new device at $3"
+    echo "00aa11bb22cc33dd" ;;
+  "device init")
+    echo "identity created"
+    echo "RECOVERY KIT: 9f3a1c0e7b2d4f68a1c3e5079b2d4f6810e2c4a6" ;;
   "device status")
     echo "party 00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
     echo "profile TPM"

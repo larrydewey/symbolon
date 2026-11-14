@@ -15,7 +15,10 @@ import 'item_page.dart';
 class VaultPage extends StatefulWidget {
   final App app;
   final String share;
-  const VaultPage({super.key, required this.app, this.share = ''});
+  /// Whether the page is in view: coming into view locked, it asks to unlock
+  /// at once (the fingerprint, or the PIN) instead of waiting for a tap.
+  final bool active;
+  const VaultPage({super.key, required this.app, this.share = '', this.active = false});
 
   @override
   State<VaultPage> createState() => _VaultPageState();
@@ -37,6 +40,17 @@ class _VaultPageState extends State<VaultPage> {
     super.initState();
     app.session.addListener(_session);
     query.addListener(() => setState(() {}));
+    if (widget.active) WidgetsBinding.instance.addPostFrameCallback((_) => _autoOpen());
+  }
+
+  @override
+  void didUpdateWidget(VaultPage old) {
+    super.didUpdateWidget(old);
+    if (widget.active && !old.active) WidgetsBinding.instance.addPostFrameCallback((_) => _autoOpen());
+  }
+
+  void _autoOpen() {
+    if (mounted && items == null && !loading && !app.session.unlocked) open();
   }
 
   @override

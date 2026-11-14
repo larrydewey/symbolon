@@ -56,7 +56,7 @@ class _DevicesPageState extends State<DevicesPage> {
     final sure = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
-        title: const Text("Remove this device's TPM keys?"),
+        title: Text(Platform.isAndroid ? "Remove this phone's keys?" : "Remove this device's TPM keys?"),
         content: const Text('This device will no longer unlock or sign, and it cannot be undone. Do this only for a device you are retiring, after another device has joined your identity.'),
         actions: [
           TextButton(onPressed: () => Navigator.of(ctx).pop(false), child: const Text('Cancel')),
@@ -81,11 +81,16 @@ class _DevicesPageState extends State<DevicesPage> {
             WideButton("Scan the new device's code", key: const Key('add-scan'), icon: Icons.qr_code_scanner, onPressed: scan),
             const SizedBox(height: 12),
           ],
-          Field(linkText, 'Or paste its link', hint: 'symbolon://link?…', url: true, fieldKey: const Key('add-link'), action: TextInputAction.done),
+          Field(linkText, Platform.isAndroid || Platform.isIOS ? 'Or paste its link' : 'Paste its link', hint: 'symbolon://link?…', url: true, fieldKey: const Key('add-link'), action: TextInputAction.done),
           WideButton('Add the device', key: const Key('add-device'), icon: Icons.add, tonal: true, onPressed: add),
         ]),
-        Section('TPM', children: [
-          OutlinedButton.icon(onPressed: forget, icon: const Icon(Icons.delete_forever, color: Colors.red), label: const Text("Remove this device's TPM keys")),
+        Section('Retire this device', subtitle: 'Before you sell, give away or wipe it, once another device has joined your identity.', children: [
+          OutlinedButton.icon(
+            key: const Key('forget'),
+            onPressed: forget,
+            icon: const Icon(Icons.delete_forever, color: Colors.red),
+            label: Text(Platform.isAndroid ? "Remove this phone's keys" : "Remove this device's TPM keys"),
+          ),
         ]),
       ]),
     );

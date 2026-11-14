@@ -127,32 +127,64 @@ class _PasskeysPageState extends State<PasskeysPage> {
   void details(Credential c) {
     showModalBottomSheet<void>(
       context: context,
+      isScrollControlled: true,
       builder: (ctx) => SafeArea(
-        child: Padding(
-          padding: const EdgeInsets.all(16),
+        child: SingleChildScrollView(
+          padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
           child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.stretch, children: [
             Text(c.rp, style: Theme.of(ctx).textTheme.titleLarge),
-            if (c.duress) const Text('Also usable under the duress PIN'),
+            if (c.userName.isNotEmpty) Text(c.userName, style: Theme.of(ctx).textTheme.bodyMedium),
             const SizedBox(height: 8),
-            HexValue('Credential ID', c.id),
-            HexValue('Public key', c.publicKey),
-            const SizedBox(height: 12),
-            WideButton('Test signature', key: const Key('test-sign'), icon: Icons.draw, onPressed: () {
+            Text(c.duress ? 'Also opens under the duress PIN.' : 'Hidden under the duress PIN.', style: Theme.of(ctx).textTheme.bodySmall),
+            const SizedBox(height: 16),
+            WideButton('Check that it works', key: const Key('test-sign'), icon: Icons.verified_outlined, tonal: true, onPressed: () {
               Navigator.of(ctx).pop();
               sign(c);
             }),
+            const SizedBox(height: 4),
+            Text('Signs a random test message with the cosigner, as a site sign-in would.', style: Theme.of(ctx).textTheme.bodySmall, textAlign: TextAlign.center),
             const SizedBox(height: 8),
-            WideButton('Sign a digest…', tonal: true, onPressed: () {
-              Navigator.of(ctx).pop();
-              sign(c, test: false);
-            }),
-            TextButton(
+            ExpansionTile(
+              tilePadding: EdgeInsets.zero,
+              shape: const Border(),
+              title: const Text('Details'),
+              children: [
+                HexValue('Credential ID', c.id),
+                HexValue('Public key', c.publicKey),
+                Align(
+                  alignment: Alignment.centerLeft,
+                  child: TextButton(
+                    onPressed: () {
+                      Navigator.of(ctx).pop();
+                      sign(c, test: false);
+                    },
+                    child: const Text('Sign a digest…'),
+                  ),
+                ),
+              ],
+            ),
+            TextButton.icon(
+              key: const Key('passkey-remove'),
+              icon: const Icon(Icons.delete_outline),
+              label: const Text('Remove from this list'),
               onPressed: () async {
+                final sure = await showDialog<bool>(
+                  context: ctx,
+                  builder: (d) => AlertDialog(
+                    title: Text('Remove ${c.rp} from this list?'),
+                    content: Text('This device will no longer offer it when you sign in to ${c.rp}. The site still lists the passkey: '
+                        'remove it in the site\'s security settings too if you no longer use it.'),
+                    actions: [
+                      TextButton(onPressed: () => Navigator.of(d).pop(false), child: const Text('Cancel')),
+                      FilledButton(key: const Key('passkey-remove-ok'), style: FilledButton.styleFrom(backgroundColor: Colors.red.shade700, foregroundColor: Colors.white), onPressed: () => Navigator.of(d).pop(true), child: const Text('Remove')),
+                    ],
+                  ),
+                );
+                if (sure != true || !ctx.mounted) return;
                 Navigator.of(ctx).pop();
                 await app.settings.removeCredential(c.id);
                 if (mounted) setState(() {});
               },
-              child: const Text('Remove from this list'),
             ),
           ]),
         ),
@@ -171,9 +203,12 @@ class _PasskeysPageState extends State<PasskeysPage> {
       body: PageBody(children: [
         const ProviderCard(),
         if (cs.isEmpty)
-          const Section('No passkeys yet', children: [
-            Text('A Symbolon passkey signs in to a site without a password. Its key is split between this device and the cosigner, '
+          const Section('No passkeys yet', key: Key('passkeys-empty'), children: [
+            Text('A passkey signs you in to a site without a password. Its key is split between this device and the cosigner, '
                 'so a stolen device alone cannot use it.'),
+            SizedBox(height: 12),
+            Text('To get one, sign up or open a site\'s security settings and choose to create a passkey: Symbolon offers to keep it. '
+                'It then shows up here.'),
           ]),
         if (cs.isNotEmpty) ...[
           FilterBar(
@@ -200,7 +235,6 @@ class _PasskeysPageState extends State<PasskeysPage> {
               ),
               title: Text(c.rp),
               subtitle: Wrap(spacing: 6, runSpacing: 4, crossAxisAlignment: WrapCrossAlignment.center, children: [
-                const KindTag('Passkey', Colors.indigo),
                 if (c.userName.isNotEmpty) Text(c.userName, style: Theme.of(context).textTheme.bodySmall),
                 if (c.duress) const KindTag('Duress', Colors.orange),
               ]),

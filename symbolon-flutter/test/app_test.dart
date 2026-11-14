@@ -161,9 +161,8 @@ void main() {
   testWidgets('vault items show their kind and can be searched and filtered', (t) async {
     await start(t);
     await t.tap(find.text('Vault').last);
-    await t.pump(const Duration(milliseconds: 300));
-    await t.tap(find.byKey(const Key('open-vault')));
-    await t.pump(const Duration(milliseconds: 300));
+    await t.pump(const Duration(milliseconds: 300));   // the tab asks for the PIN by itself,
+    await t.pump(const Duration(milliseconds: 300));   // a frame later
     await pin(t, '2468');
     expect(find.descendant(of: find.byKey(const Key('item-mail')), matching: find.text('Login')), findsOneWidget);
     expect(find.descendant(of: find.byKey(const Key('item-mail')), matching: find.text('mail.example.com')), findsOneWidget);
@@ -190,9 +189,8 @@ void main() {
   testWidgets('vault folders: items show theirs, and the picker shows one folder and those inside it', (t) async {
     await start(t);
     await t.tap(find.text('Vault').last);
-    await t.pump(const Duration(milliseconds: 300));
-    await t.tap(find.byKey(const Key('open-vault')));
-    await t.pump(const Duration(milliseconds: 300));
+    await t.pump(const Duration(milliseconds: 300));   // the tab asks for the PIN by itself,
+    await t.pump(const Duration(milliseconds: 300));   // a frame later
     await pin(t, '2468');
     expect(find.descendant(of: find.byKey(const Key('item-mail')), matching: find.text('Work › Email')), findsOneWidget);
     Future<void> choose(String key) async {
@@ -267,9 +265,8 @@ void main() {
   testWidgets('an item moves from the vault to a shared folder', (t) async {
     await start(t);
     await t.tap(find.text('Vault').last);
-    await t.pump(const Duration(milliseconds: 300));
-    await t.tap(find.byKey(const Key('open-vault')));
-    await t.pump(const Duration(milliseconds: 300));
+    await t.pump(const Duration(milliseconds: 300));   // the tab asks for the PIN by itself,
+    await t.pump(const Duration(milliseconds: 300));   // a frame later
     await pin(t, '2468');
     await t.tap(find.byKey(const Key('item-mail')));
     await t.pump(const Duration(milliseconds: 300));
@@ -330,9 +327,8 @@ void main() {
 
   Future<void> openVault(WidgetTester t) async {
     await t.tap(find.text('Vault').last);
-    await t.pump(const Duration(milliseconds: 300));
-    await t.tap(find.byKey(const Key('open-vault')));
-    await t.pump(const Duration(milliseconds: 300));
+    await t.pump(const Duration(milliseconds: 300));   // the tab asks for the PIN by itself,
+    await t.pump(const Duration(milliseconds: 300));   // a frame later
     await pin(t, '2468');
   }
 
@@ -363,6 +359,64 @@ void main() {
     await lock(t);
   });
 
+  testWidgets('choosing the Vault tab asks to unlock at once; cancelling leaves the Unlock button', (t) async {
+    await start(t);
+    await t.tap(find.text('Vault').last);
+    await t.pump(const Duration(milliseconds: 300));
+    await t.pump(const Duration(milliseconds: 300));
+    expect(find.byKey(const Key('secret-field')), findsOneWidget);
+    await t.tap(find.text('Cancel'));
+    await t.pumpAndSettle();
+    expect(find.byKey(const Key('open-vault')), findsOneWidget);
+    // Back to the tab later: asked again.
+    await t.tap(find.text('Home').last);
+    await t.pump(const Duration(milliseconds: 300));
+    await t.tap(find.text('Vault').last);
+    await t.pump(const Duration(milliseconds: 300));
+    await t.pump(const Duration(milliseconds: 300));
+    await pin(t, '2468');
+    expect(find.byKey(const Key('item-mail')), findsOneWidget);
+    await lock(t);
+  });
+
+  testWidgets('a new login can take a generated password, shown so it can be checked', (t) async {
+    await start(t);
+    await openVault(t);
+    await t.tap(find.byKey(const Key('vault-add')));
+    await t.pumpAndSettle();
+    await t.tap(find.byKey(const Key('add-login')));
+    await t.pumpAndSettle();
+    await t.tap(find.byKey(const Key('generate-current')));
+    await t.pump();
+    final made = (t.widget(find.byKey(const Key('edit-current'))) as TextFormField).controller!.text;
+    expect(made, hasLength(20));
+    expect(made, matches(RegExp(r'[a-z]')));
+    expect(made, matches(RegExp(r'[A-Z]')));
+    expect(made, matches(RegExp(r'[2-9]')));
+    expect(find.text(made), findsOneWidget);   // revealed
+    // Generating again over a password asks first.
+    await t.tap(find.byKey(const Key('generate-current')));
+    await t.pumpAndSettle();
+    expect(find.text('Replace the password?'), findsOneWidget);
+    await t.tap(find.text('Cancel'));
+    await t.pumpAndSettle();
+    expect((t.widget(find.byKey(const Key('edit-current'))) as TextFormField).controller!.text, made);
+    await t.pageBack();
+    await t.pumpAndSettle();
+    await lock(t);
+  });
+
+  testWidgets('a pending change opens Recovery, which leads with stopping it', (t) async {
+    await start(t);
+    await t.tap(find.byKey(const Key('review-recovery')));
+    await t.pump(const Duration(milliseconds: 500));
+    await settle(t);
+    expect(find.text('Recovery'), findsWidgets);
+    expect(find.byKey(const Key('recovery-pending')), findsOneWidget);
+    expect(find.text('Stop this recovery'), findsOneWidget);
+    expect(t.getTopLeft(find.byKey(const Key('recovery-pending'))).dy, lessThan(t.getTopLeft(find.text('Recover on a new device')).dy));
+  });
+
   testWidgets('a card shows its fields: hidden ones masked, custom fields labelled', (t) async {
     settings.siteIcons = false;
     await start(t);
@@ -370,6 +424,11 @@ void main() {
     await t.tap(find.byKey(const Key('item-visa')));
     await t.pump(const Duration(milliseconds: 500));
     await settle(t);
+    // The number is masked in its field as on the card face, until shown.
+    expect(find.text('4111111111111111'), findsNothing);
+    expect(find.text('•••• 1111'), findsOneWidget);
+    await t.tap(find.descendant(of: find.byKey(const Key('field-number')), matching: find.byTooltip('Show')));
+    await t.pump();
     expect(find.text('4111111111111111'), findsOneWidget);
     expect(find.text('Card number · Visa'), findsOneWidget);
     expect(find.text('•••• •••• •••• 1111'), findsOneWidget);

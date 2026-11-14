@@ -130,8 +130,10 @@ class _ShellState extends State<Shell> with WidgetsBindingObserver {
     final app = widget.app;
     final pages = [
       HomePage(key: ValueKey('home$refresh'), app: app, go: go),
-      PasskeysPage(app: app),
-      VaultPage(key: ValueKey('vault${app.dir}'), app: app),
+      // Their own messengers: a message lifts the tab's Add button instead
+      // of covering it.
+      ScaffoldMessenger(child: PasskeysPage(app: app)),
+      ScaffoldMessenger(child: VaultPage(key: ValueKey('vault${app.dir}'), app: app, active: index == 2)),
       MorePage(app: app, onSetupDone: () => go(0)),
     ];
     final lock = app.session.unlocked
