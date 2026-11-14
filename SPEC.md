@@ -1791,8 +1791,9 @@ interface that shows, as the platform reports it, where it goes.
    - in a privileged browser, when its stored origin covers the page's
      origin (22.5 step 6);
    - in any other app, only when the login was saved for that app (its
-     package and `android:apk-key-hash`, item 6), or when its stored site
-     names that app in Digital Asset Links: the site's
+     package and `android:apk-key-hash`, item 6), when the principal linked
+     it to that app in Symbolon (item 8), or when its stored site names
+     that app in Digital Asset Links: the site's
      `https://HOST/.well-known/assetlinks.json`, fetched by the agent
      directly from the stored host over TLS, without redirects and at most
      128 KiB, lists `delegate_permission/common.get_login_creds` for an
@@ -1805,7 +1806,7 @@ interface that shows, as the platform reports it, where it goes.
    an item for an app or page that matches none, since that choice is how
    a lookalike app obtains a password. The fill screen says that nothing
    is saved for this app or site, and offers only to save a new login
-   there. A card is offered in any app or privileged browser, for card
+   there, or to link one later from the item in Symbolon (item 8). A card is offered in any app or privileged browser, for card
    fields, once the principal has seen the requester on the fill screen;
    its PIN never fills.
 4. **The fill screen** is an activity of the app, outside the requesting
@@ -1833,6 +1834,26 @@ interface that shows, as the platform reports it, where it goes.
    `SYMBOLON_FIDO_SOCKET` (9.4) and a security key over NFC or USB. The
    relay only passes messages: the agent checks every assertion as 9.4
    requires, so a relay that alters one opens nothing.
+8. **Linking a login to an app.** Many apps are not named in their
+   site's Digital Asset Links. The principal may link a login to an app
+   from the login's page in Symbolon ("Use in an app"), never from a fill:
+   the in-the-moment choice a requesting app prompts is what item 3
+   forbids, while a link is made deliberately, away from the app.
+   - The principal chooses an installed app from the list the package
+     manager gives. The link screen shows the app's name and icon, its
+     package, the SHA-256 fingerprint of its signing certificate, and
+     where it was installed from, as the package manager reports the
+     installer. It warns, before the principal confirms, when the app was
+     not installed by an app store, and says that an app asking to be
+     linked is a reason to stop: no genuine app needs that.
+   - Confirming opens the device (22.7 item 1) and records the package and
+     `android:apk-key-hash` on the login, as a vault change (18.4); a
+     login may be linked to several apps. The link covers that signing
+     certificate only: an update signed by another key no longer matches,
+     and is linked again only the same way.
+   - The login's page lists its links, each with its app's name and
+     fingerprint, and removes one with a tap. Under the duress PIN no link
+     is made or removed (14.3).
 
 ### 22.7 Every fill
 
@@ -1977,6 +1998,9 @@ it are verified; this table is not a claim of security.
 - A stolen kit filed while the principal has no device left to veto, and
   no guardians, succeeds after the delay: that is what a recovery factor
   is. The kit passphrase is the defense.
+- A principal talked into linking a login to a lookalike app (22.6 item
+  8) gives that app the login. The link screen's publisher, installer and
+  warning make this harder; they cannot make it impossible.
 - A filled password is a replayable secret. The page or app that receives
   it can keep it, and malware with accessibility access can read filled
   fields. 22.5 to 22.7 decide who receives a value and whether the
