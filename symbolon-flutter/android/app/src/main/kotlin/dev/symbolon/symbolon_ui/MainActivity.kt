@@ -42,6 +42,19 @@ class MainActivity : FlutterFragmentActivity() {
             when (call.method) {
                 "paths" -> result.success(platformPaths(this))
                 "keystore" -> result.success(KeystoreServer.info(this))
+                // A secret for the clipboard, marked sensitive: Android 13+
+                // then keeps it out of the copy preview and the keyboard's
+                // clipboard suggestions. False before 13 (the Dart side copies).
+                "copySensitive" -> {
+                    if (Build.VERSION.SDK_INT >= 33) {
+                        val clip = android.content.ClipData.newPlainText("Symbolon", call.arguments as String)
+                        clip.description.extras = android.os.PersistableBundle().apply {
+                            putBoolean(android.content.ClipDescription.EXTRA_IS_SENSITIVE, true)
+                        }
+                        (getSystemService(android.content.Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager).setPrimaryClip(clip)
+                        result.success(true)
+                    } else result.success(false)
+                }
                 // What the organization's device management set (res/xml/app_restrictions.xml).
                 "managedConfig" -> {
                     val b = (getSystemService(android.content.Context.RESTRICTIONS_SERVICE) as android.content.RestrictionsManager).applicationRestrictions

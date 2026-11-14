@@ -124,6 +124,22 @@ class _VaultPageState extends State<VaultPage> {
     setState(() => _keep([...?items?.where((x) => x.name != it.name && x.name != change.saved?.name), ?change.saved]));
   }
 
+  /// What a row's copy button copies, by type: the field and its label.
+  static const _quick = {'login': ('current', 'Password'), 'wifi': ('password', 'Wi-Fi password'), 'card': ('number', 'Card number')};
+
+  /// Copies a login's or a Wi-Fi network's password, or a card's number,
+  /// without opening the item.
+  Future<void> quickCopy(VaultItem it) async {
+    final (field, label) = _quick[it.type]!;
+    final r = await app.withPin(context, (p) => app.cli.vaultShow(app.dir, it.name, p, share: share));
+    if (r == null || !mounted) return;
+    if (!r.ok) return toast(context, friendlyError(r));
+    final line = r.lines.where((l) => l.startsWith('$field ')).firstOrNull;
+    final value = line == null ? '' : unhex(line.substring(field.length + 1).trim());
+    if (value.isEmpty) return toast(context, '${it.name} has no ${label.toLowerCase()}.');
+    if (mounted) await copyText(context, label, value, secret: true);
+  }
+
   @override
   Widget build(BuildContext context) {
     final all = items;
@@ -194,7 +210,14 @@ class _VaultPageState extends State<VaultPage> {
                         Text(it.folder.replaceAll('/', ' › '), style: Theme.of(context).textTheme.bodySmall),
                       ]),
                   ]),
-                  trailing: const Icon(Icons.chevron_right),
+                  trailing: _quick.containsKey(it.type)
+                      ? IconButton(
+                          key: Key('quick-copy-${it.name}'),
+                          tooltip: 'Copy ${_quick[it.type]!.$2.toLowerCase()}',
+                          icon: const Icon(Icons.copy_outlined),
+                          onPressed: () => quickCopy(it),
+                        )
+                      : const Icon(Icons.chevron_right),
                   onTap: () => show(it),
                 ),
               ),

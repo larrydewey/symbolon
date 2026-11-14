@@ -1,11 +1,13 @@
 import 'package:flutter/material.dart';
 
 import '../app.dart';
+import '../brand.dart';
 import '../cli.dart';
 import '../widgets.dart';
 import 'hardware_page.dart';
 import 'provider_card.dart';
 import 'setup_page.dart';
+import 'tutorial_page.dart';
 
 /// The device and its identity at a glance, as `device status` verifies them.
 class HomePage extends StatefulWidget {
@@ -54,12 +56,27 @@ class _HomePageState extends State<HomePage> {
       child: PageBody(children: [
         if (loading && s == null) const Padding(padding: EdgeInsets.all(32), child: Center(child: CircularProgressIndicator())),
         if (!loading && s == null)
-          Section('Welcome to Symbolon', children: [
-            const Text('This device is not set up yet. Setup creates your identity with a cosigner and witnesses, '
-                'and gives you a recovery kit.'),
-            const SizedBox(height: 16),
-            WideButton('Set up this device', key: const Key('start-setup'), icon: Icons.add_moderator, onPressed: setup),
-          ]),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(8, 24, 8, 8),
+            child: Column(children: [
+              const SymbolonBadge(size: 104),
+              const SizedBox(height: 24),
+              Text('Welcome to Symbolon', style: t.headlineSmall, textAlign: TextAlign.center),
+              const SizedBox(height: 4),
+              Text('Two halves that fit', style: t.titleSmall?.copyWith(color: Theme.of(context).colorScheme.primary), textAlign: TextAlign.center),
+              const SizedBox(height: 16),
+              const Text('This device is not set up yet. Setup creates your identity with a cosigner and witnesses, '
+                  'and gives you a recovery kit.', textAlign: TextAlign.center),
+              const SizedBox(height: 24),
+              WideButton('Set up this device', key: const Key('start-setup'), icon: Icons.add_moderator, onPressed: setup),
+              const SizedBox(height: 8),
+              TextButton.icon(
+                icon: const Icon(Icons.school_outlined),
+                label: const Text('How Symbolon works'),
+                onPressed: () => Navigator.of(context).push(MaterialPageRoute<void>(fullscreenDialog: true, builder: (_) => const TutorialPage())),
+              ),
+            ]),
+          ),
         if (s != null && s.log == null)
           Section('Almost there', children: [
             const Text('This device has its keys but no identity yet. Finish setup to create it.'),
@@ -69,11 +86,12 @@ class _HomePageState extends State<HomePage> {
         if (s != null && s.log != null) ...[
           Card(
             margin: const EdgeInsets.only(bottom: 16),
+            color: Color.alphaBlend((r!.ok ? Colors.green : (offline ? Colors.blueGrey : Colors.red)).withValues(alpha: 0.10), Theme.of(context).colorScheme.surfaceContainerLow),
             child: Padding(
               padding: const EdgeInsets.all(16),
               child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
                 Row(children: [
-                  Icon(r!.ok ? Icons.verified : (offline ? Icons.cloud_off : Icons.error), color: r.ok ? Colors.green : (offline ? Colors.blueGrey : Colors.red), size: 32),
+                  Icon(r.ok ? Icons.verified : (offline ? Icons.cloud_off : Icons.error), color: r.ok ? Colors.green : (offline ? Colors.blueGrey : Colors.red), size: 32),
                   const SizedBox(width: 12),
                   Expanded(
                       child: Text(r.ok ? 'Your identity is verified' : (offline ? 'Offline' : 'Your identity log does not verify'),
@@ -100,11 +118,25 @@ class _HomePageState extends State<HomePage> {
             ),
           ),
           if ((s.pending ?? 0) > 0)
-            Section('A change is pending', children: [
-              const Text('A delayed event (a recovery?) is waiting to take effect. If you did not start it, veto it now.'),
-              const SizedBox(height: 12),
-              WideButton('Review in Recovery', tonal: true, onPressed: () => widget.go(3)),
-            ]),
+            Card(
+              key: const Key('pending-change'),
+              margin: const EdgeInsets.only(bottom: 16),
+              color: Colors.orange.withValues(alpha: 0.16),
+              child: Padding(
+                padding: const EdgeInsets.all(16),
+                child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+                  Row(children: [
+                    const Icon(Icons.warning_amber, color: Colors.orange),
+                    const SizedBox(width: 12),
+                    Expanded(child: Text('A change is pending', style: t.titleMedium)),
+                  ]),
+                  const SizedBox(height: 8),
+                  const Text('A delayed event (a recovery?) is waiting to take effect. If you did not start it, veto it now.'),
+                  const SizedBox(height: 12),
+                  WideButton('Review in Recovery', tonal: true, onPressed: () => widget.go(3)),
+                ]),
+              ),
+            ),
           Row(children: [
             Expanded(child: _Action(Icons.key, 'Passkeys', '${widget.app.settings.credentials.length} here', () => widget.go(1))),
             const SizedBox(width: 12),

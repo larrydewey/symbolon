@@ -2,6 +2,7 @@
 // plain-language errors, and display of long hex values.
 
 import 'dart:async';
+import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -77,10 +78,19 @@ Future<CliResult> runTask(BuildContext context, String title, Future<CliResult> 
     nav.pop();
   }
   if (!r.ok) {
-    messenger.showSnackBar(SnackBar(content: Text(friendlyError(r)), backgroundColor: Colors.red.shade700, duration: const Duration(seconds: 6)));
+    messenger.showSnackBar(errorBar(friendlyError(r)));
+  } else {
+    HapticFeedback.lightImpact();
   }
   return r;
 }
+
+/// A snack bar for something that failed: an icon, and long enough to read.
+SnackBar errorBar(String m) => SnackBar(
+      content: Row(children: [const Icon(Icons.error_outline, color: Colors.white), const SizedBox(width: 12), Expanded(child: Text(m))]),
+      backgroundColor: Colors.red.shade700,
+      duration: const Duration(seconds: 6),
+    );
 
 class _Progress extends StatefulWidget {
   final String title;
@@ -131,6 +141,39 @@ class _ProgressState extends State<_Progress> {
 
 void toast(BuildContext context, String m) => ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(m)));
 
+/// How long a copied secret stays on the clipboard.
+const clipboardKeep = Duration(seconds: 60);
+Timer? _clearClipboard;
+
+/// Copies [value] and says so. A [secret] is marked sensitive (Android 13+
+/// keeps it out of the clipboard preview and the keyboard's suggestions) and
+/// is cleared after [clipboardKeep], unless something else was copied since.
+Future<void> copyText(BuildContext context, String label, String value, {bool secret = false}) async {
+  HapticFeedback.selectionClick();
+  var marked = false;
+  if (secret && Platform.isAndroid) {
+    try {
+      marked = await const MethodChannel('symbolon/platform').invokeMethod<bool>('copySensitive', value) ?? false;
+    } on PlatformException {
+      marked = false;
+    } on MissingPluginException {
+      marked = false;
+    }
+  }
+  if (!marked) await Clipboard.setData(ClipboardData(text: value));
+  if (!context.mounted) return;
+  if (!secret) return toast(context, '$label copied');
+  _clearClipboard?.cancel();
+  // Not under flutter test, whose fake clock would see the timer outlive the test.
+  if (!Platform.environment.containsKey('FLUTTER_TEST')) {
+    _clearClipboard = Timer(clipboardKeep, () async {
+      final now = await Clipboard.getData(Clipboard.kTextPlain);
+      if (now?.text == value) await Clipboard.setData(const ClipboardData(text: ''));
+    });
+  }
+  toast(context, '$label copied. It is cleared from the clipboard in a minute.');
+}
+
 /// A long hex value, shortened to its ends, with a copy button; tap it to
 /// see all of it.
 class HexValue extends StatelessWidget {
@@ -172,10 +215,7 @@ class HexValue extends StatelessWidget {
     );
   }
 
-  void _copy(BuildContext context) {
-    Clipboard.setData(ClipboardData(text: value));
-    toast(context, '$label copied');
-  }
+  void _copy(BuildContext context) => copyText(context, label, value, secret: secret);
 }
 
 /// A card with a title.

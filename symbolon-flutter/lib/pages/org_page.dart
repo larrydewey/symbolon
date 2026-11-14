@@ -1,5 +1,4 @@
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
 
 import '../app.dart';
 import '../managed.dart';
@@ -197,7 +196,7 @@ class _OrgPageState extends State<OrgPage> {
           SelectableText(code, key: const Key('org-invite-code'), style: const TextStyle(fontFamily: 'monospace')),
         ]),
         actions: [
-          TextButton(onPressed: () => Clipboard.setData(ClipboardData(text: code)), child: const Text('Copy')),
+          TextButton(onPressed: () => copyText(ctx, 'Invite code', code, secret: true), child: const Text('Copy')),
           FilledButton(onPressed: () => Navigator.of(ctx).pop(), child: const Text('Done')),
         ],
       ),

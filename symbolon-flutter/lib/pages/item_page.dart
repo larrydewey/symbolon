@@ -1,5 +1,4 @@
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
 
 import '../app.dart';
 import '../card_face.dart';
@@ -61,10 +60,7 @@ class _ItemPageState extends State<ItemPage> {
         });
   }
 
-  void copy(String label, String value) {
-    Clipboard.setData(ClipboardData(text: value));
-    toast(context, '$label copied. Clear your clipboard when you are done.');
-  }
+  void copy(String label, String value, {bool secret = false}) => copyText(context, label, value, secret: secret);
 
   Future<void> edit() async {
     if (widget.offline) return toast(context, 'Changes need a connection to your relay.');
@@ -240,7 +236,7 @@ class _ItemPageState extends State<ItemPage> {
             icon: Icon(masked ? Icons.visibility : Icons.visibility_off),
             onPressed: () => setState(() => masked ? shown.add(key) : shown.remove(key)),
           ),
-        IconButton(tooltip: 'Copy', icon: const Icon(Icons.copy, size: 20), onPressed: () => copy(label, value)),
+        IconButton(tooltip: 'Copy', icon: const Icon(Icons.copy, size: 20), onPressed: () => copy(label, value, secret: hidden || key == 'number')),
       ]),
     );
   }

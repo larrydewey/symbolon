@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import '../app.dart';
 import '../biometric.dart';
@@ -229,6 +230,7 @@ class _SetupPageState extends State<SetupPage> {
     if (bio.supported && bio.biometric && useBio) await Bio.enroll(p);
     if (!mounted) return;
     app.session.remember(p);
+    HapticFeedback.heavyImpact();
     pin.clear();
     pin2.clear();
     duressPin.clear();
@@ -406,8 +408,18 @@ class _SetupPageState extends State<SetupPage> {
     final t = Theme.of(context).textTheme;
     return Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
       Text('Step 3 of 3 · Recovery kit', style: t.labelLarge),
-      const SizedBox(height: 4),
-      Text('Your identity is ready', key: const Key('setup-done'), style: t.headlineSmall),
+      const SizedBox(height: 16),
+      Center(
+        child: TweenAnimationBuilder<double>(
+          tween: Tween(begin: 0, end: 1),
+          duration: const Duration(milliseconds: 600),
+          curve: Curves.elasticOut,
+          builder: (_, v, child) => Transform.scale(scale: v, child: child),
+          child: CircleAvatar(radius: 36, backgroundColor: Colors.green.withValues(alpha: 0.15), child: const Icon(Icons.check_rounded, size: 44, color: Colors.green)),
+        ),
+      ),
+      const SizedBox(height: 16),
+      Text('Your identity is ready', key: const Key('setup-done'), style: t.headlineSmall, textAlign: TextAlign.center),
       const SizedBox(height: 12),
       const Text('Write down your recovery kit now and keep it somewhere safe. With it you can recover your identity '
           'if you lose every device. It is shown only this once.'),

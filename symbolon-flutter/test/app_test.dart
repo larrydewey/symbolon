@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:symbolon_ui/main.dart';
 import 'package:symbolon_ui/settings.dart';
@@ -339,6 +340,28 @@ void main() {
     await t.tap(find.byKey(const Key('lock')).first);
     await t.pumpAndSettle();
   }
+
+  testWidgets('a login\'s password and a card\'s number copy from the list, without opening the item', (t) async {
+    settings.siteIcons = false;
+    String? copied;
+    t.binding.defaultBinaryMessenger.setMockMethodCallHandler(SystemChannels.platform, (c) async {
+      if (c.method == 'Clipboard.setData') copied = (c.arguments as Map)['text'] as String?;
+      return null;
+    });
+    addTearDown(() => t.binding.defaultBinaryMessenger.setMockMethodCallHandler(SystemChannels.platform, null));
+    await start(t);
+    await openVault(t);
+    await t.tap(find.byKey(const Key('quick-copy-mail')));
+    await settle(t);
+    expect(copied, 'hunter2');
+    expect(find.textContaining('Password copied'), findsOneWidget);
+    expect(find.text('alice'), findsNothing);   // the item page, with the username, did not open
+    await t.tap(find.byKey(const Key('quick-copy-visa')));
+    await settle(t);
+    expect(copied, '4111111111111111');
+    expect(find.byKey(const Key('quick-copy-bank')), findsNothing);
+    await lock(t);
+  });
 
   testWidgets('a card shows its fields: hidden ones masked, custom fields labelled', (t) async {
     settings.siteIcons = false;

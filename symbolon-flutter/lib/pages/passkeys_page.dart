@@ -3,6 +3,7 @@ import 'dart:math';
 import 'package:flutter/material.dart';
 
 import '../app.dart';
+import '../favicons.dart';
 import '../settings.dart';
 import '../validate.dart' as v;
 import '../widgets.dart';
@@ -188,10 +189,14 @@ class _PasskeysPageState extends State<PasskeysPage> {
           Card(
             child: ListTile(
               key: Key('passkey-${c.rp}'),
-              leading: CircleAvatar(
-                backgroundColor: Colors.indigo.withValues(alpha: 0.15),
-                foregroundColor: Colors.indigo,
-                child: const Icon(Icons.key),
+              leading: SiteIcon(
+                favicons: app.favicons,
+                origin: 'https://${c.rp}',
+                fallback: CircleAvatar(
+                  backgroundColor: Colors.indigo.withValues(alpha: 0.15),
+                  foregroundColor: Colors.indigo,
+                  child: const Icon(Icons.key),
+                ),
               ),
               title: Text(c.rp),
               subtitle: Wrap(spacing: 6, runSpacing: 4, crossAxisAlignment: WrapCrossAlignment.center, children: [
