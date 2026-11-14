@@ -31,7 +31,7 @@ symbolon device status ~/.symbolon     # "not set up" until you set it up
 ## Build from source
 
 The agent is written in [Resid](https://github.com/larrydewey/Resid) and
-needs Resid v0.6.1 or later beside this repository:
+needs Resid v0.8.1 or later beside this repository:
 
 ```sh
 git clone https://github.com/larrydewey/Resid.git
