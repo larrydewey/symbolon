@@ -4,6 +4,8 @@
     <!-- The QR scanner (QrScanner.kt); optional, as a code can also be pasted. -->
     <uses-permission android:name="android.permission.CAMERA"/>
     <uses-feature android:name="android.hardware.camera" android:required="false"/>
+    <!-- The fill screen hides other apps' overlays (SPEC 22.6 item 4, Android 12+). -->
+    <uses-permission android:name="android.permission.HIDE_OVERLAY_WINDOWS"/>
     <application
         android:label="Symbolon"
         android:extractNativeLibs="true"
@@ -42,6 +44,26 @@
             android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode"
             android:hardwareAccelerated="true"
             android:windowSoftInputMode="adjustResize" />
+        <!-- The autofill fill and save screen (SPEC 22.6). -->
+        <activity
+            android:name=".AutofillActivity"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:theme="@style/NormalTheme"
+            android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode"
+            android:hardwareAccelerated="true"
+            android:windowSoftInputMode="adjustResize" />
+        <!-- Symbolon as Android's autofill service (Settings > Passwords, passkeys and accounts). -->
+        <service
+            android:name=".SymbolonAutofillService"
+            android:exported="true"
+            android:label="Symbolon"
+            android:permission="android.permission.BIND_AUTOFILL_SERVICE">
+            <intent-filter>
+                <action android:name="android.service.autofill.AutofillService" />
+            </intent-filter>
+            <meta-data android:name="android.autofill" android:resource="@xml/autofill_service" />
+        </service>
         <!-- Symbolon as a passkey provider (Settings > Passwords, passkeys and accounts). -->
         <service
             android:name=".SymbolonCredentialService"
@@ -71,6 +93,11 @@
 
          In particular, this is used by the Flutter engine in io.flutter.plugin.text.ProcessTextPlugin. -->
     <queries>
+        <!-- Launchable apps: who asks for a fill, and which app a login may be linked to (SPEC 22.6). -->
+        <intent>
+            <action android:name="android.intent.action.MAIN"/>
+            <category android:name="android.intent.category.LAUNCHER"/>
+        </intent>
         <intent>
             <action android:name="android.intent.action.PROCESS_TEXT"/>
             <data android:mimeType="text/plain"/>

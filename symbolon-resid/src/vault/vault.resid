@@ -370,6 +370,114 @@ pub Int totp_code(List(Secret(UInt(8))) seed, Int unix_time, Int step, Int digit
     return truncate_mac(mac, digits);
 }
 
+// The stored TOTP field: an `otpauth://totp/` URI (secret, period, digits,
+// algorithm), or a bare base32 key as sites show it, in any case, with
+// spaces or dashes between groups.
+pub type TotpSpec = { List(Secret(UInt(8))) seed; Int step; Int digits; Bool sha1; };
+
+// The text is declassified at this one named point inside the core, parsed,
+// and the key goes straight back to Secret; it never leaves the core
+// (SPEC 18.7). The plain copy is not wiped: a constant-time base32 decoder
+// would avoid it.
+@requires(declassify)
+pub Result(TotpSpec, Str) totp_spec(List(Secret(UInt(8))) field) {
+    List(Int) t = lower_ascii(trim_ws(ints_of(declassify(secret_join(field), "TOTP: the stored key's text is parsed in the core and re-sealed"), 0, ListBuf())), 0, ListBuf());
+    if (starts_with_bytes(t, utf8("otpauth://hotp"), 0)) { return Err("counter-based (HOTP) one-time codes are not supported"); }
+    if (!starts_with_bytes(t, utf8("otpauth://"), 0)) { return totp_from(t, 30, 6, true); }
+    if (!starts_with_bytes(t, utf8("otpauth://totp/"), 0)) { return Err("not a one-time code key"); }
+    List(List(Int)) ps = split_bytes(after_byte(t, 63, 0), 38, 0, ListBuf(), ListBuf());
+    Option(List(Int)) sec = param(ps, utf8("secret="), 0);
+    Option(List(Int)) per = param(ps, utf8("period="), 0);
+    Option(List(Int)) dig = param(ps, utf8("digits="), 0);
+    Option(List(Int)) alg = param(ps, utf8("algorithm="), 0);
+    Int step = match per { None => 30, Some(v) => dec_or(v, -1) };
+    Int digits = match dig { None => 6, Some(v) => dec_or(v, -1) };
+    if (step < 1 || step > 3600) { return Err("the code's period is not a number of seconds"); }
+    if (digits < 6 || digits > 8) { return Err("codes of 6 to 8 digits are supported"); }
+    Int a = match alg { None => 1, Some(v) => if (v == utf8("sha1")) { 1 } else { if (v == utf8("sha256")) { 256 } else { 0 } } };
+    if (a == 0) { return Err("the code's algorithm is not SHA-1 or SHA-256"); }
+    return match sec {
+        None => Err("the link has no secret"),
+        Some(k) => totp_from(k, step, digits, a == 1)
+    };
+}
+
+Result(TotpSpec, Str) totp_from(List(Int) text, Int step, Int digits, Bool sha1) {
+    Option(List(Int)) key = base32_decode(text, 0, 0, 0, ListBuf());
+    return match key {
+        None => Err("the key is not base32 (A-Z, 2-7)"),
+        Some(k) => if (k.len() < 10) { Err("the key is too short (under 80 bits)") }
+                   else { Ok(TotpSpec {.seed = secret_bytes(k), .step = step, .digits = digits, .sha1 = sha1}) }
+    };
+}
+
+// Base32 (RFC 4648), padding and the separators people type dropped.
+Option(List(Int)) base32_decode(List(Int) t, Int i, Int bits, Int n, ListBuf(Int) acc) {
+    if (i >= t.len()) { return Some(acc.finish()); }
+    Int c = t[i];
+    if (c == 32 || c == 45 || c == 61) { return base32_decode(t, i + 1, bits, n, acc); }
+    Int v = if (c >= 97 && c <= 122) { c - 97 } else { if (c >= 50 && c <= 55) { c - 24 } else { -1 } };
+    if (v < 0) { acc.finish(); return None; }
+    Int b = ((bits << 5) | v) & 4095;
+    Int m = n + 5;
+    if (m >= 8) { return base32_decode(t, i + 1, b, m - 8, acc.push((b >> (m - 8)) & 255)); }
+    return base32_decode(t, i + 1, b, m, acc);
+}
+
+List(Int) lower_ascii(List(Int) t, Int i, ListBuf(Int) acc) {
+    if (i >= t.len()) { return acc.finish(); }
+    Int c = t[i];
+    return lower_ascii(t, i + 1, acc.push(if (c >= 65 && c <= 90) { c + 32 } else { c }));
+}
+
+List(Int) trim_ws(List(Int) t) {
+    Int a = first_non_ws(t, 0);
+    Int b = last_non_ws(t, t.len() - 1);
+    return if (a > b) { [] } else { t[a..b + 1] };
+}
+
+Int first_non_ws(List(Int) t, Int i) {
+    if (i >= t.len() || (t[i] != 32 && t[i] != 9 && t[i] != 10 && t[i] != 13)) { return i; }
+    return first_non_ws(t, i + 1);
+}
+
+Int last_non_ws(List(Int) t, Int i) {
+    if (i < 0 || (t[i] != 32 && t[i] != 9 && t[i] != 10 && t[i] != 13)) { return i; }
+    return last_non_ws(t, i - 1);
+}
+
+Bool starts_with_bytes(List(Int) t, List(Int) p, Int i) {
+    if (i >= p.len()) { return true; }
+    if (i >= t.len() || t[i] != p[i]) { return false; }
+    return starts_with_bytes(t, p, i + 1);
+}
+
+List(Int) after_byte(List(Int) t, Int b, Int i) {
+    if (i >= t.len()) { return []; }
+    if (t[i] == b) { return t[i + 1..t.len()]; }
+    return after_byte(t, b, i + 1);
+}
+
+List(List(Int)) split_bytes(List(Int) t, Int sep, Int i, ListBuf(Int) cur, ListBuf(List(Int)) acc) {
+    if (i >= t.len()) { return acc.push(cur.finish()).finish(); }
+    if (t[i] == sep) { return split_bytes(t, sep, i + 1, ListBuf(), acc.push(cur.finish())); }
+    return split_bytes(t, sep, i + 1, cur.push(t[i]), acc);
+}
+
+Option(List(Int)) param(List(List(Int)) ps, List(Int) key, Int i) {
+    if (i >= ps.len()) { return None; }
+    if (starts_with_bytes(ps[i], key, 0)) { return Some(ps[i][key.len()..ps[i].len()]); }
+    return param(ps, key, i + 1);
+}
+
+Int dec_or(List(Int) t, Int bad) { return if (t.len() == 0 || t.len() > 6) { bad } else { dec_at(t, 0, 0, bad) }; }
+
+Int dec_at(List(Int) t, Int i, Int acc, Int bad) {
+    if (i >= t.len()) { return acc; }
+    if (t[i] < 48 || t[i] > 57) { return bad; }
+    return dec_at(t, i + 1, acc * 10 + (t[i] - 48), bad);
+}
+
 Int pow10(Int n) {
     if (n <= 0) { return 1; }
     return 10 * pow10(n - 1);

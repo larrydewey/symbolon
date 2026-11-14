@@ -59,11 +59,11 @@ test "only https origins, or http on loopback, may receive anything" {
 }
 
 test "a frame of the page's own origin may receive login and card fields" {
-    expect(ks(allowed_kinds("https://shop.example", fr(0, "https://shop.example", ["username", "current-password", "cc-number", "new-password", "cc-number"])))).toEqual("username,current-password,cc-number");
+    expect(ks(allowed_kinds("https://shop.example", fr(0, "https://shop.example", ["username", "current-password", "cc-number", "new-password", "cc-number", "one-time-code", "pin"])))).toEqual("username,current-password,cc-number,new-password,one-time-code");
 }
 
 test "a pinned payment processor's frame may receive card fields only" {
-    expect(ks(allowed_kinds("https://shop.example", fr(3, "https://js.stripe.com", ["cc-number", "cc-exp", "cc-csc", "current-password", "username"])))).toEqual("cc-number,cc-exp,cc-csc");
+    expect(ks(allowed_kinds("https://shop.example", fr(3, "https://js.stripe.com", ["cc-number", "cc-exp", "cc-csc", "current-password", "username", "new-password", "one-time-code"])))).toEqual("cc-number,cc-exp,cc-csc");
 }
 
 test "any other frame receives nothing, however its origin is spelled" {
@@ -101,7 +101,18 @@ test "a login's fields map to username, email and current-password; nothing else
     expect(vtext(value_for(login("https://shop.example"), "email"))).toEqual("ada@example.com");
     expect(vtext(value_for(login("https://shop.example"), "current-password"))).toEqual("pa\"ss\\w0rd");
     expect(value_for(login("https://shop.example"), "cc-number").len()).toEqual(0);
+    // The login holds a TOTP key: it never fills a code field; nor does its
+    // stored password fill a new-password field.
     expect(value_for(login("https://shop.example"), "one-time-code").len()).toEqual(0);
+    expect(value_for(login("https://shop.example"), "new-password").len()).toEqual(0);
+}
+
+@requires(declassify)
+test "a code field takes the agent's current code, and a new-password field only a just-made password" {
+    Chosen c = Chosen {.kind = "login", .fields = [fp("origin", "https://shop.example"), fp("username", "ada"), fp("current", "gen-1"), fp("new", "gen-1"), fp("otp", "287082")]};
+    expect(vtext(value_for(c, "one-time-code"))).toEqual("287082");
+    expect(vtext(value_for(c, "new-password"))).toEqual("gen-1");
+    expect(value_for(visa(), "one-time-code").len()).toEqual(0);
 }
 
 @requires(declassify)

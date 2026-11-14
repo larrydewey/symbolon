@@ -502,6 +502,27 @@ void main() {
     expect(agent.argsLog.readAsStringSync(), contains('9f3a1c0e fa8f008b293b5457ef989520c8bbcbc959a09c0a8619b1d190f78271bf6b5795'));
   });
 
+  testWidgets('a login with a one-time code key shows the current code from the agent, with its seconds left', (t) async {
+    settings.siteIcons = false;
+    await start(t);
+    await openVault(t);
+    await t.tap(find.byKey(const Key('item-mail')));
+    await t.pump(const Duration(milliseconds: 500));
+    for (var i = 0; i < 3; i++) {
+      await settle(t);
+    }
+    expect(find.text('287 082'), findsOneWidget);
+    expect(agent.argsLog.readAsStringSync(), contains('device vault code ${settings.deviceDir} mail'));
+    int left() => int.parse((t.widget(find.byKey(const Key('code-left'))) as Text).data!);
+    final before = left();
+    expect(before, inInclusiveRange(2, 12));
+    await t.pump(const Duration(seconds: 1));
+    expect(left(), before - 1);   // counting down
+    await t.pageBack();
+    await t.pumpAndSettle();
+    await lock(t);
+  });
+
   testWidgets('a card shows its fields: hidden ones masked, custom fields labelled', (t) async {
     settings.siteIcons = false;
     await start(t);

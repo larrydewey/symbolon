@@ -140,17 +140,21 @@ class VaultItem {
   final String type;
   final String detail;     // a login's origin, a card's last four digits
   final String folder;     // "" when in no folder; levels joined by "/"
-  const VaultItem(this.name, this.type, {this.detail = '', this.folder = ''});
+  final String apps;       // a login's linked Android apps: "PACKAGE CERT-SHA256" lines (SPEC 22.6 item 8)
+  const VaultItem(this.name, this.type, {this.detail = '', this.folder = '', this.apps = ''});
 
   ItemType get kind => typeOf(type);
 
-  /// "TYPE NAME-HEX DETAIL-HEX [FOLDER-HEX]"; null for a line that is not one.
+  /// The linked apps, each (package, certificate SHA-256 in hex).
+  List<(String, String)> get appLinks => appLinksOf(apps);
+
+  /// "TYPE NAME-HEX DETAIL-HEX [FOLDER-HEX [APPS-HEX]]"; null for a line that is not one.
   static VaultItem? parse(String line) {
     final p = line.trim().split(' ');
-    if (p.length != 3 && p.length != 4) return null;
+    if (p.length < 3 || p.length > 5) return null;
     String un(String h) => h == '-' ? '' : unhex(h);
     try {
-      return VaultItem(unhex(p[1]), p[0], detail: un(p[2]), folder: p.length == 4 ? un(p[3]) : '');
+      return VaultItem(unhex(p[1]), p[0], detail: un(p[2]), folder: p.length >= 4 ? un(p[3]) : '', apps: p.length == 5 ? un(p[4]) : '');
     } on FormatException {
       return null;
     }
@@ -173,3 +177,11 @@ String unhex(String h) {
   }
   return utf8.decode(b, allowMalformed: true);
 }
+
+/// A login's "apps" field: one "PACKAGE CERT-SHA256" per line.
+List<(String, String)> appLinksOf(String apps) => [
+      for (final l in apps.split('\n'))
+        if (l.trim().split(' ').length == 2) (l.trim().split(' ')[0], l.trim().split(' ')[1].toLowerCase()),
+    ];
+
+String appLinksText(List<(String, String)> links) => [for (final (p, c) in links) '$p $c'].join('\n');

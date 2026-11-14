@@ -151,46 +151,97 @@ Option(List(Secret(UInt(8)))) open_w(List(Secret(UInt(8))) out, SecKey x) {
 // Talking to the key
 // ============================================================================
 
-pub type Touch = { Bool ok; Str why; List(Int) cred_id; List(Secret(UInt(8))) out; };
+// A touch's assertion: the client data hash it signed (random, or a fill's
+// request, SPEC 22.7), the authenticator data and the signature.
+pub type Touch = { Bool ok; Str why; List(Int) cred_id; List(Secret(UInt(8))) out; List(Int) cdh; List(Int) auth_data; List(Int) sig; };
 
-Touch no_touch(Str why) { return Touch {.ok = false, .why = why, .cred_id = [], .out = []}; }
+Touch no_touch(Str why) { return Touch {.ok = false, .why = why, .cred_id = [], .out = [], .cdh = [], .auth_data = [], .sig = []}; }
 
 // The key's hmac-secret output for `salt` with one of `creds` (whichever
 // the present key holds), after its assertion checks out.
 @requires(network, environment, declassify, device)
-pub Touch touch_key(List(SecKey) creds, List(Int) salt) {
+pub Touch touch_key(List(SecKey) creds, List(Int) salt, List(Int) cdh) {
     Resp ka = resp_of(fido_exchange(req_key_agreement()));
     if (ka.status != 0) { return no_touch(if (ka.status == -1) { "no security key answers" } else { ctap_status_text(ka.status) }); }
     Pp2 k = pp2_shared(random_bytes(32), key_agreement_of(ka.body));
     if (k.aes_key.len() == 0) { return no_touch("the key's answer is malformed"); }
-    return touch_each(creds, 0, salt, k);
+    return touch_each(creds, 0, salt, k, cdh);
 }
 
 // A non-resident credential is only known to the key that made it: ask for
 // each until one answers (a key that does not hold it says so at once).
 @requires(network, environment, declassify, device)
-Touch touch_each(List(SecKey) creds, Int i, List(Int) salt, Pp2 k) {
+Touch touch_each(List(SecKey) creds, Int i, List(Int) salt, Pp2 k, List(Int) cdh) {
     if (i >= creds.len()) { return no_touch("none of the enrolled security keys is present"); }
     SecKey c = creds[i];
-    List(Int) cdh = random_bytes(32);
     Resp r = resp_of(fido_exchange(req_hmac_assertion(cdh, rp_id(), c.cred_id, k, salt, random_bytes(16))));
-    if (r.status == 46) { return touch_each(creds, i + 1, salt, k); }
+    if (r.status == 46) { return touch_each(creds, i + 1, salt, k, cdh); }
     Got g = hmac_output_of(r, rp_id(), c.cred_id, c.cred_point, cdh, k);
     if (!g.ok) { return no_touch(g.why); }
-    return Touch {.ok = true, .why = "", .cred_id = c.cred_id, .out = secret_bytes(g.output)};
+    // hmac_output_of has checked the signature over the authenticator data
+    // and cdh; both are kept for the fill record.
+    return Touch {.ok = true, .why = "", .cred_id = c.cred_id, .out = secret_bytes(g.output), .cdh = cdh,
+                  .auth_data = cv_bytes(cv_get(r.body, 2)), .sig = cv_bytes(cv_get(r.body, 3))};
 }
 
 // W from the present key, or [] with the reason printed.
-@requires(filesystem, network, environment, declassify, device)
+// W from the present key, or [] with the reason printed. Opening for a fill
+// (SYMBOLON_FILL names the request, SPEC 22.7 item 4), the key signs over
+// the request instead of a random challenge, and the assertion is kept in
+// the fill record, so each touch can be traced to the fill it approved.
+@requires(filesystem, network, environment, declassify, device, clock)
 pub List(Secret(UInt(8))) unwrap_key(Str dir) {
     SecKeys ks = read_keys(dir);
     if (ks.keys.len() == 0) { return []; }
+    Str fill = environment.get("SYMBOLON_FILL");
     eprintln("device: touch your security key");
-    Touch t = touch_key(ks.keys, ks.salt);
+    Touch t = touch_key(ks.keys, ks.salt, if (str_len(fill) > 0) { fill_hash(fill) } else { random_bytes(32) });
     if (!t.ok) { eprintln("device: " + t.why); return []; }
     SecKey x = key_with(ks.keys, t.cred_id, 0) else { SecKey {.name = "", .cred_id = [], .cred_point = [], .sealed = []} };
     Option(List(Secret(UInt(8)))) w = open_w(t.out, x);
+    if (str_len(fill) > 0 && match w { None => false, Some(_) => true }) {
+        if (!record_fill(dir, fill, t)) { eprintln("device: cannot write the fill record"); return []; }
+    }
     return w else { [] };
+}
+
+// ============================================================================
+// Fills (SPEC 22.7)
+// ============================================================================
+
+// What a fill's touch signs: SHA-256 over "symbolon v1 fill" and the
+// request (the requester and the field kinds, as the fill window gives it).
+pub List(Int) fill_hash(Str request) { return sha256_bytes(utf8("symbolon v1 fill").concat(utf8(request))); }
+
+pub Str fill_record_file(Str dir) { return dir + "/fill-record"; }
+
+// One line per approved touch: "fill TIME CRED-ID CDH AUTH-DATA SIG
+// REQUEST-HEX". Anyone holding the credential's public key (in
+// security-keys) can check a line: the signature is over AUTH-DATA || CDH,
+// and CDH is fill_hash of the request.
+@requires(filesystem, clock)
+pub Bool record_fill(Str dir, Str request, Touch t) {
+    Str f = fill_record_file(dir);
+    Str old = if (filesystem.exists(f)) { filesystem.read_all(f) } else { "" };
+    return filesystem.write_all(f, old + "fill " + f"{clock_now_seconds()}" + " " + hex_encode(t.cred_id) + " " + hex_encode(t.cdh) + " "
+                                + hex_encode(t.auth_data) + " " + hex_encode(t.sig) + " " + hex_encode(utf8(request)) + "\n");
+}
+
+pub Str fill_policy_file(Str dir) { return dir + "/fill-policy"; }
+
+// SPEC 22.7 item 2: "keys" means this device fills only with a security key.
+@requires(filesystem)
+pub Bool fills_need_key(Str dir) {
+    Str f = fill_policy_file(dir);
+    return filesystem.exists(f) && str_starts_with(filesystem.read_all(f), "keys");
+}
+
+// Why an opening for a fill is refused before the PIN is even asked, or "".
+@requires(filesystem, environment)
+pub Str fill_refusal(Str dir) {
+    if (str_len(environment.get("SYMBOLON_FILL")) == 0) { return ""; }
+    if (fills_need_key(dir) && !keys_enrolled(dir)) { return "this device fills only with a security key: enrol one under Security keys"; }
+    return "";
 }
 
 Option(SecKey) key_with(List(SecKey) ks, List(Int) id, Int i) {

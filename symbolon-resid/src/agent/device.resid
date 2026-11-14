@@ -92,7 +92,7 @@ List(UInt(8)) u8s_at(List(Int) b, Int i, ListBuf(UInt(8)) acc) {
     return u8s_at(b, i + 1, acc.push((UInt(8))(b[i] & 255)));
 }
 
-@requires(filesystem, device, declassify, provision, network, environment)
+@requires(filesystem, device, declassify, provision, network, environment, clock)
 pub Unlocked unlock_dir(Str dir, DeviceConfig c, Str pin) {
     List(Secret(UInt(8))) st = stretch(c, pin_bytes(pin));
     Bool a_first = (random_bytes(1)[0] & 1) == 0;
@@ -658,7 +658,7 @@ Int print_head(VerifiedHead vh) {
 // the old ones evicted; the unlock key's output does not depend on its
 // authValue, so the profile stays as it is. An organization's
 // min_pin_len (SPEC 29.5, from dir/org.policy) holds.
-@requires(filesystem, device, declassify, provision, network, environment)
+@requires(filesystem, device, declassify, provision, network, environment, clock)
 pub Int device_pin(Str dir) {
     Option(DeviceConfig) oc = load_config(dir);
     if (match oc { None => true, Some(_) => false }) { return dfail("not set up (device new)"); }

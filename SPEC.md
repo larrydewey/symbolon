@@ -1681,8 +1681,8 @@ Its parts:
    them. Nothing is filled on page load or on a click inside the page.
 2. **Scan.** The extension injects its field finder into every frame of
    the tab. Each frame reports the autocomplete kinds of its visible
-   fields (`username`, `email`, `current-password`, the card kinds of
-   22.2.1). Fields without an autocomplete token are classified by name,
+   fields (`username`, `email`, `current-password`, `new-password`,
+   `one-time-code`, the card kinds of 22.2.1). Fields without an autocomplete token are classified by name,
    label and position. Each frame is labelled with the origin the browser
    reports for it (`webNavigation`). A frame whose own report disagrees
    is dropped.
@@ -1716,11 +1716,19 @@ Its parts:
    executable), so a caller cannot choose what is shown, and it warns
    when the program is not a browser. It takes the PIN and offers only
    the matching items: logins whose stored site covers the page (step 6),
-   or cards. The principal chooses one. The window opens the item
-   with the agent and sends its fields on the same connection. It sends
-   only the fields its type fills: for a login the origin, username and
-   password; for a card the holder, number, expiry and code. It never
-   sends a card PIN, notes, custom fields or a TOTP seed. The agent waits
+   or cards; the only match is chosen, and Enter fills it. The principal
+   chooses one. The window opens the item with the agent (for a fill the
+   agent gives only what a fill uses, and a login's current one-time code
+   instead of its TOTP key) and sends its fields on the same connection.
+   It sends only the fields its type fills: for a login the origin,
+   username and password, and the current code when the page has a code
+   field; for a card the holder, number, expiry and code. It never sends a
+   card PIN, notes, custom fields or a TOTP seed. Where the page has a
+   `new-password` field, the window also offers to create a login for the
+   page's origin: a generated password, saved in the vault first and
+   filled only once saved, so a password is never set at a site without
+   being kept. Only such a just-created password goes into `new-password`
+   fields; a stored one never does. The agent waits
    up to 5 minutes, then closes the connection. The window then marks the
    request expired and sends nothing, so nothing goes to a port the agent
    no longer holds.
@@ -1749,11 +1757,146 @@ Its parts:
    events). Selects for month and year are matched by value or text.
    Values are not kept after the call.
 
-Where the browser is not involved (Android apps, the system's autofill),
-the platform paths of 22.1 apply instead. The extension is for desktop
-browsers. A page can still read values once they are in its fields: the
+Where the browser is not involved (Android apps, and browsers on
+Android), Android autofill (22.6) and the passkey provider (22.1) apply
+instead. The extension is for desktop browsers. Every fill also follows
+22.7. A page can still read values once they are in its fields: the
 guarantees above are about which page gets them and whether the
 principal approved it, not about what the page then does.
+
+### 22.6 Android autofill
+
+On Android 8 and later the app is also an autofill service
+(`AutofillService`): logins, cards and one-time codes for apps and for
+browsers that hand autofill to a third-party service. It follows 22.2:
+nothing leaves the agent without the principal's gesture in agent-owned
+interface that shows, as the platform reports it, where it goes.
+
+1. **Locked offer.** A fill request is answered without opening the
+   device and without vault data: one entry, "Fill with Symbolon", which
+   the system presents (a dropdown, or an inline suggestion the keyboard
+   shows). It names no item, account or site, so neither the requesting
+   app nor the keyboard learns what the vault holds. Choosing it opens the
+   fill screen (item 4) through the response's authentication intent; a
+   tap on the system's entry cannot be made by the requesting app. The
+   service answers only for fields it classifies as login, card or
+   one-time-code fields (autofill hints, input type, then id and hint
+   text), and never for a view the request reports as not visible.
+2. **The requester.** It is the package of the activity holding the
+   focused field, with its signing certificates as the package manager
+   reports them. Its identity is `android:apk-key-hash:` and the base64url
+   SHA-256 of the signing certificate, with the package name.
+   - A browser on the privileged-browser list (22.1), matched by package
+     and certificate, also reports a page: the origin is the web domain
+     the request gives for the focused field, `https` unless it is
+     `localhost` or `127.0.0.1`, as in 22.5 step 4. The platform's
+     compatibility mode is used only for browsers on that list.
+   - For any other app, every web domain in the request is ignored. An
+     app's WebView shows whatever page the app chooses, and the app can
+     read what is filled into it (the AutoSpill attacks, Black Hat Europe
+     2023), so a page inside an app is never treated as that page's site.
+3. **What may fill where.** A login is offered
+   - in a privileged browser, when its stored origin covers the page's
+     origin (22.5 step 6);
+   - in any other app, only when the login was saved for that app (its
+     package and `android:apk-key-hash`, item 6), when the principal linked
+     it to that app in Symbolon (item 8), or when its stored site names
+     that app in Digital Asset Links: the site's
+     `https://HOST/.well-known/assetlinks.json`, fetched by Symbolon
+     directly from that host over TLS, without redirects and at most
+     128 KiB, lists `delegate_permission/common.get_login_creds` for an
+     `android_app` target with that package and certificate fingerprint.
+     Only the sites the app itself claims (its manifest's
+     `asset_statements`) are looked up, never every site in the vault,
+     which would tell the network what the vault holds. The file is
+     untrusted input; a fetch that fails or does not list the app means
+     no link. A result is cached for at most 24 hours. No third-party
+     lookup service is asked. The app, not the agent, does this: it is the
+     app that learns the requester's package and certificate from the
+     platform, so the agent could only repeat the app's word.
+
+   No other login is offered: there is no search and no manual choice of
+   an item for an app or page that matches none, since that choice is how
+   a lookalike app obtains a password. The fill screen says that nothing
+   is saved for this app or site, and offers only to save a new login
+   there, or to link one later from the item in Symbolon (item 8). A card is offered in any app or privileged browser, for card
+   fields, once the principal has seen the requester on the fill screen;
+   its PIN never fills.
+4. **The fill screen** is an activity of the app, outside the requesting
+   app's process. It shows the requester (item 2) first, opens the device
+   as 22.7 requires, then lists the items item 3 allows, the only match
+   preselected. The answer is a dataset with the chosen item's values for
+   the request's classified, visible fields only: a login's username and
+   password, a card's kinds of 22.2.1, and for a one-time-code field the
+   current code (22.7 item 5). The screen is `FLAG_SECURE`, hides other
+   apps' overlay windows (Android 12 and later), and ignores touches while
+   anything covers it; before Android 12, a touch made while it is
+   obscured is refused.
+5. **Duress.** Under the duress PIN, only the duress subset (14.2) is
+   offered and saved to, with the same screens and timing.
+6. **Saving.** After an app commits a form with a password, the system
+   may ask the principal to save it, in the system's own prompt. Saving
+   opens the fill screen with the requester (item 2) and writes only once
+   the principal confirms and the device opens: a new login, or, when
+   the principal chooses one, a new version of a matching login with its
+   previous password kept as a hidden field (22.3, Coexist). No login is
+   chosen for update by default, so another account's password is never
+   replaced without a tap. A login saved in a privileged browser records the page's
+   origin. One saved in any other app records the app's package and
+   `android:apk-key-hash`, and fills only in that app. A save releases
+   nothing, so it needs no match; an unconfirmed save is dropped.
+7. **Security keys.** The app relays CTAP 2 between the agent's
+   `SYMBOLON_FIDO_SOCKET` (9.4) and a security key over NFC or USB. The
+   relay only passes messages: the agent checks every assertion as 9.4
+   requires, so a relay that alters one opens nothing.
+8. **Linking a login to an app.** Many apps are not named in their
+   site's Digital Asset Links. The principal may link a login to an app
+   from the login's page in Symbolon ("Use in an app"), never from a fill:
+   the in-the-moment choice a requesting app prompts is what item 3
+   forbids, while a link is made deliberately, away from the app.
+   - The principal chooses an installed app from the list the package
+     manager gives. The link screen shows the app's name and icon, its
+     package, the SHA-256 fingerprint of its signing certificate, and
+     where it was installed from, as the package manager reports the
+     installer. It warns, before the principal confirms, when the app was
+     not installed by an app store, and says that an app asking to be
+     linked is a reason to stop: no genuine app needs that.
+   - Confirming opens the device (22.7 item 1) and records the package and
+     `android:apk-key-hash` on the login, as a vault change (18.4); a
+     login may be linked to several apps. The link covers that signing
+     certificate only: an update signed by another key no longer matches,
+     and is linked again only the same way.
+   - The login's page lists its links, each with its app's name and
+     fingerprint, and removes one with a tap. Under the duress PIN no link
+     is made or removed (14.3).
+
+### 22.7 Every fill
+
+These hold for the extension (22.5) and Android autofill (22.6).
+
+1. **Opened for each fill.** A fill opens the device afresh (9.1): the PIN,
+   or the platform biometric that releases it, and with a security key
+   enrolled, that key's touch (9.4). No unlocked session is used for a
+   fill: not the app's "stay unlocked", and not an earlier fill's.
+2. **Keys for fills.** A principal MAY set a device to refuse every fill
+   while no security key is enrolled, rather than fill on the PIN alone.
+3. **One at a time.** The agent holds at most one pending fill per device.
+   A request that arrives while one is pending is refused, not queued, so
+   one gesture cannot approve two requests, the principal's and another
+   raised beside it.
+4. **The gesture names the request.** The requester (the page's origin and
+   its frames' origins, or the app's identity) is shown before the PIN is
+   asked and before the key is touched. The opening assertion's client
+   data hash is SHA-256 over `"symbolon v1 fill"` and the request (the
+   requester and the field kinds), and the device keeps the assertion with
+   the request in its fill record, so each touch can be traced to the fill
+   it approved.
+5. **One-time codes.** A login's TOTP code is computed in the core (18.7)
+   and released like a field, as the `one-time-code` kind, only where the
+   login itself may fill. The seed is never released.
+6. **Passkeys first.** A filled password stays a replayable secret. Where
+   the relying party accepts passkeys, the fill screen offers to register
+   a Threshold passkey and retire the password (26.6).
 
 ---
 
@@ -1833,7 +1976,7 @@ quotes, the attestation verifier, provenance records, and the `display`,
 | G11 | Duress profile and containment | 14 |
 | G12 | Cosigner receives only `m` and epoch | 12.2 |
 | G13 | DBSC, DPoP | 16 |
-| G14 | Consent outside the DOM | 22.2, 22.5 |
+| G14 | Consent outside the DOM | 22.2, 22.5-22.7 |
 | G15 | Secret types, ct gate, secret mode, mlock | 23.3 |
 | G16 | Selective disclosure; verifier-constrained release | 17 |
 | G17 | Head exchange; witnesses | 20 |
@@ -1870,6 +2013,13 @@ it are verified; this table is not a claim of security.
 - A stolen kit filed while the principal has no device left to veto, and
   no guardians, succeeds after the delay: that is what a recovery factor
   is. The kit passphrase is the defense.
+- A principal talked into linking a login to a lookalike app (22.6 item
+  8) gives that app the login. The link screen's publisher, installer and
+  warning make this harder; they cannot make it impossible.
+- A filled password is a replayable secret. The page or app that receives
+  it can keep it, and malware with accessibility access can read filled
+  fields. 22.5 to 22.7 decide who receives a value and whether the
+  principal approved; passkeys (26.6) remove the secret.
 
 ---
 

@@ -304,7 +304,11 @@ Int print_entry(List(FieldPlain) fs, Bool has_secret, Int form) {
     if (form == 1) { println(t + " " + name); return 0; }
     Str d = if (t == "login") { field_text(fs, "origin") } else { if (t == "card") { last4(field_text(fs, "number")) } else { "" } };
     Str f = field_text(fs, "folder");
-    println(t + " " + hex_encode(utf8(name)) + " " + (if (str_len(d) == 0) { "-" } else { hex_encode(utf8(d)) }) + " " + (if (str_len(f) == 0) { "-" } else { hex_encode(utf8(f)) }));
+    // A login's linked apps (SPEC 22.6 item 8), "PACKAGE CERT-SHA256" lines,
+    // as a fifth column when there are any: public, like the site.
+    Str a = if (t == "login") { field_text(fs, "apps") } else { "" };
+    println(t + " " + hex_encode(utf8(name)) + " " + (if (str_len(d) == 0) { "-" } else { hex_encode(utf8(d)) }) + " " + (if (str_len(f) == 0) { "-" } else { hex_encode(utf8(f)) })
+            + (if (str_len(a) == 0) { "" } else { " " + hex_encode(utf8(a)) }));
     return 0;
 }
 

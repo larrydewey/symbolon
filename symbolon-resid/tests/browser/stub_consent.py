@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 # A stand-in for the app's consent window (--fill-consent REQUEST) in
 # tests/browser_e2e.sh: it reads the request, records it, and answers with
-# the item named by STUB_ANSWER (card, login, other-login, cancel, wrong-token,
-# silent) over the host's loopback connection.
+# the item named by STUB_ANSWER (card, login, other-login, otp, create,
+# cancel, wrong-token, silent, slow: a login after STUB_DELAY seconds) over
+# the host's loopback connection.
 import json, os, socket, sys, time
 
 assert sys.argv[1] == "--fill-consent"
@@ -10,6 +11,9 @@ req = json.load(open(sys.argv[2]))
 with open(os.environ["STUB_LOG"], "a") as f:
     f.write(json.dumps(req) + "\n")
 mode = os.environ.get("STUB_ANSWER", "card")
+if mode == "slow":
+    time.sleep(float(os.environ.get("STUB_DELAY", "4")))
+    mode = "login"
 if mode == "silent":
     sys.exit(0)
 
@@ -19,6 +23,10 @@ items = {
     "card": ("card", {"cardholder": "Ada Lovelace", "number": "4111111111111111", "expiry": "08/29", "cvv": "123", "pin": "9999"}),
     "login": ("login", {"origin": req["top"], "username": "ada@example.com", "current": "pa\"ss\\w0rd é"}),
     "other-login": ("login", {"origin": "https://elsewhere.example", "username": "ada", "current": "x"}),
+    # The current code (the agent gives it for a fill, never the key).
+    "otp": ("login", {"origin": req["top"], "username": "ada@example.com", "current": "pw", "otp": "287082"}),
+    # A login just created here: its new password for the new-password fields.
+    "create": ("login", {"origin": req["top"], "username": "ada@shop.example", "current": "Gen-3rat3d_pw!", "new": "Gen-3rat3d_pw!"}),
 }
 token = "00" * 32 if mode == "wrong-token" else req["token"]
 if mode == "squat":

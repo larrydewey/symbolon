@@ -73,7 +73,7 @@ get() { printf '2468\n' | run 300 "$BIN" device vault get "$W/dev" "$1" 2> "$W/g
 
 put before secret-0 || fail "vault put before any key: $(cat "$W/put.log")"
 printf '2468\n' | run 300 "$BIN" device key add "$W/dev" main > "$W/add.log" 2>&1 || fail "key add: $(cat "$W/add.log") $(tail -3 "$W/fido/log")"
-[ "$(run 30 "$BIN" device key list "$W/dev")" = "$(printf main | xxd -p)" ] || fail "key list"
+[ "$(run 30 "$BIN" device key list "$W/dev")" = "$(printf main | od -v -An -tx1 | tr -d ' \n')" ] || fail "key list"
 [ -s "$W/dev/blob_a.k" ] && [ -s "$W/dev/blob_b.k" ] && [ ! -s "$W/dev/blob_a" ] && [ ! -s "$W/dev/blob_b" ] || fail "the profiles were not sealed under W"
 [ "$(get before)" = secret-0 ] || fail "vault get with the key: $(cat "$W/get.err")"
 put after secret-1 || fail "vault put with the key: $(cat "$W/put.log")"
@@ -96,6 +96,29 @@ echo ok > "$W/fido/mode"
 printf '1111\n' | run 300 "$BIN" device vault get "$W/dev" before > /dev/null 2>&1 && fail "opened with a wrong PIN and the key"
 echo "refused: another key, no key, no touch, a wrong signature, a wrong PIN"
 
+# Fills (SPEC 22.7): opening for a fill, the key signs over the request
+# (SYMBOLON_FILL) instead of a random challenge, and the fill record keeps
+# the assertion, which checks out against the key's public key.
+REQ='fill login https://mail.example https://mail.example current-password,username'
+printf '2468\n' | SYMBOLON_FILL="$REQ" run 300 "$BIN" device vault list "$W/dev" > "$W/fill.log" 2>&1 || fail "a fill's vault list: $(cat "$W/fill.log")"
+[ "$(grep -c '^fill ' "$W/dev/fill-record")" = 1 ] || fail "no fill record: $(cat "$W/dev/fill-record" 2>&1)"
+python3 -I - "$W/dev/fill-record" "$W/dev/security-keys" "$REQ" <<'PY' || fail "the fill record does not check out"
+import sys, hashlib
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives import hashes
+_, t, cred, cdh, ad, sig, req = open(sys.argv[1]).read().split("\n")[0].split(" ")
+assert bytes.fromhex(req).decode() == sys.argv[3], "the request is not the one asked"
+assert bytes.fromhex(cdh) == hashlib.sha256(b"symbolon v1 fill" + sys.argv[3].encode()).digest(), "the key did not sign over the request"
+keys = {l.split(" ")[1]: l.split(" ")[2] for l in open(sys.argv[2]).read().split("\n")[1:] if l.count(" ") == 3}
+pub = ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256R1(), bytes.fromhex(keys[cred]))
+pub.verify(bytes.fromhex(sig), bytes.fromhex(ad) + bytes.fromhex(cdh), ec.ECDSA(hashes.SHA256()))
+assert bytes.fromhex(ad)[32] & 1, "no user presence in the record"
+PY
+# A plain opening is no fill: nothing is recorded.
+get before > /dev/null || fail "plain get: $(cat "$W/get.err")"
+[ "$(grep -c '^fill ' "$W/dev/fill-record")" = 1 ] || fail "a plain opening was recorded as a fill"
+echo "a fill: the key signed over the request, and the record checks out against the key"
+
 present main backup; echo backup > "$W/fido/target"
 printf '2468\n' | run 300 "$BIN" device key add "$W/dev" backup > "$W/add2.log" 2>&1 || fail "add backup: $(cat "$W/add2.log")"
 printf '2468\n' | run 300 "$BIN" device key remove "$W/dev" main > "$W/rm.log" 2>&1 || fail "remove main: $(cat "$W/rm.log")"
@@ -111,4 +134,15 @@ printf '2468\n' | run 300 "$BIN" device key remove "$W/dev" backup > "$W/rm2.log
 present
 [ "$(get after)" = secret-1 ] || fail "PIN alone after removing every key: $(cat "$W/get.err")"
 echo "the last key removed: the PIN alone opens the device again"
+# "keys" (SPEC 22.7 item 2): with no key enrolled, a fill is refused before
+# the PIN is asked; a plain opening still works; "any" lets fills through.
+printf '2468\n' | run 300 "$BIN" device key fills "$W/dev" keys > "$W/pol.log" 2>&1 || fail "key fills keys: $(cat "$W/pol.log")"
+grep -q "fills nothing until one is" "$W/pol.log" || fail "policy message: $(cat "$W/pol.log")"
+printf '2468\n' | SYMBOLON_FILL="$REQ" run 300 "$BIN" device vault list "$W/dev" > "$W/pfill.log" 2>&1 && fail "a fill without a key went through under keys"
+grep -q "fills only with a security key" "$W/pfill.log" || fail "policy refusal: $(cat "$W/pfill.log")"
+[ "$(get after)" = secret-1 ] || fail "a plain opening under keys: $(cat "$W/get.err")"
+printf '1111\n' | run 300 "$BIN" device key fills "$W/dev" any > /dev/null 2>&1 && fail "the policy changed with a wrong PIN"
+printf '2468\n' | run 300 "$BIN" device key fills "$W/dev" any > /dev/null 2>&1 || fail "key fills any"
+printf '2468\n' | SYMBOLON_FILL="$REQ" run 300 "$BIN" device vault list "$W/dev" > /dev/null 2>&1 || fail "a fill under any"
+echo "fills need a key when set so (refused with none enrolled); a wrong PIN changes nothing"
 echo "PASS fido_e2e"

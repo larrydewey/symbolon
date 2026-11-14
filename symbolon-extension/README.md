@@ -6,7 +6,13 @@ Ctrl+Shift+L, it finds the login and card fields in each frame of the page
 and asks the agent for values. The agent opens the Symbolon window, outside
 the page, which shows the site, takes your PIN and lets you choose the item.
 The agent then checks the item against the page and sends back only the
-fields each frame may receive. See SPEC sections 22.2 and 22.5.
+fields each frame may receive. See SPEC sections 22.2, 22.5 and 22.7.
+
+On a sign-up page (a new-password field), the window also offers to create
+a login: it generates a strong password, saves it in your vault, and only
+then fills it into the new and confirm fields. On a second-step page, the
+current one-time code fills the code field; the code's key never leaves
+the agent.
 
 Card fields may also go into a payment processor's frame (Stripe,
 Braintree, Adyen, Square) on another site's checkout. Login fields go only

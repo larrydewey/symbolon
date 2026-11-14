@@ -1,6 +1,7 @@
 import 'dart:io';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:symbolon_ui/fill_consent.dart';
 import 'package:symbolon_ui/settings.dart';
@@ -78,6 +79,14 @@ void main() {
     await t.pump();
     await settle(t);
     expect(w.link.sent, ['ok card\nnumber ${hexOf('4111111111111111')}\ncvv ${hexOf('123')}\nend\n']);
+    // Each agent run was a fill, bound to the request: the requester and the
+    // kinds, sorted, without the token (SPEC 22.7 item 4).
+    final runs = (await t.runAsync(() => File('${agent.dir.path}/fill.log').readAsLines()))!;
+    expect(runs, isNotEmpty);
+    for (final r in runs) {
+      expect(r, endsWith('fill card https://shop.example https://js.stripe.com,https://shop.example cc-csc,cc-name,cc-number'));
+      expect(r, isNot(contains('abc')));
+    }
     expect(w.closed, [true]);
     final args = (await t.runAsync(() => agent.argsLog.readAsString()))!;
     expect(args, contains('device vault show ${agent.dir.path}/dev visa'));
@@ -92,6 +101,57 @@ void main() {
     await t.pump();
     await settle(t);
     expect(w.link.sent, ['ok login\norigin ${hexOf('https://mail.example.com')}\nusername ${hexOf('alice')}\ncurrent ${hexOf('hunter2')}\nend\n']);
+  });
+
+  testWidgets('Enter unlocks, then fills the only match; a code field gets the current code, never its key', (t) async {
+    final w = await open(t, login.replaceAll('"current-password"]', '"current-password","one-time-code"]'));
+    await t.enterText(find.byKey(const Key('fc-pin')), '2468');
+    await t.testTextInput.receiveAction(TextInputAction.done);
+    await t.pump();
+    await settle(t);
+    expect(find.byKey(const Key('fc-item-mail')), findsOneWidget);   // unlocked by Enter, the match chosen
+    await t.sendKeyEvent(LogicalKeyboardKey.enter);
+    await t.pump();
+    await settle(t);
+    expect(w.link.sent, ['ok login\norigin ${hexOf('https://mail.example.com')}\nusername ${hexOf('alice')}\ncurrent ${hexOf('hunter2')}\notp ${hexOf('287082')}\nend\n']);
+    expect(w.link.sent.single, isNot(contains('totp')));
+  });
+
+  testWidgets('a sign-up page: a strong password is saved first, then filled into the new-password fields', (t) async {
+    final w = await open(t, login.replaceAll('mail.example.com', 'new.example').replaceAll('"current-password"]', '"new-password"]'));
+    await unlock(t);
+    expect(find.byKey(const Key('fc-none')), findsOneWidget);
+    expect(find.byKey(const Key('fc-create')), findsOneWidget);
+    final first = (t.widget(find.byKey(const Key('fc-generated'))) as SelectableText).data!;
+    await t.tap(find.byKey(const Key('fc-regenerate')));
+    await t.pump();
+    final pw = (t.widget(find.byKey(const Key('fc-generated'))) as SelectableText).data!;
+    expect(pw, hasLength(20));
+    expect(pw, isNot(first));
+    await t.enterText(find.byKey(const Key('fc-new-user')), 'ada@new.example');
+    await t.ensureVisible(find.byKey(const Key('fc-create-fill')));
+    await t.tap(find.byKey(const Key('fc-create-fill')));
+    await t.pump();
+    await settle(t);
+    final args = (await t.runAsync(() => agent.argsLog.readAsString()))!;
+    expect(args, contains('device vault set ${agent.dir.path}/dev new.example login'));
+    final input = (await t.runAsync(() => File('${agent.dir.path}/stdin.log').readAsString()))!;
+    expect(input, contains('origin ${hexOf('https://new.example')}'));
+    expect(input, contains('username ${hexOf('ada@new.example')}'));
+    expect(input, contains('current ${hexOf(pw)}'));
+    expect(w.link.sent, ['ok login\norigin ${hexOf('https://new.example')}\nusername ${hexOf('ada@new.example')}\ncurrent ${hexOf(pw)}\nnew ${hexOf(pw)}\nend\n']);
+  });
+
+  testWidgets('a sign-up page whose save fails fills nothing', (t) async {
+    final w = await open(t, login.replaceAll('mail.example.com', 'new.example').replaceAll('"current-password"]', '"new-password"]'));
+    await unlock(t);
+    await t.runAsync(() => File('${agent.dir.path}/offline').writeAsString(''));
+    await t.ensureVisible(find.byKey(const Key('fc-create-fill')));
+    await t.tap(find.byKey(const Key('fc-create-fill')));
+    await t.pump();
+    await settle(t);
+    expect(w.link.sent, isEmpty);
+    expect(find.byKey(const Key('fc-create')), findsOneWidget);   // still offered, with the reason shown
   });
 
   testWidgets('a site with no saved login: nothing to choose, and cancel answers cancel', (t) async {

@@ -6,6 +6,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import 'app.dart';
+import 'autofill_main.dart';
 import 'brand.dart';
 import 'fill_consent.dart';
 import 'ssh_consent.dart';
@@ -29,6 +30,10 @@ Future<void> main(List<String> args) async {
 /// The passkey screen Android opens for a site or an app (PasskeyActivity).
 @pragma('vm:entry-point')
 Future<void> passkeyMain() => runPasskeyScreen();
+
+/// The autofill fill and save screen Android opens (AutofillActivity, SPEC 22.6).
+@pragma('vm:entry-point')
+Future<void> autofillMain() => runAutofillScreen();
 
 /// On Android the agent is the app's own `lib/<abi>/libsymbolon.so` and
 /// everything lives in the app's files directory; elsewhere, the XDG paths.

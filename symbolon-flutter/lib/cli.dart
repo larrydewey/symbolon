@@ -177,6 +177,11 @@ class SymbolonCli {
   Future<CliResult> vaultShow(String dir, String name, String pin, {String share = ''}) =>
       run(['device', 'vault', 'show', dir, name, ..._in(share)], input: [pin], timeout: const Duration(minutes: 5));
 
+  /// The item's current one-time code: "code CODE PERIOD LEFT". The key
+  /// stays in the agent (SPEC 18.7).
+  Future<CliResult> vaultCode(String dir, String name, String pin, {String share = ''}) =>
+      run(['device', 'vault', 'code', dir, name, ..._in(share)], input: [pin], timeout: const Duration(minutes: 5));
+
   /// Stores an item of [type] with [fields] (field name to text); replaces
   /// one of the same name.
   Future<CliResult> vaultSet(String dir, String name, String type, Map<String, String> fields, String pin, {String share = ''}) => run(['device', 'vault', 'set', dir, name, type, ..._in(share)],
@@ -315,6 +320,11 @@ class SymbolonCli {
   Future<CliResult> keyAdd(String dir, String name, String pin) => run(['device', 'key', 'add', dir, name], input: [pin], timeout: const Duration(minutes: 3));
 
   Future<CliResult> keyRemove(String dir, String name, String pin) => run(['device', 'key', 'remove', dir, name], input: [pin], timeout: const Duration(minutes: 3));
+
+  /// Whether this device fills only with a security key ("keys") or not
+  /// ("any"), SPEC 22.7 item 2. The PIN, and a touch if a key is enrolled.
+  Future<CliResult> keyFills(String dir, bool needKey, String pin) =>
+      run(['device', 'key', 'fills', dir, needKey ? 'keys' : 'any'], input: [pin], timeout: const Duration(minutes: 3));
 
   // ─── Devices and recovery ───────────────────────────────────────────
 

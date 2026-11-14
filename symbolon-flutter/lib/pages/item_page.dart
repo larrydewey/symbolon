@@ -1,3 +1,6 @@
+import 'dart:async';
+import 'dart:io';
+
 import 'package:flutter/material.dart';
 
 import '../app.dart';
@@ -6,6 +9,7 @@ import '../favicons.dart';
 import '../validate.dart' show cardBrand;
 import '../vault_types.dart';
 import '../widgets.dart';
+import 'app_link.dart';
 import 'item_editor.dart';
 import 'sharing_page.dart' show SharedFolder;
 import 'vault_page.dart' show TypeAvatar;
@@ -27,7 +31,9 @@ class ItemPage extends StatefulWidget {
   final Set<String> names;
   final Set<String> folders;
   final String share;                  // the shared folder it is in, "" for the own vault
-  const ItemPage({super.key, required this.app, required this.item, required this.offline, required this.names, this.folders = const {}, this.share = ''});
+  /// The installed apps a login may be linked to (Android); given in tests.
+  final Future<List<InstalledApp>> Function()? apps;
+  const ItemPage({super.key, required this.app, required this.item, required this.offline, required this.names, this.folders = const {}, this.share = '', this.apps});
 
   @override
   State<ItemPage> createState() => _ItemPageState();
@@ -204,6 +210,7 @@ class _ItemPageState extends State<ItemPage> {
               const SizedBox(height: 16),
               Card(
                 child: Column(children: [
+                  if ((fs['totp'] ?? '').isNotEmpty) OneTimeCode(app: app, item: it.name, share: widget.share),
                   for (final f in known) _row(f.name, f.name == 'number' ? '${f.label}${_brand(fs[f.name]!)}' : f.label, fs[f.name]!, f.hidden, multiline: f.input == Input.multiline),
                   for (final c in custom) _row(c.key, c.value.label, c.value.value, c.value.hidden, multiline: !c.value.hidden && c.value.value.contains('\n')),
                   if (known.isEmpty && custom.isEmpty) const ListTile(title: Text('No fields')),
@@ -212,9 +219,62 @@ class _ItemPageState extends State<ItemPage> {
               if (t.id == 'login') ...[
                 const SizedBox(height: 8),
                 WideButton('Change password at the site…', icon: Icons.autorenew, tonal: true, onPressed: rotate),
+                if (Platform.isAndroid || widget.apps != null) _appsCard(appLinksOf(fs['apps'] ?? '')),
               ],
             ]),
     );
+  }
+
+  // The apps this login fills in (SPEC 22.6 item 8), each removable, and
+  // "Use in an app" to link one: chosen here, never from an app's request.
+  Widget _appsCard(List<(String, String)> links) {
+    final t = Theme.of(context).textTheme;
+    return Card(
+      key: const Key('item-apps'),
+      margin: const EdgeInsets.only(top: 16),
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+          Text('Apps', style: t.titleMedium),
+          const SizedBox(height: 4),
+          Text(links.isEmpty ? 'This login fills in apps only when its site says they may, or once you link an app here.'
+              : 'This login also fills in these apps, after you unlock.', style: t.bodySmall),
+          for (final (pkg, cert) in links)
+            ListTile(
+              key: Key('item-app-$pkg'),
+              contentPadding: EdgeInsets.zero,
+              leading: const Icon(Icons.apps),
+              title: Text(pkg),
+              subtitle: Text('Publisher key ${spacedCert(cert.length > 16 ? cert.substring(0, 16) : cert)}…'),
+              trailing: IconButton(key: Key('item-app-remove-$pkg'), tooltip: 'Stop filling in this app', icon: const Icon(Icons.link_off),
+                  onPressed: () => _setApps([for (final l in links) if (l.$1 != pkg || l.$2 != cert) l], 'No longer fills in $pkg')),
+            ),
+          const SizedBox(height: 8),
+          WideButton('Use in an app…', key: const Key('item-app-add'), icon: Icons.add_link, tonal: true, onPressed: () async {
+            if (widget.offline) return toast(context, 'Changes need a connection to your relay.');
+            final a = await Navigator.of(context).push<InstalledApp>(MaterialPageRoute(builder: (_) => AppPickerPage(login: widget.item.name, apps: widget.apps ?? installedApps)));
+            if (a == null || a.certs.isEmpty || !mounted) return;
+            await _setApps([...links.where((l) => l.$1 != a.package), (a.package, a.certs.first)], '${widget.item.name} now fills in ${a.label}');
+          }),
+        ]),
+      ),
+    );
+  }
+
+  // The login again, with its apps changed and every other field as it was.
+  Future<void> _setApps(List<(String, String)> links, String done) async {
+    if (widget.offline) return toast(context, 'Changes need a connection to your relay.');
+    final f = {...?fields}..remove('type')..remove('name');
+    if (links.isEmpty) {
+      f.remove('apps');
+    } else {
+      f['apps'] = appLinksText(links);
+    }
+    final r = await app.withPin(context, (p) => runTask(context, 'Saving ${widget.item.name}', () => app.cli.vaultSet(app.dir, widget.item.name, 'login', f, p, share: widget.share), usually: 'a few seconds'));
+    if (r != null && r.ok && mounted) {
+      setState(() => fields = {...?fields, 'apps': appLinksText(links)});
+      toast(context, done);
+    }
   }
 
   static String _brand(String n) {
@@ -240,6 +300,105 @@ class _ItemPageState extends State<ItemPage> {
           ),
         IconButton(tooltip: 'Copy', icon: const Icon(Icons.copy, size: 20), onPressed: () => copy(label, value, secret: hidden || key == 'number')),
       ]),
+    );
+  }
+}
+
+
+/// An item's current one-time code, from the agent (its key never comes
+/// here), with the seconds it has left. While it is on screen, the next
+/// code is fetched when this one runs out.
+class OneTimeCode extends StatefulWidget {
+  final App app;
+  final String item;
+  final String share;
+  const OneTimeCode({super.key, required this.app, required this.item, this.share = ''});
+
+  @override
+  State<OneTimeCode> createState() => _OneTimeCodeState();
+}
+
+class _OneTimeCodeState extends State<OneTimeCode> {
+  String? code;
+  String? problem;
+  int period = 30, left = 0;
+  bool fetching = false;
+  Timer? tick;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) => fetch());
+  }
+
+  @override
+  void dispose() {
+    tick?.cancel();
+    super.dispose();
+  }
+
+  Future<void> fetch() async {
+    if (fetching || !mounted) return;
+    setState(() => fetching = true);
+    final a = widget.app;
+    final r = await a.withPin(context, (p) => a.cli.vaultCode(a.dir, widget.item, p, share: widget.share));
+    if (!mounted) return;
+    final f = r == null || !r.ok ? null : r.lines.where((l) => l.startsWith('code ')).map((l) => l.split(' ')).where((p) => p.length == 4).firstOrNull;
+    setState(() {
+      fetching = false;
+      if (f == null) {
+        code = null;
+        problem = r == null ? 'Unlock to see the code.' : (r.ok ? 'No code.' : friendlyError(r));
+        return;
+      }
+      code = f[1];
+      period = int.tryParse(f[2]) ?? 30;
+      left = int.tryParse(f[3]) ?? 0;
+      problem = null;
+    });
+    tick?.cancel();
+    if (code != null) {
+      tick = Timer.periodic(const Duration(seconds: 1), (_) {
+        if (!mounted) return;
+        if (left <= 1) {
+          tick?.cancel();
+          fetch();
+        } else {
+          setState(() => left--);
+        }
+      });
+    }
+  }
+
+  /// "287082" as "287 082", easier to read off and type.
+  static String spaced(String c) => c.length < 6 ? c : '${c.substring(0, c.length ~/ 2)} ${c.substring(c.length ~/ 2)}';
+
+  @override
+  Widget build(BuildContext context) {
+    final t = Theme.of(context).textTheme;
+    final c = code;
+    return ListTile(
+      key: const Key('field-code'),
+      title: Text('One-time code', style: t.labelMedium),
+      subtitle: c == null
+          ? Text(problem ?? 'Getting the code…')
+          : Text(spaced(c), key: const Key('code-value'), style: t.headlineSmall?.copyWith(fontFamily: 'monospace', letterSpacing: 2)),
+      trailing: c == null
+          ? (fetching ? const SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2)) : IconButton(tooltip: 'Try again', icon: const Icon(Icons.refresh), onPressed: fetch))
+          : Row(mainAxisSize: MainAxisSize.min, children: [
+              Semantics(
+                label: '$left seconds left',
+                child: SizedBox(
+                  width: 28,
+                  height: 28,
+                  child: Stack(alignment: Alignment.center, children: [
+                    CircularProgressIndicator(value: left / period, strokeWidth: 3, color: left <= 5 ? Colors.orange : null),
+                    Text('$left', key: const Key('code-left'), style: t.labelSmall),
+                  ]),
+                ),
+              ),
+              IconButton(tooltip: 'Copy', icon: const Icon(Icons.copy, size: 20), onPressed: () => copyText(context, 'Code', c, secret: true)),
+            ]),
     );
   }
 }

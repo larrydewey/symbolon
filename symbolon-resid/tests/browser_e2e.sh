@@ -7,6 +7,8 @@
 #   card: the page's cc-name and the payment processor's frame are filled;
 #         the ad frame and every password field are not.
 #   login: filled on its own site.
+#   sign-up: a just-created login's password into the new and confirm
+#         fields, a saved one never; a code into the page's code field only.
 #   refused: cancel, a login for another site, a wrong token, no answer.
 # Needs chromium and Node's playwright (mise npm-playwright).
 set -uo pipefail
@@ -48,6 +50,18 @@ check "$(tail -1 "$W/consent.log")" "d['top'] == 'https://shop.example' and d['w
 
 R=$(fill login https://shop.example/login)
 check "$R" "d['frames']['shop.example'] == {'user': 'ada@example.com', 'pw': 'pa\"ss\\\\w0rd é'}" "login on its own site"
+
+R=$(fill create https://shop.example/signup)
+check "$R" "d['frames']['shop.example'] == {'mail': 'ada@shop.example', 'pw1': 'Gen-3rat3d_pw!', 'pw2': 'Gen-3rat3d_pw!'}" "a new login into the sign-up page's new and confirm fields"
+check "$R" "d['frames']['ads.example'] == {'num': '', 'pw': ''}" "nothing into the ad frame on sign-up"
+check "$(tail -1 "$W/consent.log")" "'new-password' in d['frames'][0]['fields']" "the window was told the page wants a new password"
+
+R=$(fill otp https://shop.example/verify)
+check "$R" "d['frames']['shop.example'] == {'code': '287082'}" "the current code into the page's code field"
+check "$R" "d['frames']['ads.example'] == {'code': ''}" "no code into another site's frame"
+
+R=$(fill login https://shop.example/signup)
+check "$R" "d['frames']['shop.example']['pw1'] == '' and d['frames']['shop.example']['pw2'] == ''" "a saved password never goes into new-password fields"
 
 R=$(fill cancel https://shop.example/login)
 check "$R" "d['frames']['shop.example'] == {'user': '', 'pw': ''}" "cancel fills nothing"

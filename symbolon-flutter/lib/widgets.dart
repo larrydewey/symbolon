@@ -169,8 +169,8 @@ class _ProgressState extends State<_Progress> {
 
 void toast(BuildContext context, String m) => ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(m)));
 
-/// How long a copied secret stays on the clipboard.
-const clipboardKeep = Duration(seconds: 60);
+/// How long a copied secret stays on the clipboard: SPEC 22.2 allows at most 30 s.
+const clipboardKeep = Duration(seconds: 30);
 Timer? _clearClipboard;
 
 /// Copies [value] and says so. A [secret] is marked sensitive (Android 13+
@@ -199,7 +199,7 @@ Future<void> copyText(BuildContext context, String label, String value, {bool se
       if (now?.text == value) await Clipboard.setData(const ClipboardData(text: ''));
     });
   }
-  toast(context, '$label copied. It is cleared from the clipboard in a minute.');
+  toast(context, '$label copied. It is cleared from the clipboard in 30 seconds.');
 }
 
 /// A long hex value, shortened to its ends, with a copy button; tap it to
@@ -286,8 +286,9 @@ class Field extends StatelessWidget {
   final Key? fieldKey;
   final TextInputAction action;
   final String? Function(String)? check;   // what is wrong with the text, checked as it is typed and by Form.validate
+  final ValueChanged<String>? onSubmitted; // Enter, or the keyboard's action key
   const Field(this.controller, this.label,
-      {super.key, this.hint, this.helper, this.obscure = false, this.numeric = false, this.url = false, this.fieldKey, this.action = TextInputAction.next, this.check});
+      {super.key, this.hint, this.helper, this.obscure = false, this.numeric = false, this.url = false, this.fieldKey, this.action = TextInputAction.next, this.check, this.onSubmitted});
 
   @override
   Widget build(BuildContext context) {
@@ -300,6 +301,7 @@ class Field extends StatelessWidget {
         textInputAction: action,
         autovalidateMode: AutovalidateMode.onUserInteraction,
         validator: check == null ? null : (v) => check!(v ?? ''),
+        onFieldSubmitted: onSubmitted,
         // Keyboards such as Gboard add spaces and capitals to ordinary text
         // even without suggestions; a URL or visible-password field gets none.
         keyboardType: numeric ? TextInputType.number : (url ? TextInputType.url : TextInputType.visiblePassword),

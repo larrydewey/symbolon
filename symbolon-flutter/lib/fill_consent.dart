@@ -13,8 +13,10 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import 'cli.dart';
+import 'pages/item_editor.dart' show strongPassword;
 import 'main.dart' show loadSettings;
 import 'settings.dart';
 import 'vault_types.dart';
@@ -22,7 +24,9 @@ import 'widgets.dart';
 
 /// The fields each type may send; the host filters again.
 const _sent = {
-  'login': ['origin', 'username', 'current'],
+  // "new" only for a login just created here; "otp" is the agent's current
+  // code, never the TOTP key (the agent does not give it for a fill).
+  'login': ['origin', 'username', 'current', 'new', 'otp'],
   'card': ['cardholder', 'number', 'expiry', 'cvv'],
 };
 
@@ -65,6 +69,17 @@ class FillRequest {
 
   /// Frames of another origin (a payment processor's card fields).
   List<String> get otherOrigins => {for (final f in frames) if (f.origin != top) f.origin}.toList();
+
+  /// Whether the page's own frames have a field of [kind].
+  bool asks(String kind) => frames.any((f) => f.origin == top && f.fields.contains(kind));
+
+  /// The request the agent's opening is bound to (SPEC 22.7 item 4): the
+  /// requester and the field kinds, sorted, never the token or the port.
+  String get fillText {
+    final origins = {for (final f in frames) f.origin}.toList()..sort();
+    final kinds = {for (final f in frames) ...f.fields}.toList()..sort();
+    return 'fill $want $top ${origins.join(',')} ${kinds.join(',')}';
+  }
 }
 
 /// What follows the token line (sent when the window opened): "cancel" or
@@ -201,6 +216,10 @@ class _FillConsentPageState extends State<FillConsentPage> {
   String? chosen;
   String? caller;               // the program that asked; null until connected
   bool expired = false;         // the host is gone: nothing may be sent
+  List<String> allNames = [];   // every item's name, so a new login gets a free one
+  final newUser = TextEditingController();
+  String generated = strongPassword();
+  final keys = FocusNode(debugLabel: 'fill-consent keys');
 
   @override
   void initState() {
@@ -217,13 +236,27 @@ class _FillConsentPageState extends State<FillConsentPage> {
   }
 
   FillRequest? get rq => widget.request;
-  SymbolonCli get cli => SymbolonCli(widget.settings.binary, env: widget.settings.agentEnv);
+  // Every agent run is for this fill: SYMBOLON_FILL makes the agent apply the
+  // device's fill policy and bind a security key's touch to the request.
+  SymbolonCli get cli => SymbolonCli(widget.settings.binary, env: {...widget.settings.agentEnv, if (widget.request != null) 'SYMBOLON_FILL': widget.request!.fillText});
   String get dir => widget.settings.deviceDir;
 
   @override
   void dispose() {
     pin.dispose();
+    newUser.dispose();
+    keys.dispose();
     super.dispose();
+  }
+
+  // Enter unlocks, then fills the chosen item (the only match is chosen).
+  void onEnter() {
+    if (busy || expired || rq == null) return;
+    if (items == null) {
+      unlock();
+    } else if (chosen != null) {
+      fill();
+    }
   }
 
   bool _fits(VaultItem it) {
@@ -248,14 +281,49 @@ class _FillConsentPageState extends State<FillConsentPage> {
       });
       return;
     }
-    final found = [for (final l in r.lines) VaultItem.parse(l)].whereType<VaultItem>().where(_fits).toList()..sort((a, b) => a.name.compareTo(b.name));
+    final all = [for (final l in r.lines) VaultItem.parse(l)].whereType<VaultItem>().toList();
+    final found = all.where(_fits).toList()..sort((a, b) => a.name.compareTo(b.name));
     pin.clear();
     setState(() {
       busy = false;
       unlocked = p;
       items = found;
+      allNames = [for (final i in all) i.name];
       chosen = found.length == 1 ? found.first.name : null;
     });
+    keys.requestFocus();
+  }
+
+  /// A free name for a new login at this site: its host, then "host (2)"...
+  String freeName(String host) {
+    var n = host;
+    for (var i = 2; allNames.contains(n); i++) {
+      n = '$host ($i)';
+    }
+    return n;
+  }
+
+  // A new login for this page: saved first, and filled only once saved, so a
+  // password is never set at a site without being in the vault.
+  Future<void> create() async {
+    final r = rq!, p = unlocked;
+    if (p == null || busy || expired) return;
+    setState(() {
+      busy = true;
+      error = null;
+    });
+    final pw = generated, user = newUser.text.trim();
+    final saved = await cli.vaultSet(dir, freeName(r.host), 'login', {'origin': r.top, if (user.isNotEmpty) 'username': user, 'current': pw}, p);
+    if (!mounted) return;
+    if (!saved.ok) {
+      setState(() {
+        busy = false;
+        error = friendlyError(saved);
+      });
+      return;
+    }
+    unlocked = null;
+    await _answer('login', {'origin': r.top, 'username': user, 'current': pw, 'new': pw});
   }
 
   Future<void> fill() async {
@@ -278,6 +346,8 @@ class _FillConsentPageState extends State<FillConsentPage> {
       for (final l in r.lines)
         if (l.contains(' ')) l.substring(0, l.indexOf(' ')): unhex(l.substring(l.indexOf(' ') + 1).trim()),
     };
+    // The code goes only to a page that asked for one.
+    if (!rq!.asks('one-time-code')) fields.remove('otp');
     unlocked = null;
     await _answer(rq!.want, fields);
   }
@@ -298,7 +368,10 @@ class _FillConsentPageState extends State<FillConsentPage> {
     final t = Theme.of(context).textTheme;
     final r = rq;
     final scheme = Theme.of(context).colorScheme;
-    return Scaffold(
+    // Enter: unlock, then fill (keys holds the focus once the PIN field goes).
+    return CallbackShortcuts(
+      bindings: {const SingleActivator(LogicalKeyboardKey.enter): onEnter, const SingleActivator(LogicalKeyboardKey.numpadEnter): onEnter},
+      child: Focus(focusNode: keys, autofocus: true, child: Scaffold(
       body: PageBody(children: [
         const SizedBox(height: 16),
         Icon(Icons.shield_outlined, size: 48, color: scheme.primary),
@@ -344,7 +417,7 @@ class _FillConsentPageState extends State<FillConsentPage> {
             const SizedBox(height: 16),
             WideButton('Close', onPressed: widget.done),
           ] else if (items == null) ...[
-            Field(pin, 'Your Symbolon PIN', obscure: true, numeric: true, fieldKey: const Key('fc-pin'), action: TextInputAction.done),
+            Field(pin, 'Your Symbolon PIN', obscure: true, numeric: true, fieldKey: const Key('fc-pin'), action: TextInputAction.done, onSubmitted: (_) => unlock()),
             WideButton('Unlock', key: const Key('fc-unlock'), icon: Icons.lock_open, onPressed: busy ? null : unlock),
           ] else if (items!.isEmpty) ...[
             Text(r.want == 'card' ? 'There is no card in your vault.' : 'There is no login for ${r.top} in your vault.', key: const Key('fc-none')),
@@ -353,12 +426,38 @@ class _FillConsentPageState extends State<FillConsentPage> {
             const SizedBox(height: 8),
             WideButton('Fill', key: const Key('fc-fill'), icon: Icons.check, onPressed: busy || chosen == null ? null : fill),
           ],
+          if (!expired && items != null && r.want == 'login' && r.asks('new-password')) _createCard(r),
           if (!expired) ...[
             const SizedBox(height: 8),
             TextButton(key: const Key('fc-cancel'), onPressed: busy ? null : cancel, child: const Text('Cancel')),
           ],
         ],
       ]),
+    )));
+  }
+
+  // Signing up or choosing a password: a strong one, saved, then filled.
+  Widget _createCard(FillRequest r) {
+    final t = Theme.of(context).textTheme;
+    return Card(
+      key: const Key('fc-create'),
+      margin: const EdgeInsets.only(top: 16),
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+          Text('Create a login for ${r.host}', style: t.titleMedium),
+          const SizedBox(height: 4),
+          Text('A strong password, saved in your vault before it is filled into this page.', style: t.bodySmall),
+          const SizedBox(height: 12),
+          Field(newUser, 'Username or email (optional)', fieldKey: const Key('fc-new-user'), action: TextInputAction.done),
+          Row(children: [
+            Expanded(child: SelectableText(generated, key: const Key('fc-generated'), style: const TextStyle(fontFamily: 'monospace', fontSize: 16))),
+            IconButton(key: const Key('fc-regenerate'), tooltip: 'Another password', icon: const Icon(Icons.refresh), onPressed: busy ? null : () => setState(() => generated = strongPassword())),
+          ]),
+          const SizedBox(height: 8),
+          WideButton('Create and fill', key: const Key('fc-create-fill'), icon: Icons.add, tonal: true, onPressed: busy ? null : create),
+        ]),
+      ),
     );
   }
 

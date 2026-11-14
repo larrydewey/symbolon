@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'package:flutter/material.dart';
 
 import '../app.dart';
@@ -16,6 +18,7 @@ class SecurityKeysPage extends StatefulWidget {
 
 class _SecurityKeysPageState extends State<SecurityKeysPage> {
   List<String>? names;
+  bool fillsNeedKey = false;   // the device's fill policy (SPEC 22.7 item 2), from its fill-policy file
   App get app => widget.app;
 
   @override
@@ -26,8 +29,22 @@ class _SecurityKeysPageState extends State<SecurityKeysPage> {
 
   Future<void> load() async {
     final r = await app.cli.keyList(app.dir);
+    final policy = File('${app.dir}/fill-policy');
+    final need = await policy.exists() && (await policy.readAsString()).startsWith('keys');
     if (!mounted) return;
-    setState(() => names = r.ok ? [for (final l in r.lines) unhex(l.trim())] : []);
+    setState(() {
+      names = r.ok ? [for (final l in r.lines) unhex(l.trim())] : [];
+      fillsNeedKey = need;
+    });
+  }
+
+  Future<void> setFills(bool needKey) async {
+    final r = await app.withPin(context, (p) => runTask(context, needKey ? 'Requiring a key for fills' : 'Allowing fills with the PIN', () => app.cli.keyFills(app.dir, needKey, p),
+        detail: (names ?? []).isEmpty ? null : 'Touch any enrolled key.', usually: 'a few seconds'));
+    if (r != null && r.ok && mounted) {
+      toast(context, r.lines.isEmpty ? 'Saved' : '${r.lines.last[0].toUpperCase()}${r.lines.last.substring(1)}.');
+      load();
+    }
   }
 
   Future<String?> askName() {
@@ -101,6 +118,19 @@ class _SecurityKeysPageState extends State<SecurityKeysPage> {
                 ),
               const SizedBox(height: 12),
               WideButton(ns.isEmpty ? 'Add a security key' : 'Add a backup key', key: const Key('key-add'), icon: Icons.add, onPressed: add),
+              const SizedBox(height: 16),
+              Card(
+                child: SwitchListTile(
+                  key: const Key('fills-need-key'),
+                  title: const Text('Fills need a security key'),
+                  subtitle: Text(fillsNeedKey && ns.isEmpty
+                      ? 'No key is enrolled, so this device fills nothing until one is.'
+                      : 'Filling a login or a card into a page or an app asks for a touch of your key every time, and this device '
+                          'refuses to fill on the PIN alone.'),
+                  value: fillsNeedKey,
+                  onChanged: setFills,
+                ),
+              ),
             ]),
     );
   }

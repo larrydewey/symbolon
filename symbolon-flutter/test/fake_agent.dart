@@ -17,6 +17,7 @@ class FakeAgent {
     await File(a.path).writeAsString(r'''#!/bin/bash
 D="$(dirname "$0")"
 echo "$*" >> "$D/args.log"
+[ -n "${SYMBOLON_FILL:-}" ] && echo "$3 $SYMBOLON_FILL" >> "$D/fill.log"
 IN=$(cat)
 printf '%s\n--\n' "$IN" >> "$D/stdin.log"
 PIN=$(printf '%s\n' "$IN" | head -1)
@@ -66,8 +67,9 @@ case "$1 $2" in
       list) [ -f "$D/keys" ] && cat "$D/keys" ;;
       *) [ "$PIN" = "2468" ] || { echo "device: wrong PIN" >&2; exit 1; }
          case "$3" in
-           add) printf '%s\n' "$(printf %s "$5" | od -An -tx1 | tr -d ' \n')" >> "$D/keys"; echo "security key $5 added" ;;
-           remove) grep -v "^$(printf %s "$5" | od -An -tx1 | tr -d ' \n')\$" "$D/keys" > "$D/keys.n"; mv "$D/keys.n" "$D/keys"; echo "removed" ;;
+           add) printf '%s\n' "$(printf %s "$5" | od -v -An -tx1 | tr -d ' \n')" >> "$D/keys"; echo "security key $5 added" ;;
+           fills) mkdir -p "$4"; [ "$5" = keys ] && echo keys > "$4/fill-policy" || echo any > "$4/fill-policy"; echo "fills need a security key; none is enrolled, so this device fills nothing until one is" ;;
+           remove) grep -v "^$(printf %s "$5" | od -v -An -tx1 | tr -d ' \n')\$" "$D/keys" > "$D/keys.n"; mv "$D/keys.n" "$D/keys"; echo "removed" ;;
          esac ;;
     esac ;;
   "device ssh")
@@ -85,14 +87,20 @@ case "$1 $2" in
     [ -f "$D/offline" ] && case "$3" in list|show|get) echo "device: local copy: no log at the relay; showing vault version 2 as this device last verified it" >&2 ;; *) echo "device: no log at the relay" >&2; exit 1 ;; esac
     case "$3" in
       list) case "$5" in
-        --long) printf 'login 6d61696c 68747470733a2f2f6d61696c2e6578616d706c652e636f6d 576f726b2f456d61696c\nsecret 62616e6b -\ncard 76697361 31313131 46696e616e6365\n' ;;
+        --long) printf 'login 6d61696c 68747470733a2f2f6d61696c2e6578616d706c652e636f6d 576f726b2f456d61696c %s\nsecret 62616e6b -\ncard 76697361 31313131 46696e616e6365\n' "$(printf 'com.example.mail %s' "$(printf 'ab%.0s' $(seq 32))" | od -v -An -tx1 | tr -d ' \n')" ;;
         --kinds) printf 'login mail\nsecret bank\n' ;;
         *) printf 'mail\nbank\n' ;; esac ;;
-      show) case "$5" in
-        mail) printf 'type 6c6f67696e\nname 6d61696c\norigin 68747470733a2f2f6d61696c2e6578616d706c652e636f6d\nusername 616c696365\ncurrent 68756e74657232\n' ;;
+      show) [ -n "${SYMBOLON_FILL:-}" ] && [ "$5" = mail ] && {
+          # As the agent does for a fill: what a fill uses, the code not its key.
+          printf 'type 6c6f67696e\nname 6d61696c\norigin 68747470733a2f2f6d61696c2e6578616d706c652e636f6d\nusername 616c696365\ncurrent 68756e74657232\notp 323837303832\n'; exit 0; }
+        case "$5" in
+        mail) printf 'type 6c6f67696e\nname 6d61696c\norigin 68747470733a2f2f6d61696c2e6578616d706c652e636f6d\nusername 616c696365\ncurrent 68756e74657232\ntotp %s\n' "$(printf %s GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ | od -v -An -tx1 | tr -d ' \n')" ;;
         visa) printf 'type 63617264\nname 76697361\nnumber 34313131313131313131313131313131\ncvv 313233\ncustom_1 526577617264731f301f522d3432\n' ;;
         *) printf 'type 736563726574\nname 62616e6b\nsecret 733363726574\n' ;; esac ;;
       get) echo "hunter2" ;;
+      code) case "$5" in
+        mail) echo "code 287082 30 12" ;;
+        *) echo "device: this item has no one-time code key" >&2; exit 1 ;; esac ;;
       *) echo "vault version 2, 2 items" ;;
     esac ;;
   "device share")
