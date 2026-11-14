@@ -31,7 +31,10 @@ class JoinPage extends StatefulWidget {
   final App app;
   /// Finds this device's addresses; replaced in tests.
   final Future<List<String>> Function() addresses;
-  const JoinPage({super.key, required this.app, this.addresses = localAddresses});
+  /// Finds the key store protecting this device (which sets the shortest
+  /// PIN); replaced in tests, which must not depend on the machine's TPM.
+  final Future<HardwareState> Function({bool keystore}) hardware;
+  const JoinPage({super.key, required this.app, this.addresses = localAddresses, this.hardware = detectHardware});
 
   @override
   State<JoinPage> createState() => _JoinPageState();
@@ -56,7 +59,7 @@ class _JoinPageState extends State<JoinPage> {
   @override
   void initState() {
     super.initState();
-    detectHardware(keystore: app.settings.keystoreAvailable).then((h) {
+    widget.hardware(keystore: app.settings.keystoreAvailable).then((h) {
       if (mounted) setState(() => hardware = h);
     });
   }

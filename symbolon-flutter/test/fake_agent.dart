@@ -60,8 +60,8 @@ case "$1 $2" in
       list) [ -f "$D/keys" ] && cat "$D/keys" ;;
       *) [ "$PIN" = "2468" ] || { echo "device: wrong PIN" >&2; exit 1; }
          case "$3" in
-           add) printf '%s\n' "$(printf %s "$5" | xxd -p)" >> "$D/keys"; echo "security key $5 added" ;;
-           remove) grep -v "^$(printf %s "$5" | xxd -p)\$" "$D/keys" > "$D/keys.n"; mv "$D/keys.n" "$D/keys"; echo "removed" ;;
+           add) printf '%s\n' "$(printf %s "$5" | od -An -tx1 | tr -d ' \n')" >> "$D/keys"; echo "security key $5 added" ;;
+           remove) grep -v "^$(printf %s "$5" | od -An -tx1 | tr -d ' \n')\$" "$D/keys" > "$D/keys.n"; mv "$D/keys.n" "$D/keys"; echo "removed" ;;
          esac ;;
     esac ;;
   "device ssh")

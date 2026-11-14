@@ -3,6 +3,7 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:symbolon_ui/app.dart';
+import 'package:symbolon_ui/hardware.dart';
 import 'package:symbolon_ui/pages/devices_page.dart';
 import 'package:symbolon_ui/pages/join_page.dart';
 import 'package:symbolon_ui/qr_view.dart';
@@ -27,6 +28,9 @@ void main() {
     }
   }
 
+  // As on a machine with a TPM, whatever this one has: a 4-digit PIN is enough.
+  Future<HardwareState> tpm({bool keystore = false}) async => HardwareState.ready;
+
   void sized(WidgetTester t) {
     t.view.devicePixelRatio = 2;
     t.view.physicalSize = const Size(460, 1100) * 2;
@@ -35,7 +39,7 @@ void main() {
 
   testWidgets('joining: choose a PIN, the code appears with this device\'s addresses, then the device joins', (t) async {
     sized(t);
-    await t.pumpWidget(MaterialApp(home: JoinPage(app: App(settings), addresses: () async => ['192.168.1.20', '10.0.0.5'])));
+    await t.pumpWidget(MaterialApp(home: JoinPage(app: App(settings), hardware: tpm, addresses: () async => ['192.168.1.20', '10.0.0.5'])));
     await settle(t, 4);
     await t.enterText(find.byKey(const Key('join-pin')), '2468');
     await t.enterText(find.byKey(const Key('join-pin2')), '2468');
@@ -53,7 +57,7 @@ void main() {
 
   testWidgets('joining: mismatched PINs are refused before anything runs; a failure offers a retry', (t) async {
     sized(t);
-    await t.pumpWidget(MaterialApp(home: JoinPage(app: App(settings), addresses: () async => ['192.168.1.20'])));
+    await t.pumpWidget(MaterialApp(home: JoinPage(app: App(settings), hardware: tpm, addresses: () async => ['192.168.1.20'])));
     await settle(t, 4);
     await t.enterText(find.byKey(const Key('join-pin')), '2468');
     await t.enterText(find.byKey(const Key('join-pin2')), '2469');
