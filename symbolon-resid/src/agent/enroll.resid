@@ -109,6 +109,25 @@ Int propose(Str dir, DeviceConfig c, Unlocked u, CgConfig x, VerifiedHead vh, Pa
     Party np = Party {.id = nk.party, .kind = party_kind_device(), .auth_key = nk.auth_key, .hpke_key = nk.hpke_key,
                       .label = f"device {count_devices(q.parties, 0, 0) + 1}", .attestation = NoAttestation};
     List(SignedEvent) es = fetch_log(relay_ep(c), c.log_id, 0, []);
+    // An earlier try that was cut short after its propose-party: the log
+    // refuses a second one ("party already known"). If the verified log
+    // still holds that proposal (not vetoed, not re-shared in, not cleared
+    // by a recovery) with the same keys, re-share with it. The events must
+    // end at the head verified above, and a delayed proposal counts once its
+    // delay has run by the witnesses' time now.
+    Bool at_head = es.len() > 0 && (Int)vh.head.sequence == es.len() - 1 && bytes_eq(sha256_bytes(es[es.len() - 1].encoded), vh.head.digest);
+    Int t_last = if (at_head) { last_time(es, policy_of_e0(es)) } else { 0 };
+    Int t_wit = if (at_head) { witness_now(vh.head.policy.witnesses, relay_ep(c).ca, random_bytes(32)) } else { 0 };
+    List(Party) proposed = if (at_head) { il_proposed(c.log_id, es, if (t_wit > t_last) { t_wit } else { t_last }, lambda(e) { false }) } else { [] };
+    Int at = pos1(proposed, nk.party, 0);
+    if (at != 0) {
+        Party ep = proposed[at - 1];
+        if (!bytes_eq(ep.auth_key, nk.auth_key) || !bytes_eq(ep.hpke_key, nk.hpke_key)) {
+            return dfail("that device was proposed earlier with other keys");
+        }
+        println("device: the new device was proposed by an earlier try; re-sharing");
+        return reshare_in(dir, c, u, x, vh, q.parties.concat([np]), pin, primes_file);
+    }
     EventPayload p = next_event(vh, ProposePartyBody(np, sha256_bytes(cbor_of_keys(nk))), field6_in_force(es, vh.pending, es.len() - 1));
     List(Int) enc = payload_cbor(p) else { [] };
     Result(List(Int), Str) s = dk_sign(c, u.real, u.st, enc);

@@ -257,3 +257,36 @@ test "one co-signature out of three witnesses is not a majority" {
         .payload = ev.payload, .encoded = ev.encoded, .sigs = ev.sigs, .cosigs = [ev.cosigs[0]] };
     expect(ok(il_verify(l, [e0([2, 3]), one], 2000, lambda(x) { false }))).toBeFalse();
 }
+
+// il_proposed: what a retried link-add re-shares with (agent/enroll.resid).
+Str party_ids_str(List(Party) ps, Int i, Str acc) {
+    if (i >= ps.len()) { return acc; }
+    return party_ids_str(ps, i + 1, acc + hex_encode(ps[i].id) + ";");
+}
+
+test "a proposal with two signatures is proposed at once" {
+    List(Int) l = log_id();
+    SignedEvent ev = next(1, 1, enc(0), ProposePartyBody(test_device(4), id32(44)), [2, 3], 2000);
+    expect(party_ids_str(il_proposed(l, [e0([2, 3]), ev], 2000, lambda(x) { false }), 0, "")).toEqual(hex_encode(id32(4)) + ";");
+}
+
+test "a delayed proposal is not proposed until its delay has run" {
+    List(Int) l = log_id();
+    SignedEvent ev = next(1, 1, enc(0), ProposePartyBody(test_device(4), id32(44)), [2], 2000);
+    expect(party_ids_str(il_proposed(l, [e0([2, 3]), ev], 2000 + 86399, lambda(x) { false }), 0, "")).toEqual("");
+    expect(party_ids_str(il_proposed(l, [e0([2, 3]), ev], 2000 + 86400, lambda(x) { false }), 0, "")).toEqual(hex_encode(id32(4)) + ";");
+}
+
+test "a vetoed proposal is not proposed" {
+    List(Int) l = log_id();
+    SignedEvent ev = next(1, 1, enc(0), ProposePartyBody(test_device(4), id32(44)), [2], 2000);
+    SignedEvent veto = next(2, 2, enc(1), VetoBody(1), [3], 3000);
+    expect(party_ids_str(il_proposed(l, [e0([2, 3]), ev, veto], 2000 + 90000, lambda(x) { false }), 0, "")).toEqual("");
+}
+
+test "a log that does not verify proposes nothing" {
+    SignedEvent ev = next(1, 1, enc(0), ProposePartyBody(test_device(4), id32(44)), [2, 3], 2000);
+    expect(party_ids_str(il_proposed(id32(1), [e0([2, 3]), ev], 2000, lambda(x) { false }), 0, "")).toEqual("");
+    // Negative control: the same events under the right log id do.
+    expect(party_ids_str(il_proposed(log_id(), [e0([2, 3]), ev], 2000, lambda(x) { false }), 0, "")).toEqual(hex_encode(id32(4)) + ";");
+}

@@ -606,6 +606,22 @@ pub Result(VerifiedHead, SymbolonError) il_verify(List(Int) l, List(SignedEvent)
         .pending = pending_seqs(fin.pending, 0, ListBuf()) });
 }
 
+// The parties proposed and not yet re-shared in, as il_verify's state holds
+// them at `now`: vetoed proposals and those cleared by a re-share or a
+// settled recovery are gone, and pending ones are not yet there. [] when the
+// log does not verify.
+pub List(Party) il_proposed(List(Int) l, List(SignedEvent) events, Int now, Bool closure(EventPayload) approvals_ok) {
+    if (events.len() < 1) { return []; }
+    Result(LogState, SymbolonError) s0 = start(events[0], l);
+    return match s0 {
+        Err(_) => [],
+        Ok(a) => match run(a, events, l, approvals_ok, 1) {
+            Err(_) => [],
+            Ok(s1) => if (now < s1.last_time) { [] } else { settle(s1, now).proposed }
+        }
+    };
+}
+
 List(UInt(64)) pending_seqs(List(Pending) ps, Int i, ListBuf(UInt(64)) acc) {
     if (i >= ps.len()) { return acc.finish(); }
     return pending_seqs(ps, i + 1, acc.push(ps[i].seq));
