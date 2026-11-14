@@ -160,9 +160,48 @@ pub Int vault_show(Str dir, Str name, Str share) {
         Err(m) => dfail(m),
         Ok(v) => match item_by_id(v.st.items, item_id_of(v.vk, name), 0) {
             None => dfail("no such item"),
-            Some(it) => show_item(v, it)
+            Some(it) => if (str_len(environment.get("SYMBOLON_FILL")) > 0) { show_fill_item(v, it, clock_now_seconds()) } else { show_item(v, it) }
         }
     };
+}
+
+// For a fill (SYMBOLON_FILL), only what a fill can use leaves (SPEC 22.5
+// item 5, 22.7 item 5): a login's site, username and password, a card's
+// holder, number, expiry and code, and a login's current one-time code as
+// "otp"; never the TOTP key, notes, a card's PIN or custom fields.
+pub List(Str) fill_fields() { return ["name", "origin", "username", "current", "cardholder", "number", "expiry", "cvv"]; }
+
+@requires(declassify)
+Int show_fill_item(View v, Item it, Int now) {
+    Result(List(FieldPlain), SymbolonError) r = item_open(v.vk, v.vid, it);
+    return match r {
+        Err(e) => dfail(err_text(e)),
+        Ok(fs) => show_fill_fields(fs, type_of(fs, it.fields.contains("secret")), now)
+    };
+}
+
+@requires(declassify)
+Int show_fill_fields(List(FieldPlain) fs, Str t, Int now) {
+    println("type " + hex_encode(utf8(t)));
+    _ = print_fill_fields(fs, 0);
+    List(Secret(UInt(8))) k = field_secret(fs, "totp", 0);
+    if (t == "login" && k.len() > 0) {
+        Result(TotpSpec, Str) sp = totp_spec(k);
+        _ = match sp { Err(_) => 0, Ok(x) => print_otp(totp_code(x.seed, now, x.step, x.digits, x.sha1), x.digits) };
+    }
+    return 0;
+}
+
+@requires(declassify)
+Int print_fill_fields(List(FieldPlain) fs, Int i) {
+    if (i >= fs.len()) { return 0; }
+    if (fill_fields().contains(fs[i].name)) { println(fs[i].name + " " + hex_encode(reveal(fs[i].value))); }
+    return print_fill_fields(fs, i + 1);
+}
+
+Int print_otp(Int code, Int digits) {
+    println("otp " + hex_encode(utf8(zero_pad(f"{code}", digits))));
+    return 0;
 }
 
 @requires(declassify)

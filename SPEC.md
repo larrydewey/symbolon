@@ -1681,8 +1681,8 @@ Its parts:
    them. Nothing is filled on page load or on a click inside the page.
 2. **Scan.** The extension injects its field finder into every frame of
    the tab. Each frame reports the autocomplete kinds of its visible
-   fields (`username`, `email`, `current-password`, the card kinds of
-   22.2.1). Fields without an autocomplete token are classified by name,
+   fields (`username`, `email`, `current-password`, `new-password`,
+   `one-time-code`, the card kinds of 22.2.1). Fields without an autocomplete token are classified by name,
    label and position. Each frame is labelled with the origin the browser
    reports for it (`webNavigation`). A frame whose own report disagrees
    is dropped.
@@ -1716,11 +1716,19 @@ Its parts:
    executable), so a caller cannot choose what is shown, and it warns
    when the program is not a browser. It takes the PIN and offers only
    the matching items: logins whose stored site covers the page (step 6),
-   or cards. The principal chooses one. The window opens the item
-   with the agent and sends its fields on the same connection. It sends
-   only the fields its type fills: for a login the origin, username and
-   password; for a card the holder, number, expiry and code. It never
-   sends a card PIN, notes, custom fields or a TOTP seed. The agent waits
+   or cards; the only match is chosen, and Enter fills it. The principal
+   chooses one. The window opens the item with the agent (for a fill the
+   agent gives only what a fill uses, and a login's current one-time code
+   instead of its TOTP key) and sends its fields on the same connection.
+   It sends only the fields its type fills: for a login the origin,
+   username and password, and the current code when the page has a code
+   field; for a card the holder, number, expiry and code. It never sends a
+   card PIN, notes, custom fields or a TOTP seed. Where the page has a
+   `new-password` field, the window also offers to create a login for the
+   page's origin: a generated password, saved in the vault first and
+   filled only once saved, so a password is never set at a site without
+   being kept. Only such a just-created password goes into `new-password`
+   fields; a stored one never does. The agent waits
    up to 5 minutes, then closes the connection. The window then marks the
    request expired and sends nothing, so nothing goes to a port the agent
    no longer holds.

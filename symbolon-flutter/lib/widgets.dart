@@ -286,8 +286,9 @@ class Field extends StatelessWidget {
   final Key? fieldKey;
   final TextInputAction action;
   final String? Function(String)? check;   // what is wrong with the text, checked as it is typed and by Form.validate
+  final ValueChanged<String>? onSubmitted; // Enter, or the keyboard's action key
   const Field(this.controller, this.label,
-      {super.key, this.hint, this.helper, this.obscure = false, this.numeric = false, this.url = false, this.fieldKey, this.action = TextInputAction.next, this.check});
+      {super.key, this.hint, this.helper, this.obscure = false, this.numeric = false, this.url = false, this.fieldKey, this.action = TextInputAction.next, this.check, this.onSubmitted});
 
   @override
   Widget build(BuildContext context) {
@@ -300,6 +301,7 @@ class Field extends StatelessWidget {
         textInputAction: action,
         autovalidateMode: AutovalidateMode.onUserInteraction,
         validator: check == null ? null : (v) => check!(v ?? ''),
+        onFieldSubmitted: onSubmitted,
         // Keyboards such as Gboard add spaces and capitals to ordinary text
         // even without suggestions; a URL or visible-password field gets none.
         keyboardType: numeric ? TextInputType.number : (url ? TextInputType.url : TextInputType.visiblePassword),

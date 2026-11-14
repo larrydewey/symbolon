@@ -5,13 +5,13 @@
 // written into the fields.
 //
 // The kinds are the HTML autocomplete tokens the agent knows (SPEC 22.5):
-// username, email, current-password, cc-name, cc-number, cc-exp,
-// cc-exp-month, cc-exp-year, cc-csc.
+// username, email, current-password, new-password, one-time-code, cc-name,
+// cc-number, cc-exp, cc-exp-month, cc-exp-year, cc-csc.
 
 (() => {
   if (globalThis.__symbolon) return;
 
-  const KINDS = new Set(['username', 'email', 'current-password', 'cc-name', 'cc-number', 'cc-exp', 'cc-exp-month', 'cc-exp-year', 'cc-csc']);
+  const KINDS = new Set(['username', 'email', 'current-password', 'new-password', 'one-time-code', 'cc-name', 'cc-number', 'cc-exp', 'cc-exp-month', 'cc-exp-year', 'cc-csc']);
 
   // Guesses from name, id, placeholder and label, for fields without an
   // autocomplete token. Card guesses first: "card number" is not a username.
@@ -22,7 +22,13 @@
     ['cc-exp-year', /exp\w*.?(year|yy)|cc.?year|card.?year/i],
     ['cc-exp', /expir|exp.?date|\bmm\s*\/\s*yy|valid.?thru/i],
     ['cc-name', /name.?on.?card|card.?holder|cc.?name|holder.?name/i],
+    // After the card guesses, so a card's security code stays a card's.
+    ['one-time-code', /\b(otp|totp|2fa|mfa)\b|one.?time.?(code|pass)|verification.?code|auth(entication|enticator)?.?code|two.?factor/i],
   ];
+
+  // A password field for choosing a password (sign-up, change, confirm),
+  // by name or label when the page gives no autocomplete token.
+  const NEW_PASSWORD = /new.?pass|confirm|repeat|retype|re.?enter|again|choose|create/i;
 
   function visible(el) {
     if (el.disabled || el.readOnly) return false;
@@ -54,16 +60,18 @@
   function scanFields() {
     const out = [];
     const els = [...document.querySelectorAll('input, select')].filter(visible);
-    const passwords = els.filter((e) => e.type === 'password' && !/new-password/.test(e.getAttribute('autocomplete') || ''));
+    const isNew = (e) => /new-password/.test(e.getAttribute('autocomplete') || '') || (!token(e) && NEW_PASSWORD.test(describe(e)));
+    const passwords = els.filter((e) => e.type === 'password' && !isNew(e));
     for (const el of els) {
       let kind = token(el);
-      if (!kind && el.type === 'password') kind = passwords[0] === el ? 'current-password' : '';
+      if (!kind && el.type === 'password') kind = isNew(el) ? 'new-password' : (passwords[0] === el ? 'current-password' : '');
       if (!kind) kind = guess(el);
-      if (!kind && el.tagName === 'INPUT' && (el.type === 'email' || el.type === 'text') && passwords.length) {
+      const firstPw = passwords[0] || els.find((e) => e.type === 'password');
+      if (!kind && el.tagName === 'INPUT' && (el.type === 'email' || el.type === 'text') && firstPw) {
         // The text field just before the first password field in the same form.
-        const form = passwords[0].form;
+        const form = firstPw.form;
         const before = els.filter((e) => e.tagName === 'INPUT' && (e.type === 'email' || e.type === 'text') && e.form === form &&
-          (e.compareDocumentPosition(passwords[0]) & Node.DOCUMENT_POSITION_FOLLOWING));
+          (e.compareDocumentPosition(firstPw) & Node.DOCUMENT_POSITION_FOLLOWING));
         if (before[before.length - 1] === el) kind = el.type === 'email' ? 'email' : 'username';
       }
       if (kind) out.push({ el, kind });

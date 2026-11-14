@@ -78,7 +78,9 @@ pub List(Str) processor_origins() {
             "https://web.squarecdn.com"];
 }
 
-pub List(Str) login_kinds() { return ["username", "email", "current-password"]; }
+// A one-time code and a new password go only where a login may: the page's
+// own frames, from a login that passes the site check (SPEC 22.7 item 5).
+pub List(Str) login_kinds() { return ["username", "email", "current-password", "new-password", "one-time-code"]; }
 pub List(Str) card_kinds() { return ["cc-name", "cc-number", "cc-exp", "cc-exp-month", "cc-exp-year", "cc-csc"]; }
 
 Bool has(List(Str) xs, Str x, Int i) {
@@ -184,6 +186,12 @@ pub List(Secret(UInt(8))) value_for(Chosen c, Str kind) {
     if (c.kind == "login") {
         if (kind == "username" || kind == "email") { return field_of(c.fields, "username", 0) else { none }; }
         if (kind == "current-password") { return field_of(c.fields, "current", 0) else { none }; }
+        // The window sends "new" only for a login it has just created (a
+        // generated password), and "otp", the agent's current code, never
+        // the TOTP key: a stored password never goes into a new-password
+        // field, and the key never leaves.
+        if (kind == "new-password") { return field_of(c.fields, "new", 0) else { none }; }
+        if (kind == "one-time-code") { return field_of(c.fields, "otp", 0) else { none }; }
         return none;
     }
     if (c.kind != "card") { return none; }

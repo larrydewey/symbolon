@@ -209,6 +209,13 @@ grep -q '^code [0-9]\{6\} 30 [0-9]*$' "$W/code.log" || fail "vault code output: 
 grep -qi "GEZDGNBV" "$W/code.log" && fail "vault code printed the key"
 printf '2468\n' | run 300 "$BIN" device vault code "$W/dev" "my visa" > "$W/nocode.log" 2>&1 && fail "a card gave a code"
 grep -q "no one-time code key" "$W/nocode.log" || fail "no key: $(cat "$W/nocode.log")"
+# For a fill, show gives only what a fill uses, the code instead of its key.
+printf '2468\n' | SYMBOLON_FILL='fill login https://ex.example https://ex.example current-password,one-time-code,username' \
+    run 300 "$BIN" device vault show "$W/dev" ex > "$W/fillshow.log" 2>&1 || fail "vault show for a fill: $(cat "$W/fillshow.log")"
+grep -q "^current $(hx pw-1)$" "$W/fillshow.log" && grep -q "^username $(hx alice)$" "$W/fillshow.log" || fail "fill show: $(cat "$W/fillshow.log")"
+grep -q '^otp \(3[0-9]\)\{6\}$' "$W/fillshow.log" || fail "fill show gave no code: $(cat "$W/fillshow.log")"
+grep -q '^totp ' "$W/fillshow.log" && fail "fill show gave the one-time code key"
+printf '2468\n' | run 300 "$BIN" device vault show "$W/dev" ex | grep -q '^totp ' || fail "plain show lost the key (the editor needs it)"
 printf '2468\n' | run 300 "$BIN" device vault delete "$W/dev" ex > "$W/otpdel.log" 2>&1 || fail "vault delete ex: $(cat "$W/otpdel.log")"
 echo "one-time code: $GOT, as computed apart; a card has none"
 printf '2468\nexpiry %s\n' "$(hx 12/30)" | run 300 "$BIN" device vault set "$W/dev" nonum card > "$W/bad1.log" 2>&1 && fail "a card without a number was stored"

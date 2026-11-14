@@ -14,6 +14,18 @@ PAGES = {
 <iframe id=ad src="https://ads.example/frame" width=400 height=200></iframe>""",
     ("shop.example", "/login"): """<!doctype html><title>login</title>
 <form><input id=user type=text name=login><input id=pw type=password name=pw><button>Sign in</button></form>""",
+    # A sign-up page with no autocomplete tokens: the new and the confirm
+    # field are found by name; the ad frame's password field gets nothing.
+    ("shop.example", "/signup"): """<!doctype html><title>signup</title>
+<form><input id=mail type=email name=email><input id=pw1 type=password name=new_password><input id=pw2 type=password name=confirm_password><button>Create account</button></form>
+<iframe id=ad src="https://ads.example/frame" width=400 height=200></iframe>""",
+    # A second step: a one-time code field found by its name; another site's
+    # frame with a code field gets nothing.
+    ("shop.example", "/verify"): """<!doctype html><title>verify</title>
+<form><input id=code name=otp inputmode=numeric><button>Verify</button></form>
+<iframe id=ad src="https://ads.example/otp" width=400 height=200></iframe>""",
+    ("ads.example", "/otp"): """<!doctype html><title>ad</title>
+<input id=code autocomplete=one-time-code>""",
     ("js.stripe.com", "/fields"): """<!doctype html><title>pay</title>
 <input id=num autocomplete=cc-number><input id=exp autocomplete=cc-exp placeholder="MM / YY"><input id=cvc autocomplete=cc-csc>
 <input id=pw type=password>""",

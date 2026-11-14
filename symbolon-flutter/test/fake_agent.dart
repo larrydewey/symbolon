@@ -90,7 +90,10 @@ case "$1 $2" in
         --long) printf 'login 6d61696c 68747470733a2f2f6d61696c2e6578616d706c652e636f6d 576f726b2f456d61696c\nsecret 62616e6b -\ncard 76697361 31313131 46696e616e6365\n' ;;
         --kinds) printf 'login mail\nsecret bank\n' ;;
         *) printf 'mail\nbank\n' ;; esac ;;
-      show) case "$5" in
+      show) [ -n "${SYMBOLON_FILL:-}" ] && [ "$5" = mail ] && {
+          # As the agent does for a fill: what a fill uses, the code not its key.
+          printf 'type 6c6f67696e\nname 6d61696c\norigin 68747470733a2f2f6d61696c2e6578616d706c652e636f6d\nusername 616c696365\ncurrent 68756e74657232\notp 323837303832\n'; exit 0; }
+        case "$5" in
         mail) printf 'type 6c6f67696e\nname 6d61696c\norigin 68747470733a2f2f6d61696c2e6578616d706c652e636f6d\nusername 616c696365\ncurrent 68756e74657232\ntotp %s\n' "$(printf %s GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ | od -v -An -tx1 | tr -d ' \n')" ;;
         visa) printf 'type 63617264\nname 76697361\nnumber 34313131313131313131313131313131\ncvv 313233\ncustom_1 526577617264731f301f522d3432\n' ;;
         *) printf 'type 736563726574\nname 62616e6b\nsecret 733363726574\n' ;; esac ;;
