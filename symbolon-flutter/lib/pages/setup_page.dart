@@ -9,6 +9,9 @@ import '../app.dart';
 import '../biometric.dart';
 import '../hardware.dart';
 import '../home_link.dart';
+import '../links.dart';
+import '../recovery_sheet.dart';
+import '../cli.dart';
 import '../validate.dart' as v;
 import '../widgets.dart';
 import 'hardware_page.dart';
@@ -56,8 +59,9 @@ class _SetupPageState extends State<SetupPage> {
   bool get unprotected => !hasHardware || !useTpm;
 
   // 3. The kit.
-  String? kit;
-  bool keptKit = false;
+  RecoverySheet? sheet;   // the kit, with the identity log it recovers
+  bool checking = false;  // the sheet hidden, two of its groups asked back
+  bool keptKit = false;   // checked: setup may close
 
   App get app => widget.app;
 
@@ -235,8 +239,12 @@ class _SetupPageState extends State<SetupPage> {
     pin.clear();
     pin2.clear();
     duressPin.clear();
+    // The identity log goes on the sheet with the kit: recovery needs both.
+    final log = DeviceStatus.parse(await app.cli.status(app.dir))?.log;
+    if (!mounted) return;
     setState(() {
-      kit = r.lines.where((l) => l.startsWith('RECOVERY KIT')).map((l) => l.split(': ').last).firstOrNull;
+      final kit = r.lines.where((l) => l.startsWith('RECOVERY KIT')).map((l) => l.split(': ').last.trim().toLowerCase()).firstOrNull;
+      sheet = kit == null ? null : RecoverySheet(log ?? '', kit);
       step = 2;
     });
   }
@@ -409,8 +417,20 @@ class _SetupPageState extends State<SetupPage> {
 
   Widget kitStep() {
     final t = Theme.of(context).textTheme;
+    final sh = sheet;
+    if (sh != null && checking) {
+      return SheetCheck(
+        sheet: sh,
+        onBack: () => setState(() => checking = false),
+        onChecked: () {
+          setState(() => keptKit = true);
+          // Once rebuilt, so the page's guard lets it close.
+          WidgetsBinding.instance.addPostFrameCallback((_) => mounted ? Navigator.of(context).pop() : null);
+        },
+      );
+    }
     return Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
-      Text('Step 3 of 3 · Recovery kit', style: t.labelLarge),
+      Text('Step 3 of 3 · Recovery sheet', style: t.labelLarge),
       const SizedBox(height: 16),
       Center(
         child: TweenAnimationBuilder<double>(
@@ -424,18 +444,23 @@ class _SetupPageState extends State<SetupPage> {
       const SizedBox(height: 16),
       Text('Your identity is ready', key: const Key('setup-done'), style: t.headlineSmall, textAlign: TextAlign.center),
       const SizedBox(height: 12),
-      const Text('Write down your recovery kit now and keep it somewhere safe. With it you can recover your identity '
-          'if you lose every device. It is shown only this once.'),
+      const Text('Write down your recovery sheet now, or print it, and keep it somewhere safe and private. If you lose every '
+          'device, it gets your identity back. It is shown only this once.'),
       const SizedBox(height: 16),
-      if (kit != null) KitCard(kit!),
-      CheckboxListTile(
-        key: const Key('kept-kit'),
-        contentPadding: EdgeInsets.zero,
-        value: keptKit,
-        onChanged: (v) => setState(() => keptKit = v ?? false),
-        title: const Text('I have written it down'),
-      ),
-      WideButton('Done', key: const Key('setup-finish'), onPressed: keptKit ? () => Navigator.of(context).pop() : null),
+      if (sh != null) ...[
+        RecoverySheetCard(sh),
+        const SizedBox(height: 8),
+        WideButton('Save it to print', key: const Key('sheet-save'), icon: Icons.print_outlined, tonal: true, onPressed: () => saveSheet(context, sh)),
+        const SizedBox(height: 12),
+        WideButton('I have written it down', key: const Key('kept-kit'), icon: Icons.arrow_forward, onPressed: () => setState(() => checking = true)),
+      ] else ...[
+        const Text('The agent did not show a recovery kit. Set up recovery again from More › Recovery.', style: TextStyle(color: Colors.orange)),
+        const SizedBox(height: 12),
+        WideButton('Done', key: const Key('setup-finish'), onPressed: () {
+          setState(() => keptKit = true);
+          WidgetsBinding.instance.addPostFrameCallback((_) => mounted ? Navigator.of(context).pop() : null);
+        }),
+      ],
     ]);
   }
 }

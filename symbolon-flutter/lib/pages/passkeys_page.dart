@@ -242,7 +242,7 @@ class _PasskeysPageState extends State<PasskeysPage> {
               onTap: () => details(c),
             ),
           ),
-        const SizedBox(height: 72),
+        const SizedBox(height: 96),   // room under the floating button, at large text too
       ]),
     );
   }

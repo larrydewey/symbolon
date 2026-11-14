@@ -235,7 +235,7 @@ class _VaultPageState extends State<VaultPage> {
                   onTap: () => show(it),
                 ),
               ),
-            const SizedBox(height: 72),
+            const SizedBox(height: 96),   // room under the floating button, at large text too
           ],
         ]),
       ),

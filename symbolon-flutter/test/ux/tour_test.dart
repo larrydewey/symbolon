@@ -20,7 +20,9 @@ import 'package:symbolon_ui/pages/tutorial_page.dart';
 import 'package:symbolon_ui/app.dart';
 import 'package:symbolon_ui/brand.dart';
 import 'package:symbolon_ui/hardware.dart';
+import 'package:symbolon_ui/links.dart';
 import 'package:symbolon_ui/passkey_main.dart';
+import 'package:symbolon_ui/recovery_sheet.dart';
 import 'package:symbolon_ui/ssh_consent.dart';
 import 'package:symbolon_ui/settings.dart';
 
@@ -225,6 +227,39 @@ void main() {
     }
   });
 
+  scenario('org', (u) async {
+    await u.tap(find.text('More').last);
+    await u.key('open-org');
+    await u.settle(8);
+    await u.snap('join');
+    await u.t.enterText(find.byKey(const Key('org-link')), 'symbolon://org?o=0123456789abcdef0123456789abcdef&f=${'a' * 64}&c=fedcba9876543210fedcba9876543210');
+    await u.t.pump();
+    await u.snap('link');
+    await u.key('org-join');
+    await u.settle();
+    await u.pin();
+    await u.settle();
+    await u.key('org-invite');
+    await u.t.enterText(find.byKey(const Key('org-invite-ext')), 'erin@acme.example');
+    await u.t.enterText(find.byKey(const Key('org-invite-name')), 'Erin');
+    await u.key('org-invite-ok');
+    await u.settle();
+    await u.snap('invite');
+  });
+
+  scenario('recover', (u) async {
+    await u.key('review-recovery');
+    await u.settle(8);
+    await u.t.drag(find.byType(Scrollable).hitTestable().first, const Offset(0, -400));
+    await u.snap('page');
+  });
+
+  testWidgets('the printed sheet', (t) async {
+    await t.runAsync(_fonts);
+    final png = await t.runAsync(() => sheetPng(RecoverySheet('fa8f008b293b5457ef989520c8bbcbc959a09c0a8619b1d190f78271bf6b5795', '9f3a1c0e7b2d4f68a1c3e5079b2d4f6810e2c4a69f3a1c0e7b2d4f68a1c3e507'), made: DateTime(2026, 11, 14)));
+    File('$out/sheet-print.png').writeAsBytesSync(png!);
+  }, skip: out.isEmpty);
+
   scenario('wide', (u) async {
     await u.snap('home');
     await u.tap(find.text('Vault').last);
@@ -264,6 +299,10 @@ void main() {
     await u.snap('working');
     await u.settle(30);
     await u.snap('kit');
+    await u.key('kept-kit');
+    await u.t.enterText(find.byKey(const Key('check-1')), 'zzzz');
+    await u.key('setup-finish');
+    await u.snap('check');
   });
 
   scenario('join', (u) async {

@@ -166,7 +166,8 @@ class _ItemPageState extends State<ItemPage> {
         : (fs.entries.where((e) => CustomField.isCustom(e.key)).map((e) => MapEntry(e.key, CustomField.decode(e.value))).toList()
           ..sort((a, b) => int.parse(a.key.substring(7)).compareTo(int.parse(b.key.substring(7)))));
     return Scaffold(
-      appBar: AppBar(title: Text(it.name), actions: [
+      // The name is the heading below; the bar names the kind of item.
+      appBar: AppBar(title: Text(t.label), actions: [
         if (fs != null && type.editable) IconButton(key: const Key('item-move'), tooltip: 'Move', icon: const Icon(Icons.drive_file_move_outline), onPressed: move),
         if (fs != null && type.editable) IconButton(key: const Key('item-edit'), tooltip: 'Edit', icon: const Icon(Icons.edit), onPressed: edit),
         if (fs != null && type.editable) IconButton(key: const Key('item-delete'), tooltip: 'Delete', icon: const Icon(Icons.delete_outline), onPressed: delete),
@@ -178,7 +179,6 @@ class _ItemPageState extends State<ItemPage> {
                 t.id == 'login' ? SiteIcon(favicons: app.favicons, origin: fs['origin'] ?? '', fallback: TypeAvatar(t)) : TypeAvatar(t),
                 const SizedBox(width: 12),
                 Expanded(child: Text(it.name, style: Theme.of(context).textTheme.titleLarge)),
-                KindTag(t.label, t.color),
               ]),
               if ((fs['folder'] ?? '').isNotEmpty)
                 Padding(

@@ -117,14 +117,14 @@ case "$1 $2" in
     O=0123456789abcdef0123456789abcdef
     case "$3" in
       show)
-        [ -f "$D/org" ] || { echo "device: this device is in no organization (org join)" >&2; exit 1; }
+        [ -f "$D/org-role" ] || { echo "device: this device is in no organization (org join)" >&2; exit 1; }
         printf 'org %s 41636d65
 version 3 gov 2
 role %s
 policy min_pin_len=6
 recovery on 2/2 delay 259200
 recovery-request 00112233445566778899aabbccddeeff %s 1800000000
-' "$O" "$(cat "$D/org")" "$B"; exit 0 ;;
+' "$O" "$(cat "$D/org-role")" "$B"; exit 0 ;;
       members) printf '%s 416c696365 - owner -
 %s 426f62 626f624061636d652e6578616d706c65 member -
 ' "$A" "$B"; exit 0 ;;
@@ -133,7 +133,7 @@ recovery-request 00112233445566778899aabbccddeeff %s 1800000000
     esac
     [ "$PIN" = "2468" ] || { echo "device: wrong PIN" >&2; exit 1; }
     case "$3" in
-      join) echo owner > "$D/org"; echo "$5 41636d65 member" ;;
+      join) mkdir -p "$4"; echo "$5 $6" > "$4/org"; echo owner > "$D/org-role"; echo "$5 41636d65 member" ;;
       invite) echo "fedcba9876543210fedcba9876543210 11112222333344445555666677778888" ;;
       sync) echo "joined $B 626f62" ;;
       approve) echo "done" ;;
