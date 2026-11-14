@@ -169,8 +169,8 @@ class _ProgressState extends State<_Progress> {
 
 void toast(BuildContext context, String m) => ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(m)));
 
-/// How long a copied secret stays on the clipboard.
-const clipboardKeep = Duration(seconds: 60);
+/// How long a copied secret stays on the clipboard: SPEC 22.2 allows at most 30 s.
+const clipboardKeep = Duration(seconds: 30);
 Timer? _clearClipboard;
 
 /// Copies [value] and says so. A [secret] is marked sensitive (Android 13+
@@ -199,7 +199,7 @@ Future<void> copyText(BuildContext context, String label, String value, {bool se
       if (now?.text == value) await Clipboard.setData(const ClipboardData(text: ''));
     });
   }
-  toast(context, '$label copied. It is cleared from the clipboard in a minute.');
+  toast(context, '$label copied. It is cleared from the clipboard in 30 seconds.');
 }
 
 /// A long hex value, shortened to its ends, with a copy button; tap it to
