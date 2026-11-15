@@ -12,7 +12,7 @@ export RESID_SIGNING_KEY="${RESID_SIGNING_KEY:-$HOME/.resid/keys/resid-ed25519.k
 [ -f "$RESID_SIGNING_KEY" ] || { echo "no signing key: set RESID_SIGNING_KEY or run residc keygen"; exit 2; }
 "$SRC/tools/depmap.sh" > /dev/null
 build() {
-  ( cd "$SRC" && ulimit -v 40000000 && ulimit -s unlimited && export RESID_MEM_LIMIT=10000 &&
+  ( cd "$SRC" && ulimit -v 40000000 && ulimit -s unlimited && export RESID_MEM_LIMIT="${RESID_MEM_LIMIT:-10000}" &&
     timeout 3000 "$RC" src/main.resid -o "$1" --verify-lib-dev -depmap target/deps.map "${@:2}" 2>&1 | grep -E "^error|wrote" )
 }
 build target/symbolon-aarch64 --target aarch64
