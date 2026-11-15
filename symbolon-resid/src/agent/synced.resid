@@ -1,0 +1,249 @@
+// Synced-profile passkeys (SPEC 5.2, 22.3): a passkey another manager made,
+// brought across by `device vault import`. Its private key is a whole key,
+// and a whole key is never split after the fact, so it cannot become a
+// Threshold credential; it is kept as it came, a software key sealed in the
+// vault, and marked to migrate: the person registers a Threshold passkey at
+// the site and then deletes this one.
+//
+// A Synced passkey is a vault item of type "passkey" with the fields
+//   rp_id          the relying party's ID
+//   credential_id  the credential ID, lowercase hex
+//   key            the P-256 private scalar, 32 bytes, lowercase hex
+//   public_key     its point, SEC1 uncompressed, hex (checked at import)
+//   user_handle    the account's user handle, hex
+//   username, display_name, rp_name
+//   counter        the signature counter the source last used, decimal
+//   profile        "synced"
+//   migrate        "1": register a Threshold passkey here (SPEC 22.3)
+//   source, imported   where it came from, and when (Unix seconds)
+//
+// It signs on this device alone: no cosigner takes part, which is what
+// makes it the weaker profile, and why the agent says so.
+//   symbolon device webauthn assert DIR RP_ID CREDENTIAL_ID CDH [--uv]
+// serves a Synced credential when CREDENTIAL_ID is not one of this
+// identity's Threshold credentials (webauthn.resid), and
+//   symbolon device webauthn synced DIR
+// lists them for the app (PIN on stdin): "passkey CID-HEX RP-HEX USER-HEX
+// USERNAME-HEX DISPLAY-HEX PUBLIC-KEY-HEX", text fields hex of UTF-8, "-"
+// when empty.
+
+import "../types.resid";
+import "../vault/vault.resid";
+import "state.resid";
+import "common.resid";
+import "device.resid";
+import "vaultcli.resid";
+import "crypto.resid";
+import "cose.resid";
+import "der.resid";
+
+// ─── Reading another manager's key ──────────────────────────────────
+
+// The 32-byte P-256 private scalar of a PKCS#8 PrivateKeyInfo (RFC 5208,
+// 5915) holding an EC key on prime256v1, or [] for anything else. When the
+// ECPrivateKey carries its public key, it must be the scalar's.
+//   PrivateKeyInfo ::= SEQUENCE { INTEGER 0, SEQUENCE { OID id-ecPublicKey,
+//     OID prime256v1 }, OCTET STRING ECPrivateKey, [0] attributes OPTIONAL }
+//   ECPrivateKey ::= SEQUENCE { INTEGER 1, OCTET STRING d, [0] params
+//     OPTIONAL, [1] BIT STRING publicKey OPTIONAL }
+pub List(Int) pkcs8_p256_scalar(List(Int) b) {
+    Der top = der_top(b);
+    if (!top.ok || top.tag != 48) { return []; }
+    Der ver = der_child(b, top);
+    if (der_small_uint(b, ver) != 0) { return []; }
+    Der alg = der_sibling(b, ver, top);
+    if (!alg.ok || alg.tag != 48) { return []; }
+    Der oid1 = der_child(b, alg);
+    Der oid2 = der_sibling(b, oid1, alg);
+    if (der_oid(b, oid1) != "1.2.840.10045.2.1" || der_oid(b, oid2) != "1.2.840.10045.3.1.7" || !der_is_last(oid2, alg)) { return []; }
+    Der pk = der_sibling(b, alg, top);
+    if (!pk.ok || pk.tag != 4) { return []; }
+    return ec_private_scalar(der_value(b, pk));
+}
+
+List(Int) ec_private_scalar(List(Int) e) {
+    Der seq = der_top(e);
+    if (!seq.ok || seq.tag != 48) { return []; }
+    Der ver = der_child(e, seq);
+    if (der_small_uint(e, ver) != 1) { return []; }
+    Der d = der_sibling(e, ver, seq);
+    if (!d.ok || d.tag != 4 || d.len != 32) { return []; }
+    List(Int) k = der_value(e, d);
+    List(Int) pub = ec_public_key(P256, k);
+    if (pub.len() != 65) { return []; }
+    return if (ec_stated_pub_ok(e, d, seq, pub)) { k } else { [] };
+}
+
+// The optional [0] parameters and [1] public key after d: [0] must name
+// prime256v1, [1] must be the scalar's point.
+Bool ec_stated_pub_ok(List(Int) e, Der prev, Der seq, List(Int) pub) {
+    if (der_is_last(prev, seq)) { return true; }
+    Der x = der_sibling(e, prev, seq);
+    if (!x.ok) { return false; }
+    if (x.tag == 160) {
+        if (der_oid(e, der_child(e, x)) != "1.2.840.10045.3.1.7") { return false; }
+        return ec_stated_pub_ok(e, x, seq, pub);
+    }
+    if (x.tag == 161) {
+        DerBytes bits = der_bits(e, der_child(e, x));
+        return bits.ok && bytes_eq(bits.v, pub) && der_is_last(x, seq);
+    }
+    return false;
+}
+
+// Base64url without padding (as WebAuthn and Bitwarden write it), or []
+// for text that is not.
+pub List(Int) unb64url(Str s) {
+    Str t = str_replace(str_replace(str_trim(s), "-", "+"), "_", "/");
+    if (str_len(t) == 0 || str_contains(t, "=") || str_len(t) % 4 == 1) { return []; }
+    return base64_decode(t + str_repeat("=", (4 - str_len(t) % 4) % 4));
+}
+
+// A Bitwarden credential ID: "b64." and the ID's base64url, or the 16
+// bytes of a GUID written as one (the bytes in the order written).
+pub List(Int) bw_credential_id(Str s) {
+    Str t = str_trim(s);
+    if (str_starts_with(t, "b64.")) { return unb64url(str_slice(t, 4, str_len(t))); }
+    Str h = str_replace(t, "-", "");
+    if (str_len(t) != 36 || str_len(h) != 32 || !hex_digits(utf8(h), 0)) { return []; }
+    return cose_hex_decode(str_to_lower(h));
+}
+
+Bool hex_digits(List(Int) b, Int i) {
+    if (i >= b.len()) { return true; }
+    Int c = b[i];
+    if (!((c >= 48 && c <= 57) || (c >= 97 && c <= 102) || (c >= 65 && c <= 70))) { return false; }
+    return hex_digits(b, i + 1);
+}
+
+// ─── Finding one in the vault ───────────────────────────────────────
+
+pub type Synced = { Str rp; List(Int) cid; List(Secret(UInt(8))) key; List(Int) pub; List(Int) user; Str username; Str display; Int counter; };
+
+// Every Synced passkey in the vault.
+@requires(declassify)
+pub List(Synced) synced_all(View v, Int i, ListBuf(Synced) acc) {
+    if (i >= v.st.items.len()) { return acc.finish(); }
+    Result(List(FieldPlain), SymbolonError) r = item_open(v.vk, v.vid, v.st.items[i]);
+    return synced_all(v, i + 1, match r {
+        Err(_) => acc,
+        Ok(fs) => if (field_text(fs, "type") == "passkey") { acc.push(synced_of(fs)) } else { acc }
+    });
+}
+
+@requires(declassify)
+Synced synced_of(List(FieldPlain) fs) {
+    Str c = digits_of(field_text(fs, "counter"));
+    return Synced {.rp = field_text(fs, "rp_id"), .cid = cose_hex_decode(field_text(fs, "credential_id")), .key = key_of(fs, 0),
+                   .pub = cose_hex_decode(field_text(fs, "public_key")), .user = cose_hex_decode(field_text(fs, "user_handle")),
+                   .username = field_text(fs, "username"), .display = field_text(fs, "display_name"),
+                   .counter = if (str_len(c) == 0 || str_len(c) > 10) { 0 } else { str_parse_int(c) }};
+}
+
+Str digits_of(Str s) { List(Int) b = utf8(str_trim(s)); return if (decimal(b, 0)) { str_trim(s) } else { "" }; }
+Bool decimal(List(Int) b, Int i) { return if (i >= b.len()) { true } else { b[i] >= 48 && b[i] <= 57 && decimal(b, i + 1) }; }
+
+// The key field's hex as secret bytes; [] when it is not 64 hex digits.
+@requires(declassify)
+List(Secret(UInt(8))) key_of(List(FieldPlain) fs, Int i) {
+    if (i >= fs.len()) { return []; }
+    if (fs[i].name != "key") { return key_of(fs, i + 1); }
+    List(Secret(UInt(8))) h = fs[i].value;
+    if (h.len() != 64) { return []; }
+    return secret_unhex(h, 0, ListBuf());
+}
+
+// Hex digits to bytes without branching on them, and in bit operations
+// only (no arithmetic on the secret). A digit's low four bits v are its
+// value for 0-9; a letter (bit 6 set: A-F, a-f) has v of 1-6 and the value
+// v + 9, which is 8 | (v + 1), v + 1 being three bits wide. The field was
+// checked to be hex when it was imported; anything else gives a wrong key,
+// which then fails its public-key check, not a crash.
+List(Secret(UInt(8))) secret_unhex(List(Secret(UInt(8))) h, Int i, ListBuf(Secret(UInt(8))) acc) {
+    if (i + 1 >= h.len()) { return acc.finish(); }
+    Secret(UInt(8)) hi = nibble(h[i]);
+    Secret(UInt(8)) lo = nibble(h[i + 1]);
+    return secret_unhex(h, i + 2, acc.push((hi << 4) | lo));
+}
+
+Secret(UInt(8)) nibble(Secret(UInt(8)) c) {
+    Secret(UInt(8)) v = c & 15;
+    Secret(UInt(8)) l = (c >> 6) & 1;
+    Secret(UInt(8)) mask = l | (l << 1) | (l << 2) | (l << 3);
+    Secret(UInt(8)) b0 = v & 1;
+    Secret(UInt(8)) b1 = (v >> 1) & 1;
+    Secret(UInt(8)) b2 = (v >> 2) & 1;
+    Secret(UInt(8)) inc = (b0 ^ 1) | ((b1 ^ b0) << 1) | ((b2 ^ (b1 & b0)) << 2);
+    return (v & (mask ^ 15)) | ((8 | inc) & mask);
+}
+
+// The Synced passkey with this credential ID, if the vault has one.
+Option(Synced) synced_by_cid(List(Synced) xs, List(Int) cid, Int i) {
+    if (i >= xs.len()) { return None; }
+    if (bytes_eq(xs[i].cid, cid)) { return Some(xs[i]); }
+    return synced_by_cid(xs, cid, i + 1);
+}
+
+// ─── Signing ────────────────────────────────────────────────────────
+
+// The counter an assertion reports. A source that never counted (0, as
+// synced passkeys usually are) stays at 0. One that did must not go
+// backwards at a site that checks, and every device signs from the same
+// vault without writing back to it, so the counter is the larger of the
+// source's next value and the time in seconds: it rises on every device
+// that keeps its clock, and stays under 2^32 until 2106.
+@requires(clock(readonly))
+pub Int synced_counter(Int stored) {
+    if (stored <= 0) { return 0; }
+    Int now = clock_now_seconds();
+    return if (stored + 1 > now) { stored + 1 } else { now };
+}
+
+// An assertion by a Synced passkey: the authenticator data (BE and BS set,
+// UV with --uv, the counter above), then the signature over
+// SHA-256(authenticatorData || clientDataHash), as a Threshold assertion
+// prints them, and the user handle the response carries.
+@requires(filesystem, network, declassify, clock)
+pub Int synced_assert(Str dir, DeviceConfig c, Unlocked u, Str rp, List(Int) cid, List(Int) cdh, Int flags) {
+    Result(View, Str) rv = view_unlocked(dir, c, u);
+    return match rv {
+        Err(m) => dfail(m),
+        Ok(v) => match synced_by_cid(synced_all(v, 0, ListBuf()), cid, 0) {
+            None => dfail("that credential ID is not for this relying party (A-12)"),
+            Some(s) => if (s.rp != rp) { dfail("that credential ID is not for this relying party (A-12)") } else { synced_sign(s, cdh, flags) }
+        }
+    };
+}
+
+@requires(declassify, clock)
+Int synced_sign(Synced s, List(Int) cdh, Int flags) {
+    Int n = synced_counter(s.counter);
+    List(Int) ad = sha256_bytes(utf8(s.rp)).concat([flags, (n >> 24) & 255, (n >> 16) & 255, (n >> 8) & 255, n & 255]);
+    List(Int) m = sha256_bytes(ad.concat(cdh));
+    if (s.key.len() != 32 || !bytes_eq(ec_public_keyg(P256, s.key), s.pub)) { return dfail("this passkey's key does not match its public key"); }
+    EcSig sig = ecdsag_sign_digest(P256, Sha256, s.key, m);
+    if (!sig.ok || !ecdsa_verify_digest(P256, s.pub, m, sig)) { return dfail("no valid signature"); }
+    println("profile synced");
+    println("authenticator-data " + hex_encode(ad));
+    println("user-handle " + hex_encode(s.user));
+    println("signature-der " + hex_encode(ecdsa_der_of(sig)));
+    println(hex_encode(ecdsa_raw_of(P256, sig)));
+    return 0;
+}
+
+// ─── `device webauthn synced` ───────────────────────────────────────
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+pub Int device_wa_synced(Str dir) {
+    Result(View, Str) rv = open_view(dir);
+    return match rv { Err(m) => dfail(m), Ok(v) => print_synced(synced_all(v, 0, ListBuf()), 0) };
+}
+
+Int print_synced(List(Synced) xs, Int i) {
+    if (i >= xs.len()) { return 0; }
+    Synced s = xs[i];
+    println("passkey " + hex_encode(s.cid) + " " + hx(s.rp) + " " + (if (s.user.len() == 0) { "-" } else { hex_encode(s.user) }) + " " + hx(s.username) + " " + hx(s.display) + " " + hex_encode(s.pub));
+    return print_synced(xs, i + 1);
+}
+
+Str hx(Str s) { return if (str_len(s) == 0) { "-" } else { hex_encode(utf8(s)) }; }

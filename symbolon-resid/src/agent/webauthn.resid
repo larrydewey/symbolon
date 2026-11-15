@@ -15,6 +15,7 @@ import "common.resid";
 import "device.resid";
 import "crypto.resid";
 import "cose.resid";
+import "synced.resid";
 
 // Symbolon's AAGUID (random, fixed).
 pub List(Int) symbolon_aaguid() { return cose_hex_decode("5e7b0c1f4a2d4c8e9b316a0d2f87c4e1"); }
@@ -85,12 +86,28 @@ Int wa_print_attestation(Str rp, Bool uv, List(Int) cid, List(Int) pub65) {
 
 // `device webauthn assert`: prints the authenticator data, then signs
 // m = SHA-256(authenticatorData || clientDataHash) as `device sign` does
-// (its last lines: the signature in DER, then r || s).
+// (its last lines: the signature in DER, then r || s). A credential ID
+// that is not one of this identity's Threshold credentials may be a
+// Synced passkey brought in by an import (synced.resid); that one signs on
+// this device, prints "profile synced" first and its "user-handle", and
+// is not offered under the duress PIN.
 @requires(filesystem, network, device, declassify, clock, provision, environment)
 pub Int device_wa_assert(Str dir, Str rp, Str cid_hex, Str cdh_hex, Bool uv) {
     List(Int) cdh = cose_hex_decode(cdh_hex);
     if (cdh.len() != 32) { return dfail("the client data hash is 32 bytes"); }
+    Option(DeviceConfig) oc = load_config(dir);
+    return match oc {
+        None => dfail("not set up"),
+        Some(c) => wa_assert_with(dir, c, rp, cose_hex_decode(cid_hex), cdh, uv, read_pin())
+    };
+}
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+Int wa_assert_with(Str dir, DeviceConfig c, Str rp, List(Int) cid, List(Int) cdh, Bool uv, Str pin) {
+    Unlocked u = unlock_dir(dir, c, pin);
+    Bool threshold = u.kind != 1 || match credential_nonce(u.real.cc, rp, cid) { Some(_) => true, None => false };
+    if (!threshold) { return synced_assert(dir, c, u, rp, cid, cdh, wa_flags(uv, false)); }
     List(Int) ad = wa_auth_data(rp, wa_flags(uv, false), []);
     println("authenticator-data " + hex_encode(ad));
-    return device_sign(dir, rp, cid_hex, hex_encode(sha256_bytes(ad.concat(cdh))));
+    return sign_unlocked(dir, c, u, rp, cid, sha256_bytes(ad.concat(cdh)), pin, 0);
 }

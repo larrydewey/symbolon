@@ -34,11 +34,20 @@ printf '%s\n' "$PIN" | symbolon device vault import ~/.symbolon export.csv
 Nothing in your vault is replaced: a name already in use gets a number, as
 "Email (2)".
 
-**What doesn't come across.** Passkeys from another manager: their private
+**Passkeys from Bitwarden** come across as *Synced* passkeys. Their private
 keys are whole keys, and a Symbolon passkey is split between your device and
-the cosigner, so you make a new passkey at each site (sign in once with the
-old one or your password, then add a passkey). A password-protected Bitwarden
-export: export it again unencrypted.
+the cosigner; a whole key is never split after the fact. So each is kept as
+it came, sealed in your vault, and signs on your device alone, without the
+cosigner. That is weaker than a Symbolon passkey, so each is marked to
+migrate: sign in with it once, add a Symbolon passkey at the site, then
+delete the imported one. Only ES256 passkeys (ECDSA on P-256, which is what
+Bitwarden makes) can be kept; any other is left out, and the preview says
+so. Today a Synced passkey signs from the command line (`symbolon device
+webauthn assert`); the app and the browser extension don't offer them yet.
+
+**What doesn't come across.** Passkeys from managers whose export has none
+(every CSV export), and a password-protected Bitwarden export: export it
+again unencrypted.
 
 **Afterwards**, delete the export file and empty the trash: anyone who finds
 it can read every password in it. Once you have checked your vault, you can
@@ -93,6 +102,11 @@ and no one at work can open it. Your team's group folders appear beside your
 shared folders. See [Organizations](/symbolon/org/).
 
 ## Not built yet
+
+- **Synced passkeys in the app and the browser extension.** Passkeys
+  imported from Bitwarden sign from the command line; offering them at a
+  site's sign-in, and a reminder to replace each with a Symbolon passkey,
+  are next.
 
 - **Removing a device from your identity** by re-sharing without it. Today
   a retired device's keys are deleted on the device itself; a re-share that

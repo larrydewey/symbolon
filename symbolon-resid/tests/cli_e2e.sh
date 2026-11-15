@@ -243,9 +243,10 @@ for l in sys.stdin:
     if p and p[0] == sys.argv[1]: print(bytes.fromhex(p[1] if len(p) > 1 else '').decode(), end='')" "$2"
 }
 run 60 "$BIN" device vault import "$W/dev" $FX/bitwarden.json --dry-run > "$W/imd.log" 2>&1 || fail "import dry run: $(cat "$W/imd.log")"
-grep -qx "total 9" "$W/imd.log" && grep -qx "item login $(hx 'GitHub (2)') -" "$W/imd.log" && grep -qx "item card $(hx 'Visa 💳') $(hx Banking)" "$W/imd.log" || fail "import dry run: $(cat "$W/imd.log")"
+grep -qx "total 10" "$W/imd.log" && grep -qx "item login $(hx 'GitHub (2)') -" "$W/imd.log" && grep -qx "item card $(hx 'Visa 💳') $(hx Banking)" "$W/imd.log" \
+  && grep -qx "item passkey $(hx 'GitHub passkey (octo)') -" "$W/imd.log" && grep -q "^skip $(hx 'github.com passkey (octo-ed)') " "$W/imd.log" || fail "import dry run: $(cat "$W/imd.log")"
 printf '2468\n' | run 600 "$BIN" device vault import "$W/dev" $FX/bitwarden.json > "$W/imp.log" 2>&1 || fail "import bitwarden: $(cat "$W/imp.log")"
-grep -qx "total 9" "$W/imp.log" && grep -q "^warn " "$W/imp.log" || fail "import bitwarden: $(cat "$W/imp.log")"
+grep -qx "total 10" "$W/imp.log" && grep -qx "warn $(hx '1 passkey came across as Synced passkeys: each signs on this device alone, without your cosigner. Make a Symbolon passkey at each of those sites, then delete the imported one')" "$W/imp.log" || fail "import bitwarden: $(cat "$W/imp.log")"
 CA_NAME='Crédit Agricole – compte'
 [ "$(field "$CA_NAME" origin)" = "https://www.credit-agricole.fr" ] && [ "$(field "$CA_NAME" current)" = 'S3crét "quoted" pass' ] \
   && [ "$(field "$CA_NAME" folder)" = Banking ] && [ "$(field "$CA_NAME" totp)" = "otpauth://totp/CA:marie?secret=JBSWY3DPEHPK3PXP" ] \
@@ -255,6 +256,35 @@ CA_NAME='Crédit Agricole – compte'
 [ "$(field 'Visa 💳' number)" = 4111111111111111 ] && [ "$(field 'Visa 💳' expiry)" = 03/29 ] && [ "$(field 'Visa 💳' cvv)" = 123 ] || fail "imported card"
 [ "$(field Me full_name)" = "Dr Marie Curie" ] && [ "$(field Me address)" = "$(printf '1 Rue de la Paix\nParis 75002\nFR')" ] && [ "$(field Me document)" = X1234567 ] || fail "imported identity"
 [ "$(field 'Laptop key' type)" = secret ] && [ "$(field portal.acme.example folder)" = "Work/Clients" ] && [ "$(field 'GitHub (2)' current)" = pw2 ] || fail "imported key, folder or renamed login"
+# The export's passkey came across as a Synced passkey (SPEC 5.2, 22.3): kept
+# with its key, marked to migrate; it signs a WebAuthn assertion on this
+# device alone, under the key the export held (checked with python-fido2),
+# for its own site only, and not under the duress PIN.
+SPK='GitHub passkey (octo)'
+SPUB=046903267335530bebdbccf480b132e7809cbc768812a515ab374e4ea66f504fa2400bc42e4a819d1fc27c7d0e79b9cfee56457c98a6412e7dd976382799589c5e
+SCID=3f2a9c1e7b4d4e8a9c0f1d2e3f4a5b6c
+[ "$(field "$SPK" type)" = passkey ] && [ "$(field "$SPK" profile)" = synced ] && [ "$(field "$SPK" migrate)" = 1 ] && [ "$(field "$SPK" public_key)" = $SPUB ] \
+  && [ "$(field "$SPK" credential_id)" = $SCID ] && [ -n "$(field "$SPK" imported)" ] || fail "imported passkey: $(printf '2468\n' | "$BIN" device vault show "$W/dev" "$SPK" 2>&1)"
+printf '2468\n' | run 300 "$BIN" device webauthn synced "$W/dev" > "$W/synced.log" 2>&1 || fail "webauthn synced: $(cat "$W/synced.log")"
+grep -qx "passkey $SCID $(hx github.com) $(hx octo-user-handle) $(hx octo) $(hx 'The Octocat') $SPUB" "$W/synced.log" || fail "webauthn synced: $(cat "$W/synced.log")"
+SCDH=$(printf '%s' '{"type":"webauthn.get","challenge":"xyz","origin":"https://github.com"}' | sha256sum | cut -d' ' -f1)
+printf '2468\n' | run 300 "$BIN" device webauthn assert "$W/dev" github.com $SCID "$SCDH" --uv > "$W/sget.log" 2>&1 || fail "synced assert: $(cat "$W/sget.log")"
+python3 - "$W/sget.log" "$SCDH" "$SPUB" <<'PY' || fail "synced assertion does not verify (python-fido2): $(cat "$W/sget.log")"
+import hashlib, sys
+from fido2.webauthn import AuthenticatorData
+from fido2.cose import ES256
+from cryptography.hazmat.primitives.asymmetric import ec
+f = lambda k: next(l.split()[1] for l in open(sys.argv[1]) if l.startswith(k + " "))
+assert f("profile") == "synced" and bytes.fromhex(f("user-handle")) == b"octo-user-handle"
+ad = AuthenticatorData(bytes.fromhex(f("authenticator-data")))
+F = AuthenticatorData.FLAG
+assert ad.rp_id_hash == hashlib.sha256(b"github.com").digest() and ad.flags & F.UP and ad.flags & F.UV and ad.flags & F.BE and ad.flags & F.BS and ad.counter == 0
+ES256.from_cryptography_key(ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256R1(), bytes.fromhex(sys.argv[3]))).verify(bytes(ad) + bytes.fromhex(sys.argv[2]), bytes.fromhex(f("signature-der")))
+print("Synced passkey: assertion verifies under the imported key (python-fido2)")
+PY
+printf '2468\n' | run 300 "$BIN" device webauthn assert "$W/dev" evil.example.net $SCID "$SCDH" > "$W/sevil.log" 2>&1 && fail "a Synced passkey signed for another RP"
+grep -q "A-12" "$W/sevil.log" || fail "synced assert for another RP: $(cat "$W/sevil.log")"
+printf '1357\n' | run 600 "$BIN" device webauthn assert "$W/dev" github.com $SCID "$SCDH" > "$W/sdur.log" 2>&1 && fail "a Synced passkey signed under the duress PIN"
 printf '2468\n' | run 600 "$BIN" device vault import "$W/dev" $FX/lastpass.csv > "$W/iml.log" 2>&1 || fail "import lastpass: $(cat "$W/iml.log")"
 grep -qx "total 8" "$W/iml.log" || fail "import lastpass: $(cat "$W/iml.log")"
 [ "$(field Mastercard expiry)" = 01/28 ] && [ "$(field Mastercard notes)" = "$(printf 'Line one\nLine two')" ] && [ "$(field Mastercard folder)" = Finance/Cards ] \

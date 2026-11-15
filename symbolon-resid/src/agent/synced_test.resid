@@ -1,0 +1,36 @@
+// Synced passkeys (src/agent/synced.resid): reading the keys and credential
+// IDs another manager exports. The vectors are from Python's cryptography
+// (OpenSSL).
+import "synced.resid";
+import "crypto.resid";
+import "cose.resid";
+
+Str p256_pkcs8() { return "308187020100301306072a8648ce3d020106082a8648ce3d030107046d306b02010104205c1f0e2b8a7d4c3e9f1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f71a144034200046903267335530bebdbccf480b132e7809cbc768812a515ab374e4ea66f504fa2400bc42e4a819d1fc27c7d0e79b9cfee56457c98a6412e7dd976382799589c5e"; }
+
+test "a P-256 PKCS#8 key gives its scalar" {
+    expect(hex_encode(pkcs8_p256_scalar(cose_hex_decode(p256_pkcs8())))).toEqual("5c1f0e2b8a7d4c3e9f1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f71");
+}
+
+test "a key on another curve, a key whose stated public key is not its own, and junk are refused" {
+    // P-384 (secp384r1)
+    expect(pkcs8_p256_scalar(cose_hex_decode("3081b6020100301006072a8648ce3d020106052b8104002204819e30819b0201010430000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000007a16403620004283c1d7365ce4788f29f8ebf234edffead6fe997fbea5ffa2d58cc9dfa7b1c508b05526f55b9ebb2040f05b48fb6d0e19475c99061e41b88ba52efdb8c1690471a61d867ed799729d9c92cd01dbd225630d84ede32a78f9e64664cdac512ef8c")).len()).toEqual(0);
+    // the P-256 key above, its [1] public key replaced by another key's
+    expect(pkcs8_p256_scalar(cose_hex_decode("308187020100301306072a8648ce3d020106082a8648ce3d030107046d306b02010104205c1f0e2b8a7d4c3e9f1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f71a14403420004d1708833bb49d0831a88cefae9060459c9d6208c8b2a3c23d30c613f6eb98b5bd940d9bc9edb1bdc9a0b0ed1963419491b64e681e84f44c17c3f7689260d3a21")).len()).toEqual(0);
+    // truncated, trailing bytes, nothing
+    List(Int) k = cose_hex_decode(p256_pkcs8());
+    expect(pkcs8_p256_scalar(k[0..k.len() - 1]).len()).toEqual(0);
+    expect(pkcs8_p256_scalar(k.concat([0])).len()).toEqual(0);
+    expect(pkcs8_p256_scalar([]).len()).toEqual(0);
+}
+
+test "Bitwarden credential IDs: a GUID's 16 bytes, or b64. and base64url" {
+    expect(hex_encode(bw_credential_id("3f2a9c1e-7b4d-4e8a-9c0f-1d2e3f4a5b6c"))).toEqual("3f2a9c1e7b4d4e8a9c0f1d2e3f4a5b6c");
+    expect(hex_encode(bw_credential_id("3F2A9C1E-7B4D-4E8A-9C0F-1D2E3F4A5B6C"))).toEqual("3f2a9c1e7b4d4e8a9c0f1d2e3f4a5b6c");
+    expect(hex_encode(bw_credential_id("b64.AAECAwQFBgcICQ"))).toEqual("00010203040506070809");
+    expect(hex_encode(bw_credential_id("b64.-_8"))).toEqual("fbff");
+    expect(bw_credential_id("abc").len()).toEqual(0);
+    expect(bw_credential_id("3f2a9c1e-7b4d-4e8a-9c0f-1d2e3f4a5b6").len()).toEqual(0);
+    expect(bw_credential_id("3f2a9c1e-7b4d-4e8a-9c0f-1d2e3f4a5bzz").len()).toEqual(0);
+    expect(bw_credential_id("b64.").len()).toEqual(0);
+    expect(bw_credential_id("b64.AA==").len()).toEqual(0);
+}

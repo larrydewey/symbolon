@@ -1287,11 +1287,25 @@ the matching types; others become notes that keep every field. The first
 web address of a login gives its `origin`; the others, and app addresses,
 become custom fields. Parsing uses the resid-json and resid-csv packages.
 
-Not imported, and said so: the source's passkeys (a Symbolon passkey's key
-is split between the device and the cosigner, and a whole private key is
-never split after the fact: the person registers a new passkey at each
-site), and a password-protected Bitwarden export (it is exported again
-unencrypted). An entry that cannot be stored (a field over 64 KiB, a card
+A Bitwarden export's passkeys (`fido2Credentials`) are imported as Synced
+passkeys (Section 5.2, 22.3): a Symbolon passkey's key is split between the
+device and the cosigner, and a whole private key is never split after the
+fact, so each is kept as a software key in a vault item of type `passkey`
+(`rp_id`, `credential_id`, `key`, `public_key`, `user_handle`, `username`,
+`display_name`, `rp_name`, `counter`, `profile` "synced", `migrate` "1",
+`source`, `imported`), and the import says how many came across and that
+each should be replaced by a Threshold passkey. A passkey that is not ES256
+(ECDSA on P-256), or whose PKCS#8 key does not read or does not match the
+public key it states, is left out with the reason. `device webauthn assert`
+serves a credential ID that is not a Threshold credential of the identity
+from the Synced passkey with that ID and RP ID, signing on the device alone
+(UP, BE and BS set; UV with `--uv`; the counter 0 when the source's was 0,
+else the larger of the source's next value and the time in seconds, so it
+does not go backwards while no device writes it back); a Synced passkey is
+not available under the duress PIN. `device webauthn synced` lists them.
+
+Not imported, and said so: a password-protected Bitwarden export (it is
+exported again unencrypted). An entry that cannot be stored (a field over 64 KiB, a card
 without a number) is left out with the reason; a card without a number
 comes across as a note.
 
