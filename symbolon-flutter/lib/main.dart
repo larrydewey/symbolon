@@ -31,6 +31,10 @@ Future<void> main(List<String> args) async {
 @pragma('vm:entry-point')
 Future<void> passkeyMain() => runPasskeyScreen();
 
+/// The SSH signature window Android opens for another app (SshConsentActivity, SPEC 16.1.1).
+@pragma('vm:entry-point')
+Future<void> sshConsentMain() => runSshConsentAndroid();
+
 /// The autofill fill and save screen Android opens (AutofillActivity, SPEC 22.6).
 @pragma('vm:entry-point')
 Future<void> autofillMain() => runAutofillScreen();

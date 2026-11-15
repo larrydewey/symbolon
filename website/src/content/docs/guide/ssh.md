@@ -84,6 +84,15 @@ key so it shows commits as verified.
 - RSA signatures with SHA-1 (`ssh-rsa`); modern clients ask for SHA-2.
 - Locking and smart-card requests.
 
+## On Android, for other apps
+
+Apps Symbolon trusts by their signature, such as Pylon, can use your SSH
+keys on the phone. When a server asks for a signature, the app opens
+Symbolon's consent sheet: it names the app, the key, the user and the
+server's key fingerprint, and takes your PIN. Check that the fingerprint
+matches the host the app says it is connecting to. Other apps cannot
+reach the agent at all.
+
 ## From the command line
 
 ```sh

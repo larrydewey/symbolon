@@ -49,6 +49,7 @@ Each takes a last `--share ID` to work in a shared folder.
 | Command | Does |
 |---|---|
 | `ssh-agent DIR [SOCKET]` | the SSH agent (`SYMBOLON_CONSENT` names the app, which shows each request) |
+| `ssh-agent-stdio DIR RUNDIR PEER` | one agent connection on standard input and output, for the Android agent service; consent requests appear on standard error as `consent PATH` |
 | `device ssh new DIR NAME` | a key held by your quorum; prints its public line |
 | `device ssh import DIR NAME FILE` | an OpenSSH private key (PIN, then any passphrase, on stdin) |
 | `device ssh list DIR` | the keys' public lines (no PIN) |

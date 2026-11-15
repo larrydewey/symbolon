@@ -55,6 +55,7 @@
 //   symbolon device share me DIR               prints LOG-ID FINGERPRINT
 //   symbolon device share people DIR           "LOG-ID NAME-HEX FINGERPRINT me|-" per card at the relay
 //   symbolon ssh-agent DIR [SOCKET]            the SSH agent (SPEC 16.1) on a Unix socket
+//   symbolon ssh-agent-stdio DIR RUNDIR PEER   one agent connection on stdin/stdout (Android's service, SPEC 16.1.1)
 //   symbolon device ssh new|import|list|sign|delete ...   SSH keys in the vault (src/agent/sshcli.resid)
 //   symbolon device link-new DIR [--host H,...] [...]   a new device: shows a code (QR) for an existing one (SPEC 11.5)
 //   symbolon device link-add DIR LINK          adds the device whose code was scanned
@@ -339,6 +340,7 @@ Int main() {
     if (a1 == "home" && a2 == "invite" && n == 5) { return home_invite(args.get(3), args.get(4)); }
     if (a1 == "device" && a2 == "pin" && n == 4) { return device_pin(args.get(3)); }
     // Started by the browser (native messaging); its own arguments follow.
+    if (a1 == "ssh-agent-stdio" && n == 5) { return ssh_agent_stdio(args.get(2), args.get(3), args.get(4)); }
     if (a1 == "ssh-agent" && (n == 3 || n == 4)) { return ssh_agent(args.get(2), if (n == 4) { args.get(3) } else { "" }); }
     if (a1 == "device" && a2 == "ssh" && args.get(3) == "new" && n == 6) { return ssh_new(args.get(4), args.get(5)); }
     if (a1 == "device" && a2 == "ssh" && args.get(3) == "import" && n == 7) { return ssh_import(args.get(4), args.get(5), args.get(6)); }

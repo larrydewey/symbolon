@@ -1104,6 +1104,43 @@ messages: keys are managed in Symbolon, not added through `ssh-add`.
 Connections are served one at a time, each with a 30-second idle limit
 outside a pending consent.
 
+#### 16.1.1 The agent for other apps on Android
+
+On Android there are no Unix-socket agents between apps. Symbolon serves
+the same protocol to apps it lists by signing certificate
+(`res/values/ssh_agent_callers.xml`; Pylon's release certificates) over
+Binder: an exported `SshAgentService`, action
+`dev.symbolon.action.SSH_AGENT`, behind the permission
+`dev.symbolon.permission.SSH_SIGN` (`signature|knownSigner` with the same
+list, so on Android 12+ other apps cannot bind at all). Every call checks
+the caller again: the calling uid's package must have a single signer
+whose SHA-256 is listed; the agent then names it to the principal as its
+label and package.
+
+Each (calling app, connection number) gets its own
+`symbolon ssh-agent-stdio DIR RUNDIR PEER` process, which serves the
+agent protocol on its standard input and output with the rules above
+(binds, refusals, the PIN on every signature); `PEER` is the verified
+caller. A consent request is announced on standard error as
+`consent PATH`, the request file, which carries `peer`.
+
+| Transaction (`dev.symbolon.ISshAgent`) | Data | Reply |
+|---|---|---|
+| `CALL` (`FIRST_CALL_TRANSACTION`) | `long` conn, `byte[]` request | `int 0`, `byte[]` reply; or `int 1`, `PendingIntent`; or `int -1` |
+| `WAIT` (`+1`) | conn | `int 0`, `byte[]` reply (up to 6 minutes); or `int -1` |
+| `CLOSE` (`+2`) | conn | nothing |
+
+A background service may not start an activity, and should not: a
+signature's `CALL` returns an immutable, one-shot `PendingIntent` for
+`SshConsentActivity`, which the calling app, in front because the
+principal is using it, starts before it `WAIT`s. The activity is not
+exported, sets `FLAG_SECURE` and hides overlay windows
+(`setHideOverlayWindows`), and refuses a request file whose `peer`
+differs from the one the service verified. With no `known_hosts` on the
+phone, it shows the server's host key fingerprint and leaves the
+server's identity to the calling app's own host trust. Connections idle
+for 30 seconds outside a pending consent end.
+
 ---
 
 ## 17. Attribute presentation and verifier-constrained release

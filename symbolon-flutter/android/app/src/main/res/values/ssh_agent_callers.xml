@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Apps that may use Symbolon's SSH agent (SPEC 16.1.1): the SHA-256 of
+         each app's signing certificate, lower-case hex (colons allowed),
+         one item per certificate. Used for the permission (knownSigner,
+         Android 12+) and checked on every call. Pylon's release
+         certificate goes here when it is cut; empty, no app is served. -->
+    <string-array name="ssh_agent_callers" translatable="false">
+    </string-array>
+</resources>

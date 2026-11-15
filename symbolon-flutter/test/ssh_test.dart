@@ -77,6 +77,17 @@ void main() {
     expect(input, contains('2468\n0a0b'));
   });
 
+  testWidgets('an app on the phone: named by its signature, no process line, the server named neutrally', (t) async {
+    const app = '{"key":"github","fingerprint":"SHA256:abc","what":{"kind":"auth","user":"git"},"host":{"key":"AAAAhostkey","fingerprint":"SHA256:host","forwarding":false},"pid":0,"peer":"Pylon (dev.pylon.app)","data":"0a0b","socket":"/run/x.sock","token":"tok"}';
+    await open(t, app, exe: 'Pylon (dev.pylon.app)', cmd: '');
+    expect(SshRequest.parse(app)!.peer, 'Pylon (dev.pylon.app)');
+    expect(find.text('An app on this phone, identified by its signature'), findsOneWidget);
+    expect(find.textContaining('Asked by process'), findsNothing);
+    expect(find.text('Server'), findsOneWidget);
+    expect(find.textContaining('Server key SHA256:host. It should match'), findsOneWidget);
+    expect(find.textContaining('known_hosts'), findsNothing);
+  });
+
   testWidgets('an RSA key is signed with the algorithm the agent names', (t) async {
     final w = await open(t, auth.replaceAll('"data":"0a0b"', '"data":"0a0b","alg":"rsa-sha2-512"'));
     await t.enterText(find.byKey(const Key('sc-pin')), '2468');
