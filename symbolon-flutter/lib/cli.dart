@@ -153,8 +153,16 @@ class SymbolonCli {
   /// A passkey made for a site through the system: what register prints,
   /// with authenticator-data and attestation-object. [uv]: the PIN was
   /// entered in this ceremony.
-  Future<CliResult> waRegister(String dir, String rp, String pin, {bool uv = true}) =>
-      run(['device', 'webauthn', 'register', dir, rp, if (uv) '--uv'], input: [pin], timeout: const Duration(minutes: 5));
+  Future<CliResult> waRegister(String dir, String rp, String pin, {bool uv = true, String replaces = ''}) =>
+      run(['device', 'webauthn', 'register', dir, rp, if (uv) '--uv', if (replaces.isNotEmpty) ...['--replaces', replaces]], input: [pin], timeout: const Duration(minutes: 5));
+
+  /// The passkeys imported from another manager (Synced): "passkey ..." lines.
+  Future<CliResult> waSynced(String dir, String pin) =>
+      run(['device', 'webauthn', 'synced', dir], input: [pin], timeout: const Duration(minutes: 5));
+
+  /// Deletes an imported passkey that a Symbolon passkey replaced.
+  Future<CliResult> waRetire(String dir, String cid, String pin, {bool force = false}) =>
+      run(['device', 'webauthn', 'retire', dir, cid, if (force) '--force'], input: [pin], timeout: const Duration(minutes: 5));
 
   /// A WebAuthn assertion: authenticator-data, signature-der, r || s.
   Future<CliResult> waAssert(String dir, String rp, String cid, String clientDataHash, String pin, {bool uv = true}) =>

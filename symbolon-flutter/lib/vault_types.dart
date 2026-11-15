@@ -99,6 +99,18 @@ final itemTypes = <ItemType>[
     const FieldSpec('kind', 'Kind'),
     const FieldSpec('comment', 'Comment'),
   ], editable: false),
+  // Passkeys imported from another manager (SPEC 5.2, 22.3): kept as they
+  // came, a whole key that signs on this device alone, until a Symbolon
+  // passkey replaces each. Made only by an import; deleted, not edited. The
+  // private key is not one of the fields shown.
+  ItemType('passkey', 'Imported passkey', 'Imported passkeys', Icons.fingerprint, Colors.orange, [
+    const FieldSpec('rp_id', 'Site'),
+    const FieldSpec('username', 'Account'),
+    const FieldSpec('display_name', 'Name'),
+    const FieldSpec('credential_id', 'Credential ID'),
+    const FieldSpec('public_key', 'Public key'),
+    const FieldSpec('source', 'Imported from'),
+  ], editable: false),
   ItemType('secret', 'Secret', 'Secrets', Icons.key_outlined, Colors.deepPurple, [
     const FieldSpec('secret', 'Secret', input: Input.secret, required: true),
     _notes,

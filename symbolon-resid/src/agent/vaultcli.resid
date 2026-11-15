@@ -218,10 +218,21 @@ pub Result(View, Str) open_view(Str dir) {
     Result(Option(List(Int)), RegionError) pb = spawn (network, clock(readonly), declassify) { return blob_get(relay_ep(c), vault_blob(c.log_id)); };
     Unlocked u = unlock_dir(dir, c, read_pin());
     if (u.kind != 1) { return Err("wrong PIN"); }
+    return view_of(dir, c, u, region_log(pl), region_blob(pb));
+}
+
+// The vault for reading, the profiles already unlocked (the real one).
+@requires(filesystem, network, declassify, clock)
+pub Result(View, Str) view_unlocked(Str dir, DeviceConfig c, Unlocked u) {
+    if (c.log_id.len() == 0) { return Err("not set up (device new, device init)"); }
+    return view_of(dir, c, u, verified_log_dir(dir, relay_ep(c), c.log_id), blob_get(relay_ep(c), vault_blob(c.log_id)));
+}
+
+@requires(filesystem, declassify)
+Result(View, Str) view_of(Str dir, DeviceConfig c, Unlocked u, Result(VerifiedHead, SymbolonError) rv, Option(List(Int)) b) {
     List(Secret(UInt(8))) vk = u.real.vault_key;
     List(Int) vid = vault_id_of(c.log_id);
-    Result(VerifiedHead, SymbolonError) rv = region_log(pl);
-    Result(VaultState, Str) rs = match rv { Err(e) => Err(err_text(e)), Ok(vh) => vault_from(dir, c, vh, region_blob(pb)) };
+    Result(VaultState, Str) rs = match rv { Err(e) => Err(err_text(e)), Ok(vh) => vault_from(dir, c, vh, b) };
     return match rs {
         Ok(st) => online_view(dir, vk, vid, st),
         Err(m) => match kept_copy(dir, vk) {
@@ -302,7 +313,7 @@ Int print_entry(List(FieldPlain) fs, Bool has_secret, Int form) {
     Str name = field_text(fs, "name");
     if (form == 0) { println(name); return 0; }
     if (form == 1) { println(t + " " + name); return 0; }
-    Str d = if (t == "login") { field_text(fs, "origin") } else { if (t == "card") { last4(field_text(fs, "number")) } else { "" } };
+    Str d = if (t == "login") { field_text(fs, "origin") } else { if (t == "card") { last4(field_text(fs, "number")) } else { if (t == "passkey") { field_text(fs, "rp_id") } else { "" } } };
     Str f = field_text(fs, "folder");
     // A login's linked apps (SPEC 22.6 item 8), "PACKAGE CERT-SHA256" lines,
     // as a fifth column when there are any: public, like the site.

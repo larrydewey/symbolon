@@ -9,10 +9,15 @@
 // Safari, 1Password, KeePassXC, Proton Pass and Dashlane write. The format
 // is told from the text unless --format names it.
 //
-// What does not come across, and is said so: a source's passkeys (their
-// private keys are whole keys, and a Symbolon passkey is split between the
-// device and the cosigner: the person makes a new one at each site), and a
-// password-protected Bitwarden export (export it again unencrypted).
+// A Bitwarden export's passkeys come across as Synced passkeys (SPEC 5.2,
+// 22.3; synced.resid): their private keys are whole keys, which are never
+// split after the fact, so each is kept as a software key in the vault,
+// marked to migrate, and the person is told to make a Symbolon passkey at
+// each of those sites. One that is not ES256 on P-256, or whose key does
+// not read, is left out with the reason.
+//
+// What does not come across, and is said so: a password-protected
+// Bitwarden export (export it again unencrypted).
 //
 // With --dry-run nothing is unlocked or published: each item prints as
 // "item TYPE NAME-HEX FOLDER-HEX". Both forms print "skip NAME-HEX
@@ -27,6 +32,7 @@ import "common.resid";
 import "device.resid";
 import "vaultcli.resid";
 import "vaultitems.resid";
+import "synced.resid";
 import "sharecli.resid";
 import "crypto.resid";
 import "resid-json/json.resid";
@@ -38,8 +44,9 @@ import "resid-csv/csv.resid";
 type ImpField = { Str name; Str value; };
 type ImpCustom = { Str label; Bool hidden; Str value; };
 
-// An entry as read from a source, before it is checked and sealed.
-type Imp = { Str name; Str kind; Str folder; List(ImpField) fields; List(ImpCustom) custom; };
+// An entry as read from a source, before it is checked and sealed; `why`
+// is why it cannot come across, or "".
+type Imp = { Str name; Str kind; Str folder; List(ImpField) fields; List(ImpCustom) custom; Str why; };
 
 // What a source gave: the entries, and what the person should know.
 type ImpRead = { List(Imp) items; List(Str) warnings; };
@@ -53,7 +60,7 @@ ListBuf(ImpCustom) cput(ListBuf(ImpCustom) acc, Str label, Str value, Bool hidde
 }
 
 Imp imp(Str name, Str kind, Str folder, ListBuf(ImpField) fs, ListBuf(ImpCustom) cs) {
-    return Imp {.name = str_trim(name), .kind = kind, .folder = str_trim(folder), .fields = fs.finish(), .custom = cs.finish()};
+    return Imp {.name = str_trim(name), .kind = kind, .folder = str_trim(folder), .fields = fs.finish(), .custom = cs.finish(), .why = ""};
 }
 
 Str field_of(Imp x, Str n) { return field_at(x.fields, n, 0); }
@@ -167,12 +174,14 @@ Result(ImpRead, Str) bitwarden_json(Value top) {
     if (match value_field(top, "items") { None => true, Some(_) => false }) { return Err("this JSON has no \"items\": export from Bitwarden or Vaultwarden as .json"); }
     List(Value) folders = jl(top, "folders").concat(jl(top, "collections"));
     List(Value) items = jl(top, "items");
-    return Ok(ImpRead {.items = bw_items(items, folders, 0, ListBuf()), .warnings = bw_warnings(items)});
+    List(Imp) got = bw_items(items, folders, 0, ListBuf());
+    return Ok(ImpRead {.items = got, .warnings = synced_warnings(got)});
 }
 
 List(Imp) bw_items(List(Value) xs, List(Value) folders, Int i, ListBuf(Imp) acc) {
     if (i >= xs.len()) { return acc.finish(); }
-    return bw_items(xs, folders, i + 1, acc.push(bw_item(xs[i], folders)));
+    ListBuf(Imp) a = acc.push(bw_item(xs[i], folders));
+    return bw_items(xs, folders, i + 1, bw_fido2(jl(jo(xs[i], "login"), "fido2Credentials"), jt(xs[i], "name"), bw_folder(xs[i], folders), 0, a));
 }
 
 Str name_by_id(List(Value) xs, Str id, Int i) {
@@ -285,19 +294,51 @@ Imp bw_ssh(Value k, Str name, Str notes, Str folder, ListBuf(ImpCustom) cs) {
                cput(cput(cs, "Public key", jt(k, "publicKey"), false), "Fingerprint", jt(k, "keyFingerprint"), false));
 }
 
-// Passkeys stay behind; say how many.
-List(Str) bw_warnings(List(Value) items) {
-    Int n = bw_passkeys(items, 0, 0);
+// A login's passkeys (its "fido2Credentials"), each a Synced passkey: {
+// "credentialId" (a GUID, or "b64." and base64url), "keyType" "public-key",
+// "keyAlgorithm" "ECDSA", "keyCurve" "P-256", "keyValue" (PKCS#8,
+// base64url), "rpId", "rpName", "userHandle" (base64url), "userName",
+// "userDisplayName", "counter", "discoverable", "creationDate"}.
+ListBuf(Imp) bw_fido2(List(Value) ks, Str login, Str folder, Int i, ListBuf(Imp) acc) {
+    if (i >= ks.len()) { return acc; }
+    return bw_fido2(ks, login, folder, i + 1, acc.push(bw_passkey(ks[i], login, folder)));
+}
+
+Imp bw_passkey(Value k, Str login, Str folder) {
+    Str rp = str_to_lower(str_trim(jt(k, "rpId")));
+    Str user = jt(k, "userName");
+    Str site = if (str_len(str_trim(jt(k, "rpName"))) > 0) { jt(k, "rpName") } else { if (str_len(rp) > 0) { rp } else { name_or(login, "", "") } };
+    Str name = site + " passkey" + (if (str_len(str_trim(user)) > 0) { " (" + str_trim(user) + ")" } else { "" });
+    List(Int) cid = bw_credential_id(jt(k, "credentialId"));
+    List(Int) key = pkcs8_p256_scalar(unb64url(jt(k, "keyValue")));
+    List(Int) pub = if (key.len() == 32) { ec_public_key(P256, key) } else { [] };
+    Str alg = jt(k, "keyAlgorithm");
+    Str curve = jt(k, "keyCurve");
+    Str why = if ((str_len(alg) > 0 && str_to_upper(alg) != "ECDSA") || (str_len(curve) > 0 && str_to_upper(curve) != "P-256")) { "only ES256 passkeys (ECDSA on P-256) can be kept; this one is " + alg + " " + curve }
+              else { if (str_len(rp) == 0) { "this passkey has no site (rpId)" }
+              else { if (cid.len() == 0 || cid.len() > 1023) { "this passkey's credential ID does not read" }
+              else { if (pub.len() != 65) { "this passkey's private key does not read" } else { "" } } } };
+    ListBuf(ImpField) fs = fput(fput(fput(fput(fput(fput(fput(fput(fput(fput(fput(fput(ListBuf(),
+        "rp_id", rp), "credential_id", hex_encode(cid)), "key", hex_encode(key)), "public_key", hex_encode(pub)),
+        "user_handle", hex_encode(unb64url(jt(k, "userHandle")))), "username", user), "display_name", jt(k, "userDisplayName")),
+        "rp_name", jt(k, "rpName")), "counter", jt(k, "counter")), "profile", "synced"), "migrate", "1"), "source", "bitwarden");
+    Imp x = imp(name, "passkey", folder, fs, ListBuf());
+    return Imp {.name = x.name, .kind = x.kind, .folder = x.folder, .fields = x.fields, .custom = x.custom, .why = why};
+}
+
+// What the person should know about the passkeys that come across.
+List(Str) synced_warnings(List(Imp) xs) {
+    Int n = synced_count(xs, 0, 0);
     return if (n == 0) { [] } else { [passkey_warning(n)] };
 }
 
-Str passkey_warning(Int n) {
-    return f"{n} passkey{if (n == 1) { "" } else { "s" }} did not come across: a Symbolon passkey is split between this device and your cosigner, so make a new one at each of those sites";
+Int synced_count(List(Imp) xs, Int i, Int n) {
+    if (i >= xs.len()) { return n; }
+    return synced_count(xs, i + 1, if (xs[i].kind == "passkey" && str_len(xs[i].why) == 0) { n + 1 } else { n });
 }
 
-Int bw_passkeys(List(Value) xs, Int i, Int n) {
-    if (i >= xs.len()) { return n; }
-    return bw_passkeys(xs, i + 1, n + jl(jo(xs[i], "login"), "fido2Credentials").len());
+Str passkey_warning(Int n) {
+    return f"{n} passkey{if (n == 1) { "" } else { "s" }} came across as Synced passkeys: each signs on this device alone, without your cosigner. Make a Symbolon passkey at each of those sites, then delete the imported one";
 }
 
 // ─── CSV, whoever wrote it ──────────────────────────────────────────
@@ -522,8 +563,10 @@ Result(ImpRead, Str) read_export(Str text, Str format) {
 // The fields an entry is stored with: name, type, folder, its fields, and
 // its custom fields as the app keeps them (custom_N = label, 0x1f, "1" or
 // "0", 0x1f, the value).
-List(ImpField) stored_fields(Imp x, Str name) {
-    ListBuf(ImpField) a0 = ListBuf();
+// An imported passkey also records when it came in (`when`, Unix seconds).
+List(ImpField) stored_fields(Imp x, Str name, Str when) {
+    ListBuf(ImpField) e = ListBuf();
+    ListBuf(ImpField) a0 = if (x.kind == "passkey" && str_len(when) > 0) { e.push(ImpField {.name = "imported", .value = when}) } else { e };
     ListBuf(ImpField) a = a0.push(ImpField {.name = "name", .value = name}).push(ImpField {.name = "type", .value = x.kind});
     ListBuf(ImpField) b = if (str_len(x.folder) == 0) { a } else { a.push(ImpField {.name = "folder", .value = x.folder}) };
     return customs(x.custom, 0, x.fields.len(), push_all(x.fields, 0, b)).finish();
@@ -544,6 +587,7 @@ ListBuf(ImpField) customs(List(ImpCustom) cs, Int i, Int used, ListBuf(ImpField)
 
 // Why an entry cannot be stored, or "".
 Str problem_of(Imp x, List(ImpField) fs) {
+    if (str_len(x.why) > 0) { return x.why; }
     if (fits(fs, 0) == false) { return "a field is longer than 64 KiB"; }
     return missing_for(x.kind, plain_fields(x.fields, 0, ListBuf()));
 }
@@ -574,13 +618,13 @@ Str free_name(Str base, Int n, Set(Str) taken, List(Secret(UInt(8))) vk, List(It
 type Ready = { Str name; Str kind; Str folder; List(ImpField) fields; Str problem; };
 
 @requires(declassify)
-List(Ready) prepare(List(Imp) xs, Int i, Set(Str) taken, List(Secret(UInt(8))) vk, List(Item) items, Bool check_vault, ListBuf(Ready) acc) {
+List(Ready) prepare(List(Imp) xs, Int i, Set(Str) taken, List(Secret(UInt(8))) vk, List(Item) items, Bool check_vault, Str when, ListBuf(Ready) acc) {
     if (i >= xs.len()) { return acc.finish(); }
     Str name = free_name(xs[i].name, 1, taken, vk, items, check_vault);
-    List(ImpField) fs = stored_fields(xs[i], name);
+    List(ImpField) fs = stored_fields(xs[i], name, when);
     Str p = problem_of(xs[i], fs);
     Ready r = Ready {.name = name, .kind = xs[i].kind, .folder = xs[i].folder, .fields = fs, .problem = p};
-    return prepare(xs, i + 1, if (str_len(p) == 0) { taken.insert(name) } else { taken }, vk, items, check_vault, acc.push(r));
+    return prepare(xs, i + 1, if (str_len(p) == 0) { taken.insert(name) } else { taken }, vk, items, check_vault, when, acc.push(r));
 }
 
 Int report(List(Ready) rs, List(Str) warnings, Bool dry, Int i, Int ok) {
@@ -631,7 +675,7 @@ Int import_items(Str dir, ImpRead got, Bool dry, Str share) {
     if (dry) {
         List(Secret(UInt(8))) none = [];
         Set(Str) taken = {};
-        return report(prepare(got.items, 0, taken, none, [], false, ListBuf()), got.warnings, true, 0, 0);
+        return report(prepare(got.items, 0, taken, none, [], false, "", ListBuf()), got.warnings, true, 0, 0);
     }
     Result(Opened, Str) ro = open_place(dir, share);
     return match ro { Err(m) => dfail(m), Ok(o) => import_into(dir, o, got) };
@@ -641,7 +685,7 @@ Int import_items(Str dir, ImpRead got, Bool dry, Str share) {
 Int import_into(Str dir, Opened o, ImpRead got) {
     List(Secret(UInt(8))) vk = o.p.vk;
     Set(Str) taken = {};
-    List(Ready) rs = prepare(got.items, 0, taken, vk, o.st.items, true, ListBuf());
+    List(Ready) rs = prepare(got.items, 0, taken, vk, o.st.items, true, f"{clock_now_seconds()}", ListBuf());
     Result(List(Item), Str) sealed = seal_all(rs, 0, vk, o.p.vid, ListBuf());
     return match sealed {
         Err(m) => dfail(m),

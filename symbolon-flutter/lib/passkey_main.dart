@@ -69,6 +69,17 @@ class _PasskeyPageState extends State<PasskeyPage> {
   late final Credential? cred = create ? null : widget.settings.credentials.where((c) => c.id == rq['cid']).firstOrNull;
   String get rpId => create ? cr!.rpId : ((rq['rp'] as String?) ?? '');
 
+  // A new passkey for an account whose passkey was imported from another
+  // manager replaces that one (SPEC 22.3, 26.5): the site lists it among the
+  // credentials to exclude, or names the same user handle. The imported one
+  // keeps working until it is retired on the Passkeys page.
+  late final Credential? replacing = create
+      ? widget.settings.credentials
+          .where((x) => x.synced && x.replacedBy.isEmpty && x.rp == cr!.rpId)
+          .where((x) => cr!.exclude.contains(b64u(fromHex(x.id))) || (x.userHandle.isNotEmpty && x.userHandle == toHex(cr!.userId)))
+          .firstOrNull
+      : null;
+
   BioState bio = BioState.none;
 
   @override
@@ -95,7 +106,7 @@ class _PasskeyPageState extends State<PasskeyPage> {
     if (create) {
       final c = cr!;
       if (!c.es256) return '$rpId does not accept the kind of passkey Symbolon makes (ES256).';
-      final mine = widget.settings.credentials.where((x) => x.rp == c.rpId).map((x) => b64u(fromHex(x.id)));
+      final mine = widget.settings.credentials.where((x) => x.rp == c.rpId && !x.synced).map((x) => b64u(fromHex(x.id)));
       if (mine.any(c.exclude.contains)) return 'You already have a Symbolon passkey for this account at ${c.rpId}.';
     } else if (cred == null) {
       return 'That passkey is no longer on this device.';
@@ -120,10 +131,11 @@ class _PasskeyPageState extends State<PasskeyPage> {
     final cdh = rq['clientDataHash'] as String;
     final cdj = rq['clientDataJSON'] as String?;
     final r = create
-        ? await runTask(context, 'Creating a passkey for $rpId', () => cli.waRegister(dir, rpId, p),
+        ? await runTask(context, 'Creating a passkey for $rpId', () => cli.waRegister(dir, rpId, p, replaces: replacing?.id ?? ''),
             detail: 'Its key is split between this device and the cosigner.', usually: 'a few seconds')
         : await runTask(context, 'Signing in to $rpId', () => cli.waAssert(dir, rpId, cred!.id, cdh, p),
-            detail: 'This device and the cosigner sign together.', usually: '10-30 seconds');
+            detail: cred!.synced ? 'An imported passkey: this device signs alone.' : 'This device and the cosigner sign together.',
+            usually: cred!.synced ? 'a few seconds' : '10-30 seconds');
     pin.clear();
     if (!mounted) return;
     if (!r.ok) {
@@ -139,6 +151,8 @@ class _PasskeyPageState extends State<PasskeyPage> {
       final id = r.field('credential-id') ?? '', pub = r.field('public-key') ?? '';
       await widget.settings.addCredential(
           Credential(c.rpId, id, pub, userName: c.userName, displayName: c.displayName, userHandle: toHex(c.userId)));
+      final old = replacing;
+      if (old != null) await widget.settings.addCredential(old.replaced(id));
       await widget.channel.invokeMethod('finish', {
         'json': registrationResponse(cidHex: id, publicKeyHex: pub, authDataHex: ad, attestationHex: r.field('attestation-object') ?? '', clientDataJSON: cdj),
       });
@@ -172,6 +186,20 @@ class _PasskeyPageState extends State<PasskeyPage> {
               ListTile(leading: const Icon(Icons.open_in_new), title: Text(requester), subtitle: const Text('Asked by')),
             ]),
           ),
+          if (replacing != null)
+            const Padding(
+              key: Key('pk-replaces'),
+              padding: EdgeInsets.only(top: 8),
+              child: Text('This replaces the passkey you imported from another password manager. '
+                  'Sign in once with the new one, then retire the imported one under Passkeys.'),
+            ),
+          if (!create && (cred?.synced ?? false))
+            const Padding(
+              key: Key('pk-imported'),
+              padding: EdgeInsets.only(top: 8),
+              child: Text('An imported passkey: it signs on this device alone, without your cosigner. '
+                  'Add a Symbolon passkey at this site to replace it.'),
+            ),
           const SizedBox(height: 16),
           if (problem != null) ...[
             Text(problem!, key: const Key('pk-problem'), style: TextStyle(color: Theme.of(context).colorScheme.error)),

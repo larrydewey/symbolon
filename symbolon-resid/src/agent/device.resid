@@ -474,7 +474,13 @@ pub Int device_sign(Str dir, Str rp, Str cid_hex, Str m_hex) {
 // form 0 prints the passkey forms (DER, then r || s); 1 an SSH signature
 // blob (ecdsa-sha2-nistp256, SPEC 16.1).
 pub Int sign_with(Str dir, DeviceConfig c, Str rp, List(Int) cid, List(Int) m, Str pin, Int form) {
-    Unlocked u = unlock_dir(dir, c, pin);
+    return sign_unlocked(dir, c, unlock_dir(dir, c, pin), rp, cid, m, pin, form);
+}
+
+// The same, with the profiles already unlocked (a WebAuthn assertion
+// unlocks first to tell a threshold credential from a Synced one).
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+pub Int sign_unlocked(Str dir, DeviceConfig c, Unlocked u, Str rp, List(Int) cid, List(Int) m, Str pin, Int form) {
     if (u.kind == 2) { return duress_sign(dir, c, u, cid, m, form); }
     if (u.kind != 1) { return dfail("wrong PIN"); }
     Option(List(Int)) nonce = credential_nonce(u.real.cc, rp, cid);
