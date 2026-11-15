@@ -73,7 +73,11 @@ jobs:
           test -n "$b"
           echo "RESID_AARCH64_BUILTINS=$b" >> "$GITHUB_ENV"
           echo "RESID_HOME=$GITHUB_WORKSPACE/resid/build/boot" >> "$GITHUB_ENV"
-          echo "$GITHUB_WORKSPACE/resid/build/boot" >> "$GITHUB_PATH"
+          # Resid commits the compiler (stage2.bin), not the residc wrapper.
+          mkdir -p "$RUNNER_TEMP/bin"
+          printf '#!/usr/bin/env bash\nexec "%s/resid/build/boot/stage2.bin" "$@"\n' "$GITHUB_WORKSPACE" > "$RUNNER_TEMP/bin/residc"
+          chmod +x "$RUNNER_TEMP/bin/residc"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
           mkdir -p resid/target
           resid/build/boot/stage2.bin resid/tools/resid-manifest.resid -o resid/target/resid-manifest --profile debug
           echo "MANIFEST=$GITHUB_WORKSPACE/resid/target/resid-manifest" >> "$GITHUB_ENV"
