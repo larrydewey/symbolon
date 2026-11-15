@@ -266,7 +266,7 @@ SCID=3f2a9c1e7b4d4e8a9c0f1d2e3f4a5b6c
 [ "$(field "$SPK" type)" = passkey ] && [ "$(field "$SPK" profile)" = synced ] && [ "$(field "$SPK" migrate)" = 1 ] && [ "$(field "$SPK" public_key)" = $SPUB ] \
   && [ "$(field "$SPK" credential_id)" = $SCID ] && [ -n "$(field "$SPK" imported)" ] || fail "imported passkey: $(printf '2468\n' | "$BIN" device vault show "$W/dev" "$SPK" 2>&1)"
 printf '2468\n' | run 300 "$BIN" device webauthn synced "$W/dev" > "$W/synced.log" 2>&1 || fail "webauthn synced: $(cat "$W/synced.log")"
-grep -qx "passkey $SCID $(hx github.com) $(hx octo-user-handle) $(hx octo) $(hx 'The Octocat') $SPUB" "$W/synced.log" || fail "webauthn synced: $(cat "$W/synced.log")"
+grep -qx "passkey $SCID $(hx github.com) $(hx octo-user-handle) $(hx octo) $(hx 'The Octocat') $SPUB -" "$W/synced.log" || fail "webauthn synced: $(cat "$W/synced.log")"
 SCDH=$(printf '%s' '{"type":"webauthn.get","challenge":"xyz","origin":"https://github.com"}' | sha256sum | cut -d' ' -f1)
 printf '2468\n' | run 300 "$BIN" device webauthn assert "$W/dev" github.com $SCID "$SCDH" --uv > "$W/sget.log" 2>&1 || fail "synced assert: $(cat "$W/sget.log")"
 python3 - "$W/sget.log" "$SCDH" "$SPUB" <<'PY' || fail "synced assertion does not verify (python-fido2): $(cat "$W/sget.log")"
@@ -285,6 +285,28 @@ PY
 printf '2468\n' | run 300 "$BIN" device webauthn assert "$W/dev" evil.example.net $SCID "$SCDH" > "$W/sevil.log" 2>&1 && fail "a Synced passkey signed for another RP"
 grep -q "A-12" "$W/sevil.log" || fail "synced assert for another RP: $(cat "$W/sevil.log")"
 printf '1357\n' | run 600 "$BIN" device webauthn assert "$W/dev" github.com $SCID "$SCDH" > "$W/sdur.log" 2>&1 && fail "a Synced passkey signed under the duress PIN"
+# Migrating it (SPEC 22.3 step 4, 26.5): not retired while nothing replaces
+# it; a Symbolon passkey registered at the same site replaces it (not one
+# for another site); the imported one still signs and says what replaced
+# it; the new one signs with the cosigner; then the imported one is retired.
+printf '2468\n' | run 300 "$BIN" device webauthn retire "$W/dev" $SCID > "$W/sret0.log" 2>&1 && fail "retired an imported passkey nothing replaced"
+grep -q "nothing replaces" "$W/sret0.log" || fail "retire before replacing: $(cat "$W/sret0.log")"
+printf '2468\n' | run 300 "$BIN" device webauthn register "$W/dev" gitlab.com --replaces $SCID > "$W/srep0.log" 2>&1 && fail "replaced a passkey of another site"
+grep -q "not gitlab.com" "$W/srep0.log" && ! grep -q "^credential-id" "$W/srep0.log" || fail "replace for another site: $(cat "$W/srep0.log")"
+printf '2468\n' | run 300 "$BIN" device webauthn register "$W/dev" github.com --uv --replaces $SCID > "$W/srep.log" 2>&1 || fail "register --replaces: $(cat "$W/srep.log")"
+NCID=$(awk '/^credential-id/ {print $2}' "$W/srep.log")
+[ ${#NCID} -eq 64 ] && grep -qx "replaces-recorded $NCID" "$W/srep.log" || fail "register --replaces: $(cat "$W/srep.log")"
+[ "$(field "$SPK" replaced_by)" = "$NCID" ] && [ "$(field "$SPK" migrate)" = registered ] || fail "replacement not recorded"
+printf '2468\n' | run 300 "$BIN" device webauthn synced "$W/dev" 2>&1 | grep -q "^passkey $SCID .* $NCID$" || fail "synced list does not show the replacement"
+printf '2468\n' | run 300 "$BIN" device webauthn assert "$W/dev" github.com $SCID "$SCDH" > "$W/sget2.log" 2>&1 || fail "the replaced passkey no longer signs: $(cat "$W/sget2.log")"
+grep -qx "replaced-by $NCID" "$W/sget2.log" || fail "assert does not say what replaced it: $(cat "$W/sget2.log")"
+printf '2468\n' | run 600 "$BIN" device webauthn assert "$W/dev" github.com $NCID "$SCDH" --uv > "$W/nget.log" 2>&1 || fail "the new passkey does not sign: $(tail -2 "$W/nget.log")"
+grep -q "^signature-der " "$W/nget.log" && ! grep -q "^profile synced" "$W/nget.log" || fail "the new passkey: $(cat "$W/nget.log")"
+printf '2468\n' | run 300 "$BIN" device webauthn retire "$W/dev" $SCID > "$W/sret.log" 2>&1 || fail "retire: $(cat "$W/sret.log")"
+grep -qx "retired $(hx github.com)" "$W/sret.log" && grep -q "^note " "$W/sret.log" || fail "retire: $(cat "$W/sret.log")"
+[ -z "$(printf '2468\n' | run 300 "$BIN" device webauthn synced "$W/dev" 2>/dev/null)" ] || fail "a retired passkey is still listed"
+printf '2468\n' | run 300 "$BIN" device webauthn assert "$W/dev" github.com $SCID "$SCDH" > /dev/null 2>&1 && fail "a retired passkey signed"
+echo "Synced passkey: replaced by a Symbolon passkey at its site, then retired"
 printf '2468\n' | run 600 "$BIN" device vault import "$W/dev" $FX/lastpass.csv > "$W/iml.log" 2>&1 || fail "import lastpass: $(cat "$W/iml.log")"
 grep -qx "total 8" "$W/iml.log" || fail "import lastpass: $(cat "$W/iml.log")"
 [ "$(field Mastercard expiry)" = 01/28 ] && [ "$(field Mastercard notes)" = "$(printf 'Line one\nLine two')" ] && [ "$(field Mastercard folder)" = Finance/Cards ] \

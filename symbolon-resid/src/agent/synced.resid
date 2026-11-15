@@ -14,8 +14,20 @@
 //   username, display_name, rp_name
 //   counter        the signature counter the source last used, decimal
 //   profile        "synced"
-//   migrate        "1": register a Threshold passkey here (SPEC 22.3)
+//   migrate        "1": register a Threshold passkey here (SPEC 22.3);
+//                  "registered" once one was
+//   replaced_by    the Threshold credential registered in its place, hex
+//   replaced_at    when (Unix seconds)
 //   source, imported   where it came from, and when (Unix seconds)
+//
+// Migrating (SPEC 22.3 step 4, 26.5 method 3): a site's own registration
+// ceremony makes the Threshold passkey (WebAuthn lets only the site start
+// one), and `device webauthn register ... --replaces CID` records which
+// Synced passkey it replaces. The Synced one keeps signing until the person
+// has signed in with the new one; then
+//   symbolon device webauthn retire DIR CID [--force]
+// deletes it from the vault (--force: one that nothing replaced), and the
+// person removes it at the site.
 //
 // It signs on this device alone: no cosigner takes part, which is what
 // makes it the weaker profile, and why the agent says so.
@@ -24,8 +36,8 @@
 // identity's Threshold credentials (webauthn.resid), and
 //   symbolon device webauthn synced DIR
 // lists them for the app (PIN on stdin): "passkey CID-HEX RP-HEX USER-HEX
-// USERNAME-HEX DISPLAY-HEX PUBLIC-KEY-HEX", text fields hex of UTF-8, "-"
-// when empty.
+// USERNAME-HEX DISPLAY-HEX PUBLIC-KEY-HEX REPLACED-BY-HEX", text fields hex
+// of UTF-8, "-" when empty (REPLACED-BY: not yet replaced).
 
 import "../types.resid";
 import "../vault/vault.resid";
@@ -118,7 +130,7 @@ Bool hex_digits(List(Int) b, Int i) {
 
 // ─── Finding one in the vault ───────────────────────────────────────
 
-pub type Synced = { Str rp; List(Int) cid; List(Secret(UInt(8))) key; List(Int) pub; List(Int) user; Str username; Str display; Int counter; };
+pub type Synced = { Str rp; List(Int) cid; List(Secret(UInt(8))) key; List(Int) pub; List(Int) user; Str username; Str display; Int counter; Str replaced_by; };
 
 // Every Synced passkey in the vault.
 @requires(declassify)
@@ -137,7 +149,7 @@ Synced synced_of(List(FieldPlain) fs) {
     return Synced {.rp = field_text(fs, "rp_id"), .cid = cose_hex_decode(field_text(fs, "credential_id")), .key = key_of(fs, 0),
                    .pub = cose_hex_decode(field_text(fs, "public_key")), .user = cose_hex_decode(field_text(fs, "user_handle")),
                    .username = field_text(fs, "username"), .display = field_text(fs, "display_name"),
-                   .counter = if (str_len(c) == 0 || str_len(c) > 10) { 0 } else { str_parse_int(c) }};
+                   .counter = if (str_len(c) == 0 || str_len(c) > 10) { 0 } else { str_parse_int(c) }, .replaced_by = field_text(fs, "replaced_by")};
 }
 
 Str digits_of(Str s) { List(Int) b = utf8(str_trim(s)); return if (decimal(b, 0)) { str_trim(s) } else { "" }; }
@@ -226,6 +238,7 @@ Int synced_sign(Synced s, List(Int) cdh, Int flags) {
     println("profile synced");
     println("authenticator-data " + hex_encode(ad));
     println("user-handle " + hex_encode(s.user));
+    if (str_len(s.replaced_by) > 0) { println("replaced-by " + s.replaced_by); }
     println("signature-der " + hex_encode(ecdsa_der_of(sig)));
     println(hex_encode(ecdsa_raw_of(P256, sig)));
     return 0;
@@ -242,8 +255,92 @@ pub Int device_wa_synced(Str dir) {
 Int print_synced(List(Synced) xs, Int i) {
     if (i >= xs.len()) { return 0; }
     Synced s = xs[i];
-    println("passkey " + hex_encode(s.cid) + " " + hx(s.rp) + " " + (if (s.user.len() == 0) { "-" } else { hex_encode(s.user) }) + " " + hx(s.username) + " " + hx(s.display) + " " + hex_encode(s.pub));
+    println("passkey " + hex_encode(s.cid) + " " + hx(s.rp) + " " + (if (s.user.len() == 0) { "-" } else { hex_encode(s.user) }) + " " + hx(s.username) + " " + hx(s.display) + " " + hex_encode(s.pub)
+            + " " + (if (str_len(s.replaced_by) == 0) { "-" } else { s.replaced_by }));
     return print_synced(xs, i + 1);
 }
 
 Str hx(Str s) { return if (str_len(s) == 0) { "-" } else { hex_encode(utf8(s)) }; }
+
+// ─── Migrating to a Threshold passkey ───────────────────────────────
+
+// A Synced passkey's sealed item and its fields.
+pub type SyncedItem = { Item it; List(FieldPlain) fs; };
+
+@requires(declassify)
+pub Option(SyncedItem) synced_item(List(Item) items, List(Secret(UInt(8))) vk, List(Int) vid, List(Int) cid, Int i) {
+    if (i >= items.len()) { return None; }
+    Result(List(FieldPlain), SymbolonError) r = item_open(vk, vid, items[i]);
+    Bool hit = match r { Err(_) => false, Ok(fs) => field_text(fs, "type") == "passkey" && bytes_eq(cose_hex_decode(field_text(fs, "credential_id")), cid) };
+    if (!hit) { return synced_item(items, vk, vid, cid, i + 1); }
+    return match r { Err(_) => None, Ok(fs) => Some(SyncedItem {.it = items[i], .fs = fs}) };
+}
+
+// Why `cid` cannot be replaced at `rp` from this vault, or "".
+@requires(declassify)
+pub Str replace_problem(List(Item) items, List(Secret(UInt(8))) vk, List(Int) vid, Str rp, List(Int) cid) {
+    return match synced_item(items, vk, vid, cid, 0) {
+        None => "no imported passkey has that credential ID",
+        Some(x) => if (field_text(x.fs, "rp_id") != rp) { "that imported passkey is for " + field_text(x.fs, "rp_id") + ", not " + rp } else { "" }
+    };
+}
+
+// Records that the Threshold credential `new_cid` replaces the Synced
+// passkey `cid`: migrate "registered", replaced_by, replaced_at; one new
+// vault version. The Synced passkey keeps signing until it is retired.
+@requires(filesystem, network, device, declassify, clock, environment)
+pub Int synced_replace(Str dir, Opened o, List(Int) cid, List(Int) new_cid) {
+    return match synced_item(o.st.items, o.p.vk, o.p.vid, cid, 0) {
+        None => dfail("no imported passkey has that credential ID"),
+        Some(x) => reseal_replaced(dir, o, x, new_cid)
+    };
+}
+
+@requires(filesystem, network, device, declassify, clock, environment)
+Int reseal_replaced(Str dir, Opened o, SyncedItem x, List(Int) new_cid) {
+    List(FieldPlain) fs = with_field(with_field(with_field(x.fs, "migrate", "registered"), "replaced_by", hex_encode(new_cid)), "replaced_at", f"{clock_now_seconds()}");
+    Result(Item, SymbolonError) ri = item_seal(o.p.vk, o.p.vid, x.it.id, x.it.version + (UInt(64))1, x.it.kind, fs, x.it.in_duress_subset, x.it.handling_policy);
+    return match ri {
+        Err(e) => dfail(err_text(e)),
+        Ok(it) => if (publish_items(dir, o, without_item(o.st.items, x.it.id, 0, ListBuf()).concat([it])) != 0) { 1 } else { replaced_line(new_cid) }
+    };
+}
+
+Int replaced_line(List(Int) new_cid) { println("replaces-recorded " + hex_encode(new_cid)); return 0; }
+
+// The fields with `name` set to `value` (replaced, or added at the end).
+List(FieldPlain) with_field(List(FieldPlain) fs, Str name, Str value) {
+    return without_field(fs, name, 0, ListBuf()).concat([FieldPlain {.name = name, .value = secret_bytes(utf8(value))}]);
+}
+
+List(FieldPlain) without_field(List(FieldPlain) fs, Str name, Int i, ListBuf(FieldPlain) acc) {
+    if (i >= fs.len()) { return acc.finish(); }
+    return without_field(fs, name, i + 1, if (fs[i].name == name) { acc } else { acc.push(fs[i]) });
+}
+
+// `device webauthn retire DIR CID [--force]`: deletes a Synced passkey
+// that a Threshold passkey replaced (any one, with --force), and says to
+// remove it at the site as well.
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+pub Int device_wa_retire(Str dir, Str cid_hex, Bool force) {
+    Result(Opened, Str) ro = open_vault(dir);
+    return match ro {
+        Err(m) => dfail(m),
+        Ok(o) => match synced_item(o.st.items, o.p.vk, o.p.vid, cose_hex_decode(cid_hex), 0) {
+            None => dfail("no imported passkey has that credential ID"),
+            Some(x) => retire(dir, o, x, force)
+        }
+    };
+}
+
+@requires(filesystem, network, device, declassify, clock, environment)
+Int retire(Str dir, Opened o, SyncedItem x, Bool force) {
+    Str rp = field_text(x.fs, "rp_id");
+    if (str_len(field_text(x.fs, "replaced_by")) == 0 && !force) {
+        return dfail("nothing replaces this passkey yet: add a Symbolon passkey at " + rp + " first (or retire it anyway with --force)");
+    }
+    if (publish_items(dir, o, without_item(o.st.items, x.it.id, 0, ListBuf())) != 0) { return 1; }
+    println("retired " + hx(rp));
+    println("note " + hex_encode(utf8("Remove the imported passkey in " + rp + "'s account settings too: until you do, anyone with a copy of the export can still sign in with it")));
+    return 0;
+}

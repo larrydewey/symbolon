@@ -60,12 +60,16 @@ class SymbolonCredentialService : CredentialProviderService() {
             val req = JSONObject(option.requestJson)
             val rp = req.optString("rpId")
             val allowed = req.optJSONArray("allowCredentials")?.let { a -> (0 until a.length()).map { a.getJSONObject(it).getString("id") }.toSet() }
+            fun offered(c: Known) = c.rp == rp && (allowed == null || allowed.isEmpty() || b64url(hex(c.id)) in allowed)
             for (c in known) {
-                if (c.rp != rp) continue
-                if (allowed != null && allowed.isNotEmpty() && b64url(hex(c.id)) !in allowed) continue
+                if (!offered(c)) continue
+                // An imported passkey a Symbolon passkey replaced is not
+                // offered where the site takes the new one (SPEC 26.5).
+                if (c.synced && known.any { it.id == c.replacedBy && offered(it) }) continue
                 val pi = PasskeyActivity.pending(this, PasskeyActivity.GET, c.rp, c.id, requestCode = code++)
+                val name = if (c.displayName.isNotEmpty()) c.displayName else c.rp
                 entries.add(PublicKeyCredentialEntry.Builder(this, c.userName.ifEmpty { c.rp }, pi, option)
-                    .setDisplayName(if (c.displayName.isNotEmpty()) c.displayName else c.rp).build())
+                    .setDisplayName(if (c.synced) "$name (imported)" else name).build())
             }
         }
         callback.onResult(BeginGetCredentialResponse(entries))
@@ -77,7 +81,7 @@ class SymbolonCredentialService : CredentialProviderService() {
         callback: OutcomeReceiver<Void?, ClearCredentialException>,
     ) = callback.onResult(null)
 
-    private data class Known(val rp: String, val id: String, val userName: String, val displayName: String)
+    private data class Known(val rp: String, val id: String, val userName: String, val displayName: String, val synced: Boolean, val replacedBy: String)
 
     private fun credentials(): List<Known> {
         val f = File(filesDir, "settings.json")
@@ -85,7 +89,7 @@ class SymbolonCredentialService : CredentialProviderService() {
         return try {
             val a = JSONObject(f.readText()).optJSONArray("credentials") ?: return emptyList()
             (0 until a.length()).map { a.getJSONObject(it) }.map {
-                Known(it.getString("rp"), it.getString("id"), it.optString("userName"), it.optString("displayName"))
+                Known(it.getString("rp"), it.getString("id"), it.optString("userName"), it.optString("displayName"), it.optBoolean("synced"), it.optString("replacedBy"))
             }
         } catch (e: Exception) {
             emptyList()

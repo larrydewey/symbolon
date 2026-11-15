@@ -4,6 +4,7 @@ import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 
 import '../app.dart';
+import '../settings.dart';
 import '../vault_types.dart';
 import '../widgets.dart';
 
@@ -103,7 +104,17 @@ class _ImportPageState extends State<ImportPage> {
     final f = file;
     final p = preview;
     if (f == null || p == null || p.items.isEmpty) return;
-    final r = await app.withPin(context, (pin) => runTask(context, 'Importing ${p.items.length} items', () => app.cli.vaultImport(app.dir, f, pin, share: widget.share), usually: 'under a minute'));
+    final passkeys = widget.share.isEmpty && p.items.any((i) => i.type == 'passkey');
+    final r = await app.withPin(context, (pin) => runTask(context, 'Importing ${p.items.length} items', () async {
+          final r = await app.cli.vaultImport(app.dir, f, pin, share: widget.share);
+          // Imported passkeys are offered at sign-in, and listed to be
+          // replaced, from the same list as Symbolon's own.
+          if (r.ok && passkeys) {
+            final s = await app.cli.waSynced(app.dir, pin);
+            if (s.ok) await app.settings.setSynced(Credential.syncedFrom(s.lines));
+          }
+          return r;
+        }, usually: 'under a minute'));
     if (!mounted || r == null || !r.ok) return;
     await _forgetCopy();
     final total = r.lines.map((l) => l.trim()).where((l) => l.startsWith('total ')).map((l) => int.tryParse(l.substring(6)) ?? 0).firstOrNull ?? p.items.length;

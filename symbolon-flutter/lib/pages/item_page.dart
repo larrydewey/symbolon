@@ -91,6 +91,10 @@ class _ItemPageState extends State<ItemPage> {
     if (ok != true || !mounted) return;
     final r = await app.withPin(context, (p) => runTask(context, 'Deleting ${widget.item.name}', () => app.cli.vaultDelete(app.dir, widget.item.name, p, share: widget.share), usually: 'a few seconds'));
     if (r != null && r.ok && mounted) {
+      // An imported passkey is no longer offered at sign-in either.
+      final cid = fields?['credential_id'] ?? '';
+      if (type.id == 'passkey' && cid.isNotEmpty) await app.settings.removeCredential(cid);
+      if (!mounted) return;
       toast(context, '${widget.item.name} deleted');
       Navigator.of(context).pop(const ItemChange(null));
     }
