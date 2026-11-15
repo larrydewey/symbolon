@@ -45,6 +45,12 @@ case "$1 $2" in
         echo "public-key 04bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
         echo "authenticator-data 0102"
         echo "attestation-object a3" ;;
+      synced)
+        # an imported passkey for example.com, account alice (user handle 0707)
+        echo "passkey dddd $(printf example.com | od -An -tx1 | tr -d ' \n') 0707 $(printf alice | od -An -tx1 | tr -d ' \n') - 04ee -" ;;
+      retire)
+        echo "retired $(printf example.com | od -An -tx1 | tr -d ' \n')"
+        echo "note 00" ;;
       assert)
         echo "authenticator-data 0304"
         echo "signature-der 3006020101020101"

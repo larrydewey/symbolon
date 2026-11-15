@@ -192,9 +192,88 @@ class _PasskeysPageState extends State<PasskeysPage> {
     );
   }
 
+  // An imported passkey (SPEC 5.2, 22.3): what it is, the next step of its
+  // migration, and retiring it once a Symbolon passkey replaced it.
+  void imported(Credential c) {
+    final done = c.replacedBy.isNotEmpty;
+    showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      builder: (ctx) => SafeArea(
+        child: SingleChildScrollView(
+          padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+          child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+            Text(c.rp, style: Theme.of(ctx).textTheme.titleLarge),
+            if (c.userName.isNotEmpty) Text(c.userName, style: Theme.of(ctx).textTheme.bodyMedium),
+            const SizedBox(height: 12),
+            const Text('Imported from another password manager. Its key is a whole key: it signs on this device alone, without your cosigner, '
+                'and a copy of the export it came in can use it too. A Symbolon passkey is safer: its key is split, so neither this device nor a copy can sign alone.'),
+            const SizedBox(height: 12),
+            if (!done) ...[
+              Text('To replace it', style: Theme.of(ctx).textTheme.titleMedium),
+              const SizedBox(height: 4),
+              Text('1. Sign in to ${c.rp} (this passkey still works).\n'
+                  '2. In its security settings, add a passkey and choose Symbolon.\n'
+                  '3. Sign in once with the new passkey, then come back here to retire this one.'),
+            ] else ...[
+              Text('Replaced', key: const Key('imported-replaced'), style: Theme.of(ctx).textTheme.titleMedium),
+              const SizedBox(height: 4),
+              Text('A Symbolon passkey replaced it at ${c.rp}. Once you have signed in with the new one, retire this one, '
+                  'then remove it in ${c.rp}\'s security settings too.'),
+              const SizedBox(height: 12),
+              WideButton('Retire the imported passkey', key: const Key('imported-retire'), icon: Icons.delete_outline, onPressed: () {
+                Navigator.of(ctx).pop();
+                retire(c);
+              }),
+            ],
+            if (!done)
+              TextButton(
+                key: const Key('imported-retire-force'),
+                onPressed: () async {
+                  final sure = await showDialog<bool>(
+                    context: ctx,
+                    builder: (d) => AlertDialog(
+                      title: Text('Retire it without a replacement?'),
+                      content: Text('You will no longer be able to sign in to ${c.rp} with it from Symbolon. '
+                          'Make sure you can sign in another way (a password, or another passkey) first.'),
+                      actions: [
+                        TextButton(onPressed: () => Navigator.of(d).pop(false), child: const Text('Cancel')),
+                        FilledButton(style: FilledButton.styleFrom(backgroundColor: Colors.red.shade700, foregroundColor: Colors.white), onPressed: () => Navigator.of(d).pop(true), child: const Text('Retire')),
+                      ],
+                    ),
+                  );
+                  if (sure != true || !ctx.mounted) return;
+                  Navigator.of(ctx).pop();
+                  retire(c, force: true);
+                },
+                child: const Text('Retire it anyway…'),
+              ),
+          ]),
+        ),
+      ),
+    );
+  }
+
+  Future<void> retire(Credential c, {bool force = false}) async {
+    final r = await app.withPin(context, (p) => runTask(context, 'Retiring the imported passkey for ${c.rp}', () => app.cli.waRetire(app.dir, c.id, p, force: force), usually: 'a few seconds'));
+    if (r == null || !r.ok) return;
+    await app.settings.removeCredential(c.id);
+    if (!mounted) return;
+    setState(() {});
+    await showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Retired', key: Key('imported-retired')),
+        content: Text('Now remove the old passkey in ${c.rp}\'s security settings: until you do, anyone with a copy of the export can still sign in with it.'),
+        actions: [FilledButton(onPressed: () => Navigator.of(ctx).pop(), child: const Text('Close'))],
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
-    final cs = app.settings.credentials;
+    final cs = app.settings.credentials.where((c) => !c.synced).toList();
+    final imports = app.settings.credentials.where((c) => c.synced).toList()..sort((a, b) => a.rp.compareTo(b.rp));
     final q = query.text.trim().toLowerCase();
     final shown = cs.where((c) => (filter == 0 || c.duress) && (c.rp.toLowerCase().contains(q) || c.userName.toLowerCase().contains(q))).toList()
       ..sort((a, b) => a.rp.compareTo(b.rp));
@@ -202,6 +281,25 @@ class _PasskeysPageState extends State<PasskeysPage> {
       floatingActionButton: FloatingActionButton.extended(heroTag: null, key: const Key('new-passkey'), onPressed: register, icon: const Icon(Icons.add), label: const Text('Passkey')),
       body: PageBody(children: [
         const ProviderCard(),
+        if (imports.isNotEmpty)
+          Section('Imported passkeys to replace', key: const Key('imported-passkeys'), children: [
+            Text('${imports.length} passkey${imports.length == 1 ? '' : 's'} came from another password manager and sign on this device alone. '
+                'Replace each with a Symbolon passkey, whose key is split with your cosigner.'),
+            const SizedBox(height: 8),
+            for (final c in imports)
+              Card(
+                child: ListTile(
+                  key: Key('imported-${c.rp}'),
+                  leading: const Icon(Icons.fingerprint),
+                  title: Text(c.rp),
+                  subtitle: Text(c.replacedBy.isEmpty
+                      ? 'Next: add a Symbolon passkey at ${c.rp}${c.userName.isEmpty ? '' : ' for ${c.userName}'}'
+                      : 'Replaced: retire it once the new one works'),
+                  trailing: c.replacedBy.isEmpty ? const KindTag('To replace', Colors.orange) : const KindTag('Replaced', Colors.green),
+                  onTap: () => imported(c),
+                ),
+              ),
+          ]),
         if (cs.isEmpty)
           const Section('No passkeys yet', key: Key('passkeys-empty'), children: [
             Text('A passkey signs you in to a site without a password. Its key is split between this device and the cosigner, '

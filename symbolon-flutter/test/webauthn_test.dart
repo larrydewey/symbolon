@@ -125,6 +125,35 @@ void main() {
       expect(args, contains('device webauthn register ${agent.dir.path}/dev example.com --uv'));
     });
 
+    testWidgets('a new passkey for an account whose passkey was imported replaces it', (t) async {
+      settings.credentials = [const Credential('example.com', 'dddd', '04ee', userName: 'alice', userHandle: '0707', synced: true)];
+      await show(t, createRq);
+      expect(find.byKey(const Key('pk-replaces')), findsOneWidget);
+      expect(find.byKey(const Key('pk-problem')), findsNothing);
+      await t.enterText(find.byKey(const Key('pk-pin')), '2468');
+      await t.tap(find.byKey(const Key('pk-go')));
+      await t.pump();
+      await settle(t);
+      expect(finished, hasLength(1));
+      final args = (await t.runAsync(() => agent.argsLog.readAsString()))!;
+      expect(args, contains('device webauthn register ${agent.dir.path}/dev example.com --uv --replaces dddd'));
+      final old = settings.credentials.firstWhere((c) => c.id == 'dddd');
+      expect(old.synced, isTrue);
+      expect(old.replacedBy, 'c' * 64);
+      expect(settings.credentials.where((c) => !c.synced).single.id, 'c' * 64);
+    });
+
+    testWidgets('an imported passkey the site excludes is replaced, not refused', (t) async {
+      settings.credentials = [const Credential('example.com', 'dddd', '04ee', synced: true)];
+      final rq = jsonDecode(createRq['requestJson'] as String) as Map<String, dynamic>;
+      rq['excludeCredentials'] = [
+        {'type': 'public-key', 'id': b64u(fromHex('dddd'))},
+      ];
+      await show(t, {...createRq, 'requestJson': jsonEncode(rq)});
+      expect(find.byKey(const Key('pk-problem')), findsNothing);
+      expect(find.byKey(const Key('pk-replaces')), findsOneWidget);
+    });
+
     testWidgets('a wrong PIN is reported and nothing is answered', (t) async {
       await show(t, createRq);
       await t.enterText(find.byKey(const Key('pk-pin')), '0000');
