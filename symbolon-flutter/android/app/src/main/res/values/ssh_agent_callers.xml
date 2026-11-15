@@ -3,8 +3,9 @@
     <!-- Apps that may use Symbolon's SSH agent (SPEC 16.1.1): the SHA-256 of
          each app's signing certificate, lower-case hex (colons allowed),
          one item per certificate. Used for the permission (knownSigner,
-         Android 12+) and checked on every call. Pylon's release
-         certificate goes here when it is cut; empty, no app is served. -->
+         Android 12+) and checked on every call. Empty: no app is served.
+         Pylon, signed with the same key as Symbolon's published APKs. -->
     <string-array name="ssh_agent_callers" translatable="false">
+        <item>7edf81fe80818c5593d8a3fb323a24791d090775403aea2cd88c507330c79826</item>
     </string-array>
 </resources>
