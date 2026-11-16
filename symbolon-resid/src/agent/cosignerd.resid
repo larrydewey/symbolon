@@ -191,8 +191,28 @@ pub List(List(UInt(64))) primes_line(Str f, Int k) {
 }
 
 // A finished signing session a peer keeps, in case the designated party
-// asks for abort-2 openings.
-type Kept = { List(Int) sid; ThState st; List(Remote) peers; };
+// asks for abort-2 openings, until `until` (seconds).
+type Kept = { List(Int) sid; ThState st; List(Remote) peers; Int until; };
+
+// How long a co-signed session is kept. The designated party asks for the
+// openings as soon as the signature shares fail to add up, within the
+// session's 120 seconds of waiting for a round; after that nothing asks.
+// A session kept for good kept its serve-for child from ever exiting (it
+// exits only with nothing kept), and the child, which frees nothing, grew
+// by about 20 MB a second until the kernel's OOM killer ended it, half an
+// hour after each signature.
+pub Int kept_sec() { return 300; }
+
+List(Kept) unexpired(List(Kept) ks, Int now, Int i, List(Kept) acc) {
+    if (i >= ks.len()) { return acc; }
+    return unexpired(ks, now, i + 1, if (ks[i].until > now) { acc.concat([ks[i]]) } else { acc });
+}
+
+// When the first kept session expires.
+Int soonest(List(Kept) ks, Int i, Int best) {
+    if (i >= ks.len()) { return best; }
+    return soonest(ks, i + 1, if (ks[i].until < best) { ks[i].until } else { best });
+}
 
 // One child process's share of the work (`cosigner serve-for`): turns until
 // `until` (seconds) has passed and no signing session is waiting for late
@@ -202,13 +222,17 @@ type Kept = { List(Int) sid; ThState st; List(Remote) peers; };
 // the kernel takes back each one's memory when it exits. The session state
 // in `kept` (nonce shares among it) only ever lives in memory.
 @requires(network, filesystem, declassify, clock, provision)
-Int serve_loop(Str dir, Str primes_file, List(Kept) kept, Int n, Int until) {
-    if (clock_now_seconds() >= until && kept.len() == 0) { return 0; }
+Int serve_loop(Str dir, Str primes_file, List(Kept) kept0, Int n, Int until) {
+    Int now = clock_now_seconds();
+    List(Kept) kept = unexpired(kept0, now, 0, []);
+    if (now >= until && kept.len() == 0) { return 0; }
     List(Kept) next = serve_turn(dir, primes_file, kept, n);
-    // Idle, wait for mail in a loop that frees each poll's garbage (TLS
-    // polls every 200 ms in this loop kept hundreds of megabytes alive
-    // until a session began). Kept sessions keep the short turns.
-    _ = if (next.len() == 0) { idle_wait(dir, until) } else { clock_sleep_ms(200) };
+    // Wait for mail in a loop that frees each poll's garbage: until this
+    // child's time is up, or while a session is kept, until it expires (a
+    // late abort request is mail too, and wakes it). A turn every 200 ms
+    // here, as there once was for kept sessions, kept every turn's
+    // allocations: TLS to the relay, the configuration read and written.
+    _ = idle_wait(dir, if (next.len() == 0) { until } else { soonest(next, 0, next[0].until) });
     return serve_loop(dir, primes_file, next, n + 1, until);
 }
 
@@ -510,7 +534,7 @@ Handled run_cosign(Cosigner c, SignInvite inv, Quorum q, CgCtx ctx, List(Got) ea
         lambda(t, msgs) { sign_adapt(t, msgs) }, 120);
     if (str_len(r.fail) > 0) { return Handled {.c = cos_fail(c, "session: " + r.fail), .kept = kept}; }
     println("cosigner: co-signed session " + hex_encode(inv.session_id));
-    return Handled {.c = c, .kept = [Kept {.sid = inv.session_id, .st = r.seats[0].st, .peers = rs}]};
+    return Handled {.c = c, .kept = [Kept {.sid = inv.session_id, .st = r.seats[0].st, .peers = rs, .until = clock_now_seconds() + kept_sec()}]};
 }
 
 pub Result(Stepped(ThState), CgFail) sign_adapt(ThState st, List(ThMsg) msgs) {

@@ -149,4 +149,16 @@ done
 echo "sshd: logged in with each key; the window was shown the user and the server's host key ($HOSTFP)"
 
 ls "$W/run/symbolon/" | grep -v '^ssh-agent.sock$' && fail "request files were left behind"
+
+# After co-signing, the cosigner's child keeps the session a while for a
+# late abort request, waiting for mail, not turning: it once took a turn
+# every 200 ms and kept every turn's memory (about 20 MB a second), and
+# never exited, until the kernel's OOM killer ended it.
+cpid=$(pgrep -f "cosigner serve-for $W/cos" | head -1)
+[ -n "$cpid" ] || fail "no cosigner child after the co-signs"
+r0=$(awk '/^VmRSS/{print $2}' "/proc/$cpid/status")
+sleep 10
+r1=$(awk '/^VmRSS/{print $2}' "/proc/$cpid/status" 2>/dev/null || echo "$r0")
+[ $((r1 - r0)) -lt 20480 ] || fail "the cosigner's child grew $(((r1 - r0) / 1024)) MB in 10 s after co-signing"
+echo "cosigner: its child after co-signing grew $(((r1 - r0) / 1024)) MB in 10 s"
 echo "PASS ssh_e2e"
