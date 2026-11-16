@@ -41,6 +41,12 @@
                 <action android:name="android.intent.action.MAIN"/>
                 <category android:name="android.intent.category.LAUNCHER"/>
             </intent-filter>
+            <!-- Straight to SSH keys: what an app that uses the SSH agent
+                 (Pylon) opens when Symbolon has no key for it yet. -->
+            <intent-filter>
+                <action android:name="dev.symbolon.action.SSH_KEYS"/>
+                <category android:name="android.intent.category.DEFAULT"/>
+            </intent-filter>
         </activity>
         <!-- A passkey ceremony for the system (Android 14+). -->
         <activity

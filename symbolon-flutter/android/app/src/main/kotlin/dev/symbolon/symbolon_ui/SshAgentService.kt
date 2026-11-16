@@ -7,8 +7,10 @@ import android.content.pm.PackageManager
 import android.os.Binder
 import android.os.IBinder
 import android.os.Parcel
+import android.util.Log
 import org.json.JSONObject
 import java.io.File
+import java.io.IOException
 import java.io.InputStream
 import java.security.MessageDigest
 import java.util.concurrent.ConcurrentHashMap
@@ -45,6 +47,7 @@ class SshAgentService : Service() {
         const val CALL = IBinder.FIRST_CALL_TRANSACTION
         const val WAIT = IBinder.FIRST_CALL_TRANSACTION + 1
         const val CLOSE = IBinder.FIRST_CALL_TRANSACTION + 2
+        const val TAG = "SymbolonSshAgent"
     }
 
     private class Conn(val proc: Process, val peer: String) {
@@ -121,18 +124,30 @@ class SshAgentService : Service() {
         val bin = File(applicationInfo.nativeLibraryDir, "libsymbolon.so").absolutePath
         val p = ProcessBuilder(bin, "ssh-agent-stdio", deviceDir(), runDir().absolutePath, peer).start()
         val c = Conn(p, peer)
+        // Closing a connection destroys its process under these readers:
+        // the read then fails, which ends the thread. Uncaught, it would
+        // end the whole app and every other connection with it.
         Thread {
-            val i = p.inputStream
-            while (true) {
-                val h = readFully(i, 4) ?: break
-                val n = ((h[0].toInt() and 255) shl 24) or ((h[1].toInt() and 255) shl 16) or ((h[2].toInt() and 255) shl 8) or (h[3].toInt() and 255)
-                if (n < 1 || n > 262144) break
-                val body = readFully(i, n) ?: break
-                c.replies.put(h + body)
+            try {
+                val i = p.inputStream
+                while (true) {
+                    val h = readFully(i, 4) ?: break
+                    val n = ((h[0].toInt() and 255) shl 24) or ((h[1].toInt() and 255) shl 16) or ((h[2].toInt() and 255) shl 8) or (h[3].toInt() and 255)
+                    if (n < 1 || n > 262144) break
+                    val body = readFully(i, n) ?: break
+                    c.replies.put(h + body)
+                }
+            } catch (_: IOException) {
             }
         }.apply { isDaemon = true }.start()
+        // The agent's other lines say why a request failed: logcat has them.
         Thread {
-            p.errorStream.bufferedReader().forEachLine { l -> if (l.startsWith("consent ")) c.consents.put(l.substring(8)) }
+            try {
+                p.errorStream.bufferedReader().forEachLine { l ->
+                    if (l.startsWith("consent ")) c.consents.put(l.substring(8)) else Log.w(TAG, l.take(500))
+                }
+            } catch (_: IOException) {
+            }
         }.apply { isDaemon = true }.start()
         conns[key] = c
         return c

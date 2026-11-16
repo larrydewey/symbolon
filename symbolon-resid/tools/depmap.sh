@@ -12,6 +12,9 @@ mkdir -p target
 # serial.resid as a package (the same code). The agent already uses the
 # standard library's copy (CBOR), and two copies would define every serial
 # name twice, so resid-json is pointed at that one.
-STDLIB="${RESID_LIB:-$HOME/git/larry/resid/lib}"
+# The standard library the compiler uses: RESID_LIB, else as residc finds
+# it from RESID_HOME (an install's lib/, or a checkout's beside build/boot).
+RH="${RESID_HOME:-$HOME/.resid}"
+if [ -n "${RESID_LIB:-}" ]; then STDLIB="$RESID_LIB"; elif [ -d "$RH/lib" ]; then STDLIB="$RH/lib"; else STDLIB="$RH/../../lib"; fi
 sed -i "s|^resid-serial::.*|resid-serial::$STDLIB/serial.resid|" target/deps.map
 echo target/deps.map

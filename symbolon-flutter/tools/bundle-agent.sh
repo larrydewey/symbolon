@@ -5,7 +5,9 @@
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
 SRC="$HERE/../symbolon-resid"
-RC="${RESIDC:-$HOME/git/larry/resid/build/boot/residc}"
+# The installed Resid (~/.resid, install.sh): one compiler and standard
+# library for every project; RESIDC overrides (CI uses its checkout).
+RC="${RESIDC:-$(command -v residc || echo "$HOME/.resid/bin/residc")}"
 # Release builds (-O2, about ten times faster than debug) are signed: with
 # RESID_SIGNING_KEY, else the Resid install's key.
 export RESID_SIGNING_KEY="${RESID_SIGNING_KEY:-$HOME/.resid/keys/resid-ed25519.key}"
