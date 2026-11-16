@@ -61,6 +61,11 @@ jobs:
         with:
           repository: larrydewey/resid-csv
           path: resid-csv
+      # resid-json's own dependency, beside it (its resid.toml: ../resid-serial).
+      - uses: actions/checkout@v4
+        with:
+          repository: larrydewey/resid-serial
+          path: resid-serial
 
       - name: Toolchain
         run: |
