@@ -68,7 +68,8 @@ jobs:
           sudo apt-get install -y -q lld
           # The agent's compile peaks near 14 GB; swap keeps a peak from
           # killing the runner.
-          sudo fallocate -l 8G /swapfile && sudo chmod 600 /swapfile && sudo mkswap /swapfile && sudo swapon /swapfile
+          # A file of its own: the runner image may already swap on /swapfile.
+          sudo fallocate -l 8G /swap-symbolon && sudo chmod 600 /swap-symbolon && sudo mkswap /swap-symbolon && sudo swapon /swap-symbolon
           b=$(find "$ANDROID_NDK_LATEST_HOME" -name 'libclang_rt.builtins-aarch64-android.a' | head -1)
           test -n "$b"
           echo "RESID_AARCH64_BUILTINS=$b" >> "$GITHUB_ENV"
@@ -79,7 +80,8 @@ jobs:
           chmod +x "$RUNNER_TEMP/bin/residc"
           echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
           mkdir -p resid/target
-          resid/build/boot/stage2.bin resid/tools/resid-manifest.resid -o resid/target/resid-manifest --profile debug
+          # $GITHUB_ENV applies from the next step: name the runtime here.
+          RESID_HOME="$GITHUB_WORKSPACE/resid/build/boot" resid/build/boot/stage2.bin resid/tools/resid-manifest.resid -o resid/target/resid-manifest --profile debug
           echo "MANIFEST=$GITHUB_WORKSPACE/resid/target/resid-manifest" >> "$GITHUB_ENV"
 
       - name: Signing material
