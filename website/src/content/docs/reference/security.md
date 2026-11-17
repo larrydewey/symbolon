@@ -4,7 +4,7 @@ description: What Symbolon protects against, what it relies on, and what it does
 ---
 
 This page is a summary. The specification,
-[SPEC.md](https://github.com/larrydewey/symbolon/blob/main/SPEC.md), states
+[SPEC.md](https://github.com/larrydewey/symbolon/blob/master/SPEC.md), states
 every goal, the threats and the residual risks, with a red-team audit in its
 Appendix A.
 

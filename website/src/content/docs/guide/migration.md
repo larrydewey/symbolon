@@ -123,7 +123,7 @@ shared folders. See [Organizations](/symbolon/org/).
 - **Replacing imported passkeys without visiting each site.** Today each
   site's own "add a passkey" page makes the replacement. Doing it from a
   recipe, or by a rollover the site accepts during an ordinary sign-in
-  ([SPEC 26.5](https://github.com/larrydewey/symbolon/blob/main/SPEC.md)),
+  ([SPEC 26.5](https://github.com/larrydewey/symbolon/blob/master/SPEC.md)),
   and offering imported passkeys in the browser extension, are next.
 
 - **Removing a device from your identity** by re-sharing without it. Today

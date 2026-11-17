@@ -1,5 +1,5 @@
 # Builds the Android app: the agent (libsymbolon.so for arm64-v8a and
-# x86_64, tools/bundle-agent.sh) and then the APK. Pushes to main and pull
+# x86_64, tools/bundle-agent.sh) and then the APK. Pushes to master and pull
 # requests keep the APK as a short-lived workflow artifact; a published
 # release gets it attached.
 #
@@ -24,7 +24,7 @@ name: apk
 
 on:
   push:
-    branches: [main]
+    branches: [master]
     paths: ["symbolon-resid/**", "symbolon-flutter/**", ".github/workflows/apk.yml"]
   pull_request:
     paths: ["symbolon-resid/**", "symbolon-flutter/**", ".github/workflows/apk.yml"]
