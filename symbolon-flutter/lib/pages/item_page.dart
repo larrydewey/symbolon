@@ -44,6 +44,21 @@ class _ItemPageState extends State<ItemPage> with ClosesOnLock {
   @override
   PinSession get lockingSession => widget.app.session;
 
+  // Locked while the editor is open above: this page forgets what it showed
+  // (the editor keeps its own draft, covered) and loads it again, with the
+  // PIN, when the editor closes.
+  bool reloadAfterEdit = false;
+
+  @override
+  void onLock() {
+    if (ModalRoute.of(context)?.isCurrent ?? true) return closeHere();
+    setState(() {
+      fields = null;
+      shown.clear();
+      reloadAfterEdit = true;
+    });
+  }
+
   Map<String, String>? fields;
   final shown = <String>{};
 
@@ -76,7 +91,11 @@ class _ItemPageState extends State<ItemPage> with ClosesOnLock {
     if (widget.offline) return toast(context, 'Changes need a connection to your relay.');
     final saved = await Navigator.of(context).push<VaultItem>(MaterialPageRoute(
         builder: (_) => ItemEditor(app: app, type: type, names: widget.names, name: widget.item.name, fields: fields, folders: widget.folders, share: widget.share)));
-    if (saved != null && mounted) Navigator.of(context).pop(ItemChange(saved));
+    if (saved != null && mounted) return Navigator.of(context).pop(ItemChange(saved));
+    if (reloadAfterEdit && mounted) {
+      reloadAfterEdit = false;
+      load();
+    }
   }
 
   Future<void> delete() async {

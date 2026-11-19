@@ -103,16 +103,17 @@ class PinSession extends ChangeNotifier {
 
 /// For a screen that shows vault contents: when the app locks (the person
 /// left it, or tapped the lock), it closes whatever is open above it (a
-/// dialog, a sheet, the editor) and then itself, so nothing of the vault is
-/// on screen when the app is opened again.
+/// dialog, a sheet) and then itself, so nothing of the vault is on screen
+/// when the app is opened again. A screen can do otherwise ([onLock]): the
+/// editor covers its draft instead.
 mixin ClosesOnLock<T extends StatefulWidget> on State<T> {
   PinSession get lockingSession;
-  late final int _opened = lockingSession.locks;
+  late int _seen = lockingSession.locks;
 
   @override
   void initState() {
     super.initState();
-    _opened;
+    _seen;
     lockingSession.addListener(_onSession);
   }
 
@@ -123,11 +124,25 @@ mixin ClosesOnLock<T extends StatefulWidget> on State<T> {
   }
 
   void _onSession() {
-    if (!mounted || lockingSession.locks == _opened) return;
+    if (!mounted || lockingSession.locks == _seen) return;
+    _seen = lockingSession.locks;
+    onLock();
+  }
+
+  /// What the screen does when the app locks; by default it closes.
+  void onLock() => closeHere();
+
+  /// Closes whatever is open above this screen (a dialog, a sheet).
+  void closeAbove() {
+    final me = ModalRoute.of(context);
+    if (me != null && me.isActive) Navigator.of(context).popUntil((r) => r == me);
+  }
+
+  /// Closes what is above this screen, then the screen itself.
+  void closeHere() {
     final me = ModalRoute.of(context);
     if (me == null || !me.isActive) return;
-    final nav = Navigator.of(context);
-    nav.popUntil((r) => r == me);
-    nav.removeRoute(me);
+    closeAbove();
+    Navigator.of(context).removeRoute(me);
   }
 }
