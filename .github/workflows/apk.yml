@@ -66,18 +66,24 @@ jobs:
           repository: larrydewey/Resid
           ref: v0.10.1
           path: resid
+      # The Resid packages, each at a fixed commit (they have no releases),
+      # so a build is the same from run to run; raise a pin when Symbolon
+      # needs a newer one.
       - uses: actions/checkout@v4
         with:
           repository: larrydewey/resid-json
+          ref: 937cda69ae9d15caed7a3c6fb3cce5b51b10ab4d
           path: resid-json
       - uses: actions/checkout@v4
         with:
           repository: larrydewey/resid-csv
+          ref: 516886ae77dc57d01294e92d5f2b9b2dc55ff9bb
           path: resid-csv
       # resid-json's own dependency, beside it (its resid.toml: ../resid-serial).
       - uses: actions/checkout@v4
         with:
           repository: larrydewey/resid-serial
+          ref: 32a664b26e6c5dad3f58c82f3f1e69e5b539e0f2
           path: resid-serial
 
       - name: Toolchain
