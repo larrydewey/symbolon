@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import '../app.dart';
+import '../session.dart';
 import '../card_face.dart';
 import '../validate.dart' as v;
 import '../vault_types.dart';
@@ -33,7 +34,10 @@ class _Custom {
   bool hidden = false;
 }
 
-class _ItemEditorState extends State<ItemEditor> {
+class _ItemEditorState extends State<ItemEditor> with ClosesOnLock {
+  @override
+  PinSession get lockingSession => widget.app.session;
+
   final form = GlobalKey<FormState>();
   late final name = TextEditingController(text: widget.name ?? '');
   late final folder = TextEditingController(text: widget.fields?['folder'] ?? widget.folder);

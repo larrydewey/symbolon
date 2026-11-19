@@ -25,7 +25,7 @@ class PinSession extends ChangeNotifier {
       _pin = null;
       return;
     }
-    if (keepMinutes > 0) _timer = Timer(Duration(minutes: keepMinutes), lock);
+    if (keepMinutes > 0) _timer = Timer(Duration(minutes: keepMinutes), forget);
   }
 
   /// Remembers [pin] (after an action it unlocked succeeded).
@@ -36,11 +36,27 @@ class PinSession extends ChangeNotifier {
     notifyListeners();
   }
 
-  void lock() {
+  /// Drops the PIN (the "stay unlocked" time ran out, or a PIN was wrong).
+  /// What is on screen stays: the next action asks again.
+  void forget() {
     _timer?.cancel();
     final was = _pin != null;
     _pin = null;
     if (was) notifyListeners();
+  }
+
+  /// Counts the locks: each one closes whatever shows vault contents.
+  int locks = 0;
+
+  /// Locks the app: the person left it (another app, the home screen, the
+  /// screen off) or tapped the lock. Drops the PIN, and every screen that
+  /// shows vault contents closes or clears, even when no PIN was kept
+  /// ("Ask every time").
+  void lock() {
+    _timer?.cancel();
+    _pin = null;
+    locks++;
+    notifyListeners();
   }
 
   /// Where a PIN can come from before it is typed (biometric unlock);
@@ -73,7 +89,7 @@ class PinSession extends ChangeNotifier {
     if (ok(r)) {
       remember(p);
     } else if (wrongPin(r)) {
-      lock();
+      forget();
     }
     return r;
   }
@@ -82,5 +98,36 @@ class PinSession extends ChangeNotifier {
   void dispose() {
     _timer?.cancel();
     super.dispose();
+  }
+}
+
+/// For a screen that shows vault contents: when the app locks (the person
+/// left it, or tapped the lock), it closes whatever is open above it (a
+/// dialog, a sheet, the editor) and then itself, so nothing of the vault is
+/// on screen when the app is opened again.
+mixin ClosesOnLock<T extends StatefulWidget> on State<T> {
+  PinSession get lockingSession;
+  late final int _opened = lockingSession.locks;
+
+  @override
+  void initState() {
+    super.initState();
+    _opened;
+    lockingSession.addListener(_onSession);
+  }
+
+  @override
+  void dispose() {
+    lockingSession.removeListener(_onSession);
+    super.dispose();
+  }
+
+  void _onSession() {
+    if (!mounted || lockingSession.locks == _opened) return;
+    final me = ModalRoute.of(context);
+    if (me == null || !me.isActive) return;
+    final nav = Navigator.of(context);
+    nav.popUntil((r) => r == me);
+    nav.removeRoute(me);
   }
 }

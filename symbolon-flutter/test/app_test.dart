@@ -523,6 +523,76 @@ void main() {
     await lock(t);
   });
 
+  // The screen turning off (or another app) is the app going to the
+  // background; coming back resumes it.
+  Future<void> awayAndBack(WidgetTester t) async {
+    for (final s in [AppLifecycleState.inactive, AppLifecycleState.hidden, AppLifecycleState.paused,
+                     AppLifecycleState.hidden, AppLifecycleState.inactive, AppLifecycleState.resumed]) {
+      t.binding.handleAppLifecycleStateChanged(s);
+    }
+    await t.pump();
+    await t.pump(const Duration(milliseconds: 500));
+  }
+
+  Future<void> openVisa(WidgetTester t) async {
+    await openVault(t);
+    await t.tap(find.byKey(const Key('item-visa')));
+    await t.pump(const Duration(milliseconds: 500));
+    await settle(t);
+    if (find.byKey(const Key('secret-field')).evaluate().isNotEmpty) await pin(t, '2468');
+    await t.tap(find.descendant(of: find.byKey(const Key('field-cvv')), matching: find.byTooltip('Show')));
+    await t.pump();
+    expect(find.text('123'), findsOneWidget);   // the code, in plain view
+  }
+
+  testWidgets('the screen turning off closes an open item, its revealed fields and the vault list', (t) async {
+    settings.siteIcons = false;
+    await start(t);
+    await openVisa(t);
+    await awayAndBack(t);
+    expect(find.text('123'), findsNothing);
+    expect(find.byKey(const Key('field-cvv')), findsNothing);
+    expect(find.byKey(const Key('item-visa')), findsNothing);
+    expect(find.byKey(const Key('open-vault')), findsOneWidget);   // locked
+  });
+
+  testWidgets('with "ask every time", leaving the app still closes what was open', (t) async {
+    settings.siteIcons = false;
+    settings.keepUnlockedMinutes = 0;
+    await start(t);
+    await openVisa(t);
+    await awayAndBack(t);
+    expect(find.text('123'), findsNothing);
+    expect(find.byKey(const Key('item-visa')), findsNothing);
+    expect(find.byKey(const Key('open-vault')), findsOneWidget);
+  });
+
+  testWidgets('leaving the app closes the editor, and what was typed in it', (t) async {
+    await start(t);
+    await openVault(t);
+    await t.tap(find.byKey(const Key('vault-add')));
+    await t.pumpAndSettle();
+    await t.tap(find.byKey(const Key('add-login')));
+    await t.pumpAndSettle();
+    await t.enterText(find.byKey(const Key('edit-current')), 'typed-secret');
+    await awayAndBack(t);
+    expect(find.text('typed-secret'), findsNothing);
+    expect(find.byKey(const Key('edit-current')), findsNothing);
+    expect(find.byKey(const Key('open-vault')), findsOneWidget);
+  });
+
+  testWidgets('"stay unlocked" running out forgets the PIN but leaves the open item where it is', (t) async {
+    settings.siteIcons = false;
+    settings.keepUnlockedMinutes = 1;
+    await start(t);
+    await openVisa(t);
+    await t.pump(const Duration(minutes: 1, seconds: 1));
+    expect(find.text('123'), findsOneWidget);
+    expect(find.byKey(const Key('lock')), findsNothing);   // the PIN is gone
+    await awayAndBack(t);                                   // leaving still closes it
+    expect(find.text('123'), findsNothing);
+  });
+
   testWidgets('a card shows its fields: hidden ones masked, custom fields labelled', (t) async {
     settings.siteIcons = false;
     await start(t);

@@ -6,6 +6,7 @@ import 'package:flutter/material.dart';
 import '../app.dart';
 import '../card_face.dart';
 import '../favicons.dart';
+import '../session.dart';
 import '../validate.dart' show cardBrand;
 import '../vault_types.dart';
 import '../widgets.dart';
@@ -39,7 +40,10 @@ class ItemPage extends StatefulWidget {
   State<ItemPage> createState() => _ItemPageState();
 }
 
-class _ItemPageState extends State<ItemPage> {
+class _ItemPageState extends State<ItemPage> with ClosesOnLock {
+  @override
+  PinSession get lockingSession => widget.app.session;
+
   Map<String, String>? fields;
   final shown = <String>{};
 
