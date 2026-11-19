@@ -1,7 +1,8 @@
 # Builds the Android app: the agent (libsymbolon.so for arm64-v8a and
 # x86_64, tools/bundle-agent.sh) and then the APK. Pushes to master and pull
 # requests keep the APK as a short-lived workflow artifact; a published
-# release gets it attached.
+# release gets it attached (release.yml calls this for the releases it
+# publishes itself).
 #
 # Signing (repository secrets; without them the APK is debug-signed and
 # says so in its name):
@@ -30,6 +31,14 @@ on:
     paths: ["symbolon-resid/**", "symbolon-flutter/**", ".github/workflows/apk.yml"]
   release:
     types: [published]
+  # From release.yml, for the release it just published (a release made
+  # with the workflow's token does not start this workflow by itself).
+  workflow_call:
+    inputs:
+      tag:
+        description: the release to attach the APK to
+        type: string
+        required: true
   workflow_dispatch:
 
 permissions:
@@ -37,7 +46,7 @@ permissions:
   actions: write    # delete earlier runs' artifacts
 
 concurrency:
-  group: apk-${{ github.ref }}
+  group: apk-${{ inputs.tag || github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -158,7 +167,7 @@ jobs:
           flutter test
           flutter build apk --release
           # The release asset is symbolon-vX.Y.Z.apk, the name Obtainium follows.
-          name="symbolon-${{ github.event_name == 'release' && github.event.release.tag_name || github.sha }}"
+          name="symbolon-${{ inputs.tag || (github.event_name == 'release' && github.event.release.tag_name) || github.sha }}"
           [ "$SIGNED" = release ] || name="$name-debug-signed"
           mkdir -p "$RUNNER_TEMP/out"
           cp build/app/outputs/flutter-apk/app-release.apk "$RUNNER_TEMP/out/$name.apk"
@@ -173,10 +182,10 @@ jobs:
           if-no-files-found: error
 
       - name: Attach to the release
-        if: github.event_name == 'release'
+        if: github.event_name == 'release' || inputs.tag != ''
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.event.release.tag_name }}
+          TAG: ${{ inputs.tag || github.event.release.tag_name }}
           REPO: ${{ github.repository }}
         run: |
           # Only a release-signed APK goes out: Obtainium updates an installed

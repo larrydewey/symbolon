@@ -1,0 +1,80 @@
+# Publishes a release when the app's version changes on master.
+#
+# The version is symbolon-flutter/pubspec.yaml's (0.6.3+17 is v0.6.3). When a
+# push to master carries a version that has no release yet, this job:
+#   - requires release-notes/vX.Y.Z.md, the release's text (no notes, no
+#     release: the run fails and says so);
+#   - checks the extension's manifest.json has the same version;
+#   - creates the tag on the pushed commit and publishes the release, with
+#     the browser extension's zip and SHA256SUMS attached;
+#   - then runs the APK build (apk.yml), which attaches the release-signed
+#     APK and adds it to SHA256SUMS.
+# A release made with the workflow's own token does not start other
+# workflows, which is why the APK build is called from here.
+#
+# The Linux binaries are not built here: attach them by hand when the agent
+# changed. Releasing again: delete the release and its tag, push again or
+# run this workflow by hand.
+name: release
+
+on:
+  push:
+    branches: [master]
+    paths: ["symbolon-flutter/pubspec.yaml", "release-notes/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Version
+        id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          v=$(sed -n 's/^version: *\([0-9][0-9.]*\)+[0-9]*$/\1/p' symbolon-flutter/pubspec.yaml)
+          test -n "$v" || { echo "::error::no version in symbolon-flutter/pubspec.yaml"; exit 1; }
+          tag="v$v"
+          if gh release view "$tag" -R "$REPO" > /dev/null 2>&1; then
+            echo "$tag is released already: nothing to do"
+            echo "tag=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          test -s "release-notes/$tag.md" || { echo "::error::release-notes/$tag.md is missing: $tag needs its notes to be released"; exit 1; }
+          ext=$(jq -r .version symbolon-extension/manifest.json)
+          [ "$ext" = "$v" ] || { echo "::error::the extension is $ext, the app $v"; exit 1; }
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Publish
+        if: steps.version.outputs.tag != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          out="$RUNNER_TEMP/out" && mkdir -p "$out"
+          (cd symbolon-extension && zip -q -X "$out/symbolon-extension-$TAG.zip" manifest.json background.js fields.js install.sh README.md)
+          (cd "$out" && sha256sum "symbolon-extension-$TAG.zip" > SHA256SUMS)
+          gh release create "$TAG" -R "$REPO" --target "$GITHUB_SHA" --title "Symbolon $TAG" \
+            --notes-file "release-notes/$TAG.md" "$out/symbolon-extension-$TAG.zip" "$out/SHA256SUMS"
+
+  apk:
+    needs: publish
+    if: needs.publish.outputs.tag != ''
+    uses: ./.github/workflows/apk.yml
+    with:
+      tag: ${{ needs.publish.outputs.tag }}
+    secrets: inherit
