@@ -20,7 +20,7 @@ Run with `MODEL_TIMEOUT=180 ./run.sh <model>` to reproduce a single model.
 | quorum change sanity (`sanity_reshare_setup`) | `reshare.spthy` | verified |
 | quorum change safety (L-01 reshare, L-03, L-04) | `reshare.spthy` | not yet attempted |
 | L-02 fork prevention and fork detection | `fork.spthy` | verified |
-| L-03 to L-20, C-01 to C-04 | -- | not written |
+| L-03 to L-22, C-01 to C-05 | -- | not written |
 
 ## What the verified lemmas do and do not establish
 

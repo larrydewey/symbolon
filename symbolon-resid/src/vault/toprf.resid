@@ -1,0 +1,366 @@
+// Threshold OPRF for protected vault items (SPEC 18.10).
+//
+// RFC 9497's VOPRF over P-256 with SHA-256 ("P256-SHA256", mode 0x01),
+// evaluated by t parties of the quorum, each holding a Shamir share k_j of
+// the vault OPRF key k_v (2HashTDH: Jarecki, Kiayias, Krawczyk, Xu, 2017):
+//
+//   requester:  B = r * HashToGroup(input)                 toprf_blind
+//   party j:    Z_j = k_j * B, DLEQ proof against K_j       toprf_evaluate
+//   requester:  check each proof (K_j from the quorum's     toprf_verify,
+//               Feldman commitments), Z = sum lambda_j Z_j   toprf_party_key,
+//               y = Finalize(input, r, Z)                    toprf_combine,
+//                                                            toprf_finalize
+//   pitem_key = HKDF(vault_key || y, vault_id,               protected_item_key
+//                    "symbolon v1 protected item" || item_id, 32)
+//
+// Since sum lambda_j k_j = k_v, y equals RFC 9497's Evaluate(k_v, input);
+// tests/gen_toprf_ref.py checks that, and the RFCs' own vectors, from an
+// independent implementation.
+//
+// Secrets: the blind r, a party's share k_j, the proof nonce, the unblinded
+// element and y are Secret, and every multiplication by one of them is the
+// constant-time generic P-256 ladder at Secret(UInt(576)). What leaves the
+// secret type does so at one named declassify: a blinded element, an
+// evaluated element, a proof commitment or response, a public key -- all of
+// them sent to another party by design. Hash-to-curve runs on public data
+// (the input names an item the relay already knows) and may take a
+// data-dependent path.
+
+import "../types.resid";
+import "vault.resid";
+import "p256.resid";
+import "p256ops.resid";
+import "shamir.resid";
+import "cggmp_secret_scalar.resid";
+import "sha256g.resid";
+import "word.resid";
+import "crypto.resid";
+import "random.resid";
+
+// ============================================================================
+// Encodings
+// ============================================================================
+
+List(Int) be2(Int n) { return [(n >> 8) & 255, n & 255]; }
+
+// I2OSP(len(b), 2) || b
+List(Int) lp(List(Int) b) { return be2(b.len()).concat(b); }
+
+// "OPRFV1-" || 0x01 || "-P256-SHA256"
+pub List(Int) toprf_context() { return utf8("OPRFV1-").concat([1]).concat(utf8("-P256-SHA256")); }
+
+// SEC 1 compressed: 02/03 || x. Empty for infinity.
+pub List(Int) toprf_ser(P256Aff pt) {
+    if (!pt.ok) { return []; }
+    Int par = wrapping_i64(pt.y & 1);
+    return [2 + par].concat(p256_to_be(pt.x));
+}
+
+// A compressed point other than infinity, on the curve (RFC 9497
+// DeserializeElement); ok = false otherwise.
+pub P256Aff toprf_deser(List(Int) b) {
+    if (b.len() != 33) { return p256_bad(); }
+    return pt_dec(b);
+}
+
+UInt(576) os2ip_acc(List(Int) b, Int i, UInt(576) acc) {
+    if (i >= b.len()) { return acc; }
+    return os2ip_acc(b, i + 1, (acc << 8) | (UInt(576)) b[i]);
+}
+
+// ============================================================================
+// RFC 9380: expand_message_xmd (SHA-256), hash_to_field, simplified SWU
+// ============================================================================
+
+List(Int) xor_bytes(List(Int) a, List(Int) b, Int i, ListBuf(Int) acc) {
+    if (i >= a.len()) { return acc.finish(); }
+    return xor_bytes(a, b, i + 1, acc.push(a[i] ^ b[i]));
+}
+
+List(Int) xmd_more(List(Int) b0, List(Int) prev, List(Int) dstp, Int i, Int ell, List(Int) acc) {
+    if (i > ell) { return acc; }
+    List(Int) bi = sha256_bytes(xor_bytes(b0, prev, 0, ListBuf()).concat([i]).concat(dstp));
+    return xmd_more(b0, bi, dstp, i + 1, ell, acc.concat(bi));
+}
+
+// RFC 9380 5.3.1, n <= 255 * 32 bytes, dst <= 255 bytes.
+pub List(Int) toprf_expand_xmd(List(Int) msg, List(Int) dst, Int n) {
+    Int ell = (n + 31) / 32;
+    List(Int) dstp = dst.concat([dst.len()]);
+    List(Int) zpad = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    List(Int) b0 = sha256_bytes(zpad.concat(msg).concat(be2(n)).concat([0]).concat(dstp));
+    List(Int) b1 = sha256_bytes(b0.concat([1]).concat(dstp));
+    List(Int) all = xmd_more(b0, b1, dstp, 2, ell, b1);
+    return all[0..n];
+}
+
+// hash_to_field with L = 48: element i of u (count * 48 bytes of
+// expand_message_xmd output) modulo m. Elements are taken one at a time:
+// the runtime cannot hold a UInt(576) in a list.
+UInt(576) h2f_elem(List(Int) u, Int i, UInt(576) m) {
+    return os2ip_acc(u[48 * i..48 * i + 48], 0, 0) % m;
+}
+
+// Field arithmetic mod p on ordinary integers below p (public values).
+UInt(576) fm(UInt(576) a, UInt(576) b) { return (a * b) % p256_p(); }
+UInt(576) fa(UInt(576) a, UInt(576) b) { return (a + b) % p256_p(); }
+UInt(576) fneg(UInt(576) a) { return if (a == 0) { 0 } else { p256_p() - a }; }
+UInt(576) finv_pub(UInt(576) a) {
+    UInt(576) m = p256_fto(a);
+    UInt(576) r = p256_finv(m);
+    return p256_ffrom(r);
+}
+UInt(576) fsqrt_pub(UInt(576) a) {
+    UInt(576) m = p256_fto(a);
+    UInt(576) r = p256_fsqrt(m);
+    return p256_ffrom(r);
+}
+
+UInt(576) p256_b_pub() { return 41058363725152142129326129780047268409114441015993725554835256314039467401291; }
+UInt(576) gx_of(UInt(576) x) { return fa(fa(fm(fm(x, x), x), fm(fneg(3), x)), p256_b_pub()); }
+
+// RFC 9380 6.6.2 simplified SWU for P-256 (Z = -10, A = -3).
+P256Aff sswu(UInt(576) u) {
+    UInt(576) z = p256_p() - 10;
+    UInt(576) u2 = fm(u, u);
+    UInt(576) tv1 = fa(fm(fm(z, z), fm(u2, u2)), fm(z, u2));
+    // -B/A and B/(Z*A), precomputed
+    UInt(576) x1 = if (tv1 == 0) { 74703601957397362287352587393959705516025038863550323175665808372750477554212 }
+                   else { fm(52283484311836130297341192243151613979733528143761346583456295874302188418414, fa(1, finv_pub(tv1))) };
+    UInt(576) gx1 = gx_of(x1);
+    UInt(576) y1 = fsqrt_pub(gx1);
+    Bool sq1 = fm(y1, y1) == gx1;
+    UInt(576) x = if (sq1) { x1 } else { fm(fm(z, u2), x1) };
+    UInt(576) y0 = if (sq1) { y1 } else { fsqrt_pub(gx_of(x)) };
+    Bool flip = wrapping_i64(u & 1) != wrapping_i64(y0 & 1);
+    UInt(576) y = if (flip) { fneg(y0) } else { y0 };
+    return P256Aff {.x = x, .y = y, .ok = true};
+}
+
+// hash_to_curve, suite P256_XMD:SHA-256_SSWU_RO_ (the cofactor is 1).
+pub P256Aff toprf_hash_to_curve(List(Int) msg, List(Int) dst) {
+    List(Int) u = toprf_expand_xmd(msg, dst, 96);
+    return pt_add(sswu(h2f_elem(u, 0, p256_p())), sswu(h2f_elem(u, 1, p256_p())));
+}
+
+// RFC 9497 HashToGroup and HashToScalar for P256-SHA256.
+pub P256Aff toprf_hash_to_group(List(Int) x) { return toprf_hash_to_curve(x, utf8("HashToGroup-").concat(toprf_context())); }
+pub UInt(576) toprf_hash_to_scalar(List(Int) x) {
+    return h2f_elem(toprf_expand_xmd(x, utf8("HashToScalar-").concat(toprf_context()), 48), 0, p256_n());
+}
+
+// ============================================================================
+// Secret scalar multiplication
+// ============================================================================
+
+// k * P made public: the result is sent to another party.
+@requires(declassify)
+P256Aff smul_open(Secret(UInt(576)) k, P256Aff pt) {
+    if (!pt.ok) { return p256_bad(); }
+    P256Pt(Secret(UInt(576))) pp = p256_from_aff(pt);
+    P256Xy(Secret(UInt(576))) a = p256_affine(p256_mul(k, pp));
+    if (!a.ok) { return p256_bad(); }
+    UInt(576) x = ct_public(declassify(a.x, "threshold OPRF: a blinded or evaluated element or proof commitment is sent by design"));
+    UInt(576) y = ct_public(declassify(a.y, "threshold OPRF: a blinded or evaluated element or proof commitment is sent by design"));
+    return P256Aff {.x = x, .y = y, .ok = true};
+}
+
+// A uniformly random scalar in [1, q). Whether a draw was refused (q is
+// within 2^-32 of 2^256) is made public, as p256_scalar_ok does.
+@requires(declassify)
+pub Secret(UInt(576)) toprf_random_scalar() {
+    List(Secret(UInt(8))) b = random_secret(32);
+    Secret(UInt(576)) k = p256_load(b);
+    if (p256_scalar_ok(k)) { return k; }
+    return toprf_random_scalar();
+}
+
+// ============================================================================
+// Blind (requester)
+// ============================================================================
+
+pub type ToprfBlind = { Secret(UInt(576)) r; List(Int) blinded; };
+
+// B = r * HashToGroup(input), compressed; empty if the input maps to the
+// identity (negligible) or r is not usable.
+@requires(declassify)
+pub List(Int) toprf_blind_with(List(Int) input, Secret(UInt(576)) r) {
+    P256Aff pt = toprf_hash_to_group(input);
+    if (!pt.ok || !p256_scalar_ok(r)) { return []; }
+    return toprf_ser(smul_open(r, pt));
+}
+
+@requires(declassify)
+pub ToprfBlind toprf_blind(List(Int) input) {
+    Secret(UInt(576)) r = toprf_random_scalar();
+    return ToprfBlind {.r = r, .blinded = toprf_blind_with(input, r)};
+}
+
+// ============================================================================
+// DLEQ proofs (RFC 9497 2.2), A = G, B = the party's key
+// ============================================================================
+
+type Composite = { P256Aff m; P256Aff z; Bool ok; };
+
+Composite composites_at(List(Int) seed, List(P256Aff) cs, List(P256Aff) ds, Int i, P256Aff m, P256Aff z) {
+    if (i >= cs.len()) { return Composite {.m = m, .z = z, .ok = true}; }
+    List(Int) tr = lp(seed).concat(be2(i)).concat(lp(toprf_ser(cs[i]))).concat(lp(toprf_ser(ds[i]))).concat(utf8("Composite"));
+    UInt(576) di = toprf_hash_to_scalar(tr);
+    return composites_at(seed, cs, ds, i + 1, pt_add(pt_mul(di, cs[i]), m), pt_add(pt_mul(di, ds[i]), z));
+}
+
+// ComputeComposites over public C and D. The server's fast variant,
+// Z = k * M, is the same point; computing it from D keeps k out of it.
+Composite composites(P256Aff pk, List(P256Aff) cs, List(P256Aff) ds) {
+    List(Int) seed = sha256_bytes(lp(toprf_ser(pk)).concat(lp(utf8("Seed-").concat(toprf_context()))));
+    return composites_at(seed, cs, ds, 0, p256_bad(), p256_bad());
+}
+
+UInt(576) challenge(P256Aff pk, P256Aff m, P256Aff z, P256Aff t2, P256Aff t3) {
+    List(Int) tr = lp(toprf_ser(pk)).concat(lp(toprf_ser(m))).concat(lp(toprf_ser(z)))
+                   .concat(lp(toprf_ser(t2))).concat(lp(toprf_ser(t3))).concat(utf8("Challenge"));
+    return toprf_hash_to_scalar(tr);
+}
+
+// Verify a batched proof that the same scalar takes G to pk and each
+// blinded element to its evaluated element.
+pub Bool toprf_verify(P256Aff pk, List(List(Int)) blinded, List(List(Int)) evaluated, List(Int) proof) {
+    if (!pk.ok || proof.len() != 64 || blinded.len() == 0 || blinded.len() != evaluated.len()) { return false; }
+    UInt(576) c = p256_from_be(proof[0..32]);
+    UInt(576) s = p256_from_be(proof[32..64]);
+    if (c >= p256_n() || s >= p256_n()) { return false; }
+    List(P256Aff) cs = decode_all(blinded, 0, ListBuf());
+    List(P256Aff) ds = decode_all(evaluated, 0, ListBuf());
+    if (!all_ok(cs, 0) || !all_ok(ds, 0)) { return false; }
+    Composite mz = composites(pk, cs, ds);
+    P256Aff t2 = pt_add(pt_mul_base(s), pt_mul(c, pk));
+    P256Aff t3 = pt_add(pt_mul(s, mz.m), pt_mul(c, mz.z));
+    return challenge(pk, mz.m, mz.z, t2, t3) == c;
+}
+
+List(P256Aff) decode_all(List(List(Int)) bs, Int i, ListBuf(P256Aff) acc) {
+    if (i >= bs.len()) { return acc.finish(); }
+    return decode_all(bs, i + 1, acc.push(toprf_deser(bs[i])));
+}
+
+Bool all_ok(List(P256Aff) ps, Int i) {
+    if (i >= ps.len()) { return true; }
+    return ps[i].ok && all_ok(ps, i + 1);
+}
+
+// ============================================================================
+// Evaluate (a party holding a share)
+// ============================================================================
+
+// elements[i] = k * blinded[i], compressed, and one proof for all of them.
+// ok = false when an element does not decode, is the identity, or the list
+// is empty or longer than 256 (SPEC 18.10.3).
+pub type ToprfEval = { Bool ok; List(List(Int)) elements; List(Int) proof; };
+
+ToprfEval eval_bad() { return ToprfEval {.ok = false, .elements = [], .proof = []}; }
+
+@requires(declassify)
+List(P256Aff) mul_all(Secret(UInt(576)) k, List(P256Aff) ps, Int i, ListBuf(P256Aff) acc) {
+    if (i >= ps.len()) { return acc.finish(); }
+    return mul_all(k, ps, i + 1, acc.push(smul_open(k, ps[i])));
+}
+
+List(List(Int)) ser_all(List(P256Aff) ps, Int i, ListBuf(List(Int)) acc) {
+    if (i >= ps.len()) { return acc.finish(); }
+    return ser_all(ps, i + 1, acc.push(toprf_ser(ps[i])));
+}
+
+// With the proof's nonce given (tests reproduce RFC 9497's vectors).
+@requires(declassify)
+pub ToprfEval toprf_evaluate_with(Secret(UInt(576)) k, List(List(Int)) blinded, Secret(UInt(576)) nonce) {
+    if (blinded.len() == 0 || blinded.len() > 256 || !p256_scalar_ok(k) || !p256_scalar_ok(nonce)) { return eval_bad(); }
+    List(P256Aff) cs = decode_all(blinded, 0, ListBuf());
+    if (!all_ok(cs, 0)) { return eval_bad(); }
+    List(P256Aff) ds = mul_all(k, cs, 0, ListBuf());
+    if (!all_ok(ds, 0)) { return eval_bad(); }
+    P256Aff pk = p256_public(k);
+    Composite mz = composites(pk, cs, ds);
+    P256Aff t2 = p256_public(nonce);
+    P256Aff t3 = smul_open(nonce, mz.m);
+    UInt(576) c = challenge(pk, mz.m, mz.z, t2, t3);
+    // s = nonce - c * k mod q
+    Secret(UInt(576)) ck = cggmp_secret_scalar_mul(classify(c), k);
+    Secret(UInt(576)) s = cggmp_secret_scalar_add(nonce, wrapping_usub(classify(p256_n()), ck));
+    UInt(576) sp = ct_public(declassify(s, "threshold OPRF: a DLEQ proof response is sent by design"));
+    return ToprfEval {.ok = true, .elements = ser_all(ds, 0, ListBuf()), .proof = p256_to_be(c).concat(p256_to_be(sp))};
+}
+
+@requires(declassify)
+pub ToprfEval toprf_evaluate(Secret(UInt(576)) k, List(List(Int)) blinded) {
+    return toprf_evaluate_with(k, blinded, toprf_random_scalar());
+}
+
+// ============================================================================
+// Shares, combination and Finalize (requester)
+// ============================================================================
+
+// K_j = sum_l j^l C_l from the quorum's Feldman commitments (compressed).
+pub P256Aff toprf_party_key(List(List(Int)) commits, Int j) {
+    if (commits.len() == 0 || j < 1) { return p256_bad(); }
+    return party_key_at(commits, (UInt(576)) j, 0, 1, p256_bad());
+}
+
+P256Aff party_key_at(List(List(Int)) commits, UInt(576) j, Int l, UInt(576) jl, P256Aff acc) {
+    if (l >= commits.len()) { return acc; }
+    P256Aff c = toprf_deser(commits[l]);
+    if (!c.ok) { return p256_bad(); }
+    return party_key_at(commits, j, l + 1, sc_mul(jl, j), pt_add(acc, pt_mul(jl, c)));
+}
+
+// Z = sum lambda_j Z_j at zero over the evaluating set `ids` (distinct, >= 1).
+pub P256Aff toprf_combine(List(Int) ids, List(List(Int)) elements) {
+    if (ids.len() == 0 || ids.len() != elements.len() || !distinct(ids, 0)) { return p256_bad(); }
+    return combine_at(ids, elements, 0, p256_bad());
+}
+
+Bool distinct(List(Int) ids, Int i) {
+    if (i >= ids.len()) { return true; }
+    return ids[i] >= 1 && !ids[i + 1..].contains(ids[i]) && distinct(ids, i + 1);
+}
+
+P256Aff combine_at(List(Int) ids, List(List(Int)) elements, Int i, P256Aff acc) {
+    if (i >= ids.len()) { return acc; }
+    P256Aff z = toprf_deser(elements[i]);
+    if (!z.ok) { return p256_bad(); }
+    UInt(576) lam = (UInt(576)) sh_lagrange0(ids, ids[i]);
+    return combine_at(ids, elements, i + 1, pt_add(acc, pt_mul(lam, z)));
+}
+
+// y = SHA-256(I2OSP(len(input), 2) || input || I2OSP(33, 2) ||
+//             SerializeElement(r^-1 * Z) || "Finalize"), secret. Empty if Z is
+// not a point.
+@requires(declassify)
+pub List(Secret(UInt(8))) toprf_finalize(List(Int) input, Secret(UInt(576)) r, P256Aff z) {
+    List(Secret(UInt(8))) none = [];
+    if (!z.ok) { return none; }
+    Secret(UInt(576)) rinv = cggmp_secret_scalar_inv(r);
+    P256Pt(Secret(UInt(576))) zp = p256_from_aff(z);
+    P256Xy(Secret(UInt(576))) n = p256_affine(p256_mul(rinv, zp));
+    if (!n.ok) { return none; }
+    Secret(UInt(576)) one = classify((UInt(576)) 1);
+    Secret(UInt(576)) two = classify((UInt(576)) 2);
+    List(Secret(UInt(8))) prefix = p256_store(wrapping_uadd(n.y & one, two));
+    List(Secret(UInt(8))) xb = p256_store(n.x);
+    List(Secret(UInt(8))) msg = secret_bytes(lp(input).concat(be2(33))).concat(prefix[31..32]).concat(xb).concat(secret_bytes(utf8("Finalize")));
+    return sha256g(msg);
+}
+
+// ============================================================================
+// The protected item (SPEC 18.10.2)
+// ============================================================================
+
+// "symbolon v1 protected" || vault_id || item_id
+pub List(Int) toprf_item_input(List(Int) vault_id, List(Int) item_id) {
+    return utf8("symbolon v1 protected").concat(vault_id).concat(item_id);
+}
+
+// pitem_key = HKDF(vault_key || y, vault_id, "symbolon v1 protected item" || item_id, 32)
+pub List(Secret(UInt(8))) protected_item_key(List(Secret(UInt(8))) vault_key, List(Secret(UInt(8))) y, List(Int) vault_id, List(Int) item_id) {
+    return hkdf_secret(secret_bytes(vault_id), vault_key.concat(y), utf8("symbolon v1 protected item").concat(item_id), 32);
+}

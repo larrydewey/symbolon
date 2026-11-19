@@ -252,6 +252,11 @@ P-256 base point, `q` its order.
   rotation is due, without the principal's involvement except where a
   relying party demands a factor the agent cannot supply; no rotation can
   leave the principal without a working credential. (A1, A4, A6)
+- **G19 Per-item containment.** An item the principal marks protected is
+  opened only with `t` parties of the quorum, as a passkey signs: no single
+  device, unlocked or not, opens protected items faster than the
+  cosigner's limit, and an opening is recorded where the other devices see
+  it. (A4, A6)
 
 ---
 
@@ -374,6 +379,7 @@ quorum = {
   3 => pubkey,                               ; root public key X
   4 => uint,                                 ; epoch
   5 => digest,                               ; H(epoch transcript)
+  ? 6 => [+ pubkey],                         ; Feldman commitments C_0..C_{t-1} of the vault OPRF key (18.10.1)
 }
 
 policy = {
@@ -388,6 +394,7 @@ policy = {
 cosigner-policy = {
   1 => uint,                                 ; max signatures per device per hour
   2 => bool,                                 ; reserved (draft 1; kit rule now unconditional, 10.6)
+  ? 3 => uint,                               ; max protected-item evaluations per device per hour (18.10.4; default 60)
 }
 
 witness-ref     = { 1 => tstr, 2 => pubkey }
@@ -820,6 +827,11 @@ same credential. A cosigner that colludes with a relying party can still
 correlate by timing; running the cosigner on the principal's own machine
 removes that.
 
+For protected vault items (18.10) the cosigner receives only blinded
+points, uniformly random to it, with the epoch, a purpose and a DK-signed
+request. It cannot tell which item is opened, or whether two openings are
+of one item.
+
 ### 12.3 Policy enforcement
 
 Before each signing session the cosigner MUST verify that:
@@ -1205,7 +1217,7 @@ seeds, Synced-profile keys, attribute credentials and notes.
 vault_key : 32 random bytes per vault, wrapped to each device party's DEK and,
             for recovery, under the kit's split key k_K (Section 10.6), never to the kit alone
             while a cosigner exists
-item_key  = HKDF(vault_key, vault_id, "symbolon v1 item" || item_id, 32)
+item_key  = HKDF(vault_key, vault_id, "symbolon v1 item" || item_id, 32)   ; standard tier; protected items: 18.10
 field_key = HKDF(item_key, nil, "symbolon v1 field" || field_name || u64(item_version), 32)
 nonce     = HKDF(item_key, nil, "symbolon v1 nonce" || field_name || u64(item_version), 12)
 ```
@@ -1360,6 +1372,229 @@ comes across as a note.
 The export file holds every secret in clear. The agent reads it and
 writes nothing of it outside the sealed vault; the app removes the copy the
 platform's file picker made and tells the person to delete the original.
+
+### 18.10 Protected items: a second tier under the quorum
+
+Status: specified 2026-11-19. The evaluation core (`src/vault/toprf.resid`)
+is implemented and tested against RFC 9497's vectors and an independent
+reference; key generation, the cosigner's evaluation endpoint, the agent
+and the app are not yet built.
+
+The keys of 18.1 separate items from each other cryptographically, but every
+device holds `vault_key`, and anyone with `vault_key` derives every item key.
+One unlocked device, or malware in it, therefore opens the whole vault. A
+passkey cannot be taken this way, because no party holds `x` (Section 10).
+This section gives individual items the same property. An item marked
+**protected** can only be opened when `t` parties of the quorum take part,
+as a passkey can only sign when they do. The cosigner, which takes part
+without learning which item it is (G12), limits how fast any one device can
+open protected items and records every opening.
+
+The vault therefore has two tiers:
+
+| | Standard | Protected |
+|---|---|---|
+| Key | `item_key` (18.1), from `vault_key` alone | `pitem_key`, from `vault_key` **and** a threshold OPRF output that needs `t` parties |
+| One unlocked device can open | everything | only the fields that stay standard (below), and protected items only at the cosigner's rate |
+| Offline | readable from the cache (18.8) | the list only; protected fields need the quorum |
+| Fill latency | none | one round trip to the cosigner (or a second device) |
+| Duress subset | allowed | not allowed (below) |
+| Default for | every item | none: the principal marks items. The app SHOULD suggest it for kinds `bank`, `card` and `secret`, for logins whose origin is an email or identity provider, and for Synced passkeys (18.9) |
+
+#### 18.10.1 The vault OPRF key
+
+The quorum shares a second secret, the vault OPRF key `k_v`, a scalar
+modulo the P-256 order `q`. `k_v` is independent of the root key `x`: the two
+are never the same scalar and never derived from each other. `k_v` is
+shared with Shamir's scheme at the quorum's threshold `t`, using each
+party's share index from the epoch transcript (11.3), and is committed with
+Feldman commitments `C_0 .. C_{t-1}` (`C_l = a_l G` for the sharing
+polynomial `f(z) = Σ a_l z^l`, `f(0) = k_v`). The commitments are field 6
+of the quorum (Section 7), so every device verifies them from its verified
+log head and never from the relay (G5). Party `j`'s verification key is
+`K_j = Σ_l j^l C_l`, and the vault OPRF public key is `K = C_0`.
+
+- **Generation.** At inception, or the first time protected items are turned
+  on, the online parties (devices and cosigner) run a joint Feldman key
+  generation. Each draws a random polynomial of degree `t - 1`, sends each
+  party its value by HPKE mode_auth (info `"symbolon v1 vault oprf"` ||
+  log-id || u64(epoch) || party-id), and publishes its commitments. A party
+  whose value does not match the sender's commitments complains with the
+  opened value, and the sender is excluded and the run restarts. `k_v` is
+  the sum of the constant terms and no party ever holds it. The result goes
+  into the next `reshare` event (11.3), whose transcript digest covers the
+  commitments.
+- **Offline parties.** The kit's share is computed and split exactly as
+  `x_K` is (10.6): `a_v` is wrapped to the kit and `b_v` to the cosigner,
+  and `b_v` is released only after a path-1 `recover` takes effect.
+  Guardians hold `k_v` shares only if they hold `x` shares.
+- **Re-share and refresh.** Every re-share and proactive refresh (11.3)
+  re-shares `k_v` together with `x`, to the same parties at the same `t`. A
+  device MUST refuse an epoch whose `C_0` differs from the previous
+  epoch's, because `k_v` never changes across epochs. Removing a party
+  therefore kills its `k_v` share at the same moment as its `x` share (G4)
+  and re-encrypts nothing.
+
+#### 18.10.2 The protected item key
+
+```
+input     = "symbolon v1 protected" || vault_id || item_id
+y         = OPRF(k_v, input)                    ; RFC 9497, VOPRF mode, P256-SHA256, 32 bytes
+pitem_key = HKDF(vault_key || y, vault_id, "symbolon v1 protected item" || item_id, 32)
+```
+
+`y` is what RFC 9497's `Evaluate(k_v, input)` would return. It is computed
+without any party holding `k_v`, as in 18.10.3. The field keys and nonces
+of a protected field are derived from `pitem_key` exactly as 18.1 derives
+them from `item_key`, and the AEAD and AAD are those of 18.3.
+
+`pitem_key` needs `vault_key` **and** `y`. The OPRF alone does not open an
+item: the cosigner and the kit together (`t = 2`), even after a recovery
+has given them both their shares, still lack `vault_key`, so 18.1's rule
+that the vault key is never released to the kit alone while a cosigner
+exists still holds. `vault_key` alone does not open a protected item
+either. That is the point of the tier.
+
+A protected item keeps these fields standard, under `item_key`, so that the
+vault can be listed, searched and matched for filling without the quorum:
+`type`, `name`, `folder`, `origin` and the marker `protected` (value `"1"`,
+the OPRF suite of this section). Every other field is sealed under
+`pitem_key`. A device reads the marker before opening any other field, and
+an item whose marker does not open, or names a suite other than `"1"`, is
+refused (G8). A protected field moved into the standard tier, or the
+reverse, does not open, because the two tiers' keys differ and the AAD
+names the field.
+
+#### 18.10.3 Evaluation
+
+The requesting device `D` opens a protected item as follows:
+
+1. `D` computes `P = HashToGroup(input)` and chooses a random nonzero
+   `r`, then sends the blinded element `B = r P`. The DST and the
+   `HashToScalar` hash are RFC 9497's for context string
+   `"OPRFV1-" || 0x01 || "-P256-SHA256"`.
+2. `D` chooses `t - 1` other parties of the current epoch: the cosigner
+   if the quorum has one, otherwise another device (18.10.5). `D` sends
+   each of them an evaluation request:
+   ```cddl
+   eval-request = COSE_Sign1 over {      ; signed by D's DK
+     1 => log-id,
+     2 => uint,                          ; epoch
+     3 => bstr .size 16,                 ; session id, random
+     4 => uint,                          ; purpose: 0 open, 1 re-key (18.6), 2 rotation (26)
+     5 => [+ bstr .size 33],             ; blinded elements, compressed, at most 256
+     6 => uint / null,                   ; for purpose 1: the log sequence of the event that requires the re-key
+   }
+   ```
+3. Party `j` checks the request as the cosigner checks a signing request
+   (12.3): signer in the quorum of its highest verified head, epoch
+   current, not a kit or pending-recovery device, rate (18.10.4) and duress
+   window. It then checks that every `B_i` decodes to a point other than
+   the identity, and answers
+   `Z_ij = k_j B_i` for each `i`, together with **one** batched DLEQ proof
+   (RFC 9497 `GenerateProof(k_j, G, K_j, [B_i], [Z_ij])`) that the same
+   `k_j` was used throughout.
+4. `D` checks each proof against `K_j`, computed from the quorum's
+   commitments. A failed proof names party `j` (an abort with a culprit,
+   as in 10.4) and `D` retries with another party if it can. `D` computes
+   its own `Z_iD = k_D B_i` locally, without a proof, and combines the
+   answers for the evaluating set `S` (`|S| = t`, `D ∈ S`) with
+   Lagrange coefficients at zero:
+   `Z_i = Σ_{j∈S} λ_j Z_ij`.
+5. `D` finishes as RFC 9497 does:
+   `y = Finalize(input, r, Z_i)` = `Hash(I2OSP(len(input), 2) || input ||
+   I2OSP(33, 2) || SerializeElement(r^{-1} Z_i) || "Finalize")`.
+
+This is the 2HashTDH threshold OPRF (Jarecki, Kiayias, Krawczyk and Xu,
+2017), using RFC 9497's encodings and proofs. `Σ λ_j k_j = k_v`, so `y`
+equals the single-key evaluation, and that equality is what the
+implementation's reference tests check. The blinding makes `B` a uniformly
+random point to every party but `D`: an evaluating party learns neither
+`input` nor `y` (G12), and two evaluations of the same item cannot be told
+apart from evaluations of two items.
+
+Each `Z_ij`, `r`, `y` and `pitem_key` is a secret value (23.3). A device
+keeps `pitem_key` in memory for at most five minutes after its last use,
+and drops it at lock (9.3) and when the item is closed, whichever comes
+first. It never writes `y` or `pitem_key` to storage.
+
+#### 18.10.4 The cosigner's limits
+
+`cosigner-policy` gains field 3: the maximum number of blinded elements per
+device per hour for purposes 0 and 2. The default is 60, and the principal
+may lower it. Purpose 1 (a re-key) is exempt from the limit only when field
+6 names an event in the cosigner's verified log head, at or after its
+current epoch's `reshare`, that requires a vault rotation under 18.6
+(`remove-party`, the end of a duress window, a completed `recover`, or a
+`rotate-vault`), and only once per item per event. Re-keys therefore cost
+one blinded element per protected item, at most once per event.
+
+The cosigner appends to its session log (12.3) one record per evaluation:
+time, requesting device, purpose, number of elements, and the session
+id. It records no element. The app shows each device's protected openings
+for the day from that log. An opening rate well above that device's usual
+rate is shown as an alert on every other device, because the most likely
+cause is malware in an unlocked device.
+
+During a duress window the cosigner refuses every evaluation request, and
+the refusal reads as a network failure (14.3).
+
+#### 18.10.5 Without a cosigner
+
+Without a cosigner, the other evaluator is one of the principal's other
+devices. That device answers only after its user confirms on it, with a
+consent screen outside the requesting page (22.2) that shows the requesting
+device's label and the number of items. A device that is locked does not
+answer. Every protected opening is then an approval on a second device, as a
+security-key prompt is, and the interface says this before the first item is
+marked protected. The kit never evaluates unless a recovery has taken
+effect (10.6), so the kit with one device cannot open protected items while
+the principal's other devices can still veto (13.4).
+
+#### 18.10.6 Interaction with the rest of the vault
+
+- **Duress (18.5).** The duress profile holds no `k_v` share. An item can be
+  protected or in the duress subset, but not both. The device refuses to
+  set both flags, and marking an item protected removes it from the subset,
+  after saying so.
+- **Rotation (18.6).** A new `vault_key` changes every `pitem_key` but not
+  `y`. The rotating device obtains every protected item's `y` with one
+  purpose-1 request of up to 256 elements per batch, then reseals.
+- **Offline reading (18.8).** The cache keeps protected items as they are,
+  sealed. Offline, a device lists and searches them and shows their
+  standard fields, but opening one says that it needs the cosigner (or
+  another device).
+- **Sharing (19).** In this format version a collection has no OPRF key, so
+  its items are all standard. Moving a protected item into a collection
+  makes it standard there, and the device asks before doing so. Moving one
+  back reseals it as protected.
+- **Credential rotation (26).** A password change on a protected login
+  makes purpose-2 evaluations, which count against the device's limit. A
+  rotator device (24.2) holds `vault_key` but no unrequested `y`, so a
+  stolen rotator yields protected items only at the cosigner's rate.
+- **Filling (22.5-22.7).** Matching uses the standard `origin`. The value is
+  filled only after the evaluation succeeds, and the fill prompt says
+  "protected item". A device may evaluate ahead of time for the item the
+  principal has selected, but never for items they have not selected.
+- **Organizations (29).** Group folders are collections, so they are
+  standard in this format version (Section 28).
+- **Turning the tier off.** Unmarking an item reseals it under `item_key`
+  as a new version. This is an ordinary change and needs one evaluation.
+
+#### 18.10.7 What the tier does and does not give
+
+- Against one unlocked, compromised device: at most the cosigner's limit
+  of protected items per hour, each opening recorded in a log the other
+  devices read. Without a cosigner, only the items the principal approves
+  on a second device.
+- Against a leaked `pitem_key`, field key or plaintext: nothing about
+  other items, because each `y` is an independent PRF output and HKDF is
+  one-way.
+- Against the relay, the kit or the cosigner alone: nothing (they lack
+  `vault_key`, a share, or both).
+- Against the cosigner colluding with a compromised unlocked device:
+  everything, as for signing (12.4). The defense is the same: a cosigner
+  of the principal's own, an attested cosigner, or a larger `t`.
 
 ---
 
@@ -1996,10 +2231,33 @@ secret mode. The threshold protocol's implementation MUST check every
 proof and parameter its paper requires, with a negative test for each
 check, and MUST be fuzzed on every message parser.
 
-### 23.4 What Resid lacks (checked 2026-10-12)
+### 23.4 What Resid lacks (checked 2026-11-19, against Resid v0.10.1)
 
 | Missing | Needed by |
 |---|---|
+| Constant-time, secret-typed threshold ECDSA. CGGMP21 runs, but shares, Paillier `p`/`q` and nonces are public `List(UInt(64))`, and the tweak crosses in at one named `declassify` (PLAN-CGGMP layer 8). This blocks a release. | Sections 10-13, G15 |
+| RSA blind signatures and Privacy Pass issuance/redemption (RSA is verification and signing only) | Section 15 |
+| A fast Argon2id. It exists (`argon2g.resid`) but works on byte lists, so new devices use m = 19 MiB, t = 2 rather than 6.1's 256 MiB, t = 3 | Sections 6.1, 9 |
+| `mlock` of secret memory and exclusion from core dumps | G15 |
+| CTAP 2 hybrid transport (caBLE), and credential-provider bindings beyond Android | Section 22 |
+| Pairings and BBS | Section 17.3 |
+| Capability sets in provenance records, per entry point, verifiable remotely | Section 17.4 |
+| A GUI library (PLAN-gui: not started; the app is Flutter over the agent) | Section 22.2 |
+| Targets beyond Linux and Android | platform coverage |
+
+Present: threshold ECDSA (CGGMP21 key generation, refresh, re-share,
+presigning, signing with the blind tweak and identifiable abort, in
+`lib/cggmp*.resid`), Paillier, Shamir and Feldman, Argon2id and BLAKE2b,
+HMAC-SHA1, ECDSA P-256 (RFC 6979), HPKE, AES-GCM, ChaCha20-Poly1305, HKDF,
+PBKDF2, SHA-1/256/384/512, COSE, CBOR, X.509, TLS 1.3, TPM key creation,
+PIN-policy sealing and signing, quotes and the attestation verifier,
+provenance records, CTAP 2.1 over USB HID, and the `display`, `terminal`
+and `device` capability families. In Symbolon itself: the threshold OPRF of
+18.10 (`src/vault/toprf.resid`), the recipe interpreter and its CDP driver
+(26.3), the Pwned Passwords range check (26.1, `src/rotation/breach.resid`),
+and the Android credential provider and autofill service (22.1, 22.6).
+
+---|---|
 | Threshold ECDSA (DKG, signing, re-share, refresh) and its oblivious transfer or Paillier machinery | Sections 10-13 |
 | RSA blind signatures and Privacy Pass issuance/redemption (RSA is verification-only today) | Section 15 |
 | Argon2id, BLAKE2b | Section 9 |
@@ -2033,6 +2291,7 @@ quotes, the attestation verifier, provenance records, and the `display`,
 | G4 | Re-share as revocation; epoch checks | 11 |
 | G5 | Log-reached keys; witnesses or fingerprints; `RecipientKey` | 8, 19, 23.2 |
 | G6-G8 | Vault head, per-field keys, fixed suite | 18, 6 |
+| G19 | Threshold OPRF per protected item; cosigner limit and log | 18.10 |
 | G9 | No party holds `x`; guardian shares opt-in | 10, 13 |
 | G10 | Delay and veto | 13.4 |
 | G11 | Duress profile and containment | 14 |
@@ -2078,6 +2337,15 @@ it are verified; this table is not a claim of security.
 - A principal talked into linking a login to a lookalike app (22.6 item
   8) gives that app the login. The link screen's publisher, installer and
   warning make this harder; they cannot make it impossible.
+- Standard vault items open with `vault_key` alone, so one unlocked,
+  compromised device reads all of them; only protected items (18.10)
+  resist that, and only up to the cosigner's limit per hour, which is a
+  rate, not a bar. The cosigner with one unlocked device opens every
+  protected item.
+- The threshold OPRF of 18.10 rests on the one-more gap Diffie-Hellman
+  assumption in the random-oracle model (2HashTDH). Its joint Feldman key
+  generation can bias the distribution of `K`; that this does not matter
+  for an OPRF key is argued, not proven (C-05).
 - A filled password is a replayable secret. The page or app that receives
   it can keep it, and malware with accessibility access can read filled
   fields. 22.5 to 22.7 decide who receives a value and whether the
@@ -2097,6 +2365,9 @@ it are verified; this table is not a claim of security.
 - Guardians, sharing peers and witnesses see the log identifier.
 - A cosigner colluding with a relying party can correlate by timing
   (Section 12.2).
+- For protected items (18.10) the cosigner sees when each device opens
+  one and how many, never which; the relay sees which items are protected
+  (their field `protected`), as it already sees field names (18.2).
 
 ---
 
@@ -2130,6 +2401,23 @@ benefit for unique random secrets. Triggers:
 
 Proactive refresh of shares (every 30 days, Section 11.3) is scheduled,
 since it is invisible to relying parties and cannot lock anyone out.
+
+**The breach check** (`device vault breach DIR`, 2026-11-19). For each
+login's `current` password the agent computes SHA-1 inside the core and
+sends only the first five hex digits to the range service
+(`GET /range/PREFIX` with `Add-Padding: true`), one query per distinct
+prefix. The service answers with every suffix it holds under that prefix.
+The agent compares its own suffix against every line in constant time with
+respect to the hash, so the matching line is never a branch, and it makes
+public only the resulting count. A login with a nonzero count is reported
+and becomes due for rotation under this trigger. The service is Pwned
+Passwords over TLS, trusting the platform's root bundle, or a mirror the
+principal names. A service that cannot be reached, or whose certificate
+does not verify, fails the check and does not report the logins clean.
+Protected items (18.10) are skipped, because their passwords need the
+quorum. The range service learns the prefixes and their timing, which is
+the anonymity set the protocol is designed around (about 800 to 1,000
+passwords per prefix).
 
 After a device is removed, the attacker who holds it may already be
 racing to change the same passwords. The agent MUST rotate in order of the
@@ -2383,6 +2671,9 @@ compromise rules under which the lemma must hold.
 | C-02 | **Vault construction.** The key derivation and AEAD of 18.1-18.3 give authenticated encryption with key separation per (vault, item, field, version). | -- | 2, CryptoVerif |
 | C-03 | **Threshold ECDSA.** The chosen protocol's published security proof covers the variant implemented, including the designated party's tweak and output delivery to one party (6.2). | -- | 2, the paper's proof; any deviation needs its own proof |
 | C-04 | **Credential-ID MAC.** HMAC truncation to 16 bytes gives the binding L-16 assumes. | -- | 2, standard PRF argument (paper) |
+| L-21 | **Protected-item containment (G19).** An adversary holding one device's DK, share and `vault_key` obtains `pitem_key` for at most as many protected items as evaluations the quorum answered for that device; the kit before a recovery takes effect, and the cosigner, obtain none. | `RevealDK` + `RevealShare` of one device, `StealKit`, sync service | 1, Tamarin (the OPRF as an ideal functionality that answers only `t` parties of one epoch) |
+| L-22 | **Evaluation blindness (G12).** An evaluating party cannot distinguish two evaluations of one item from evaluations of two items. | `CorruptCosigner` | 1, ProVerif (equivalence) |
+| C-05 | **Threshold OPRF.** 2HashTDH over P-256 with RFC 9497's hashing, per-party batched DLEQ proofs and a joint Feldman key, combined as `HKDF(vault_key ‖ y)`, gives keys that are pseudorandom to any party lacking `vault_key` or `t` shares, and the culprit named on a failed proof is the party that cheated. | -- | 2, the published proof for 2HashTDH, plus a paper argument for the Feldman key and the combiner |
 
 ### 27.4 Abstractions
 
@@ -2429,6 +2720,7 @@ compromise rules under which the lemma must hold.
 5. C-01, C-02, C-04; choose the threshold protocol by the strength of the
    proof for C-03.
 6. L-02, L-03, L-04, L-18, L-19, L-20.
+7. L-21, L-22, C-05 (protected items, 18.10).
 
 ---
 
@@ -2458,6 +2750,11 @@ compromise rules under which the lemma must hold.
     additive tweak of Section 10.3 is secure when `τ` is a PRF output.
 12. A second red-team round over draft 2 (Appendix A's fixes introduce
     new mechanisms: the split kit, contests, rotator devices).
+13. Protected items in collections and group folders (18.10.6): an OPRF key
+    per collection would need a quorum spanning several principals' parties.
+14. Whether the cosigner's limit on protected openings (18.10.4) should
+    rise with a second device's approval, so that a large legitimate export
+    is not throttled.
 
 ---
 

@@ -58,7 +58,7 @@ List(Int) ints_of(List(UInt(8)) bs, Int i, ListBuf(Int) acc) {
 // Key derivation (SPEC 18.1)
 // ============================================================================
 
-List(Secret(UInt(8))) hkdf_secret(List(Secret(UInt(8))) salt, List(Secret(UInt(8))) ikm, List(Int) info, Int n) {
+pub List(Secret(UInt(8))) hkdf_secret(List(Secret(UInt(8))) salt, List(Secret(UInt(8))) ikm, List(Int) info, Int n) {
     List(Secret(UInt(8))) prk = hkdf256g_extract(salt, ikm);
     return hkdf256g_expand(prk, secret_bytes(info), n);
 }
@@ -93,7 +93,12 @@ pub List(Int) field_aad(List(Int) vault_id, List(Int) item_id, UInt(64) version,
 
 @requires(declassify)
 pub List(Int) field_seal(List(Secret(UInt(8))) vault_key, List(Int) vault_id, List(Int) item_id, UInt(64) version, Str kind, Str field, List(Secret(UInt(8))) plaintext) {
-    List(Secret(UInt(8))) ik = item_key(vault_key, vault_id, item_id);
+    return field_seal_ik(item_key(vault_key, vault_id, item_id), vault_id, item_id, version, kind, field, plaintext);
+}
+
+// Under a given item key: item_key (18.1) or pitem_key (18.10.2).
+@requires(declassify)
+pub List(Int) field_seal_ik(List(Secret(UInt(8))) ik, List(Int) vault_id, List(Int) item_id, UInt(64) version, Str kind, Str field, List(Secret(UInt(8))) plaintext) {
     List(Secret(UInt(8))) ct = aes_gcmg_seal_ivb(field_key(ik, field, version), field_nonce(ik, field, version), plaintext,
                                        field_aad(vault_id, item_id, version, kind, field));
     return ints_of(declassify(secret_join(ct), "AEAD output is public"), 0, ListBuf());
@@ -101,7 +106,11 @@ pub List(Int) field_seal(List(Secret(UInt(8))) vault_key, List(Int) vault_id, Li
 
 @requires(declassify)
 pub Result(List(Secret(UInt(8))), SymbolonError) field_open(List(Secret(UInt(8))) vault_key, List(Int) vault_id, List(Int) item_id, UInt(64) version, Str kind, Str field, List(Int) ct) {
-    List(Secret(UInt(8))) ik = item_key(vault_key, vault_id, item_id);
+    return field_open_ik(item_key(vault_key, vault_id, item_id), vault_id, item_id, version, kind, field, ct);
+}
+
+@requires(declassify)
+pub Result(List(Secret(UInt(8))), SymbolonError) field_open_ik(List(Secret(UInt(8))) ik, List(Int) vault_id, List(Int) item_id, UInt(64) version, Str kind, Str field, List(Int) ct) {
     Option(List(Secret(UInt(8)))) pt = aes_gcmg_decrypt_ivb(field_key(ik, field, version), field_nonce(ik, field, version), ct,
                                                   field_aad(vault_id, item_id, version, kind, field));
     return match pt {
@@ -144,9 +153,119 @@ pub Result(List(FieldPlain), SymbolonError) item_open(List(Secret(UInt(8))) vaul
     return open_fields(vault_key, vault_id, it, sort(it.fields.keys()), 0, ListBuf());
 }
 
+// ============================================================================
+// Protected items (SPEC 18.10)
+// ============================================================================
+//
+// A protected item's fields `type`, `name`, `folder`, `origin` and the
+// marker `protected` are sealed under item_key, so the vault lists and
+// matches without the quorum; every other field is sealed under pitem_key
+// (src/vault/toprf.resid), which needs the threshold OPRF output y as well
+// as vault_key. A protected item is never in the duress subset (18.10.6).
+
+pub Bool field_is_standard_tier(Str name) {
+    return name == "type" || name == "name" || name == "folder" || name == "origin" || name == "protected";
+}
+
+pub Bool item_is_protected(Item it) { return it.fields.contains("protected"); }
+
+@requires(declassify)
+Result(Map(Str, List(Int)), SymbolonError) pseal_fields(List(Secret(UInt(8))) ik, List(Secret(UInt(8))) pik, List(Int) vault_id, List(Int) item_id, UInt(64) version, Str kind, List(FieldPlain) fs, Int i, Map(Str, List(Int)) acc) {
+    if (i >= fs.len()) { return Ok(acc); }
+    Str name = fs[i].name;
+    if (name == "protected") { return Err(ErrVaultIntegrity("field name protected is reserved (18.10.2)")); }
+    if (acc.contains(name)) { return Err(ErrVaultIntegrity("duplicate field " + name)); }
+    List(Secret(UInt(8))) k = if (field_is_standard_tier(name)) { ik } else { pik };
+    List(Int) ct = field_seal_ik(k, vault_id, item_id, version, kind, name, fs[i].value);
+    return pseal_fields(ik, pik, vault_id, item_id, version, kind, fs, i + 1, acc.insert(name, ct));
+}
+
+// Seal an item as protected under vault_key and its pitem_key.
+@requires(declassify)
+pub Result(Item, SymbolonError) protected_item_seal(List(Secret(UInt(8))) vault_key, List(Secret(UInt(8))) pik, List(Int) vault_id, List(Int) item_id, UInt(64) version, Str kind, List(FieldPlain) fs, Option(Str) handling) {
+    if (item_id.len() != 16) { return Err(ErrVaultIntegrity("item id is 16 bytes")); }
+    if (pik.len() != 32) { return Err(ErrVaultIntegrity("protected item key is 32 bytes")); }
+    List(Secret(UInt(8))) ik = item_key(vault_key, vault_id, item_id);
+    Map(Str, List(Int)) f0 = pseal_fields(ik, pik, vault_id, item_id, version, kind, fs, 0, {})?;
+    List(Int) marker = field_seal_ik(ik, vault_id, item_id, version, kind, "protected", secret_bytes(utf8("1")));
+    return Ok(Item {
+        .id = item_id, .version = version, .kind = kind, .fields = f0.insert("protected", marker),
+        .in_duress_subset = false, .handling_policy = handling });
+}
+
+// The marker opens under item_key and names suite "1"; anything else is refused (G8).
+@requires(declassify)
+Result(Bool, SymbolonError) check_marker(List(Secret(UInt(8))) ik, List(Int) vault_id, Item it) {
+    List(Int) ct = it.fields["protected"] else { [] };
+    List(Secret(UInt(8))) m = field_open_ik(ik, vault_id, it.id, it.version, it.kind, "protected", ct)?;
+    List(UInt(8)) mv = declassify(secret_join(m), "the protected marker names a public suite");
+    if (mv.len() != 1 || (Int) mv[0] != 49) { return Err(ErrVaultIntegrity("protected item names an unknown suite")); }
+    if (it.in_duress_subset) { return Err(ErrVaultIntegrity("a protected item is never in the duress subset")); }
+    return Ok(true);
+}
+
+@requires(declassify)
+Result(List(FieldPlain), SymbolonError) popen_fields(List(Secret(UInt(8))) ik, List(Secret(UInt(8))) pik, List(Int) vault_id, Item it, List(Str) names, Int i, ListBuf(FieldPlain) acc) {
+    if (i >= names.len()) { return Ok(acc.finish()); }
+    Str name = names[i];
+    if (name == "protected") { return popen_fields(ik, pik, vault_id, it, names, i + 1, acc); }
+    Bool std = field_is_standard_tier(name);
+    // pik empty: the listing, which skips the protected tier
+    if (!std && pik.len() == 0) { return popen_fields(ik, pik, vault_id, it, names, i + 1, acc); }
+    List(Secret(UInt(8))) k = if (std) { ik } else { pik };
+    List(Int) ct = it.fields[name] else { [] };
+    List(Secret(UInt(8))) pt = field_open_ik(k, vault_id, it.id, it.version, it.kind, name, ct)?;
+    return popen_fields(ik, pik, vault_id, it, names, i + 1, acc.push(FieldPlain {.name = name, .value = pt}));
+}
+
+// Every field of a protected item but the marker.
+@requires(declassify)
+pub Result(List(FieldPlain), SymbolonError) protected_item_open(List(Secret(UInt(8))) vault_key, List(Secret(UInt(8))) pik, List(Int) vault_id, Item it) {
+    if (!item_is_protected(it)) { return Err(ErrVaultIntegrity("not a protected item")); }
+    List(Secret(UInt(8))) ik = item_key(vault_key, vault_id, it.id);
+    check_marker(ik, vault_id, it)?;
+    if (pik.len() != 32) { return Err(ErrVaultIntegrity("protected item key is 32 bytes")); }
+    return popen_fields(ik, pik, vault_id, it, sort(it.fields.keys()), 0, ListBuf());
+}
+
+// What vault_key alone opens: for a standard item, everything; for a
+// protected one, its standard-tier fields (18.10.6, listing and offline).
+@requires(declassify)
+pub Result(List(FieldPlain), SymbolonError) item_open_listing(List(Secret(UInt(8))) vault_key, List(Int) vault_id, Item it) {
+    if (!item_is_protected(it)) { return item_open(vault_key, vault_id, it); }
+    List(Secret(UInt(8))) ik = item_key(vault_key, vault_id, it.id);
+    check_marker(ik, vault_id, it)?;
+    List(Secret(UInt(8))) none = [];
+    return popen_fields(ik, none, vault_id, it, sort(it.fields.keys()), 0, ListBuf());
+}
+
+// 18.10.6 rotation: a new vault_key changes pitem_key but not y, so the
+// caller derives both pitem_keys from the same y.
+@requires(declassify)
+pub Result(Item, SymbolonError) protected_item_reencrypt(List(Secret(UInt(8))) old_key, List(Secret(UInt(8))) old_pik, List(Secret(UInt(8))) new_key, List(Secret(UInt(8))) new_pik, List(Int) vault_id, Item it) {
+    List(FieldPlain) plain = protected_item_open(old_key, old_pik, vault_id, it)?;
+    return protected_item_seal(new_key, new_pik, vault_id, it.id, it.version + 1, it.kind, plain, it.handling_policy);
+}
+
+// Standard to protected, or back (18.10.6): a new version under the other tier.
+@requires(declassify)
+pub Result(Item, SymbolonError) item_protect(List(Secret(UInt(8))) vault_key, List(Secret(UInt(8))) pik, List(Int) vault_id, Item it) {
+    if (item_is_protected(it)) { return Err(ErrVaultIntegrity("already protected")); }
+    List(FieldPlain) plain = item_open(vault_key, vault_id, it)?;
+    return protected_item_seal(vault_key, pik, vault_id, it.id, it.version + 1, it.kind, plain, it.handling_policy);
+}
+
+@requires(declassify)
+pub Result(Item, SymbolonError) item_unprotect(List(Secret(UInt(8))) vault_key, List(Secret(UInt(8))) pik, List(Int) vault_id, Item it) {
+    List(FieldPlain) plain = protected_item_open(vault_key, pik, vault_id, it)?;
+    return item_seal(vault_key, vault_id, it.id, it.version + 1, it.kind, plain, false, it.handling_policy);
+}
+
 // New key, version + 1, same content (rotation 18.6, duress subset 18.5).
+// A protected item needs its OPRF output: protected_item_reencrypt.
 @requires(declassify)
 pub Result(Item, SymbolonError) item_reencrypt(List(Secret(UInt(8))) old_key, List(Secret(UInt(8))) new_key, List(Int) vault_id, Item it) {
+    if (item_is_protected(it)) { return Err(ErrVaultIntegrity("protected item: re-key needs its OPRF output (18.10.6)")); }
     List(FieldPlain) plain = item_open(old_key, vault_id, it)?;
     return item_seal(new_key, vault_id, it.id, it.version + 1, it.kind, plain, it.in_duress_subset, it.handling_policy);
 }

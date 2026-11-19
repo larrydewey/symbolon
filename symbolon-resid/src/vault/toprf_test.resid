@@ -1,0 +1,183 @@
+// SPEC 18.10 end to end with fresh randomness: a vault OPRF key shared
+// 2-of-3, a requester's own share plus another party's proven evaluation,
+// the protected item format, and what vault_key alone can and cannot open.
+// The values are checked against an independent implementation in
+// toprf_ref_test.resid; here the properties are.
+
+import "../types.resid";
+import "toprf.resid";
+import "vault.resid";
+import "p256ops.resid";
+import "shamir.resid";
+import "word.resid";
+import "crypto.resid";
+import "random.resid";
+
+List(Int) widen(List(UInt(8)) b, Int i, ListBuf(Int) acc) {
+    if (i >= b.len()) { return acc.finish(); }
+    return widen(b, i + 1, acc.push((Int) b[i]));
+}
+
+@requires(declassify)
+List(Int) opened(List(Secret(UInt(8))) b) {
+    return widen(declassify(secret_join(b), "test compares values"), 0, ListBuf());
+}
+
+UInt(256) rand_coeff() { return (UInt(256)) sc_from_be(random_bytes(32)); }
+
+Secret(UInt(576)) sec(UInt(256) v) { return classify((UInt(576)) v); }
+
+List(List(Int)) ser_commits(List(P256Aff) cs, Int i, ListBuf(List(Int)) acc) {
+    if (i >= cs.len()) { return acc.finish(); }
+    return ser_commits(cs, i + 1, acc.push(toprf_ser(cs[i])));
+}
+
+// y for `input` with the requester `me` and the other party `other`, each
+// holding shares[id - 1]; the other party's answer is proven.
+@requires(declassify)
+List(Secret(UInt(8))) evaluate_pair(List(UInt(256)) shares, List(List(Int)) commits, Int me, Int other, List(Int) input) {
+    ToprfBlind bl = toprf_blind(input);
+    ToprfEval mine = toprf_evaluate(sec(shares[me - 1]), [bl.blinded]);
+    ToprfEval theirs = toprf_evaluate(sec(shares[other - 1]), [bl.blinded]);
+    assert(theirs.ok);
+    assert(toprf_verify(toprf_party_key(commits, other), [bl.blinded], theirs.elements, theirs.proof));
+    P256Aff z = toprf_combine([me, other], [mine.elements[0], theirs.elements[0]]);
+    return toprf_finalize(input, bl.r, z);
+}
+
+FieldPlain fp(Str n, Str v) { return FieldPlain {.name = n, .value = secret_bytes(utf8(v))}; }
+
+Bool has_field(List(FieldPlain) fs, Str n, Int i) {
+    if (i >= fs.len()) { return false; }
+    return fs[i].name == n || has_field(fs, n, i + 1);
+}
+
+@requires(declassify)
+List(Int) field_bytes(List(FieldPlain) fs, Str n, Int i) {
+    if (i >= fs.len()) { return []; }
+    if (fs[i].name == n) { return opened(fs[i].value); }
+    return field_bytes(fs, n, i + 1);
+}
+
+// A failed Result gives an empty value, which the assertions after it fail on.
+Item fail_item() {
+    return Item {.id = [], .version = 0, .kind = "", .fields = {}, .in_duress_subset = false, .handling_policy = None};
+}
+List(FieldPlain) no_fields() { List(FieldPlain) none = []; return none; }
+Item must_item(Result(Item, SymbolonError) r) { return r else { fail_item() }; }
+List(FieldPlain) must_fields(Result(List(FieldPlain), SymbolonError) r) { return r else { no_fields() }; }
+
+@requires(declassify)
+test "every pair of a 2-of-3 quorum derives the same y, which is the single-key PRF; blinds differ" {
+    List(UInt(256)) coeffs = [rand_coeff(), rand_coeff()];
+    List(UInt(256)) shares = sh_split(coeffs, 3);
+    List(List(Int)) commits = ser_commits(sh_commit(coeffs), 0, ListBuf());
+    List(Int) input = toprf_item_input(random_bytes(32), random_bytes(16));
+    List(Int) y12 = opened(evaluate_pair(shares, commits, 1, 2, input));
+    List(Int) y13 = opened(evaluate_pair(shares, commits, 1, 3, input));
+    List(Int) y32 = opened(evaluate_pair(shares, commits, 3, 2, input));
+    assert(y12.len() == 32);
+    assert(y12 == y13);
+    assert(y12 == y32);
+    // the whole key k_v = coeffs[0], as one party: RFC 9497 Evaluate
+    ToprfBlind bl = toprf_blind(input);
+    ToprfEval whole = toprf_evaluate(sec(coeffs[0]), [bl.blinded]);
+    assert(toprf_verify(toprf_deser(commits[0]), [bl.blinded], whole.elements, whole.proof));
+    assert(opened(toprf_finalize(input, bl.r, toprf_deser(whole.elements[0]))) == y12);
+    // two blinds of one input look unrelated to the evaluator
+    ToprfBlind b2 = toprf_blind(input);
+    assert(b2.blinded != bl.blinded);
+    // another item gives another y
+    List(Int) other = toprf_item_input(random_bytes(32), random_bytes(16));
+    assert(opened(evaluate_pair(shares, commits, 1, 2, other)) != y12);
+}
+
+@requires(declassify)
+test "one share is not enough, a lying party is caught, bad requests are refused" {
+    List(UInt(256)) coeffs = [rand_coeff(), rand_coeff()];
+    List(UInt(256)) shares = sh_split(coeffs, 3);
+    List(List(Int)) commits = ser_commits(sh_commit(coeffs), 0, ListBuf());
+    List(Int) input = toprf_item_input(random_bytes(32), random_bytes(16));
+    List(Int) y = opened(evaluate_pair(shares, commits, 1, 2, input));
+    ToprfBlind bl = toprf_blind(input);
+    // one party's element alone, as if it were the whole key
+    ToprfEval mine = toprf_evaluate(sec(shares[0]), [bl.blinded]);
+    assert(opened(toprf_finalize(input, bl.r, toprf_deser(mine.elements[0]))) != y);
+    // party 2 answers with party 3's share: its proof fails against K_2
+    ToprfEval liar = toprf_evaluate(sec(shares[2]), [bl.blinded]);
+    assert(!toprf_verify(toprf_party_key(commits, 2), [bl.blinded], liar.elements, liar.proof));
+    assert(toprf_verify(toprf_party_key(commits, 3), [bl.blinded], liar.elements, liar.proof));
+    // malformed requests
+    List(List(Int)) empty = [];
+    assert(!toprf_evaluate(sec(shares[0]), empty).ok);
+    assert(!toprf_evaluate(sec(shares[0]), [[2].concat(random_bytes(31))]).ok);
+    assert(!toprf_evaluate(sec(shares[0]), [pt_enc(pt_mul_base(5))]).ok);
+    // combination needs distinct, positive ids
+    assert(!toprf_combine([1, 1], [mine.elements[0], mine.elements[0]]).ok);
+    assert(!toprf_combine([0, 2], [mine.elements[0], mine.elements[0]]).ok);
+}
+
+@requires(declassify)
+test "a protected item: listing with vault_key alone, opening with pitem_key, never in the duress subset" {
+    List(Secret(UInt(8))) vk = random_secret(32);
+    List(Int) vid = random_bytes(32);
+    List(Int) iid = random_bytes(16);
+    List(Secret(UInt(8))) y = random_secret(32);
+    List(Secret(UInt(8))) pik = protected_item_key(vk, y, vid, iid);
+    List(FieldPlain) fs = [fp("type", "bank"), fp("name", "Credit union"), fp("origin", "https://cu.example"),
+                           fp("username", "ada"), fp("current", "correct horse"), fp("totp", "JBSWY3DPEHPK3PXP")];
+    Item it = must_item(protected_item_seal(vk, pik, vid, iid, 1, "password", fs, None));
+    assert(item_is_protected(it));
+    assert(!it.in_duress_subset);
+    // vault_key alone: the listing fields, nothing else; item_open refuses
+    List(FieldPlain) listing = must_fields(item_open_listing(vk, vid, it));
+    assert(field_bytes(listing, "name", 0) == utf8("Credit union"));
+    assert(field_bytes(listing, "origin", 0) == utf8("https://cu.example"));
+    assert(!has_field(listing, "current", 0));
+    assert(!has_field(listing, "totp", 0));
+    assert(!has_field(listing, "protected", 0));
+    assert(match item_open(vk, vid, it) { Ok(_) => false, Err(_) => true });
+    // the right pitem_key opens all of it
+    List(FieldPlain) all = must_fields(protected_item_open(vk, pik, vid, it));
+    assert(field_bytes(all, "current", 0) == utf8("correct horse"));
+    assert(field_bytes(all, "username", 0) == utf8("ada"));
+    assert(!has_field(all, "protected", 0));
+    // a pitem_key from another y, or from another vault key with this y, does not
+    List(Secret(UInt(8))) wrong_y = protected_item_key(vk, random_secret(32), vid, iid);
+    assert(match protected_item_open(vk, wrong_y, vid, it) { Ok(_) => false, Err(_) => true });
+    List(Secret(UInt(8))) vk2 = random_secret(32);
+    assert(match protected_item_open(vk2, protected_item_key(vk2, y, vid, iid), vid, it) { Ok(_) => false, Err(_) => true });
+    // the marker field is reserved; a duress flag on a protected item is refused
+    assert(match protected_item_seal(vk, pik, vid, iid, 1, "password", [fp("protected", "1")], None) { Ok(_) => false, Err(_) => true });
+    Item flagged = Item {.id = it.id, .version = it.version, .kind = it.kind, .fields = it.fields, .in_duress_subset = true, .handling_policy = None};
+    assert(match protected_item_open(vk, pik, vid, flagged) { Ok(_) => false, Err(_) => true });
+    // a protected ciphertext moved under a standard name does not open
+    List(Int) moved = it.fields["current"] else { [] };
+    Item swapped = Item {.id = it.id, .version = it.version, .kind = it.kind, .fields = it.fields.insert("name", moved), .in_duress_subset = false, .handling_policy = None};
+    assert(match item_open_listing(vk, vid, swapped) { Ok(_) => false, Err(_) => true });
+}
+
+@requires(declassify)
+test "rotation keeps y, protecting and unprotecting are new versions, plain re-encryption refuses" {
+    List(Secret(UInt(8))) vk = random_secret(32);
+    List(Int) vid = random_bytes(32);
+    List(Int) iid = random_bytes(16);
+    List(Secret(UInt(8))) y = random_secret(32);
+    Item plain = must_item(item_seal(vk, vid, iid, 4, "password", [fp("name", "Mail"), fp("current", "hunter2")], false, None));
+    List(Secret(UInt(8))) pik = protected_item_key(vk, y, vid, iid);
+    Item prot = must_item(item_protect(vk, pik, vid, plain));
+    assert(prot.version == 5);
+    assert(match item_reencrypt(vk, random_secret(32), vid, prot) { Ok(_) => false, Err(_) => true });
+    List(Secret(UInt(8))) vk2 = random_secret(32);
+    List(Secret(UInt(8))) pik2 = protected_item_key(vk2, y, vid, iid);
+    Item rot = must_item(protected_item_reencrypt(vk, pik, vk2, pik2, vid, prot));
+    assert(rot.version == 6);
+    assert(match protected_item_open(vk, pik, vid, rot) { Ok(_) => false, Err(_) => true });
+    List(FieldPlain) after = must_fields(protected_item_open(vk2, pik2, vid, rot));
+    assert(field_bytes(after, "current", 0) == utf8("hunter2"));
+    Item back = must_item(item_unprotect(vk2, pik2, vid, rot));
+    assert(!item_is_protected(back));
+    assert(back.version == 7);
+    List(FieldPlain) open_again = must_fields(item_open(vk2, vid, back));
+    assert(field_bytes(open_again, "current", 0) == utf8("hunter2"));
+}
