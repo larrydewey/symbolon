@@ -114,6 +114,10 @@ class _ItemPageState extends State<ItemPage> with ClosesOnLock {
     if (ok != true || !mounted) return;
     final r = await app.withPin(context, (p) => runTask(context, 'Deleting ${widget.item.name}', () => app.cli.vaultDelete(app.dir, widget.item.name, p, share: widget.share), usually: 'a few seconds'));
     if (r != null && r.ok && mounted) {
+      // An imported passkey is no longer offered at sign-in either.
+      final cid = fields?['credential_id'] ?? '';
+      if (type.id == 'passkey' && cid.isNotEmpty) await app.settings.removeCredential(cid);
+      if (!mounted) return;
       toast(context, '${widget.item.name} deleted');
       Navigator.of(context).pop(const ItemChange(null));
     }
@@ -199,7 +203,7 @@ class _ItemPageState extends State<ItemPage> with ClosesOnLock {
       appBar: AppBar(title: Text(t.label), actions: [
         if (fs != null && type.editable) IconButton(key: const Key('item-move'), tooltip: 'Move', icon: const Icon(Icons.drive_file_move_outline), onPressed: move),
         if (fs != null && type.editable) IconButton(key: const Key('item-edit'), tooltip: 'Edit', icon: const Icon(Icons.edit), onPressed: edit),
-        if (fs != null && type.editable) IconButton(key: const Key('item-delete'), tooltip: 'Delete', icon: const Icon(Icons.delete_outline), onPressed: delete),
+        if (fs != null && (type.editable || type.id == 'passkey')) IconButton(key: const Key('item-delete'), tooltip: 'Delete', icon: const Icon(Icons.delete_outline), onPressed: delete),
       ]),
       body: fs == null
           ? const Center(child: CircularProgressIndicator())
@@ -239,6 +243,13 @@ class _ItemPageState extends State<ItemPage> with ClosesOnLock {
                   if (known.isEmpty && custom.isEmpty) const ListTile(title: Text('No fields')),
                 ]),
               ),
+              if (t.id == 'passkey')
+                const Padding(
+                  padding: EdgeInsets.only(top: 8),
+                  child: Text('This passkey came from another password manager. It signs on this device alone, '
+                      'without your cosigner. Sign in with it once, add a Symbolon passkey at the site, then delete this one.',
+                      key: Key('item-passkey-migrate')),
+                ),
               if (t.id == 'login') ...[
                 const SizedBox(height: 8),
                 WideButton('Change password at the site…', icon: Icons.autorenew, tonal: true, onPressed: rotate),

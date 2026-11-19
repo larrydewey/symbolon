@@ -70,4 +70,4 @@ the log.
 | [An organization](/symbolon/org/servers/) | the company's servers | the company's |
 | The demo | your desktop | your desktop |
 
-The full design is in [SPEC.md](https://github.com/larrydewey/symbolon/blob/main/SPEC.md).
+The full design is in [SPEC.md](https://github.com/larrydewey/symbolon/blob/master/SPEC.md).

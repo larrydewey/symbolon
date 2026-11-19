@@ -12,6 +12,7 @@ import 'dart:io';
 
 import 'package:crypto/crypto.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import 'cli.dart';
 import 'fill_consent.dart' show isBrowserExe;
@@ -27,8 +28,11 @@ class SshRequest {
   final String hostKey, hostFingerprint;    // "" when the session is not bound
   final bool forwarding;
   final int pid;
+  /// On Android, the calling app as the agent service verified it
+  /// ("Label (package)"); "" on desktop, where [pid] names the caller.
+  final String peer;
   const SshRequest({required this.key, required this.fingerprint, required this.data, required this.socket, required this.token, required this.what, this.alg = '',
-      this.user = '', this.namespace = '', this.hostKey = '', this.hostFingerprint = '', this.forwarding = false, this.pid = 0});
+      this.user = '', this.namespace = '', this.hostKey = '', this.hostFingerprint = '', this.forwarding = false, this.pid = 0, this.peer = ''});
 
   static SshRequest? parse(String text) {
     try {
@@ -40,6 +44,7 @@ class SshRequest {
         what: w['kind'] as String, alg: (j['alg'] as String?) ?? '', user: (w['user'] as String?) ?? '', namespace: (w['namespace'] as String?) ?? '',
         hostKey: (h?['key'] as String?) ?? '', hostFingerprint: (h?['fingerprint'] as String?) ?? '', forwarding: h?['forwarding'] == true,
         pid: (j['pid'] as int?) ?? 0,
+        peer: (j['peer'] as String?) ?? '',
       );
     } catch (_) {
       return null;
@@ -157,6 +162,25 @@ Future<void> runSshConsent(String path) async {
   } catch (_) {}
   final req = SshRequest.parse(text);
   runApp(SshConsentApp(settings: settings, request: req, link: UnixSshLink(), knownHosts: known, caller: callerOfPid(req?.pid ?? 0), done: () => exit(0)));
+}
+
+/// Android (SshConsentActivity, SPEC 16.1.1): the request and the verified
+/// calling app come from the agent service through the activity.
+Future<void> runSshConsentAndroid() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  const ch = MethodChannel('symbolon/ssh');
+  final settings = await loadSettings();
+  final r = await ch.invokeMapMethod<String, dynamic>('request') ?? {};
+  String text = '';
+  try {
+    text = await File((r['path'] as String?) ?? '').readAsString();
+  } catch (_) {}
+  final req = SshRequest.parse(text);
+  final peer = (r['peer'] as String?) ?? '';
+  // The service's word on who is asking, not the request file's.
+  final ok = req != null && req.peer == peer && peer.isNotEmpty;
+  runApp(SshConsentApp(
+      settings: settings, request: ok ? req : null, link: UnixSshLink(), knownHosts: '', caller: (exe: peer, cmdline: ''), done: () => ch.invokeMethod('done')));
 }
 
 class SshConsentApp extends StatelessWidget {
@@ -277,9 +301,18 @@ class _SshConsentPageState extends State<SshConsentPage> {
                 key: const Key('sc-caller'),
                 leading: const Icon(Icons.terminal),
                 title: Text(exeName),
-                subtitle: Text(c.cmdline.isEmpty ? 'Asked by process ${r.pid}' : c.cmdline, maxLines: 3, overflow: TextOverflow.ellipsis),
+                subtitle: Text(r.peer.isNotEmpty ? 'An app on this phone, identified by its signature' : (c.cmdline.isEmpty ? 'Asked by process ${r.pid}' : c.cmdline), maxLines: 3, overflow: TextOverflow.ellipsis),
               ),
-              if (r.hostFingerprint.isNotEmpty)
+              if (r.hostFingerprint.isNotEmpty && r.peer.isNotEmpty)
+                ListTile(
+                  key: const Key('sc-host'),
+                  // Another app on the phone: there is no known_hosts here; the
+                  // app keeps its own host trust. The key is what the session is bound to.
+                  leading: const Icon(Icons.dns_outlined),
+                  title: const Text('Server'),
+                  subtitle: Text('Server key ${r.hostFingerprint}. It should match the host you are connecting to in ${c.exe}.'),
+                ),
+              if (r.hostFingerprint.isNotEmpty && r.peer.isEmpty)
                 ListTile(
                   key: const Key('sc-host'),
                   // A server ssh has not met before: the moment a stranger in the

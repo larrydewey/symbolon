@@ -25,7 +25,7 @@
     {
       "id": "i2", "folderId": null, "type": 1, "name": "GitHub", "notes": null, "favorite": false,
       "login": {
-        "fido2Credentials": [ { "credentialId": "abc", "keyType": "public-key", "keyAlgorithm": "ECDSA", "keyCurve": "P-256", "keyValue": "MIGH", "rpId": "github.com", "userName": "octo", "counter": "0", "discoverable": "true", "creationDate": "2026-02-02T00:00:00.000Z" } ],
+        "fido2Credentials": [ {"credentialId": "3f2a9c1e-7b4d-4e8a-9c0f-1d2e3f4a5b6c", "keyType": "public-key", "keyAlgorithm": "ECDSA", "keyCurve": "P-256", "keyValue": "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgXB8OK4p9TD6fGis8TV5vcIGSo7TF1uf4CRorPE1eb3GhRANCAARpAyZzNVML69vM9ICxMueAnLx2iBKlFas3Tk6mb1BPokALxC5KgZ0fwnx9Dnm5z-5WRXyYpkEufdl2OCeZWJxe", "rpId": "github.com", "userHandle": "b2N0by11c2VyLWhhbmRsZQ", "userName": "octo", "counter": "0", "rpName": "GitHub", "userDisplayName": "The Octocat", "discoverable": "true", "creationDate": "2026-02-02T00:00:00.000Z"}, {"credentialId": "b64.AAECAwQFBgcICQ", "keyType": "public-key", "keyAlgorithm": "EdDSA", "keyCurve": "Ed25519", "keyValue": "MC4CAQAwBQYDK2VwBCIEIA", "rpId": "github.com", "userName": "octo-ed", "counter": "0", "discoverable": "true", "creationDate": "2026-02-02T00:00:00.000Z"} ],
         "uris": [ { "match": null, "uri": "github.com" } ], "username": "octo", "password": null, "totp": null
       }
     },

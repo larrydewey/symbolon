@@ -1,0 +1,213 @@
+# Builds the Android app: the agent (libsymbolon.so for arm64-v8a and
+# x86_64, tools/bundle-agent.sh) and then the APK. Pushes to master and pull
+# requests keep the APK as a short-lived workflow artifact; a published
+# release gets it attached.
+#
+# Signing (repository secrets; without them the APK is debug-signed and
+# says so in its name):
+#   ANDROID_KEYSTORE_BASE64    the signing keystore, base64. It must be the
+#                              key earlier releases were signed with, or
+#                              Obtainium cannot update an installed app.
+#   ANDROID_KEYSTORE_PASSWORD, ANDROID_KEY_ALIAS, ANDROID_KEY_PASSWORD
+#   RESID_SIGNING_KEY          the Resid provenance key (hex seed); without
+#                              it each run signs the agent with a fresh key
+# Repository variable (optional; the source carries the default):
+#   PYLON_CERT_SHA256          the apps allowed to use the SSH agent
+#                              (SPEC 16.1.1), comma-separated; when set it
+#                              replaces res/values/ssh_agent_callers.xml
+#
+# Cleaning up: secrets are written to the runner's temporary directory and
+# removed when the job ends, whatever happened; build outputs stay on the
+# discarded runner; artifacts expire after 14 days, and each run deletes
+# the APK artifacts of earlier runs on the same branch.
+name: apk
+
+on:
+  push:
+    branches: [master]
+    paths: ["symbolon-resid/**", "symbolon-flutter/**", ".github/workflows/apk.yml"]
+  pull_request:
+    paths: ["symbolon-resid/**", "symbolon-flutter/**", ".github/workflows/apk.yml"]
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: write   # attach the APK to a release
+  actions: write    # delete earlier runs' artifacts
+
+concurrency:
+  group: apk-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  apk:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    steps:
+      # Side by side, as resid.toml's paths expect (../../resid-json).
+      - uses: actions/checkout@v4
+        with:
+          path: symbolon
+      - uses: actions/checkout@v4
+        with:
+          repository: larrydewey/Resid
+          path: resid
+      - uses: actions/checkout@v4
+        with:
+          repository: larrydewey/resid-json
+          path: resid-json
+      - uses: actions/checkout@v4
+        with:
+          repository: larrydewey/resid-csv
+          path: resid-csv
+      # resid-json's own dependency, beside it (its resid.toml: ../resid-serial).
+      - uses: actions/checkout@v4
+        with:
+          repository: larrydewey/resid-serial
+          path: resid-serial
+
+      - name: Toolchain
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q lld
+          # The agent's compile peaks near 14 GB; swap keeps a peak from
+          # killing the runner.
+          # A file of its own: the runner image may already swap on /swapfile.
+          sudo fallocate -l 8G /swap-symbolon && sudo chmod 600 /swap-symbolon && sudo mkswap /swap-symbolon && sudo swapon /swap-symbolon
+          b=$(find "$ANDROID_NDK_LATEST_HOME" -name 'libclang_rt.builtins-aarch64-android.a' | head -1)
+          test -n "$b"
+          echo "RESID_AARCH64_BUILTINS=$b" >> "$GITHUB_ENV"
+          echo "RESID_HOME=$GITHUB_WORKSPACE/resid/build/boot" >> "$GITHUB_ENV"
+          # Resid commits the compiler (stage2.bin), not the residc wrapper.
+          mkdir -p "$RUNNER_TEMP/bin"
+          printf '#!/usr/bin/env bash\nexec "%s/resid/build/boot/stage2.bin" "$@"\n' "$GITHUB_WORKSPACE" > "$RUNNER_TEMP/bin/residc"
+          chmod +x "$RUNNER_TEMP/bin/residc"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+          mkdir -p resid/target
+          # $GITHUB_ENV applies from the next step: name the runtime here.
+          RESID_HOME="$GITHUB_WORKSPACE/resid/build/boot" resid/build/boot/stage2.bin resid/tools/resid-manifest.resid -o resid/target/resid-manifest --profile debug
+          echo "MANIFEST=$GITHUB_WORKSPACE/resid/target/resid-manifest" >> "$GITHUB_ENV"
+
+      - name: Signing material
+        env:
+          KEYSTORE: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          RESID_KEY: ${{ secrets.RESID_SIGNING_KEY }}
+        run: |
+          umask 077
+          mkdir -p "$RUNNER_TEMP/keys"
+          if [ -n "$RESID_KEY" ]; then
+            printf '%s\n' "$RESID_KEY" > "$RUNNER_TEMP/keys/resid-ed25519.key"
+          else
+            residc keygen "$RUNNER_TEMP/keys" > /dev/null
+          fi
+          echo "RESID_SIGNING_KEY=$RUNNER_TEMP/keys/resid-ed25519.key" >> "$GITHUB_ENV"
+          if [ -n "$KEYSTORE" ]; then
+            printf '%s' "$KEYSTORE" | base64 -d > "$RUNNER_TEMP/keys/release.jks"
+            echo "ANDROID_KEYSTORE=$RUNNER_TEMP/keys/release.jks" >> "$GITHUB_ENV"
+            echo "SIGNED=release" >> "$GITHUB_ENV"
+          else
+            echo "SIGNED=debug" >> "$GITHUB_ENV"
+          fi
+
+      - name: Agent for Android
+        working-directory: symbolon/symbolon-flutter
+        env:
+          RESIDC: residc
+          RESID_MEM_LIMIT: "14000"
+          RESID_LIB: ${{ github.workspace }}/resid/lib
+        run: bash tools/bundle-agent.sh
+
+      - name: Apps allowed to use the SSH agent
+        if: vars.PYLON_CERT_SHA256 != ''
+        working-directory: symbolon/symbolon-flutter/android/app/src/main/res/values
+        env:
+          CERTS: ${{ vars.PYLON_CERT_SHA256 }}
+        run: |
+          {
+            echo '<?xml version="1.0" encoding="utf-8"?>'
+            echo '<resources>'
+            echo '    <string-array name="ssh_agent_callers">'
+            for c in $(echo "$CERTS" | tr ',' ' '); do
+              echo "$c" | grep -Eq '^[0-9A-Fa-f:]{64,95}$' || { echo "bad certificate digest: $c"; exit 1; }
+              echo "        <item>$c</item>"
+            done
+            echo '    </string-array>'
+            echo '</resources>'
+          } > ssh_agent_callers.xml
+          cat ssh_agent_callers.xml
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: 3.47.9
+          channel: stable
+
+      - name: Test and build the APK
+        working-directory: symbolon/symbolon-flutter
+        env:
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          flutter pub get
+          flutter analyze
+          flutter test
+          flutter build apk --release
+          # The release asset is symbolon-vX.Y.Z.apk, the name Obtainium follows.
+          name="symbolon-${{ github.event_name == 'release' && github.event.release.tag_name || github.sha }}"
+          [ "$SIGNED" = release ] || name="$name-debug-signed"
+          mkdir -p "$RUNNER_TEMP/out"
+          cp build/app/outputs/flutter-apk/app-release.apk "$RUNNER_TEMP/out/$name.apk"
+          (cd "$RUNNER_TEMP/out" && sha256sum "$name.apk" > "$name.apk.sha256")
+          echo "APK_NAME=$name" >> "$GITHUB_ENV"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: symbolon-apk-${{ github.run_id }}
+          path: ${{ runner.temp }}/out/
+          retention-days: 14
+          if-no-files-found: error
+
+      - name: Attach to the release
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          # Only a release-signed APK goes out: Obtainium updates an installed
+          # app only from an APK signed with the same key.
+          [ "$SIGNED" = release ] || { echo "no release keystore in the secrets: not attaching a debug-signed APK"; exit 1; }
+          cd "$RUNNER_TEMP/out"
+          gh release upload "$TAG" "$APK_NAME.apk" --clobber -R "$REPO"
+          # SHA256SUMS lists every asset: its APK line is replaced, the rest kept.
+          gh release download "$TAG" -p SHA256SUMS -R "$REPO" 2>/dev/null || touch SHA256SUMS
+          grep -v " $APK_NAME.apk\$" SHA256SUMS > sums.new || true
+          sha256sum "$APK_NAME.apk" >> sums.new
+          sort -k2 sums.new > SHA256SUMS
+          gh release upload "$TAG" SHA256SUMS --clobber -R "$REPO"
+
+      - name: Remove signing material
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/keys"
+
+  prune:
+    # Earlier runs' APK artifacts on the same branch are superseded.
+    needs: apk
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Delete superseded artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          BRANCH: ${{ github.ref_name }}
+          RUN: ${{ github.run_id }}
+        run: |
+          gh api --paginate "repos/$REPO/actions/artifacts?per_page=100" \
+            --jq ".artifacts[] | select(.name | startswith(\"symbolon-apk-\")) | select(.workflow_run.head_branch == \"$BRANCH\") | select(.workflow_run.id != $RUN) | .id" |
+          while read -r id; do gh api -X DELETE "repos/$REPO/actions/artifacts/$id"; done

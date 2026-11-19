@@ -6,7 +6,9 @@
 # tpm_ak_pubkey (2026-10-29) and is not yet re-pinned in the compiler.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-RC="${RESIDC:-$HOME/git/larry/resid/build/boot/residc}"
+# The installed Resid (~/.resid, install.sh): one compiler and standard
+# library for every project; RESIDC overrides (CI uses its checkout).
+RC="${RESIDC:-$(command -v residc || echo "$HOME/.resid/bin/residc")}"
 fail=0
 for t in $(find src -name '*_test.resid' | sort); do
     case "$t" in src/net/net_test.resid) continue ;; esac   # needs the services: tests/net_e2e.sh

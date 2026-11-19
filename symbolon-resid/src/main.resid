@@ -55,6 +55,7 @@
 //   symbolon device share me DIR               prints LOG-ID FINGERPRINT
 //   symbolon device share people DIR           "LOG-ID NAME-HEX FINGERPRINT me|-" per card at the relay
 //   symbolon ssh-agent DIR [SOCKET]            the SSH agent (SPEC 16.1) on a Unix socket
+//   symbolon ssh-agent-stdio DIR RUNDIR PEER   one agent connection on stdin/stdout (Android's service, SPEC 16.1.1)
 //   symbolon device ssh new|import|list|sign|delete ...   SSH keys in the vault (src/agent/sshcli.resid)
 //   symbolon device link-new DIR [--host H,...] [...]   a new device: shows a code (QR) for an existing one (SPEC 11.5)
 //   symbolon device link-add DIR LINK          adds the device whose code was scanned
@@ -70,8 +71,14 @@
 //   symbolon home serve DIR                    pairing, relay, three witnesses and every cosigner
 //   symbolon device webauthn register DIR RP_ID [--uv] [--duress]          PIN on stdin; adds authenticator-data
 //                                              and attestation-object (fmt none) to what register prints
+//                                              --replaces CID: it replaces that imported (Synced) passkey
+//   symbolon device webauthn retire DIR CID [--force]   PIN on stdin; deletes an imported passkey a
+//                                              Symbolon passkey replaced (--force: any)
 //   symbolon device webauthn assert DIR RP_ID CREDENTIAL_ID CDH [--uv]   PIN on stdin; authenticator-data,
-//                                              signature-der, then r || s
+//                                              signature-der, then r || s; a Synced passkey (imported)
+//                                              prints "profile synced" and user-handle too
+//   symbolon device webauthn synced DIR        PIN on stdin; the Synced passkeys an import brought:
+//                                              "passkey CID RP USER USERNAME DISPLAY PUBLIC-KEY REPLACED-BY" (hex)
 //   symbolon device enroll DIR NEW_KEYS [PRIMES]   PIN on stdin; adds the device NEW_KEYS (re-share)
 //   symbolon device join DIR ENROLLER_KEYS [PRIMES] PIN on stdin; joins when that device enrolls this one
 //   symbolon device recover DIR KIT_SEED LOG_ID    a new device starts a kit recovery (SPEC 13.2)
@@ -339,6 +346,7 @@ Int main() {
     if (a1 == "home" && a2 == "invite" && n == 5) { return home_invite(args.get(3), args.get(4)); }
     if (a1 == "device" && a2 == "pin" && n == 4) { return device_pin(args.get(3)); }
     // Started by the browser (native messaging); its own arguments follow.
+    if (a1 == "ssh-agent-stdio" && n == 5) { return ssh_agent_stdio(args.get(2), args.get(3), args.get(4)); }
     if (a1 == "ssh-agent" && (n == 3 || n == 4)) { return ssh_agent(args.get(2), if (n == 4) { args.get(3) } else { "" }); }
     if (a1 == "device" && a2 == "ssh" && args.get(3) == "new" && n == 6) { return ssh_new(args.get(4), args.get(5)); }
     if (a1 == "device" && a2 == "ssh" && args.get(3) == "import" && n == 7) { return ssh_import(args.get(4), args.get(5), args.get(6)); }
@@ -383,7 +391,9 @@ Int main() {
     if (a1 == "device" && a2 == "vault" && args.get(3) == "list" && ns == 5) { return vault_list_at(args.get(4), 0, share); }
     if (a1 == "device" && a2 == "vault" && args.get(3) == "list" && ns == 6 && args.get(5) == "--kinds") { return vault_list_at(args.get(4), 1, share); }
     if (a1 == "device" && a2 == "vault" && args.get(3) == "list" && ns == 6 && args.get(5) == "--long") { return vault_list_at(args.get(4), 2, share); }
-    if (a1 == "device" && a2 == "webauthn" && args.get(3) == "register" && n >= 6) { return device_wa_register(args.get(4), args.get(5), has_flag("--uv", 6), has_flag("--duress", 6)); }
+    if (a1 == "device" && a2 == "webauthn" && args.get(3) == "register" && n >= 6) { return device_wa_register(args.get(4), args.get(5), has_flag("--uv", 6), has_flag("--duress", 6), flag_arg("--replaces", 1, 6)); }
+    if (a1 == "device" && a2 == "webauthn" && args.get(3) == "retire" && n >= 6) { return device_wa_retire(args.get(4), args.get(5), has_flag("--force", 6)); }
+    if (a1 == "device" && a2 == "webauthn" && args.get(3) == "synced" && n == 5) { return device_wa_synced(args.get(4)); }
     if (a1 == "device" && a2 == "webauthn" && args.get(3) == "assert" && n >= 8) { return device_wa_assert(args.get(4), args.get(5), args.get(6), args.get(7), has_flag("--uv", 8)); }
     if (a1 == "device" && a2 == "vault" && args.get(3) == "show" && ns == 6) { return vault_show(args.get(4), args.get(5), share); }
     if (a1 == "device" && a2 == "vault" && args.get(3) == "code" && ns == 6) { return vault_code(args.get(4), args.get(5), share); }

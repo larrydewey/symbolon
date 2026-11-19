@@ -2,7 +2,7 @@
 // attestation object of a new credential (format "none") and the message
 // an assertion signs, formed here in the agent, so that the relying
 // party's hash and the flags are the agent's, not the caller's.
-//   symbolon device webauthn register DIR RP_ID [--uv] [--duress]
+//   symbolon device webauthn register DIR RP_ID [--uv] [--duress] [--replaces CID]
 //   symbolon device webauthn assert DIR RP_ID CREDENTIAL_ID CLIENT_DATA_HASH [--uv]
 // Flags are truthful: UP (the caller obtained the gesture), BE and BS (a
 // threshold credential survives the loss of a device), UV only with --uv,
@@ -15,6 +15,7 @@ import "common.resid";
 import "device.resid";
 import "crypto.resid";
 import "cose.resid";
+import "synced.resid";
 
 // Symbolon's AAGUID (random, fixed).
 pub List(Int) symbolon_aaguid() { return cose_hex_decode("5e7b0c1f4a2d4c8e9b316a0d2f87c4e1"); }
@@ -53,27 +54,52 @@ pub List(Int) wa_attestation_object(List(Int) ad) {
 }
 
 // `device webauthn register`: a new credential as `device register` makes
-// it, with its authenticator data and attestation object.
+// it, with its authenticator data and attestation object. With --replaces
+// CID, the new credential replaces that imported (Synced) passkey of the
+// same site (synced.resid): checked before the credential is made, and
+// recorded in the vault after ("replaces-recorded NEW-CID").
 @requires(filesystem, network, device, declassify, clock, provision, environment)
-pub Int device_wa_register(Str dir, Str rp, Bool uv, Bool in_subset) {
+pub Int device_wa_register(Str dir, Str rp, Bool uv, Bool in_subset, Str replaces) {
     Option(DeviceConfig) oc = load_config(dir);
     return match oc {
         None => dfail("not set up"),
-        Some(c) => wa_register_with(dir, c, rp, unlock_dir(dir, c, read_pin()), uv, in_subset)
+        Some(c) => wa_register_with(dir, c, rp, read_pin(), uv, in_subset, cose_hex_decode(replaces))
     };
 }
 
-@requires(filesystem, network, device, declassify, clock)
-Int wa_register_with(Str dir, DeviceConfig c, Str rp, Unlocked u, Bool uv, Bool in_subset) {
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+Int wa_register_with(Str dir, DeviceConfig c, Str rp, Str pin, Bool uv, Bool in_subset, List(Int) replaces) {
+    Unlocked u = unlock_dir(dir, c, pin);
     if (u.kind != 1) { return dfail("wrong PIN"); }
     Result(VerifiedHead, SymbolonError) v = verified_log_dir(dir, relay_ep(c), c.log_id);
-    List(Int) nonce = random_bytes(16);
     return match v {
         Err(e) => dfail(err_text(e)),
-        Ok(vh) => if (print_credential(dir, u, rp, vh.head.quorum.root_pubkey, nonce, in_subset) != 0) { 1 } else {
-            wa_print_attestation(rp, uv, credential_id(u.real.cc, rp, nonce), credential_pubkey(vh.head.quorum.root_pubkey, tweak_scalar(u.real.cc, rp, nonce)))
-        }
+        Ok(vh) => if (replaces.len() == 0) { wa_make(dir, u, rp, vh, uv, in_subset, random_bytes(16)) } else { wa_make_replacing(dir, c, u, rp, vh, uv, in_subset, replaces, pin) }
     };
+}
+
+@requires(filesystem, declassify)
+Int wa_make(Str dir, Unlocked u, Str rp, VerifiedHead vh, Bool uv, Bool in_subset, List(Int) nonce) {
+    if (print_credential(dir, u, rp, vh.head.quorum.root_pubkey, nonce, in_subset) != 0) { return 1; }
+    return wa_print_attestation(rp, uv, credential_id(u.real.cc, rp, nonce), credential_pubkey(vh.head.quorum.root_pubkey, tweak_scalar(u.real.cc, rp, nonce)));
+}
+
+@requires(filesystem, network, device, declassify, clock, environment)
+Int wa_make_replacing(Str dir, DeviceConfig c, Unlocked u, Str rp, VerifiedHead vh, Bool uv, Bool in_subset, List(Int) old, Str pin) {
+    Result(VaultState, Str) rs = fetch_vault(dir, c, vh);
+    return match rs {
+        Err(m) => dfail(m),
+        Ok(st) => wa_replace_checked(dir, Opened {.c = c, .u = u, .vh = vh, .st = st, .pin = pin, .p = own_place(c, u), .ep = relay_ep(c)}, rp, uv, in_subset, old)
+    };
+}
+
+@requires(filesystem, network, device, declassify, clock, environment)
+Int wa_replace_checked(Str dir, Opened o, Str rp, Bool uv, Bool in_subset, List(Int) old) {
+    Str p = replace_problem(o.st.items, o.p.vk, o.p.vid, rp, old);
+    if (str_len(p) > 0) { return dfail(p); }
+    List(Int) nonce = random_bytes(16);
+    if (wa_make(dir, o.u, rp, o.vh, uv, in_subset, nonce) != 0) { return 1; }
+    return synced_replace(dir, o, old, credential_id(o.u.real.cc, rp, nonce));
 }
 
 Int wa_print_attestation(Str rp, Bool uv, List(Int) cid, List(Int) pub65) {
@@ -85,12 +111,28 @@ Int wa_print_attestation(Str rp, Bool uv, List(Int) cid, List(Int) pub65) {
 
 // `device webauthn assert`: prints the authenticator data, then signs
 // m = SHA-256(authenticatorData || clientDataHash) as `device sign` does
-// (its last lines: the signature in DER, then r || s).
+// (its last lines: the signature in DER, then r || s). A credential ID
+// that is not one of this identity's Threshold credentials may be a
+// Synced passkey brought in by an import (synced.resid); that one signs on
+// this device, prints "profile synced" first and its "user-handle", and
+// is not offered under the duress PIN.
 @requires(filesystem, network, device, declassify, clock, provision, environment)
 pub Int device_wa_assert(Str dir, Str rp, Str cid_hex, Str cdh_hex, Bool uv) {
     List(Int) cdh = cose_hex_decode(cdh_hex);
     if (cdh.len() != 32) { return dfail("the client data hash is 32 bytes"); }
+    Option(DeviceConfig) oc = load_config(dir);
+    return match oc {
+        None => dfail("not set up"),
+        Some(c) => wa_assert_with(dir, c, rp, cose_hex_decode(cid_hex), cdh, uv, read_pin())
+    };
+}
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+Int wa_assert_with(Str dir, DeviceConfig c, Str rp, List(Int) cid, List(Int) cdh, Bool uv, Str pin) {
+    Unlocked u = unlock_dir(dir, c, pin);
+    Bool threshold = u.kind != 1 || match credential_nonce(u.real.cc, rp, cid) { Some(_) => true, None => false };
+    if (!threshold) { return synced_assert(dir, c, u, rp, cid, cdh, wa_flags(uv, false)); }
     List(Int) ad = wa_auth_data(rp, wa_flags(uv, false), []);
     println("authenticator-data " + hex_encode(ad));
-    return device_sign(dir, rp, cid_hex, hex_encode(sha256_bytes(ad.concat(cdh))));
+    return sign_unlocked(dir, c, u, rp, cid, sha256_bytes(ad.concat(cdh)), pin, 0);
 }

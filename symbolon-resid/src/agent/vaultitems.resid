@@ -30,6 +30,7 @@ pub Str missing_for(Str t, List(FieldPlain) fs) {
     if (t == "login" && !has(fs, "origin") && !has(fs, "current") && !has(fs, "username")) { return "a login needs a site, a username or a password"; }
     if (t == "secret" && !has(fs, "secret")) { return "a secret needs its secret"; }
     if (t == "note" && !has(fs, "text")) { return "a note needs its text"; }
+    if (t == "passkey" && !(has(fs, "rp_id") && has(fs, "credential_id") && has(fs, "key") && has(fs, "public_key"))) { return "a passkey needs its site, credential ID and key"; }
     if (fs.len() == 0) { return "an item needs at least one field"; }
     return "";
 }

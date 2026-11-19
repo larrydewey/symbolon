@@ -80,14 +80,19 @@ pub Str rsa_alg_of(List(Int) key, Int flags) {
     return "refused";
 }
 
-pub Str consent_json(SshEntry e, Signed w, AgentSession s, Int pid, List(Int) data, Str sock, Str token, Str rsa_alg) {
+pub Str consent_json(SshEntry e, Signed w, AgentSession s, Int pid, List(Int) data, Str sock, Str token, Str rsa_alg) { return consent_json_peer(e, w, s, pid, "", data, sock, token, rsa_alg); }
+
+// `peer`: who is asking, when the platform says so instead of a pid (on
+// Android, the calling app as the agent service verified it: its label
+// and package); "" leaves the field out.
+pub Str consent_json_peer(SshEntry e, Signed w, AgentSession s, Int pid, Str peer, List(Int) data, Str sock, Str token, Str rsa_alg) {
     Str what = if (w.kind == "auth") { "{\"kind\":\"auth\",\"user\":" + json_quote(w.user) + "}" }
                else { if (w.kind == "sshsig") { "{\"kind\":\"sshsig\",\"namespace\":" + json_quote(w.namespace) + "}" } else { "{\"kind\":\"unknown\"}" } };
     Str host = if (s.bound) { "{\"key\":" + json_quote(base64_encode(s.host_key)) + ",\"fingerprint\":" + json_quote(ssh_fingerprint(s.host_key)) + ",\"forwarding\":" + (if (s.forwarding) { "true" } else { "false" }) + "}" } else { "null" };
     Option(List(Int)) ob = ssh_blob_of_line(e.line);
     List(Int) blob = ob else { [] };
     return "{\"key\":" + json_quote(e.name) + ",\"fingerprint\":" + json_quote(ssh_fingerprint(blob)) + ",\"what\":" + what + ",\"host\":" + host
-        + ",\"pid\":" + f"{pid}" + ",\"data\":" + json_quote(hex_encode(data)) + ",\"alg\":" + json_quote(rsa_alg) + ",\"socket\":" + json_quote(sock) + ",\"token\":" + json_quote(token) + "}";
+        + ",\"pid\":" + f"{pid}" + (if (str_len(peer) > 0) { ",\"peer\":" + json_quote(peer) } else { "" }) + ",\"data\":" + json_quote(hex_encode(data)) + ",\"alg\":" + json_quote(rsa_alg) + ",\"socket\":" + json_quote(sock) + ",\"token\":" + json_quote(token) + "}";
 }
 
 Bool shell_safe(Str s) { return str_len(s) > 0 && !str_contains(s, "'") && !str_contains(s, "\n"); }
@@ -168,6 +173,35 @@ pub List(Int) ask_window(SshEntry e, Signed w, AgentSession s, Int pid, List(Int
     return if (str_len(hx) % 2 == 0 && str_len(hx) > 0) { cose_hex_decode(hx) } else { [] };
 }
 
+// The consent window on a platform that opens it itself (Android: the
+// agent service, SPEC 16.1.1): the same request file, per-request socket
+// and one-time token as ask_window, announced as one line "consent PATH"
+// on standard error instead of a program run. The window has five
+// minutes.
+@requires(filesystem, network, clock, process)
+pub List(Int) ask_platform(SshEntry e, Signed w, AgentSession s, Str peer, List(Int) data, Str rt, Str rsa_alg) {
+    if (!word_safe(rt)) { return []; }
+    Str base = rt + "/symbolon/sign-" + hex_encode(random_bytes(8));
+    Str sock = base + ".sock";
+    Int l = resid_unix_listen(sock);
+    if (l < 0) { return []; }
+    Str token = hex_encode(random_bytes(32));
+    Str req = base + ".json";
+    _ = filesystem.write_secret(req, json_utf8(consent_json_peer(e, w, s, 0, peer, data, sock, token, rsa_alg)));
+    eprintln("consent " + req);
+    TokenConn tc = accept_token(l, token, 3000);
+    _ = resid_unix_close(l);
+    if (tc.fd < 0) { _ = process.run("rm -f " + req); return []; }
+    _ = resid_unix_deadline(tc.fd, 300000);
+    List(Int) ans = read_line_from(tc.fd, tc.rest, 262144);
+    _ = resid_unix_close(tc.fd);
+    _ = process.run("rm -f " + req);
+    Str t = str_trim(http_text(ans, 0, ans.len()));
+    if (!str_starts_with(t, "ok ")) { return []; }
+    Str hx = str_slice(t, 3, str_len(t));
+    return if (str_len(hx) % 2 == 0 && str_len(hx) > 0) { cose_hex_decode(hx) } else { [] };
+}
+
 // ============================================================================
 // Messages
 // ============================================================================
@@ -191,18 +225,23 @@ pub List(Int) failure() { return agent_msg(msg_failure(), []); }
 pub type Reply = { List(Int) out; AgentSession s; };
 
 @requires(filesystem, network, clock, process, environment)
-pub Reply answer(Str dir, Str rt, Int pid, AgentSession s, Int t, List(Int) body) {
+pub Reply answer(Str dir, Str rt, Int pid, AgentSession s, Int t, List(Int) body) { return answer_via(dir, rt, pid, "", s, t, body); }
+
+// `peer` non-empty: the stdio agent (Android), whose consent window the
+// platform opens (ask_platform); else the desktop agent's (ask_window).
+@requires(filesystem, network, clock, process, environment)
+pub Reply answer_via(Str dir, Str rt, Int pid, Str peer, AgentSession s, Int t, List(Int) body) {
     if (t == msg_request_identities()) { return Reply {.out = identities_answer(idents_of(read_index(dir), 0, [])), .s = s}; }
     if (t == msg_extension()) {
         Option(AgentSession) b = checked_bind(body);
         return match b { None => Reply {.out = failure(), .s = s}, Some(x) => Reply {.out = agent_msg(msg_success(), []), .s = x} };
     }
-    if (t == msg_sign_request()) { return Reply {.out = sign_reply(dir, rt, pid, s, body), .s = s}; }
+    if (t == msg_sign_request()) { return Reply {.out = sign_reply(dir, rt, pid, peer, s, body), .s = s}; }
     return Reply {.out = failure(), .s = s};
 }
 
 @requires(filesystem, network, clock, process, environment)
-List(Int) sign_reply(Str dir, Str rt, Int pid, AgentSession s, List(Int) body) {
+List(Int) sign_reply(Str dir, Str rt, Int pid, Str peer, AgentSession s, List(Int) body) {
     Option(SignReq) or = sign_req_of(body);
     SignReq r = or else { SignReq {.key = [], .data = [], .flags = 0} };
     Option(SshEntry) oe = entry_for(read_index(dir), r.key, 0);
@@ -212,7 +251,7 @@ List(Int) sign_reply(Str dir, Str rt, Int pid, AgentSession s, List(Int) body) {
     if (str_len(refused(s, r.key, w)) > 0) { return failure(); }
     Str alg = rsa_alg_of(r.key, r.flags);
     if (alg == "refused") { return failure(); }
-    List(Int) sig = ask_window(e, w, s, pid, r.data, rt, alg);
+    List(Int) sig = if (str_len(peer) > 0) { ask_platform(e, w, s, peer, r.data, rt, alg) } else { ask_window(e, w, s, pid, r.data, rt, alg) };
     if (sig.len() == 0 || !verifies(r.key, r.data, sig)) { return failure(); }
     return agent_msg(msg_sign_response(), sstring(sig));
 }
@@ -276,4 +315,52 @@ pub Int ssh_agent(Str dir, Str sock0) {
     if (l < 0) { eprintln("ssh-agent: cannot listen on " + sock); return 1; }
     println("SSH_AUTH_SOCK=" + sock + "; export SSH_AUTH_SOCK;");
     return agent_loop(dir, rt, l);
+}
+
+// ============================================================================
+// One connection on standard input and output (Android, SPEC 16.1.1)
+// ============================================================================
+
+// `symbolon ssh-agent-stdio DIR RUNDIR PEER`: the agent for one client
+// connection, its messages on standard input and replies on standard
+// output; started by Symbolon's agent service for each connection of an
+// app it verified (PEER names it: label and package). RUNDIR holds the
+// per-request consent files and sockets (0700, the app's own). It ends at
+// the end of its input; the service closes that after 30 seconds without a
+// message outside a pending consent.
+
+@requires(network)
+List(Int) stdin_until(Int n, List(Int) acc) {
+    if (acc.len() >= n) { return acc; }
+    List(Int) more = resid_read_some(65536);
+    if (more.len() == 0) { return acc; }
+    return stdin_until(n, acc.concat(more));
+}
+
+pub type StdMsg = { Int t; List(Int) body; List(Int) rest; };
+
+@requires(network)
+StdMsg stdin_msg(List(Int) buf) {
+    List(Int) h = stdin_until(4, buf);
+    if (h.len() < 4) { return StdMsg {.t = -1, .body = [], .rest = []}; }
+    Int n = msg_len(h[0..4]);
+    if (n < 0) { return StdMsg {.t = -1, .body = [], .rest = []}; }
+    List(Int) b = stdin_until(4 + n, h);
+    if (b.len() < 4 + n) { return StdMsg {.t = -1, .body = [], .rest = []}; }
+    return StdMsg {.t = b[4], .body = b[5..4 + n], .rest = b[4 + n..b.len()]};
+}
+
+@requires(filesystem, network, clock, process, environment)
+Int serve_stdio(Str dir, Str rt, Str peer, AgentSession s, List(Int) buf) {
+    StdMsg m = stdin_msg(buf);
+    if (m.t < 0) { return 0; }
+    Reply r = answer_via(dir, rt, 0, peer, s, m.t, m.body);
+    _ = print_bytes(r.out);
+    return serve_stdio(dir, rt, peer, r.s, m.rest);
+}
+
+@requires(filesystem, network, clock, process, environment)
+pub Int ssh_agent_stdio(Str dir, Str rt, Str peer) {
+    if (!word_safe(rt) || str_len(peer) == 0 || str_len(peer) > 300 || str_contains(peer, "\n")) { eprintln("ssh-agent-stdio: give DIR RUNDIR PEER"); return 2; }
+    return serve_stdio(dir, rt, peer, unbound(), []);
 }

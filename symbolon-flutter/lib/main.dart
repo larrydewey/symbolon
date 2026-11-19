@@ -13,6 +13,7 @@ import 'ssh_consent.dart';
 import 'pages/home_page.dart';
 import 'pages/more_page.dart';
 import 'pages/passkeys_page.dart';
+import 'pages/ssh_page.dart';
 import 'pages/tutorial_page.dart';
 import 'pages/vault_page.dart';
 import 'passkey_main.dart';
@@ -30,6 +31,10 @@ Future<void> main(List<String> args) async {
 /// The passkey screen Android opens for a site or an app (PasskeyActivity).
 @pragma('vm:entry-point')
 Future<void> passkeyMain() => runPasskeyScreen();
+
+/// The SSH signature window Android opens for another app (SshConsentActivity, SPEC 16.1.1).
+@pragma('vm:entry-point')
+Future<void> sshConsentMain() => runSshConsentAndroid();
 
 /// The autofill fill and save screen Android opens (AutofillActivity, SPEC 22.6).
 @pragma('vm:entry-point')
@@ -101,6 +106,27 @@ class _ShellState extends State<Shell> with WidgetsBindingObserver {
     widget.app.session.addListener(_changed);
     widget.app.settings.addListener(_changed);
     if (!widget.app.settings.tutorialSeen) WidgetsBinding.instance.addPostFrameCallback((_) => _tutorial());
+    // Started for a page (Android: another app sent the principal to SSH
+    // keys), or sent there while running.
+    _nav.setMethodCallHandler((c) async {
+      if (c.method == 'open') _openPage(c.arguments as String?);
+    });
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      try {
+        _openPage(await _nav.invokeMethod<String>('take'));
+      } on MissingPluginException {
+        // Not Android: nothing starts Symbolon at a page.
+      }
+    });
+  }
+
+  static const _nav = MethodChannel('symbolon/nav');
+
+  void _openPage(String? page) {
+    if (page != 'ssh-keys' || !mounted) return;
+    go(3);
+    Navigator.of(context).popUntil((r) => r.isFirst);
+    Navigator.of(context).push(MaterialPageRoute<void>(builder: (_) => SshPage(app: widget.app)));
   }
 
   // The first start: how the app works, which the user may skip.
@@ -112,6 +138,7 @@ class _ShellState extends State<Shell> with WidgetsBindingObserver {
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    _nav.setMethodCallHandler(null);
     widget.app.session.removeListener(_changed);
     widget.app.settings.removeListener(_changed);
     super.dispose();

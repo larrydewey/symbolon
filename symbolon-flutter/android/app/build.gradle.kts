@@ -34,11 +34,26 @@ android {
     // Keep native libraries extracted on disk: the agent is executed, not loaded.
     packaging { jniLibs { useLegacyPackaging = true } }
 
+    // Release builds are signed with the release key when the environment
+    // names it (CI: ANDROID_KEYSTORE and friends, from repository secrets);
+    // otherwise with the debug key, so `flutter run --release` works locally.
+    // The release certificate is what the other app pins (Pylon <-> Symbolon,
+    // SPEC 7.3), so a published APK must carry it.
+    val releaseStore = System.getenv("ANDROID_KEYSTORE")?.takeIf { it.isNotEmpty() }
+    signingConfigs {
+        if (releaseStore != null) {
+            create("release") {
+                storeFile = file(releaseStore)
+                storePassword = System.getenv("ANDROID_KEYSTORE_PASSWORD")
+                keyAlias = System.getenv("ANDROID_KEY_ALIAS")
+                keyPassword = System.getenv("ANDROID_KEY_PASSWORD")
+            }
+        }
+    }
+
     buildTypes {
         release {
-            // TODO: Add your own signing config for the release build.
-            // Signing with the debug keys for now, so `flutter run --release` works.
-            signingConfig = signingConfigs.getByName("debug")
+            signingConfig = signingConfigs.getByName(if (releaseStore != null) "release" else "debug")
         }
     }
 }

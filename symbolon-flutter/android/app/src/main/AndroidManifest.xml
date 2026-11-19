@@ -6,6 +6,13 @@
     <uses-feature android:name="android.hardware.camera" android:required="false"/>
     <!-- The fill screen hides other apps' overlays (SPEC 22.6 item 4, Android 12+). -->
     <uses-permission android:name="android.permission.HIDE_OVERLAY_WINDOWS"/>
+    <!-- Apps that may use the SSH agent service (SPEC 16.1.1): Symbolon's own
+         signer, or one listed in res/values/ssh_agent_callers.xml. -->
+    <permission
+        android:name="dev.symbolon.permission.SSH_SIGN"
+        android:protectionLevel="signature|knownSigner"
+        android:knownCerts="@array/ssh_agent_callers"
+        android:label="Use Symbolon's SSH keys" />
     <application
         android:label="Symbolon"
         android:extractNativeLibs="true"
@@ -34,6 +41,12 @@
                 <action android:name="android.intent.action.MAIN"/>
                 <category android:name="android.intent.category.LAUNCHER"/>
             </intent-filter>
+            <!-- Straight to SSH keys: what an app that uses the SSH agent
+                 (Pylon) opens when Symbolon has no key for it yet. -->
+            <intent-filter>
+                <action android:name="dev.symbolon.action.SSH_KEYS"/>
+                <category android:name="android.intent.category.DEFAULT"/>
+            </intent-filter>
         </activity>
         <!-- A passkey ceremony for the system (Android 14+). -->
         <activity
@@ -53,6 +66,24 @@
             android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode"
             android:hardwareAccelerated="true"
             android:windowSoftInputMode="adjustResize" />
+        <!-- The SSH signature window for another app (SPEC 16.1.1). -->
+        <activity
+            android:name=".SshConsentActivity"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:theme="@style/NormalTheme"
+            android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode"
+            android:hardwareAccelerated="true"
+            android:windowSoftInputMode="adjustResize" />
+        <!-- The SSH agent for other apps (SPEC 16.1.1). -->
+        <service
+            android:name=".SshAgentService"
+            android:exported="true"
+            android:permission="dev.symbolon.permission.SSH_SIGN">
+            <intent-filter>
+                <action android:name="dev.symbolon.action.SSH_AGENT" />
+            </intent-filter>
+        </service>
         <!-- Symbolon as Android's autofill service (Settings > Passwords, passkeys and accounts). -->
         <service
             android:name=".SymbolonAutofillService"

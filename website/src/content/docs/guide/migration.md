@@ -34,11 +34,37 @@ printf '%s\n' "$PIN" | symbolon device vault import ~/.symbolon export.csv
 Nothing in your vault is replaced: a name already in use gets a number, as
 "Email (2)".
 
-**What doesn't come across.** Passkeys from another manager: their private
+**Passkeys from Bitwarden** come across as *Synced* passkeys. Their private
 keys are whole keys, and a Symbolon passkey is split between your device and
-the cosigner, so you make a new passkey at each site (sign in once with the
-old one or your password, then add a passkey). A password-protected Bitwarden
-export: export it again unencrypted.
+the cosigner; a whole key is never split after the fact. So each is kept as
+it came, sealed in your vault, and signs on your device alone, without the
+cosigner, and anyone holding a copy of the export can use it too. Only
+ES256 passkeys (ECDSA on P-256, which is what Bitwarden makes) can be kept;
+any other is left out, and the preview says so.
+
+So replace each one with a Symbolon passkey. **More › Passkeys** lists them
+under *Imported passkeys to replace*, each with its next step:
+
+1. Sign in to the site; the imported passkey still works (Android offers it,
+   marked "imported").
+2. In the site's security settings, add a passkey and choose Symbolon. It
+   sees that the account has an imported passkey and records that the new
+   one replaces it.
+3. Sign in once with the new passkey. Then, under Passkeys, **Retire** the
+   imported one: it is deleted from your vault, and Android stops offering
+   it.
+4. Remove the old passkey in the site's security settings too: until you
+   do, a copy of the export can still sign in there.
+
+On the command line: `symbolon device webauthn synced DIR` lists them,
+`device webauthn register DIR SITE --replaces CID` makes the replacement,
+and `device webauthn retire DIR CID` retires one (`--force` retires one
+nothing replaced). The browser extension doesn't offer imported passkeys
+yet.
+
+**What doesn't come across.** Passkeys from managers whose export has none
+(every CSV export), and a password-protected Bitwarden export: export it
+again unencrypted.
 
 **Afterwards**, delete the export file and empty the trash: anyone who finds
 it can read every password in it. Once you have checked your vault, you can
@@ -93,6 +119,12 @@ and no one at work can open it. Your team's group folders appear beside your
 shared folders. See [Organizations](/symbolon/org/).
 
 ## Not built yet
+
+- **Replacing imported passkeys without visiting each site.** Today each
+  site's own "add a passkey" page makes the replacement. Doing it from a
+  recipe, or by a rollover the site accepts during an ordinary sign-in
+  ([SPEC 26.5](https://github.com/larrydewey/symbolon/blob/master/SPEC.md)),
+  and offering imported passkeys in the browser extension, are next.
 
 - **Removing a device from your identity** by re-sharing without it. Today
   a retired device's keys are deleted on the device itself; a re-share that

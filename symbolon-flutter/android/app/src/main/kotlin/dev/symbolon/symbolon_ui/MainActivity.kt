@@ -25,12 +25,26 @@ import io.flutter.plugin.common.MethodChannel
 class MainActivity : FlutterFragmentActivity() {
     private var scanner: QrScanner? = null
 
+    // A page the activity was started for (dev.symbolon.action.SSH_KEYS),
+    // until the Dart side takes it; later intents are sent to it directly.
+    private var pendingPage: String? = null
+    private var nav: MethodChannel? = null
+
+    private fun pageFor(i: Intent?): String? = if (i?.action == "dev.symbolon.action.SSH_KEYS") "ssh-keys" else null
+
     override fun onCreate(savedInstanceState: android.os.Bundle?) {
+        if (savedInstanceState == null) pendingPage = pageFor(intent)
         super.onCreate(savedInstanceState)
         // The recent-apps screen keeps a picture of the app as it was left,
         // taken before the app locks: Android 13+ shows a blank one instead.
         // Screenshots inside the app still work.
         if (Build.VERSION.SDK_INT >= 33) setRecentsScreenshotEnabled(false)
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        pageFor(intent)?.let { p -> nav?.invokeMethod("open", p) ?: run { pendingPage = p } }
     }
 
     override fun onResume() {
@@ -46,6 +60,11 @@ class MainActivity : FlutterFragmentActivity() {
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
         scanner = QrScanner(this, flutterEngine)
+        nav = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "symbolon/nav").apply {
+            setMethodCallHandler { call, result ->
+                if (call.method == "take") { result.success(pendingPage); pendingPage = null } else result.notImplemented()
+            }
+        }
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "symbolon/platform").setMethodCallHandler { call, result ->
             if (Biometric.handle(this, call, result)) return@setMethodCallHandler
             when (call.method) {

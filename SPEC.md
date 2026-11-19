@@ -1104,6 +1104,43 @@ messages: keys are managed in Symbolon, not added through `ssh-add`.
 Connections are served one at a time, each with a 30-second idle limit
 outside a pending consent.
 
+#### 16.1.1 The agent for other apps on Android
+
+On Android there are no Unix-socket agents between apps. Symbolon serves
+the same protocol to apps it lists by signing certificate
+(`res/values/ssh_agent_callers.xml`; Pylon's release certificates) over
+Binder: an exported `SshAgentService`, action
+`dev.symbolon.action.SSH_AGENT`, behind the permission
+`dev.symbolon.permission.SSH_SIGN` (`signature|knownSigner` with the same
+list, so on Android 12+ other apps cannot bind at all). Every call checks
+the caller again: the calling uid's package must have a single signer
+whose SHA-256 is listed; the agent then names it to the principal as its
+label and package.
+
+Each (calling app, connection number) gets its own
+`symbolon ssh-agent-stdio DIR RUNDIR PEER` process, which serves the
+agent protocol on its standard input and output with the rules above
+(binds, refusals, the PIN on every signature); `PEER` is the verified
+caller. A consent request is announced on standard error as
+`consent PATH`, the request file, which carries `peer`.
+
+| Transaction (`dev.symbolon.ISshAgent`) | Data | Reply |
+|---|---|---|
+| `CALL` (`FIRST_CALL_TRANSACTION`) | `long` conn, `byte[]` request | `int 0`, `byte[]` reply; or `int 1`, `PendingIntent`; or `int -1` |
+| `WAIT` (`+1`) | conn | `int 0`, `byte[]` reply (up to 6 minutes); or `int -1` |
+| `CLOSE` (`+2`) | conn | nothing |
+
+A background service may not start an activity, and should not: a
+signature's `CALL` returns an immutable, one-shot `PendingIntent` for
+`SshConsentActivity`, which the calling app, in front because the
+principal is using it, starts before it `WAIT`s. The activity is not
+exported, sets `FLAG_SECURE` and hides overlay windows
+(`setHideOverlayWindows`), and refuses a request file whose `peer`
+differs from the one the service verified. With no `known_hosts` on the
+phone, it shows the server's host key fingerprint and leaves the
+server's identity to the calling app's own host trust. Connections idle
+for 30 seconds outside a pending consent end.
+
 ---
 
 ## 17. Attribute presentation and verifier-constrained release
@@ -1287,11 +1324,36 @@ the matching types; others become notes that keep every field. The first
 web address of a login gives its `origin`; the others, and app addresses,
 become custom fields. Parsing uses the resid-json and resid-csv packages.
 
-Not imported, and said so: the source's passkeys (a Symbolon passkey's key
-is split between the device and the cosigner, and a whole private key is
-never split after the fact: the person registers a new passkey at each
-site), and a password-protected Bitwarden export (it is exported again
-unencrypted). An entry that cannot be stored (a field over 64 KiB, a card
+A Bitwarden export's passkeys (`fido2Credentials`) are imported as Synced
+passkeys (Section 5.2, 22.3): a Symbolon passkey's key is split between the
+device and the cosigner, and a whole private key is never split after the
+fact, so each is kept as a software key in a vault item of type `passkey`
+(`rp_id`, `credential_id`, `key`, `public_key`, `user_handle`, `username`,
+`display_name`, `rp_name`, `counter`, `profile` "synced", `migrate` "1",
+`source`, `imported`), and the import says how many came across and that
+each should be replaced by a Threshold passkey. A passkey that is not ES256
+(ECDSA on P-256), or whose PKCS#8 key does not read or does not match the
+public key it states, is left out with the reason. `device webauthn assert`
+serves a credential ID that is not a Threshold credential of the identity
+from the Synced passkey with that ID and RP ID, signing on the device alone
+(UP, BE and BS set; UV with `--uv`; the counter 0 when the source's was 0,
+else the larger of the source's next value and the time in seconds, so it
+does not go backwards while no device writes it back); a Synced passkey is
+not available under the duress PIN. `device webauthn synced` lists them.
+Replacing one (Section 22.3 step 4, 26.5 method 3): `device webauthn
+register ... --replaces CID`, during the site's own registration ceremony,
+checks that CID is a Synced passkey of the same RP ID, makes the Threshold
+credential and records it in the Synced item (`migrate` "registered",
+`replaced_by`, `replaced_at`); the Synced passkey keeps signing (its
+assertions add `replaced-by`) until `device webauthn retire DIR CID` deletes
+it, which is refused while nothing replaces it unless `--force`. The app
+replaces an account's imported passkey when the site excludes its
+credential ID or names its user handle, lists imported passkeys apart with
+their next step, and does not offer a replaced one where the site accepts
+its replacement.
+
+Not imported, and said so: a password-protected Bitwarden export (it is
+exported again unencrypted). An entry that cannot be stored (a field over 64 KiB, a card
 without a number) is left out with the reason; a card without a number
 comes across as a note.
 
