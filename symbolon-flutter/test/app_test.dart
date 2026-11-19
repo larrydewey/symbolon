@@ -335,6 +335,7 @@ void main() {
   }
 
   Future<void> lock(WidgetTester t) async {
+    if (find.byKey(const Key('lock')).evaluate().isEmpty) return;   // locked already
     await t.tap(find.byKey(const Key('lock')).first);
     await t.pumpAndSettle();
   }
@@ -521,6 +522,142 @@ void main() {
     await t.pageBack();
     await t.pumpAndSettle();
     await lock(t);
+  });
+
+  // The screen turning off (or another app) is the app going to the
+  // background; coming back resumes it.
+  Future<void> awayAndBack(WidgetTester t) async {
+    for (final s in [AppLifecycleState.inactive, AppLifecycleState.hidden, AppLifecycleState.paused,
+                     AppLifecycleState.hidden, AppLifecycleState.inactive, AppLifecycleState.resumed]) {
+      t.binding.handleAppLifecycleStateChanged(s);
+    }
+    await t.pump();
+    await t.pump(const Duration(milliseconds: 500));
+  }
+
+  Future<void> openVisa(WidgetTester t) async {
+    await openVault(t);
+    await t.tap(find.byKey(const Key('item-visa')));
+    await t.pump(const Duration(milliseconds: 500));
+    await settle(t);
+    if (find.byKey(const Key('secret-field')).evaluate().isNotEmpty) await pin(t, '2468');
+    await t.tap(find.descendant(of: find.byKey(const Key('field-cvv')), matching: find.byTooltip('Show')));
+    await t.pump();
+    expect(find.text('123'), findsOneWidget);   // the code, in plain view
+  }
+
+  testWidgets('the screen turning off closes an open item, its revealed fields and the vault list', (t) async {
+    settings.siteIcons = false;
+    await start(t);
+    await openVisa(t);
+    await awayAndBack(t);
+    expect(find.text('123'), findsNothing);
+    expect(find.byKey(const Key('field-cvv')), findsNothing);
+    expect(find.byKey(const Key('item-visa')), findsNothing);
+    expect(find.byKey(const Key('open-vault')), findsOneWidget);   // locked
+  });
+
+  testWidgets('with "ask every time", leaving the app still closes what was open', (t) async {
+    settings.siteIcons = false;
+    settings.keepUnlockedMinutes = 0;
+    await start(t);
+    await openVisa(t);
+    await awayAndBack(t);
+    expect(find.text('123'), findsNothing);
+    expect(find.byKey(const Key('item-visa')), findsNothing);
+    expect(find.byKey(const Key('open-vault')), findsOneWidget);
+  });
+
+  Future<void> newLoginDraft(WidgetTester t) async {
+    await openVault(t);
+    await t.tap(find.byKey(const Key('vault-add')));
+    await t.pumpAndSettle();
+    await t.tap(find.byKey(const Key('add-login')));
+    await t.pumpAndSettle();
+    await t.enterText(find.byKey(const Key('item-name')), 'my draft site');
+    await t.enterText(find.byKey(const Key('edit-username')), 'draft-user');
+    await t.enterText(find.byKey(const Key('edit-current')), 'typed-secret');
+  }
+
+  testWidgets('leaving the app covers a draft; unlocking brings it back as it was, and it saves', (t) async {
+    await start(t);
+    await newLoginDraft(t);
+    await awayAndBack(t);
+    expect(find.byKey(const Key('editor-locked')), findsOneWidget);
+    expect(find.text('draft-user'), findsNothing);          // nothing of the draft shows
+    expect(find.text('my draft site'), findsNothing);
+    await t.tap(find.byKey(const Key('editor-unlock')));
+    await t.pump(const Duration(milliseconds: 300));
+    await pin(t, '2468');                                     // checked by the agent
+    expect(find.byKey(const Key('editor-locked')), findsNothing);
+    expect(find.text('draft-user'), findsOneWidget);         // as it was left
+    expect(find.text('my draft site'), findsOneWidget);
+    expect((t.widget(find.byKey(const Key('edit-current'))) as TextFormField).controller!.text, 'typed-secret');
+    await t.tap(find.byKey(const Key('item-save')));
+    await t.pump();
+    await settle(t);
+    final args = (await t.runAsync(() => agent.argsLog.readAsString()))!;
+    expect(args, contains('device vault set ${settings.deviceDir} my draft site login'));
+    await lock(t);
+  });
+
+  testWidgets('a covered draft is discarded after 15 minutes, or at once on request', (t) async {
+    await start(t);
+    await newLoginDraft(t);
+    await awayAndBack(t);
+    await t.pump(const Duration(minutes: 15, seconds: 1));
+    await t.pump(const Duration(milliseconds: 500));
+    expect(find.byKey(const Key('editor-locked')), findsNothing);
+    expect(find.byKey(const Key('edit-current')), findsNothing);
+    expect(find.textContaining('discarded after 15 minutes'), findsOneWidget);
+    await t.pump(const Duration(seconds: 8));            // the message goes
+    await t.tap(find.byKey(const Key('open-vault')));   // on the Vault tab already: unlock by hand
+    await t.pump(const Duration(milliseconds: 300));
+    await pin(t, '2468');
+    await t.tap(find.byKey(const Key('vault-add')));
+    await t.pumpAndSettle();
+    await t.tap(find.byKey(const Key('add-login')));
+    await t.pumpAndSettle();
+    await awayAndBack(t);
+    await t.tap(find.byKey(const Key('editor-discard')));
+    await t.pump(const Duration(milliseconds: 500));
+    expect(find.byKey(const Key('editor-locked')), findsNothing);
+    await lock(t);
+  });
+
+  testWidgets('editing an item: the edit survives the lock, and the item page reloads after', (t) async {
+    settings.siteIcons = false;
+    await start(t);
+    await openVisa(t);
+    await t.tap(find.byKey(const Key('item-edit')));
+    await t.pumpAndSettle();
+    await t.enterText(find.byKey(const Key('edit-cardholder')), 'Ada Draft');
+    await awayAndBack(t);
+    expect(find.byKey(const Key('editor-locked')), findsOneWidget);
+    await t.tap(find.byKey(const Key('editor-unlock')));
+    await t.pump(const Duration(milliseconds: 300));
+    await pin(t, '2468');
+    expect(find.text('Ada Draft'), findsOneWidget);
+    await t.pageBack();                                       // gave up the edit
+    await t.pump(const Duration(milliseconds: 500));
+    await settle(t);
+    expect(find.byKey(const Key('field-cvv')), findsOneWidget);   // the item, loaded again
+    expect(find.text('123'), findsNothing);                        // revealed fields hidden again
+    await t.pageBack();
+    await t.pumpAndSettle();
+    await lock(t);
+  });
+
+  testWidgets('"stay unlocked" running out forgets the PIN but leaves the open item where it is', (t) async {
+    settings.siteIcons = false;
+    settings.keepUnlockedMinutes = 1;
+    await start(t);
+    await openVisa(t);
+    await t.pump(const Duration(minutes: 1, seconds: 1));
+    expect(find.text('123'), findsOneWidget);
+    expect(find.byKey(const Key('lock')), findsNothing);   // the PIN is gone
+    await awayAndBack(t);                                   // leaving still closes it
+    expect(find.text('123'), findsNothing);
   });
 
   testWidgets('a card shows its fields: hidden ones masked, custom fields labelled', (t) async {

@@ -35,6 +35,10 @@ class MainActivity : FlutterFragmentActivity() {
     override fun onCreate(savedInstanceState: android.os.Bundle?) {
         if (savedInstanceState == null) pendingPage = pageFor(intent)
         super.onCreate(savedInstanceState)
+        // The recent-apps screen keeps a picture of the app as it was left,
+        // taken before the app locks: Android 13+ shows a blank one instead.
+        // Screenshots inside the app still work.
+        if (Build.VERSION.SDK_INT >= 33) setRecentsScreenshotEnabled(false)
     }
 
     override fun onNewIntent(intent: Intent) {

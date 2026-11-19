@@ -1,9 +1,11 @@
+import 'dart:async';
 import 'dart:math';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import '../app.dart';
+import '../session.dart';
 import '../card_face.dart';
 import '../validate.dart' as v;
 import '../vault_types.dart';
@@ -33,7 +35,45 @@ class _Custom {
   bool hidden = false;
 }
 
-class _ItemEditorState extends State<ItemEditor> {
+class _ItemEditorState extends State<ItemEditor> with ClosesOnLock {
+  @override
+  PinSession get lockingSession => widget.app.session;
+
+  /// How long a covered draft is kept before it is discarded.
+  static const keepDraft = Duration(minutes: 15);
+
+  // Locked with the editor open: the draft is kept, in memory only, behind
+  // a cover until the device opens again, for at most [keepDraft]. Nothing
+  // typed is written anywhere.
+  DateTime? coveredAt;
+  Timer? discardTimer;
+
+  @override
+  void onLock() {
+    closeAbove();
+    discardTimer?.cancel();
+    discardTimer = Timer(keepDraft, discardDraft);
+    setState(() => coveredAt = DateTime.now());
+  }
+
+  void discardDraft() {
+    if (!mounted) return;
+    toast(context, 'Your unsaved changes were discarded after ${keepDraft.inMinutes} minutes locked.');
+    closeHere();
+  }
+
+  // The device opens again (the PIN, checked by the agent): back to the draft.
+  Future<void> uncover() async {
+    final at = coveredAt;
+    if (at == null) return;
+    if (DateTime.now().difference(at) >= keepDraft) return discardDraft();
+    final r = await widget.app.withPin(context, (p) => widget.app.cli.vaultList(widget.app.dir, p), note: 'Unlock to go on with your changes.');
+    if (!mounted || r == null) return;
+    if (!r.ok) return toast(context, friendlyError(r));
+    discardTimer?.cancel();
+    setState(() => coveredAt = null);
+  }
+
   final form = GlobalKey<FormState>();
   late final name = TextEditingController(text: widget.name ?? '');
   late final folder = TextEditingController(text: widget.fields?['folder'] ?? widget.folder);
@@ -65,6 +105,7 @@ class _ItemEditorState extends State<ItemEditor> {
 
   @override
   void dispose() {
+    discardTimer?.cancel();
     name.dispose();
     folder.dispose();
     _folderFocus.dispose();
@@ -299,6 +340,7 @@ class _ItemEditorState extends State<ItemEditor> {
   @override
   Widget build(BuildContext context) {
     final t = widget.type;
+    if (coveredAt != null) return _cover();
     return Scaffold(
       appBar: AppBar(
         title: Text(widget.name == null ? 'New ${t.label.toLowerCase()}' : 'Edit ${widget.name}'),
@@ -358,6 +400,27 @@ class _ItemEditorState extends State<ItemEditor> {
           WideButton('Save', icon: Icons.check, onPressed: save),
         ]),
       ),
+    );
+  }
+
+  // The draft behind a cover: nothing of it shows until the device opens.
+  Widget _cover() {
+    final t = Theme.of(context).textTheme;
+    return Scaffold(
+      key: const Key('editor-locked'),
+      appBar: AppBar(title: Text(widget.name == null ? 'New ${widget.type.label.toLowerCase()}' : 'Edit ${widget.name}')),
+      body: PageBody(children: [
+        const SizedBox(height: 32),
+        Icon(Icons.lock_outline, size: 56, color: Theme.of(context).colorScheme.primary),
+        const SizedBox(height: 16),
+        Text('Locked', style: t.headlineSmall, textAlign: TextAlign.center),
+        const SizedBox(height: 8),
+        Text('Your unsaved changes are kept for ${keepDraft.inMinutes} minutes. Unlock to go on where you left off.', textAlign: TextAlign.center),
+        const SizedBox(height: 24),
+        WideButton('Unlock', key: const Key('editor-unlock'), icon: Icons.lock_open, onPressed: uncover),
+        const SizedBox(height: 8),
+        TextButton(key: const Key('editor-discard'), onPressed: closeHere, child: const Text('Discard changes')),
+      ]),
     );
   }
 }

@@ -128,13 +128,14 @@ class _VaultPageState extends State<VaultPage> {
     if (t == null || !mounted) return;
     final saved = await Navigator.of(context).push<VaultItem>(
         MaterialPageRoute(builder: (_) => ItemEditor(app: app, type: t, names: {for (final i in items ?? <VaultItem>[]) i.name}, folders: folders, folder: folder ?? '', share: share)));
-    if (saved != null && mounted) setState(() => _keep([...?items?.where((x) => x.name != saved.name), saved]));
+    // Locked meanwhile: the list stays locked, and shows the item once opened.
+    if (saved != null && mounted && items != null) setState(() => _keep([...?items?.where((x) => x.name != saved.name), saved]));
   }
 
   Future<void> show(VaultItem it) async {
     final change = await Navigator.of(context).push<ItemChange>(
         MaterialPageRoute(builder: (_) => ItemPage(app: app, item: it, offline: offline, names: {for (final i in items ?? <VaultItem>[]) i.name}, folders: folders, share: share)));
-    if (change == null || !mounted) return;
+    if (change == null || !mounted || items == null) return;
     setState(() => _keep([...?items?.where((x) => x.name != it.name && x.name != change.saved?.name), ?change.saved]));
   }
 
