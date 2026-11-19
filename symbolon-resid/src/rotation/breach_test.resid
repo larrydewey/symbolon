@@ -1,0 +1,44 @@
+// SPEC 26.1 breach range query. Expected SHA-1 values are the well-known
+// ones ("password" is 5BAA61E4C9B93F3F0682250B6CF8331B7EE68FD8, which
+// Pwned Passwords has seen millions of times); the bodies below are shaped
+// as the service answers, padding lines included.
+
+import "../types.resid";
+import "breach.resid";
+import "../vault/vault.resid";
+import "word.resid";
+import "crypto.resid";
+
+List(Secret(UInt(8))) pw(Str s) { return secret_bytes(utf8(s)); }
+
+
+
+@requires(declassify)
+test "the prefix is the first five hex digits of SHA-1" {
+    expect(breach_prefix(breach_hash(pw("password")))).toEqual("5BAA6");
+    expect(breach_prefix(breach_hash(pw("correct horse battery staple")))).toEqual("ABF7A");
+    expect(breach_range_path("5BAA6")).toEqual("/range/5BAA6");
+}
+
+@requires(declassify)
+test "a suffix in the answer gives its count; padding and other suffixes give 0" {
+    Str body = "1E4C9B93F3F0682250B6CF8331B7EE68FD7:0\r\n"
+             + "1E4C9B93F3F0682250B6CF8331B7EE68FD8:9659365\r\n"
+             + "011053FD0102E94D6AE2F8B83D76FAF94F6:0\r\n"
+             + "00D4F6E8FA6EECAD2A3AA415EEC418D38EC:2";
+    expect(breach_count(breach_hash(pw("password")), body)).toEqual(9659365);
+    expect(breach_count(breach_hash(pw("password1")), body)).toEqual(0);
+    // lower case hex is read too
+    expect(breach_count(breach_hash(pw("password")), "1e4c9b93f3f0682250b6cf8331b7ee68fd8:12")).toEqual(12);
+}
+
+@requires(declassify)
+test "malformed lines never match" {
+    List(Secret(UInt(8))) h = breach_hash(pw("password"));
+    expect(breach_count(h, "")).toEqual(0);
+    expect(breach_count(h, "1E4C9B93F3F0682250B6CF8331B7EE68FD8")).toEqual(0);
+    expect(breach_count(h, "1E4C9B93F3F0682250B6CF8331B7EE68FD:5")).toEqual(0);
+    expect(breach_count(h, "1E4C9B93F3F0682250B6CF8331B7EE68FDX:5")).toEqual(0);
+    expect(breach_count(h, "1E4C9B93F3F0682250B6CF8331B7EE68FD8:x")).toEqual(0);
+    expect(breach_count(h, "<html>rate limited</html>")).toEqual(0);
+}

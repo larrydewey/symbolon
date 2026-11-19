@@ -29,6 +29,9 @@
 //   symbolon device vault get DIR NAME         PIN on stdin; prints the secret
 //   symbolon device vault list DIR [--kinds|--long]  PIN on stdin; prints the names (--kinds: TYPE NAME;
 //                                              --long: TYPE NAME-HEX DETAIL-HEX FOLDER-HEX [APPS-HEX]); offline, this device's copy
+//   symbolon device vault breach DIR           PIN on stdin; each login's password against Pwned Passwords
+//                                              (k-anonymity range query, SPEC 26.1): "breached NAME-HEX COUNT"
+//                                              lines, then "checked N breached M"; SYMBOLON_BREACH_URL, _CA
 //   symbolon device vault show DIR NAME        PIN on stdin; prints "FIELD VALUE-HEX" per field
 //   symbolon device vault code DIR NAME        PIN on stdin; prints "code CODE PERIOD LEFT", the
 //                                              item's current one-time code (its key never leaves)
@@ -99,6 +102,7 @@ import "agent/enroll.resid";
 import "agent/recover.resid";
 import "agent/rotatecli.resid";
 import "agent/vaultitems.resid";
+import "agent/breachcli.resid";
 import "agent/importers.resid";
 import "agent/sharecli.resid";
 import "browser/nmhost.resid";
@@ -389,6 +393,7 @@ Int main() {
     if (a1 == "device" && a2 == "rotate" && (ns == 7 || ns == 8)) { return device_rotate(args.get(3), args.get(4), args.get(5), args.get(6), if (ns == 8) { args.get(7) } else { "chromium" }, share); }
     if (a1 == "device" && a2 == "vault" && args.get(3) == "move" && ns == 7) { return vault_move(args.get(4), args.get(5), args.get(6), share); }
     if (a1 == "device" && a2 == "vault" && args.get(3) == "list" && ns == 5) { return vault_list_at(args.get(4), 0, share); }
+    if (a1 == "device" && a2 == "vault" && args.get(3) == "breach" && ns == 5) { return vault_breach(args.get(4), share); }
     if (a1 == "device" && a2 == "vault" && args.get(3) == "list" && ns == 6 && args.get(5) == "--kinds") { return vault_list_at(args.get(4), 1, share); }
     if (a1 == "device" && a2 == "vault" && args.get(3) == "list" && ns == 6 && args.get(5) == "--long") { return vault_list_at(args.get(4), 2, share); }
     if (a1 == "device" && a2 == "webauthn" && args.get(3) == "register" && n >= 6) { return device_wa_register(args.get(4), args.get(5), has_flag("--uv", 6), has_flag("--duress", 6), flag_arg("--replaces", 1, 6)); }

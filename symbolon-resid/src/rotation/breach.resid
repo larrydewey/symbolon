@@ -1,0 +1,83 @@
+// A password in a breach corpus (SPEC 26.1): the k-anonymity range query
+// of Pwned Passwords. Only the first five hex digits of the password's
+// SHA-1 leave the agent; the service answers with every suffix it holds
+// under that prefix ("SUFFIX:COUNT" lines, padded with count-0 lines when
+// asked with "Add-Padding: true"), and the agent looks for its own suffix.
+//
+// The password and its SHA-1 are secret. The prefix is made public at one
+// named declassify (that is the protocol). The match runs over every line
+// in constant time with respect to the hash, and only the resulting count
+// is made public: which line matched, which would give away the hash, is
+// never a branch.
+
+import "../types.resid";
+import "sha1g.resid";
+import "word.resid";
+import "crypto.resid";
+
+pub Str breach_range_host() { return "api.pwnedpasswords.com"; }
+
+pub List(Secret(UInt(8))) breach_hash(List(Secret(UInt(8))) password) { return sha1g(password); }
+
+Str hex_digit_upper(Int n) { return str_slice("0123456789ABCDEF", n, n + 1); }
+
+// The five uppercase hex digits sent to the service.
+@requires(declassify)
+pub Str breach_prefix(List(Secret(UInt(8))) hash) {
+    List(UInt(8)) h = declassify(secret_join(hash[0..3]), "the 5-hex-digit SHA-1 prefix of a breach range query (SPEC 26.1) is sent by design");
+    Int a = (Int) h[0];
+    Int b = (Int) h[1];
+    Int c = (Int) h[2];
+    return hex_digit_upper(a >> 4) + hex_digit_upper(a & 15) + hex_digit_upper(b >> 4) + hex_digit_upper(b & 15) + hex_digit_upper(c >> 4);
+}
+
+// The URL path of the query for `prefix`.
+pub Str breach_range_path(Str prefix) { return "/range/" + prefix; }
+
+Int hex_val(Int c) {
+    if (c >= 48 && c <= 57) { return c - 48; }
+    if (c >= 65 && c <= 70) { return c - 55; }
+    if (c >= 97 && c <= 102) { return c - 87; }
+    return -1;
+}
+
+// Nibble i (0 = the high nibble of byte 0) of the secret hash; i is public.
+Secret(UInt(8)) nibble(List(Secret(UInt(8))) hash, Int i) {
+    Secret(UInt(8)) b = hash[i / 2];
+    Secret(UInt(8)) fifteen = classify((UInt(8)) 15);
+    return if (i % 2 == 0) { (b >> (UInt(8)) 4) & fifteen } else { b & fifteen };
+}
+
+// OR of (hash nibble XOR line nibble) over nibbles 5..39: zero exactly when
+// the line's 35-digit suffix is the hash's. A line that is not 35 hex
+// digits never matches.
+Secret(UInt(8)) suffix_diff(List(Secret(UInt(8))) hash, Str suffix, Int i, Secret(UInt(8)) acc) {
+    if (i >= 35) { return acc; }
+    Int v = hex_val(str_char_at(suffix, i));
+    Secret(UInt(8)) d = if (v < 0) { classify((UInt(8)) 16) } else { nibble(hash, 5 + i) ^ classify((UInt(8)) v) };
+    return suffix_diff(hash, suffix, i + 1, acc | d);
+}
+
+// Over every line: count = the matching line's count, else 0.
+Secret(UInt(64)) count_lines(List(Secret(UInt(8))) hash, List(Str) lines, Int i, Secret(UInt(64)) acc) {
+    if (i >= lines.len()) { return acc; }
+    Str l = str_trim(lines[i]);
+    Int colon = str_index_of(l, ":", 0);
+    Bool shaped = colon == 35 && str_is_int(str_slice(l, 36, str_len(l)));
+    Str suffix = if (shaped) { str_slice(l, 0, 35) } else { "" };
+    Int n = if (shaped) { str_parse_int(str_slice(l, 36, str_len(l))) } else { 0 };
+    Secret(UInt(8)) zero = classify((UInt(8)) 0);
+    Secret(Bool) differs = if (shaped) { ct_nonzero(suffix_diff(hash, suffix, 0, zero)) } else { classify(true) };
+    Secret(UInt(64)) here = classify((UInt(64)) (if (n > 0) { n } else { 0 }));
+    return count_lines(hash, lines, i + 1, ct_select(differs, acc, here));
+}
+
+// How many times the corpus has seen the password whose SHA-1 is `hash`,
+// from the service's answer to the range query for its prefix; 0 if it
+// is not there.
+@requires(declassify)
+pub Int breach_count(List(Secret(UInt(8))) hash, Str body) {
+    Secret(UInt(64)) zero = classify((UInt(64)) 0);
+    Secret(UInt(64)) c = count_lines(hash, str_split(body, "\n"), 0, zero);
+    return (Int) declassify(c, "whether and how often a password appears in a breach corpus (SPEC 26.1)");
+}

@@ -1,0 +1,100 @@
+// `symbolon device vault breach DIR [--share ID]` (SPEC 26.1): every login's
+// current password checked against Pwned Passwords with the k-anonymity
+// range query (src/rotation/breach.resid). The PIN on standard input.
+//
+// Prints "breached NAME-HEX COUNT" for each login whose password the corpus
+// holds, then "checked N breached M". Only five hex digits of each
+// password's SHA-1 leave the device, one query per distinct prefix, with
+// "Add-Padding: true" so the answer's size does not tell the prefix apart.
+//
+// The service: https://api.pwnedpasswords.com, trusted through the PEM
+// bundle in SYMBOLON_BREACH_CA (default /etc/ssl/certs/ca-certificates.crt).
+// SYMBOLON_BREACH_URL replaces the service (https://HOST:PORT), for tests
+// and for a mirror the principal runs.
+
+import "../types.resid";
+import "../vault/vault.resid";
+import "../rotation/breach.resid";
+import "../rotation/rotation.resid";
+import "vaultcli.resid";
+import "sharecli.resid";
+import "device.resid";
+import "common.resid";
+import "tlsclient.resid";
+import "chain.resid";
+import "crypto.resid";
+import "word.resid";
+
+pub type BreachSvc = { Str base; TrustStore store; };
+
+@requires(filesystem, environment)
+Result(BreachSvc, Str) breach_service() {
+    Str u = environment.get("SYMBOLON_BREACH_URL");
+    Str base = if (str_len(u) > 0) { u } else { "https://" + breach_range_host() };
+    if (!str_starts_with(base, "https://")) { return Err("SYMBOLON_BREACH_URL must be an https:// address"); }
+    Str ca0 = environment.get("SYMBOLON_BREACH_CA");
+    Str ca = if (str_len(ca0) > 0) { ca0 } else { "/etc/ssl/certs/ca-certificates.crt" };
+    List(Int) pem = filesystem.read_bytes(ca);
+    if (pem.len() == 0) { return Err("no trust anchors at " + ca + " (set SYMBOLON_BREACH_CA to a PEM bundle)"); }
+    return Ok(BreachSvc {.base = base, .store = trust_store_add_pem(trust_store_empty(), text_of(pem))});
+}
+
+// The service's answer for one prefix; Err when it cannot be had.
+@requires(network, clock(readonly), declassify)
+Result(Str, Str) breach_range(BreachSvc s, Str prefix) {
+    HttpsGet g = tls_https_request(s.base + breach_range_path(prefix), "", s.store, ["http/1.1"], 30000, "GET", "Add-Padding: true\r\n", []);
+    if (g.status != 200) { return Err(if (str_len(g.err) > 0) { g.err } else { f"the service answered {g.status}" }); }
+    return Ok(text_of(g.bytes));
+}
+
+pub type BreachTally = { Int checked; Int breached; Map(Str, Str) answers; };
+
+@requires(network, clock(readonly), declassify)
+Result(BreachTally, Str) breach_items(BreachSvc s, View v, Int i, BreachTally t) {
+    if (i >= v.st.items.len()) { return Ok(t); }
+    Item it = v.st.items[i];
+    // A protected item's password needs the quorum (SPEC 18.10): not read here.
+    if (item_is_protected(it)) { return breach_items(s, v, i + 1, t); }
+    Result(List(FieldPlain), SymbolonError) r = item_open(v.vk, v.vid, it);
+    List(FieldPlain) fs = match r { Ok(x) => x, Err(_) => no_plain() };
+    List(Secret(UInt(8))) nopw = [];
+    List(Secret(UInt(8))) pw = field_value(fs, "current", 0) else { nopw };
+    if (pw.len() == 0) { return breach_items(s, v, i + 1, t); }
+    List(Secret(UInt(8))) h = breach_hash(pw);
+    Str prefix = breach_prefix(h);
+    Bool have = t.answers.contains(prefix);
+    Str body = if (have) { t.answers[prefix] else { "" } } else { breach_range(s, prefix)? };
+    Int n = breach_count(h, body);
+    if (n > 0) { println("breached " + hex_encode(utf8(field_text(fs, "name"))) + " " + f"{n}"); }
+    BreachTally next = BreachTally {.checked = t.checked + 1, .breached = t.breached + (if (n > 0) { 1 } else { 0 }), .answers = t.answers.insert(prefix, body)};
+    return breach_items(s, v, i + 1, next);
+}
+
+List(FieldPlain) no_plain() { List(FieldPlain) none = []; return none; }
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+pub Int vault_breach(Str dir, Str share) {
+    Result(BreachSvc, Str) rs = breach_service();
+    return match rs { Err(m) => dfail(m), Ok(s) => breach_view(dir, share, s) };
+}
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+Int breach_view(Str dir, Str share, BreachSvc s) {
+    Result(View, Str) rv = view_place(dir, share);
+    return match rv { Err(m) => dfail(m), Ok(v) => breach_run(s, v) };
+}
+
+@requires(network, clock(readonly), declassify)
+Int breach_run(BreachSvc s, View v) {
+    Map(Str, Str) none = {};
+    Result(BreachTally, Str) rt = breach_items(s, v, 0, BreachTally {.checked = 0, .breached = 0, .answers = none});
+    return match rt {
+        Err(m) => dfail("breach check: " + m),
+        Ok(t) => print_tally(t)
+    };
+}
+
+Int print_tally(BreachTally t) {
+    println(f"checked {t.checked} breached {t.breached}");
+    return 0;
+}
