@@ -2413,9 +2413,10 @@ public only the resulting count. A login with a nonzero count is reported
 and becomes due for rotation under this trigger. The service is Pwned
 Passwords over TLS, trusting the platform's root bundle, or a mirror the
 principal names. A service that cannot be reached, or whose certificate
-does not verify, fails the check and does not report the logins clean.
-Protected items (18.10) are skipped, because their passwords need the
-quorum. The range service learns the prefixes and their timing, which is
+does not verify, fails the check and does not report the logins clean, and
+so does an item that does not open. Protected items (18.10) are skipped,
+because their passwords need the quorum, and the check says how many it
+skipped. The range service learns the prefixes and their timing, which is
 the anonymity set the protocol is designed around (about 800 to 1,000
 passwords per prefix).
 

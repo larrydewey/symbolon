@@ -361,6 +361,10 @@ pub List(Int) toprf_item_input(List(Int) vault_id, List(Int) item_id) {
 }
 
 // pitem_key = HKDF(vault_key || y, vault_id, "symbolon v1 protected item" || item_id, 32)
+// Empty (which protected_item_seal refuses) unless y is a 32-byte OPRF output:
+// a failed finalize must not yield a key that vault_key alone derives.
 pub List(Secret(UInt(8))) protected_item_key(List(Secret(UInt(8))) vault_key, List(Secret(UInt(8))) y, List(Int) vault_id, List(Int) item_id) {
+    List(Secret(UInt(8))) none = [];
+    if (y.len() != 32) { return none; }
     return hkdf_secret(secret_bytes(vault_id), vault_key.concat(y), utf8("symbolon v1 protected item").concat(item_id), 32);
 }

@@ -31,7 +31,8 @@
 //                                              --long: TYPE NAME-HEX DETAIL-HEX FOLDER-HEX [APPS-HEX]); offline, this device's copy
 //   symbolon device vault breach DIR           PIN on stdin; each login's password against Pwned Passwords
 //                                              (k-anonymity range query, SPEC 26.1): "breached NAME-HEX COUNT"
-//                                              lines, then "checked N breached M"; SYMBOLON_BREACH_URL, _CA
+//                                              lines, "protected N not checked" if any,
+//                                              then "checked N breached M"; SYMBOLON_BREACH_URL, _CA
 //   symbolon device vault show DIR NAME        PIN on stdin; prints "FIELD VALUE-HEX" per field
 //   symbolon device vault code DIR NAME        PIN on stdin; prints "code CODE PERIOD LEFT", the
 //                                              item's current one-time code (its key never leaves)

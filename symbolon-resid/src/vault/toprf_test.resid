@@ -147,6 +147,11 @@ test "a protected item: listing with vault_key alone, opening with pitem_key, ne
     assert(match protected_item_open(vk, wrong_y, vid, it) { Ok(_) => false, Err(_) => true });
     List(Secret(UInt(8))) vk2 = random_secret(32);
     assert(match protected_item_open(vk2, protected_item_key(vk2, y, vid, iid), vid, it) { Ok(_) => false, Err(_) => true });
+    // a failed finalize (empty y) or a short y gives no key, which sealing refuses
+    List(Secret(UInt(8))) no_y = [];
+    assert(protected_item_key(vk, no_y, vid, iid).len() == 0);
+    assert(protected_item_key(vk, random_secret(31), vid, iid).len() == 0);
+    assert(match protected_item_seal(vk, protected_item_key(vk, no_y, vid, iid), vid, iid, 1, "password", fs, None) { Ok(_) => false, Err(_) => true });
     // the marker field is reserved; a duress flag on a protected item is refused
     assert(match protected_item_seal(vk, pik, vid, iid, 1, "password", [fp("protected", "1")], None) { Ok(_) => false, Err(_) => true });
     Item flagged = Item {.id = it.id, .version = it.version, .kind = it.kind, .fields = it.fields, .in_duress_subset = true, .handling_policy = None};
