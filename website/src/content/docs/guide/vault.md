@@ -42,18 +42,31 @@ don't expect, and stop before anything destructive.
 
 ## Breached passwords
 
-`symbolon device vault breach DIR` checks every login's current password
-against [Pwned Passwords](https://haveibeenpwned.com/Passwords), the
-collection of passwords seen in published breaches. Only the first five hex
-digits of each password's SHA-1 hash leave the device, in a padded request,
-so the service learns neither the password nor which of the several hundred
-it returned under that prefix was yours. Each breached login is printed with
-the number of times it has been seen; change those passwords first.
+**More › Breached passwords** (or **Check for breached passwords** under the
+vault list) checks every login's current password against
+[Pwned Passwords](https://haveibeenpwned.com/Passwords), the collection of
+passwords seen in published breaches. Only the first five hex digits of each
+password's SHA-1 hash leave the device, in a padded request, so the service
+learns neither the password nor which of the several hundred it returned
+under that prefix was yours. Each breached login is listed with the number
+of times it has been seen; change those passwords first, starting with your
+email.
+
+The app remembers what the last check found, on this device: the vault shows
+a banner and marks each breached login, the login's page warns, and so do
+the fill windows of the [browser extension](/symbolon/guide/browser/) and
+Android autofill. A login is still filled, so you can sign in and change it.
+Changing its password in Symbolon, or at the site with **Change password at
+the site…**, clears the warning. A shared folder has its own check, under
+its list.
 
 If the service cannot be reached, its certificate does not verify or an
 item does not open, the check fails rather than calling your logins clean.
+Protected items are skipped, and the check says how many.
+
+On the command line it is `symbolon device vault breach DIR`.
 `SYMBOLON_BREACH_URL` and `SYMBOLON_BREACH_CA` point it at a mirror of your
-own and its certificate. The app does not run the check yet.
+own and its certificate.
 
 ## Moving items
 

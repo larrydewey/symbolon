@@ -53,6 +53,10 @@ a recovery someone started), **Passkeys**, **Vault** and **More**.
 - **Vault**: logins, cards, identities, notes, bank accounts, Wi-Fi networks
   and secrets, with folders. Without a connection it opens read-only from
   the phone's own verified copy and says so.
+- **Breached passwords** (**More › Breached passwords**): checks your logins'
+  passwords against known data breaches and marks the ones to change, in the
+  vault and when autofill offers them. See
+  [Breached passwords](/symbolon/guide/vault/#breached-passwords).
 - **Sharing** (**More › Sharing**): folders shared with your household. See
   [Sharing](/symbolon/guide/sharing/).
 - **Organization** (**More › Organization**): your company, if you have

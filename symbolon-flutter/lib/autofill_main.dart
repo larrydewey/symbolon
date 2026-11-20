@@ -298,6 +298,9 @@ class _AutofillPageState extends State<AutofillPage> {
     } else {
       res = await plainCli.vaultSet(dir, freeName(placeName), 'login', {...placeFields, if (user.isNotEmpty) 'username': user, 'current': r.savePassword}, p);
     }
+    // The saved login has a new password: the last breach check's finding is
+    // about the old one.
+    if (res.ok && same != null) await widget.settings.clearBreached(same.name);
     if (!mounted) return;
     if (!res.ok) {
       setState(() {
@@ -402,7 +405,8 @@ class _AutofillPageState extends State<AutofillPage> {
           child: ListTile(
             leading: Icon(it.type == 'card' ? Icons.credit_card : Icons.person_outline),
             title: Text(it.name),
-            subtitle: Text(it.type == 'card' ? '•••• ${it.detail}' : (it.detail.isEmpty ? 'Saved for this app' : it.detail)),
+            subtitle: breachedUnder(Text(it.type == 'card' ? '•••• ${it.detail}' : (it.detail.isEmpty ? 'Saved for this app' : it.detail)),
+                it.type == 'card' ? null : widget.settings.breachedCount(it.name), Key('af-breached-${it.name}')),
           ),
         ),
       ),

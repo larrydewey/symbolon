@@ -42,7 +42,7 @@ Each takes a last `--share ID` to work in a shared folder.
 | `device vault delete DIR NAME` | removes an item |
 | `device vault move DIR NAME TO` | to `own` or a shared folder |
 | `device vault import DIR FILE [--format F] [--dry-run]` | from another password manager |
-| `device vault breach DIR` | checks each login's password against Pwned Passwords: `breached NAME-HEX COUNT` lines, then `checked N breached M` (`SYMBOLON_BREACH_URL` and `SYMBOLON_BREACH_CA` name a mirror) |
+| `device vault breach DIR` | checks each login's password against Pwned Passwords: `breached NAME-HEX COUNT` lines, `protected N not checked` when any were skipped, then `checked N breached M` (`SYMBOLON_BREACH_URL` and `SYMBOLON_BREACH_CA` name a mirror and its roots; `RESID_RESOLV_CONF` gives DNS servers where there is no `/etc/resolv.conf`) |
 | `device rotate DIR NAME BUNDLE REPOSITORY` | changes a login's password at the site |
 
 ## SSH keys

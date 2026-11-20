@@ -205,6 +205,14 @@ class SymbolonCli {
   Future<CliResult> vaultImport(String dir, String file, String pin, {String share = ''}) =>
       run(['device', 'vault', 'import', dir, file, ..._in(share)], input: [pin], timeout: const Duration(minutes: 15));
 
+  /// Each login's password against Pwned Passwords (SPEC 26.1):
+  /// "breached NAME-HEX COUNT" lines, "protected N not checked", then
+  /// "checked N breached M". [extraEnv]: where the trust anchors and DNS
+  /// servers are, where the system does not say (breach.dart).
+  Future<CliResult> vaultBreach(String dir, String pin, {String share = '', Map<String, String> extraEnv = const {}}) =>
+      SymbolonCli(binary, env: {...env, ...extraEnv})
+          .run(['device', 'vault', 'breach', dir, ..._in(share)], input: [pin], timeout: const Duration(minutes: 20));
+
   Future<CliResult> vaultDelete(String dir, String name, String pin, {String share = ''}) =>
       run(['device', 'vault', 'delete', dir, name, ..._in(share)], input: [pin], timeout: const Duration(minutes: 5));
 

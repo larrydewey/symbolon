@@ -7,6 +7,7 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
+import 'breach.dart';
 import 'cli.dart';
 
 /// Asks for the PIN (or another secret) in a dialog. The text is obscured
@@ -437,3 +438,17 @@ Future<void> showOutput(BuildContext context, String title, String text) {
   );
 }
 
+
+/// An item's line in a list, with a warning under it when the last breach
+/// check found its password (SPEC 26.1). The fill windows show it: the login
+/// is filled anyway, but the person sees it is time to change it.
+Widget breachedUnder(Widget line, int? seen, Key key) => seen == null
+    ? line
+    : Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
+        line,
+        Row(key: key, children: [
+          Icon(Icons.gpp_bad_outlined, size: 16, color: Colors.red.shade700),
+          const SizedBox(width: 4),
+          Flexible(child: Text('${seenInBreaches(seen)}: change it', style: TextStyle(color: Colors.red.shade700))),
+        ]),
+      ]);

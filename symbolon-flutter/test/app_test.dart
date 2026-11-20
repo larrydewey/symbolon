@@ -160,6 +160,135 @@ void main() {
     expect(settings.tutorialSeen, isTrue);
   });
 
+  // A route coming into view or leaving: a few frames, not one.
+  Future<void> route(WidgetTester t) async {
+    for (var i = 0; i < 4; i++) {
+      await t.pump(const Duration(milliseconds: 200));
+    }
+  }
+
+  testWidgets('the breach check: run from More, its findings marked in the vault and on the item', (t) async {
+    settings.siteIcons = false;
+    await start(t);
+    await t.tap(find.text('More').last);
+    await t.pumpAndSettle();
+    await t.ensureVisible(find.byKey(const Key('open-breach')));
+    await t.pumpAndSettle();
+    await t.tap(find.byKey(const Key('open-breach')));
+    await route(t);
+    expect(find.byKey(const Key('breach-result')), findsNothing);
+    await t.tap(find.byKey(const Key('breach-check')));
+    await t.pump(const Duration(milliseconds: 300));
+    await pin(t, '2468');
+    expect(find.byKey(const Key('breach-result')), findsOneWidget);
+    expect(find.text('1 breached password'), findsOneWidget);
+    expect(find.descendant(of: find.byKey(const Key('breached-mail')), matching: find.text('Seen 9,659,365 times in data breaches')), findsOneWidget);
+    expect(find.byKey(const Key('breach-protected')), findsOneWidget);
+    // The PIN went on standard input, never the command line; the system's
+    // own bundle was used (no SYMBOLON_BREACH_CA on this Linux).
+    final args = (await t.runAsync(() => agent.argsLog.readAsString()))!;
+    expect(args, contains('device vault breach ${agent.dir.path}/dev'));
+    expect(args, isNot(contains('2468')));
+    expect(settings.breachedCount('mail'), 9659365);
+
+    // The finding opens the item, which warns.
+    await t.tap(find.byKey(const Key('breached-mail')));
+    await t.pump(const Duration(milliseconds: 300));
+    await settle(t);
+    expect(find.byKey(const Key('item-breached')), findsOneWidget);
+    await t.pageBack();
+    await route(t);
+    await t.pageBack();
+    await route(t);
+
+    // The vault list: a banner and a tag on the login, none on the others.
+    await t.tap(find.text('Vault').last);
+    await t.pump(const Duration(milliseconds: 300));
+    await settle(t);
+    expect(find.byKey(const Key('breach-banner')), findsOneWidget);
+    expect(find.text('1 password found in data breaches'), findsOneWidget);
+    expect(find.byKey(const Key('breached-tag-mail')), findsOneWidget);
+    expect(find.byKey(const Key('breached-tag-bank')), findsNothing);
+    await t.tap(find.byKey(const Key('lock')));
+    await t.pump();
+  });
+
+  testWidgets('a new password clears the finding; a rename keeps it under the new name', (t) async {
+    settings.siteIcons = false;
+    settings.breach = {'': BreachFindings(DateTime.utc(2026, 11, 20), {'mail': 12}, checked: 2)};
+    await start(t);
+    await t.tap(find.text('Vault').last);
+    await t.pump(const Duration(milliseconds: 300));
+    await t.pump(const Duration(milliseconds: 300));
+    await pin(t, '2468');
+    expect(find.byKey(const Key('breached-tag-mail')), findsOneWidget);
+
+    Future<void> edit(Key field, String text) async {
+      await t.tap(find.byKey(const Key('item-mail')));
+      await t.pump(const Duration(milliseconds: 300));
+      await settle(t);
+      await t.tap(find.byKey(const Key('item-edit')));
+      await route(t);
+      await t.enterText(find.byKey(field), text);
+      await t.pump();
+      await t.tap(find.byKey(const Key('item-save')));
+      await t.pump();
+      await settle(t);
+      await settle(t);   // the agent's runs, then the settings file
+    }
+
+    await edit(const Key('edit-current'), 'a new long passphrase');
+    expect(settings.breachedCount('mail'), isNull);
+    expect(find.byKey(const Key('breach-banner')), findsNothing);
+    expect(find.byKey(const Key('breached-tag-mail')), findsNothing);
+
+    await t.runAsync(() => settings.setBreach('', BreachFindings(DateTime.utc(2026, 11, 20), {'mail': 12}, checked: 2)));
+    await t.pump();
+    await edit(const Key('item-name'), 'webmail');
+    expect(settings.breachedCount('mail'), isNull);
+    expect(settings.breachedCount('webmail'), 12);
+    await route(t);
+    expect(find.byKey(const Key('item-webmail')), findsOneWidget);
+    expect(find.byKey(const Key('breached-tag-webmail')), findsOneWidget);
+    await t.tap(find.byKey(const Key('lock')));
+    await t.pump();
+  });
+
+  testWidgets('a login opened from the breach list warns before a rename replaces another item', (t) async {
+    settings.siteIcons = false;
+    settings.breach = {'': BreachFindings(DateTime.utc(2026, 11, 20), {'mail': 12}, checked: 2)};
+    await start(t);
+    await t.tap(find.text('More').last);
+    await t.pumpAndSettle();
+    await t.ensureVisible(find.byKey(const Key('open-breach')));
+    await t.pumpAndSettle();
+    await t.tap(find.byKey(const Key('open-breach')));
+    await route(t);
+    await t.tap(find.byKey(const Key('breached-mail')));
+    await t.pump(const Duration(milliseconds: 300));
+    await pin(t, '2468');
+    await route(t);
+    expect(find.byKey(const Key('item-breached')), findsOneWidget);
+    await t.tap(find.byKey(const Key('item-edit')));
+    await route(t);
+    await t.enterText(find.byKey(const Key('item-name')), 'bank');
+    await t.pump();
+    await t.tap(find.byKey(const Key('item-save')));
+    await route(t);
+    expect(find.text('Replace bank?'), findsOneWidget);
+    await t.tap(find.text('Cancel'));
+    await route(t);
+    final args = (await t.runAsync(() => agent.argsLog.readAsString()))!;
+    expect(args, isNot(contains('vault set')));
+    expect(settings.breachedCount('mail'), 12);
+    for (var i = 0; i < 3; i++) {   // the editor, the item, the list
+      await t.pageBack();
+      await route(t);
+    }
+    await t.tap(find.byKey(const Key('lock')).first);
+    await t.pumpAndSettle();
+  });
+
   testWidgets('vault items show their kind and can be searched and filtered', (t) async {
     await start(t);
     await t.tap(find.text('Vault').last);

@@ -1,6 +1,7 @@
 // What the UI remembers between runs: where the agent and the device
-// directory are, and the credentials registered from it (public data: the
-// relying party, credential ID and public key). Never a PIN or a secret.
+// directory are, the credentials registered from it (public data: the
+// relying party, credential ID and public key), and the last breach check's
+// findings (item names and counts). Never a PIN or a secret.
 // Kept as JSON in $XDG_CONFIG_HOME/symbolon-ui/settings.json.
 
 import 'dart:convert';
@@ -69,6 +70,11 @@ class Settings extends ChangeNotifier {
   bool tutorialSeen;                     // the first-start tutorial was shown (or skipped)
   bool siteIcons;                        // fetch logins' icons from their sites
   List<Credential> credentials;
+  // The last breach check (SPEC 26.1) of each vault ("" the own vault, else
+  // a shared folder's id): when it ran, the breached logins by name with the
+  // number of times each password was seen, and the protected items skipped.
+  // Kept so the vault, the item and the fill windows can warn.
+  Map<String, BreachFindings> breach = {};
 
   // Not saved: what this run of the app found. On Android, where the agent
   // reaches the Keystore through the app (SYMBOLON_KEYSTORE), and whether
@@ -103,6 +109,7 @@ class Settings extends ChangeNotifier {
       s.tutorialSeen = (j['tutorialSeen'] as bool?) ?? s.tutorialSeen;
       s.siteIcons = (j['siteIcons'] as bool?) ?? s.siteIcons;
       s.credentials = ((j['credentials'] as List?) ?? []).map((e) => Credential.fromJson(e as Map<String, dynamic>)).toList();
+      s.breach = BreachFindings.allFromJson(j['breach']);
     } on FormatException {
       // A damaged file: start from the defaults rather than refuse to open.
     }
@@ -120,11 +127,13 @@ class Settings extends ChangeNotifier {
       'tutorialSeen': tutorialSeen,
       'siteIcons': siteIcons,
       'credentials': credentials.map((c) => c.toJson()).toList(),
+      if (breach.isNotEmpty) 'breach': {for (final e in breach.entries) e.key: e.value.toJson()},
     }));
     notifyListeners();
   }
 
   Future<void> update({String? binary, String? deviceDir, String? chromium, int? keepUnlockedMinutes, String? demoUrl, bool? tutorialSeen, bool? siteIcons}) async {
+    await reloadCredentials();   // what the other windows wrote is kept
     this.binary = binary ?? this.binary;
     this.deviceDir = deviceDir ?? this.deviceDir;
     this.chromium = chromium ?? this.chromium;
@@ -135,13 +144,15 @@ class Settings extends ChangeNotifier {
     await save();
   }
 
-  // The passkey screen the system opens runs apart from the app and adds
-  // to the same file: read the list again before changing it.
+  // The passkey, fill and autofill screens the system opens run apart from
+  // the app and write the same file: read what they change again before
+  // changing it.
   Future<void> reloadCredentials() async {
     try {
       if (!await file.exists()) return;
       final j = jsonDecode(await file.readAsString()) as Map<String, dynamic>;
       credentials = ((j['credentials'] as List?) ?? []).map((e) => Credential.fromJson(e as Map<String, dynamic>)).toList();
+      breach = BreachFindings.allFromJson(j['breach']);
       notifyListeners();
     } on FormatException {
       // keep what is in memory
@@ -166,5 +177,51 @@ class Settings extends ChangeNotifier {
     await reloadCredentials();
     credentials = credentials.where((x) => x.id != id).toList();
     await save();
+  }
+
+  /// How many times [name]'s password was seen in breaches at the last
+  /// check of [share]'s vault; null when it was not found (or not checked).
+  int? breachedCount(String name, {String share = ''}) => breach[share]?.items[name];
+
+  Future<void> setBreach(String share, BreachFindings f) async {
+    await reloadCredentials();
+    breach = {...breach, share: f};
+    await save();
+  }
+
+  /// [name] no longer has the password the last check found (it was
+  /// changed, renamed away or deleted).
+  Future<void> clearBreached(String name, {String share = ''}) async {
+    await reloadCredentials();
+    final f = breach[share];
+    if (f == null || !f.items.containsKey(name)) return;
+    breach = {...breach, share: f.without(name)};
+    await save();
+  }
+}
+
+class BreachFindings {
+  final DateTime at;
+  final Map<String, int> items;    // breached logins: name to times seen
+  final int checked;
+  final int protected;
+  const BreachFindings(this.at, this.items, {this.checked = 0, this.protected = 0});
+
+  BreachFindings without(String name) => BreachFindings(at, {...items}..remove(name), checked: checked, protected: protected);
+
+  Map<String, dynamic> toJson() => {'at': at.toUtc().toIso8601String(), 'items': items, 'checked': checked, 'protected': protected};
+
+  static BreachFindings? fromJson(Object? j) {
+    if (j is! Map<String, dynamic>) return null;
+    final at = DateTime.tryParse((j['at'] as String?) ?? '');
+    final items = j['items'];
+    if (at == null || items is! Map<String, dynamic>) return null;
+    return BreachFindings(at, {for (final e in items.entries) if (e.value is int) e.key: e.value as int},
+        checked: (j['checked'] as int?) ?? 0, protected: (j['protected'] as int?) ?? 0);
+  }
+
+  static Map<String, BreachFindings> allFromJson(Object? j) {
+    if (j is! Map<String, dynamic>) return {};
+    return {for (final e in j.entries) e.key: ?fromJson(e.value)};
   }
 }

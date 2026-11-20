@@ -3,6 +3,7 @@ import 'dart:io';
 
 import 'package:flutter/material.dart';
 
+import '../breach.dart';
 import '../app.dart';
 import '../card_face.dart';
 import '../favicons.dart';
@@ -117,6 +118,7 @@ class _ItemPageState extends State<ItemPage> with ClosesOnLock {
       // An imported passkey is no longer offered at sign-in either.
       final cid = fields?['credential_id'] ?? '';
       if (type.id == 'passkey' && cid.isNotEmpty) await app.settings.removeCredential(cid);
+      await app.settings.clearBreached(widget.item.name, share: widget.share);
       if (!mounted) return;
       toast(context, '${widget.item.name} deleted');
       Navigator.of(context).pop(const ItemChange(null));
@@ -152,6 +154,8 @@ class _ItemPageState extends State<ItemPage> with ClosesOnLock {
     if (to == null || !mounted) return;
     final m = await app.withPin(context, (p) => runTask(context, 'Moving $name', () => app.cli.vaultMove(app.dir, name, to.id, p, from: widget.share), usually: 'a few seconds'));
     if (m != null && m.ok && mounted) {
+      await app.settings.clearBreached(name, share: widget.share);
+      if (!mounted) return;
       toast(context, '$name moved to ${to.name}');
       Navigator.of(context).pop(const ItemChange(null));
     }
@@ -182,6 +186,8 @@ class _ItemPageState extends State<ItemPage> with ClosesOnLock {
     if (ok != true || !mounted) return;
     final r = await app.withPin(context, (p) => runTask(context, 'Changing the password of $name',
         () => app.cli.rotate(app.dir, name, bundle.text.trim(), repo.text.trim(), p, chromium: app.settings.chromium, share: widget.share), usually: '1-2 minutes'));
+    // Rotated: the password the breach check found is gone.
+    if (r != null && r.ok) await app.settings.clearBreached(name, share: widget.share);
     if (r != null && (r.ok || r.code == 2 || r.code == 3) && mounted) {
       await showOutput(context, name, r.out.trim());
       load();
@@ -221,6 +227,17 @@ class _ItemPageState extends State<ItemPage> with ClosesOnLock {
                     const SizedBox(width: 6),
                     Text(fs['folder']!.replaceAll('/', ' › '), key: const Key('item-folder-shown')),
                   ]),
+                ),
+              if (t.id == 'login') if (app.settings.breachedCount(it.name, share: widget.share) case final n?)
+                Card(
+                  key: const Key('item-breached'),
+                  color: Colors.red.withValues(alpha: 0.12),
+                  margin: const EdgeInsets.only(top: 12),
+                  child: ListTile(
+                    leading: Icon(Icons.gpp_bad_outlined, color: Colors.red.shade700),
+                    title: Text(seenInBreaches(n)),
+                    subtitle: const Text('This password is on the lists attackers try first. Change it here and at the site.'),
+                  ),
                 ),
               if (t.id == 'card' && (fs['number'] ?? '').isNotEmpty) ...[
                 const SizedBox(height: 16),

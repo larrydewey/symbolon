@@ -70,6 +70,9 @@ class MainActivity : FlutterFragmentActivity() {
             when (call.method) {
                 "paths" -> result.success(platformPaths(this))
                 "keystore" -> result.success(KeystoreServer.info(this))
+                // The current network's DNS servers: Android has no
+                // /etc/resolv.conf, so the agent is told (RESID_RESOLV_CONF).
+                "dnsServers" -> result.success(dnsServers(this))
                 // Android autofill (SPEC 22.6): whether Symbolon is the service,
                 // the system page to choose it, and the apps a login may be linked to.
                 "autofillEnabled" -> result.success(Build.VERSION.SDK_INT >= 26 &&
@@ -131,6 +134,15 @@ class MainActivity : FlutterFragmentActivity() {
             }
         }
     }
+}
+
+fun dnsServers(a: android.content.Context): List<String> {
+    if (Build.VERSION.SDK_INT < 23) return emptyList()
+    val cm = a.getSystemService(android.net.ConnectivityManager::class.java) ?: return emptyList()
+    val net = cm.activeNetwork ?: return emptyList()
+    // IPv4 first; a link-local IPv6 server needs a scope the agent cannot name.
+    val all = cm.getLinkProperties(net)?.dnsServers ?: return emptyList()
+    return all.filter { !it.isLinkLocalAddress }.sortedBy { if (it is java.net.Inet4Address) 0 else 1 }.mapNotNull { it.hostAddress }
 }
 
 fun platformPaths(a: android.content.Context) = mapOf(

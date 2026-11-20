@@ -4,6 +4,7 @@ import '../app.dart';
 import '../favicons.dart';
 import '../vault_types.dart';
 import '../widgets.dart';
+import 'breach_page.dart';
 import 'import_page.dart';
 import 'item_editor.dart';
 import 'item_page.dart';
@@ -39,6 +40,7 @@ class _VaultPageState extends State<VaultPage> {
   void initState() {
     super.initState();
     app.session.addListener(_session);
+    app.settings.addListener(_settings);
     query.addListener(() => setState(() {}));
     if (widget.active) WidgetsBinding.instance.addPostFrameCallback((_) => _autoOpen());
   }
@@ -56,6 +58,7 @@ class _VaultPageState extends State<VaultPage> {
   @override
   void dispose() {
     app.session.removeListener(_session);
+    app.settings.removeListener(_settings);
     query.dispose();
     super.dispose();
   }
@@ -64,6 +67,13 @@ class _VaultPageState extends State<VaultPage> {
   void _session() {
     if (!app.session.unlocked && items != null) setState(() => items = null);
   }
+
+  // A breach check, or a breached password changed, elsewhere.
+  void _settings() {
+    if (mounted) setState(() {});
+  }
+
+  Future<void> checkBreaches() => Navigator.of(context).push(MaterialPageRoute<void>(builder: (_) => BreachPage(app: app, share: share)));
 
   void _keep(List<VaultItem> xs) => items = xs..sort((a, b) => a.name.toLowerCase().compareTo(b.name.toLowerCase()));
 
@@ -184,6 +194,9 @@ class _VaultPageState extends State<VaultPage> {
             ])
           else ...[
             if (offline) _OfflineBanner(reason: localCopy!, onRetry: open),
+            // Only items still here: one deleted on another device is not counted.
+            if (all.where((x) => x.type == 'login' && app.settings.breachedCount(x.name, share: share) != null).length case final n when n > 0)
+              _BreachBanner(count: n, onTap: checkBreaches),
             if (all.isEmpty)
               Section('Empty', children: [
                 Text(share.isEmpty
@@ -217,6 +230,7 @@ class _VaultPageState extends State<VaultPage> {
                   title: Text(it.name),
                   subtitle: Wrap(spacing: 8, crossAxisAlignment: WrapCrossAlignment.center, children: [
                     KindTag(it.kind.label, it.kind.color),
+                    if (it.type == 'login' && app.settings.breachedCount(it.name, share: share) != null) KindTag('Breached', Colors.red.shade700, key: Key('breached-tag-${it.name}')),
                     if (it.type == 'login' || it.type == 'card') Text(it.subtitle, style: Theme.of(context).textTheme.bodySmall),
                     if (it.folder.isNotEmpty && folder != it.folder)
                       Row(mainAxisSize: MainAxisSize.min, children: [
@@ -235,6 +249,11 @@ class _VaultPageState extends State<VaultPage> {
                       : const Icon(Icons.chevron_right),
                   onTap: () => show(it),
                 ),
+              ),
+            if (all.any((x) => x.type == 'login'))
+              Align(
+                alignment: Alignment.centerLeft,
+                child: TextButton.icon(key: const Key('vault-breach'), onPressed: checkBreaches, icon: const Icon(Icons.policy_outlined), label: const Text('Check for breached passwords')),
               ),
             const SizedBox(height: 96),   // room under the floating button, at large text too
           ],
@@ -322,4 +341,25 @@ class _OfflineBanner extends StatelessWidget {
       ),
     );
   }
+}
+
+/// The last breach check found logins whose passwords are in known breaches.
+class _BreachBanner extends StatelessWidget {
+  final int count;
+  final VoidCallback onTap;
+  const _BreachBanner({required this.count, required this.onTap});
+
+  @override
+  Widget build(BuildContext context) => Card(
+        key: const Key('breach-banner'),
+        color: Colors.red.withValues(alpha: 0.12),
+        margin: const EdgeInsets.only(bottom: 12),
+        child: ListTile(
+          leading: Icon(Icons.gpp_bad_outlined, color: Colors.red.shade700),
+          title: Text('$count password${count == 1 ? '' : 's'} found in data breaches'),
+          subtitle: Text(count == 1 ? 'Change it first: it is on the lists attackers try.' : 'Change them first: they are on the lists attackers try.'),
+          trailing: const Icon(Icons.chevron_right),
+          onTap: onTap,
+        ),
+      );
 }

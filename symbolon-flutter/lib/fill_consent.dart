@@ -479,10 +479,12 @@ class _FillConsentPageState extends State<FillConsentPage> {
           child: ListTile(
             leading: Icon(card ? Icons.credit_card : Icons.person_outline),
             title: Text(it.name),
-            subtitle: Text(card ? (it.detail.isEmpty ? 'Card' : '•••• ${it.detail}') : it.detail),
+            subtitle: breachedUnder(Text(card ? (it.detail.isEmpty ? 'Card' : '•••• ${it.detail}') : it.detail),
+                card ? null : widget.settings.breachedCount(it.name), Key('fc-breached-${it.name}')),
           ),
         ),
       ),
     );
   }
 }
+

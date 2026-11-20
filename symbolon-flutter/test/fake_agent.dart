@@ -104,6 +104,9 @@ case "$1 $2" in
         visa) printf 'type 63617264\nname 76697361\nnumber 34313131313131313131313131313131\ncvv 313233\ncustom_1 526577617264731f301f522d3432\n' ;;
         *) printf 'type 736563726574\nname 62616e6b\nsecret 733363726574\n' ;; esac ;;
       get) echo "hunter2" ;;
+      breach)
+        echo "${SYMBOLON_BREACH_CA:-default}" > "$D/breach-ca.log"
+        printf 'breached 6d61696c 9659365\nprotected 1 not checked\nchecked 2 breached 1\n' ;;
       code) case "$5" in
         mail) echo "code 287082 30 12" ;;
         *) echo "device: this item has no one-time code key" >&2; exit 1 ;; esac ;;

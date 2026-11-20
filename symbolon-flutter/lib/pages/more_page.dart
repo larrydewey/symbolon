@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 
 import '../app.dart';
 import '../widgets.dart';
+import 'breach_page.dart';
 import 'devices_page.dart';
 import 'hardware_page.dart';
 import 'keys_page.dart';
@@ -77,6 +78,16 @@ class MorePage extends StatelessWidget {
           subtitle: const Text('Your company: people, invites, recovery'),
           trailing: const Icon(Icons.chevron_right),
           onTap: () => open(OrgPage(app: app)),
+        ),
+      ]),
+      group('Your vault', [
+        ListTile(
+          key: const Key('open-breach'),
+          leading: const Icon(Icons.policy_outlined),
+          title: const Text('Breached passwords'),
+          subtitle: const Text('Check your logins against known data breaches'),
+          trailing: const Icon(Icons.chevron_right),
+          onTap: () => open(BreachPage(app: app)),
         ),
       ]),
       group('Bring in, use elsewhere', [

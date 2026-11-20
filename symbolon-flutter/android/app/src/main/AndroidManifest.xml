@@ -1,6 +1,8 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <!-- The agent talks to the relay, witnesses and cosigner. -->
     <uses-permission android:name="android.permission.INTERNET"/>
+    <!-- The network's DNS servers, for the agent's lookups (no /etc/resolv.conf on Android). -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>
     <!-- The QR scanner (QrScanner.kt); optional, as a code can also be pasted. -->
     <uses-permission android:name="android.permission.CAMERA"/>
     <uses-feature android:name="android.hardware.camera" android:required="false"/>

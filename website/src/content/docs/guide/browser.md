@@ -46,6 +46,10 @@ site's subdomains: one saved for `proton.me` also fills at
 `login.example.com` is not offered at `example.com` or at
 `mail.example.com`.
 
+A login whose password the last [breach check](/symbolon/guide/vault/#breached-passwords)
+found is marked in red in the window. It still fills, so you can sign in and
+change it.
+
 Nothing fills when you click inside a page, and nothing fills on its own
 when a page loads: a page cannot trick you into approving something by
 drawing over the window, because the window is not part of the page.

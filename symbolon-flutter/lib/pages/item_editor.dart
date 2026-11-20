@@ -4,6 +4,7 @@ import 'dart:math';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
+import '../settings.dart';
 import '../app.dart';
 import '../session.dart';
 import '../card_face.dart';
@@ -156,6 +157,20 @@ class _ItemEditorState extends State<ItemEditor> with ClosesOnLock {
           return app.cli.vaultDelete(app.dir, widget.name!, p, share: widget.share);
         }, usually: 'a few seconds'));
     if (!mounted || r == null || !r.ok) return;
+    // The breach check's findings follow the passwords: the name saved to
+    // holds this item's password now (whatever it held before is gone), and
+    // a renamed item's finding moves with it while its password stays.
+    final s = app.settings;
+    final old = widget.name;
+    final seen = old == null ? null : s.breachedCount(old, share: widget.share);
+    final samePassword = old != null && t.id == 'login' && fields['current'] == widget.fields?['current'];
+    if (renamed) await s.clearBreached(old!, share: widget.share);
+    if (!samePassword || renamed) await s.clearBreached(n, share: widget.share);
+    final f = s.breach[widget.share];
+    if (renamed && samePassword && seen != null && f != null) {
+      await s.setBreach(widget.share, BreachFindings(f.at, {...f.items, n: seen}, checked: f.checked, protected: f.protected));
+    }
+    if (!mounted) return;
     final detail = switch (t.id) {
       'login' => fields['origin'] ?? '',
       'card' => (fields['number'] ?? '').length >= 4 ? fields['number']!.substring(fields['number']!.length - 4) : '',

@@ -8,6 +8,8 @@
 # each SHA-1 reached the service, one query per distinct prefix, padding was
 # asked for; an untrusted certificate fails the check instead of passing it.
 # RESID_DIR: the Resid checkout (default ~/git/larry/resid), for its test keys.
+# LIVE=1 also checks the same vault against the real api.pwnedpasswords.com
+# with the system's roots (only 5-digit prefixes of these test passwords go).
 set -uo pipefail
 cd "$(dirname "$0")/.."
 BIN="${BIN:-$PWD/target/symbolon}"
@@ -84,4 +86,29 @@ echo "each query carried five hex digits and asked for padding"
 OUT=$(breach "$W/other.pem" 2>&1) && fail "an untrusted certificate passed: $OUT"
 echo "$OUT" | grep -q "breach check" || fail "untrusted: $OUT"
 echo "an untrusted service fails the check"
+
+if [ -n "${LIVE:-}" ]; then
+  OUT=$(printf '2468\n' | run 300 "$BIN" device vault breach "$W/dev" 2>&1) || fail "live: $OUT"
+  echo "$OUT" | grep -q "^breached $(hexname mail) [0-9]" || fail "live: mail not reported: $OUT"
+  echo "$OUT" | grep -q "^breached $(hexname bank) [0-9]" || fail "live: bank not reported: $OUT"
+  echo "$OUT" | grep -q "breached $(hexname shop)" && fail "live: the random password reported: $OUT"
+  echo "$OUT" | grep -qx "checked 3 breached 2" || fail "live tally: $OUT"
+  echo "live: api.pwnedpasswords.com names the two breached logins, $(echo "$OUT" | grep "$(hexname mail)" | cut -d' ' -f3) and $(echo "$OUT" | grep "$(hexname bank)" | cut -d' ' -f3) times"
+  # As the Android app runs it: the roots gathered from one-certificate files
+  # into a bundle, and no /etc/resolv.conf read (RESID_RESOLV_CONF instead).
+  python3 -I - /etc/ssl/certs "$W/roots.pem" <<'PY'
+import os, re, sys
+pem = re.compile(r'-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----', re.S)
+out = []
+for f in sorted(os.listdir(sys.argv[1])):
+    p = os.path.join(sys.argv[1], f)
+    if f.endswith('.pem') and os.path.isfile(p):
+        out += pem.findall(open(p, errors='replace').read())
+open(sys.argv[2], 'w').write('\n'.join(out) + '\n')
+PY
+  NS=$(awk '$1 == "nameserver" { print "nameserver " $2 }' /etc/resolv.conf)
+  OUT=$(printf '2468\n' | SYMBOLON_BREACH_CA="$W/roots.pem" RESID_RESOLV_CONF="$NS" run 300 "$BIN" device vault breach "$W/dev" 2>&1) || fail "live, Android-style: $OUT"
+  echo "$OUT" | grep -qx "checked 3 breached 2" || fail "live, Android-style tally: $OUT"
+  echo "live: the same with a gathered bundle of $(grep -c 'BEGIN CERTIFICATE' "$W/roots.pem") roots and RESID_RESOLV_CONF"
+fi
 echo "PASS breach_e2e"

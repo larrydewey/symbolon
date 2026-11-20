@@ -2414,7 +2414,13 @@ and becomes due for rotation under this trigger. The service is Pwned
 Passwords over TLS, trusting the platform's root bundle, or a mirror the
 principal names. A service that cannot be reached, or whose certificate
 does not verify, fails the check and does not report the logins clean, and
-so does an item that does not open. Protected items (18.10) are skipped,
+so does an item that does not open. The app runs the same check (More ›
+Breached passwords) and keeps the names of the breached logins and their
+counts on the device, never a password or a hash, so the vault list, the
+item and the fill windows can warn; changing a login's password clears its
+mark. On Android it hands the agent the system's roots as one PEM bundle and
+the network's DNS servers (`RESID_RESOLV_CONF`), which Android does not
+keep where the agent looks. Protected items (18.10) are skipped,
 because their passwords need the quorum, and the check says how many it
 skipped. The range service learns the prefixes and their timing, which is
 the anonymity set the protocol is designed around (about 800 to 1,000

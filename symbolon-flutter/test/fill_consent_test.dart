@@ -103,6 +103,18 @@ void main() {
     expect(w.link.sent, ['ok login\norigin ${hexOf('https://mail.example.com')}\nusername ${hexOf('alice')}\ncurrent ${hexOf('hunter2')}\nend\n']);
   });
 
+  testWidgets('a login the last breach check found is still offered, with a warning to change it', (t) async {
+    settings.breach = {'': BreachFindings(DateTime.utc(2026, 11, 20), {'mail': 9659365}, checked: 2)};
+    final w = await open(t, login);
+    await unlock(t);
+    expect(find.byKey(const Key('fc-breached-mail')), findsOneWidget);
+    expect(find.text('Seen 9,659,365 times in data breaches: change it'), findsOneWidget);
+    await t.tap(find.byKey(const Key('fc-fill')));
+    await t.pump();
+    await settle(t);
+    expect(w.link.sent, hasLength(1));
+  });
+
   testWidgets('Enter unlocks, then fills the only match; a code field gets the current code, never its key', (t) async {
     final w = await open(t, login.replaceAll('"current-password"]', '"current-password","one-time-code"]'));
     await t.enterText(find.byKey(const Key('fc-pin')), '2468');
