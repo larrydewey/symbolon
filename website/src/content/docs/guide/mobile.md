@@ -40,8 +40,12 @@ The app has four tabs: **Home** (your identity and anything waiting, such as
 a recovery someone started), **Passkeys**, **Vault** and **More**.
 
 - **Unlock** with your PIN or fingerprint. The app stays unlocked for a
-  while (**More › Settings › Stay unlocked**) and locks when you leave it or
-  tap the lock.
+  while (**More › Settings › Stay unlocked**) and locks when you leave it,
+  when the screen turns off or when you tap the lock. Locking closes the
+  open item and hides its revealed fields, and the recent-apps screen shows
+  a blank thumbnail (Android 13 and later). An item you were adding or
+  editing is kept, in memory only, and comes back when you unlock; it is
+  discarded after 15 minutes locked, or at once with **Discard**.
 - **Passkeys**: **Turn on Symbolon for passkeys**, or choose it under
   Android's *Settings › Passwords, passkeys and accounts*. Sites and apps
   then offer Symbolon passkeys; on a computer, "Use a phone or tablet" shows

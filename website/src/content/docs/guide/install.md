@@ -31,10 +31,14 @@ symbolon device status ~/.symbolon     # "not set up" until you set it up
 ## Build from source
 
 The agent is written in [Resid](https://github.com/larrydewey/Resid) and
-needs Resid v0.8.1 or later beside this repository:
+needs Resid v0.10.1 or later, and the resid-json, resid-serial and
+resid-csv packages, beside this repository:
 
 ```sh
-git clone https://github.com/larrydewey/Resid.git
+git clone --branch v0.10.1 https://github.com/larrydewey/Resid.git
+git clone https://github.com/larrydewey/resid-json.git
+git clone https://github.com/larrydewey/resid-serial.git
+git clone https://github.com/larrydewey/resid-csv.git
 git clone https://github.com/larrydewey/symbolon.git
 cd Resid && ./boot.sh && ./install.sh && cd ..
 cd symbolon/symbolon-resid

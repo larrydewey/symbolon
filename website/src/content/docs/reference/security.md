@@ -56,6 +56,11 @@ at once, never give it.
 
 ## Not built yet
 
+- Protected vault items, a second tier that one unlocked device cannot open
+  alone: each needs a blinded evaluation from the cosigner or another of
+  your devices, which limit and log how often it happens (SPEC 18.10). The
+  cryptography and the item format are written and tested, but key
+  generation, the cosigner's side and the app are not.
 - Security keys on Android.
 - Removing a device from an identity by re-sharing without it.
 - Moving an identity to another relay.

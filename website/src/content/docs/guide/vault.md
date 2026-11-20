@@ -40,6 +40,21 @@ signed recipe for that site (**rotate** on the command line). Recipes are
 checked against the sites they name, never type a secret into a field they
 don't expect, and stop before anything destructive.
 
+## Breached passwords
+
+`symbolon device vault breach DIR` checks every login's current password
+against [Pwned Passwords](https://haveibeenpwned.com/Passwords), the
+collection of passwords seen in published breaches. Only the first five hex
+digits of each password's SHA-1 hash leave the device, in a padded request,
+so the service learns neither the password nor which of the several hundred
+it returned under that prefix was yours. Each breached login is printed with
+the number of times it has been seen; change those passwords first.
+
+If the service cannot be reached, its certificate does not verify or an
+item does not open, the check fails rather than calling your logins clean.
+`SYMBOLON_BREACH_URL` and `SYMBOLON_BREACH_CA` point it at a mirror of your
+own and its certificate. The app does not run the check yet.
+
 ## Moving items
 
 An item moves between your own vault and a shared folder (**Move** on the

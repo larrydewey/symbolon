@@ -13,7 +13,7 @@ base = "/symbolon"
 content = "src/content/docs"
 assets = "public"
 repository = "https://github.com/larrydewey/symbolon"
-edit_base = "https://github.com/larrydewey/symbolon/edit/main/website/"
+edit_base = "https://github.com/larrydewey/symbolon/edit/master/website/"
 
 nav = [
     "topic|Guide|guide/how-it-works",
