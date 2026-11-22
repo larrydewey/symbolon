@@ -22,6 +22,7 @@ import "common.resid";
 import "device.resid";
 import "duresscli.resid";
 import "vaultcli.resid";
+import "protect.resid";
 import "vaultitems.resid";
 import "rotatecli.resid";
 import "crypto.resid";
@@ -226,8 +227,8 @@ pub Int ssh_sign(Str dir, Str name, Str rsa_alg) {
 
 @requires(filesystem, network, device, declassify, clock, provision, environment)
 Int sign_item(Str dir, Opened o, Item it, List(Int) data, Str rsa_alg) {
-    Result(List(FieldPlain), SymbolonError) r = item_open(o.p.vk, o.p.vid, it);
-    return match r { Err(e) => dfail(err_text(e)), Ok(fs) => sign_fields(dir, o, fs, data, rsa_alg) };
+    Result(List(FieldPlain), Str) r = open_full(dir, opened_ctx(o), o.p.vk, o.p.vid, it);
+    return match r { Err(m) => dfail(m), Ok(fs) => sign_fields(dir, o, fs, data, rsa_alg) };
 }
 
 @requires(filesystem, network, device, declassify, clock, provision, environment)

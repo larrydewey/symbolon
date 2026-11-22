@@ -1,0 +1,63 @@
+// Protected vault items on this device (SPEC 18.10): opening one takes its
+// pitem_key, which needs the threshold OPRF output y from t parties of the
+// quorum, the cosigner among them. Every reader and writer of the person's
+// own vault goes through open_full and protected_key, so no path opens or
+// rewrites a protected item under vault_key alone, or turns it standard by
+// accident. Shared folders (SPEC 19) hold no protected items in this
+// format version (18.10.6), so their readers pass no context.
+//
+// Nothing here keeps y or pitem_key past the command (the agent is one
+// process per command), and neither is ever written to storage.
+
+import "../types.resid";
+import "../vault/vault.resid";
+import "../duress/duress.resid";
+import "state.resid";
+import "common.resid";
+import "device.resid";
+
+// What opening a protected item needs from this device: its configuration
+// and its unlocked real profile (the device key signs the request, and the
+// device's own k_v share is under its DEK).
+pub type Opener = { DeviceConfig c; Unlocked u; };
+
+pub Str needs_cosigner() { return "this item is protected: opening it needs the cosigner"; }
+
+// The pitem_key of a protected item of the person's own vault.
+@requires(filesystem, network, device, declassify, clock, environment)
+pub Result(List(Secret(UInt(8))), Str) protected_key(Str dir, Option(Opener) x, List(Secret(UInt(8))) vk, List(Int) vid, Item it) {
+    if (!item_is_protected(it)) { return Err("not a protected item"); }
+    return match x {
+        None => Err(needs_cosigner()),
+        Some(_) => Err(needs_cosigner())
+    };
+}
+
+// Every field of an item: a standard item under vault_key alone, a
+// protected one with its pitem_key as well.
+@requires(filesystem, network, device, declassify, clock, environment)
+pub Result(List(FieldPlain), Str) open_full(Str dir, Option(Opener) x, List(Secret(UInt(8))) vk, List(Int) vid, Item it) {
+    if (!item_is_protected(it)) {
+        return match item_open(vk, vid, it) { Ok(fs) => Ok(fs), Err(e) => Err(err_text(e)) };
+    }
+    return match protected_key(dir, x, vk, vid, it) {
+        Err(m) => Err(m),
+        Ok(pik) => match protected_item_open(vk, pik, vid, it) { Ok(fs) => Ok(fs), Err(e) => Err(err_text(e)) }
+    };
+}
+
+// The item written again with new fields, in its tier (vault.resid
+// item_reseal): a protected item asks for its pitem_key first.
+@requires(filesystem, network, device, declassify, clock, environment)
+pub Result(Item, Str) reseal_item(Str dir, Option(Opener) x, List(Secret(UInt(8))) vk, List(Int) vid, Option(Item) old, List(Int) id, Str kind, List(FieldPlain) fs) {
+    Bool prot = match old { None => false, Some(o) => item_is_protected(o) };
+    List(Secret(UInt(8))) none = [];
+    Result(List(Secret(UInt(8))), Str) rk = match old {
+        None => Ok(none),
+        Some(o) => if (prot) { protected_key(dir, x, vk, vid, o) } else { Ok(none) }
+    };
+    return match rk {
+        Err(m) => Err(m),
+        Ok(pik) => match item_reseal(vk, pik, vid, old, id, kind, fs) { Ok(it) => Ok(it), Err(e) => Err(err_text(e)) }
+    };
+}

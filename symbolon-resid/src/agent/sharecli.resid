@@ -28,6 +28,7 @@ import "sharetypes.resid";
 import "orgcore.resid";
 import "escrowcore.resid";
 import "vaultcli.resid";
+import "protect.resid";
 import "crypto.resid";
 import "ecdsa.resid";
 import "hpkeg.resid";
@@ -521,7 +522,7 @@ pub Result(View, Str) view_place(Str dir, Str share) {
     Result(Ctx, Str) rx = online(dir, d);
     Result(Opened, Str) ro = match rx { Err(m) => Err(m), Ok(x) => opened_in(dir, x, share) };
     return match ro {
-        Ok(o) => Ok(View {.vk = o.p.vk, .vid = o.p.vid, .st = o.st, .offline = false}),
+        Ok(o) => Ok(View {.vk = o.p.vk, .vid = o.p.vid, .st = o.st, .offline = false, .dir = dir, .ctx = None}),
         Err(m) => if (gone(m)) { Err(m) } else { kept_view(dir, d, share, m) }
     };
 }
@@ -534,7 +535,7 @@ Result(View, Str) kept_view(Str dir, Dev d, Str cid, Str why) {
     if (days > 0 && clock_now_seconds() - seen > days * 86400) { return Err(f"the organization allows reading a shared folder offline for {days} days after the relay was last reached; reach it (" + why + ")"); }
     KeyRec k = need(kept_key(dir, d.u, id), why)?;
     VaultState st = need(kept_place_copy(place_local(dir, cid), k.key), why)?;
-    return offline_view(why, View {.vk = k.key, .vid = coll_vid(id), .st = st, .offline = true});
+    return offline_view(why, View {.vk = k.key, .vid = coll_vid(id), .st = st, .offline = true, .dir = dir, .ctx = None});
 }
 
 // `symbolon device vault list DIR [--kinds | --long] [--share ID]`.
@@ -956,16 +957,20 @@ Result(Int, Str) mark_duress(Str dir, Str cid, Str on) {
     return Ok(0);
 }
 
-// `symbolon device vault move DIR NAME TO [--share FROM]`: the PIN on
+// `symbolon device vault move DIR NAME TO [--unprotect] [--share FROM]`: the PIN on
 // stdin; moves an item from the own vault (or the folder FROM) to the own
 // vault (TO "own") or the folder TO. It is written at TO first, then
 // removed from where it was, so a failure in between leaves it in both,
 // never in neither.
 @requires(filesystem, network, device, declassify, clock, provision, environment)
-pub Int vault_move(Str dir, Str name, Str to, Str from) { return done(move_item(dir, name, if (to == "own") { "" } else { to }, from)); }
+// A protected item (SPEC 18.10) moves into a shared folder only with
+// --unprotect: a folder has no OPRF key in this format version, so it holds
+// the item standard there (18.10.6). Moved back, it stays standard until
+// protected again.
+pub Int vault_move(Str dir, Str name, Str to, Str from, Bool unprotect) { return done(move_item(dir, name, if (to == "own") { "" } else { to }, from, unprotect)); }
 
 @requires(filesystem, network, device, declassify, clock, provision, environment)
-Result(Int, Str) move_item(Str dir, Str name, Str to, Str from) {
+Result(Int, Str) move_item(Str dir, Str name, Str to, Str from, Bool unprotect) {
     if (to == from) { return Err("the item is already there"); }
     if (str_len(to) > 0 && !share_id_ok(to)) { return Err("move to own, or to a shared folder's id"); }
     Ctx x = unlocked(dir)?;
@@ -973,8 +978,8 @@ Result(Int, Str) move_item(Str dir, Str name, Str to, Str from) {
     Opened dst = place_in(dir, x, to)?;
     List(Int) id = item_id_of(src.p.vk, name);
     Item it = need(item_by_id(src.st.items, id, 0), "no such item")?;
-    Result(List(FieldPlain), SymbolonError) rf = item_open(src.p.vk, src.p.vid, it);
-    List(FieldPlain) fs = match rf { Err(e) => Err(err_text(e)), Ok(v) => Ok(v) }?;
+    if (item_is_protected(it) && !unprotect) { return Err("this item is protected, and a shared folder holds it unprotected: move it with --unprotect"); }
+    List(FieldPlain) fs = open_full(dir, opened_ctx(src), src.p.vk, src.p.vid, it)?;
     if (has_named(fs, "pending", 0)) { return Err("a password change is under way for this item: let it finish first"); }
     if (match item_by_id(dst.st.items, item_id_of(dst.p.vk, name), 0) { Some(_) => true, None => false }) { return Err("there is already an item of that name there"); }
     Item moved = sealed_again(dst.p.vk, dst.p.vid, fs)?;

@@ -14,6 +14,7 @@ import "state.resid";
 import "common.resid";
 import "device.resid";
 import "auditlog.resid";
+import "protect.resid";
 import "serials.resid";
 import "crypto.resid";
 import "word.resid";
@@ -138,11 +139,10 @@ Int put_item(Str dir, Opened o, Str name, Str secret) {
     List(Int) vid = o.p.vid;
     List(Int) id = item_id_of(vk, name);
     Option(Item) old = item_by_id(o.st.items, id, 0);
-    UInt(64) version = match old { None => (UInt(64))1, Some(x) => x.version + (UInt(64))1 };
-    Result(Item, SymbolonError) ri = item_seal(vk, vid, id, version, "password",
-        [FieldPlain {.name = "name", .value = secret_bytes(utf8(name))}, FieldPlain {.name = "secret", .value = secret_bytes(utf8(secret))}], false, None);
+    Result(Item, Str) ri = reseal_item(dir, opened_ctx(o), vk, vid, old, id, "password",
+        [FieldPlain {.name = "name", .value = secret_bytes(utf8(name))}, FieldPlain {.name = "secret", .value = secret_bytes(utf8(secret))}]);
     return match ri {
-        Err(e) => dfail(err_text(e)),
+        Err(m) => dfail(m),
         Ok(it) => publish_items(dir, o, without_item(o.st.items, id, 0, ListBuf()).concat([it]))
     };
 }
@@ -182,7 +182,16 @@ Int store_vault(Str dir, Opened o, VaultState st) {
 // cannot be had, and says so on standard error; a change always needs the
 // relay and the verified log.
 
-pub type View = { List(Secret(UInt(8))) vk; List(Int) vid; VaultState st; Bool offline; };
+// `dir` and `ctx`: what opening a protected item of the person's own
+// vault needs (protect.resid); a shared folder's view has no ctx.
+pub type View = { List(Secret(UInt(8))) vk; List(Int) vid; VaultState st; Bool offline; Str dir; Option(Opener) ctx; };
+
+// Every field of an item of this view (protect.resid open_full).
+@requires(filesystem, network, device, declassify, clock, environment)
+pub Result(List(FieldPlain), Str) view_open(View v, Item it) { return open_full(v.dir, v.ctx, v.vk, v.vid, it); }
+
+// The context for protected items: the person's own vault only.
+pub Option(Opener) opened_ctx(Opened o) { return if (str_len(o.p.share) == 0) { Some(Opener {.c = o.c, .u = o.u}) } else { None }; }
 
 @requires(declassify)
 List(Int) cache_tag(List(Secret(UInt(8))) vk, List(Int) b) { return hmac_sha256_bytes(reveal(hk(vk, "symbolon v1 vault cache", 32)), b); }
@@ -234,18 +243,18 @@ Result(View, Str) view_of(Str dir, DeviceConfig c, Unlocked u, Result(VerifiedHe
     List(Int) vid = vault_id_of(c.log_id);
     Result(VaultState, Str) rs = match rv { Err(e) => Err(err_text(e)), Ok(vh) => vault_from(dir, c, vh, b) };
     return match rs {
-        Ok(st) => online_view(dir, vk, vid, st),
+        Ok(st) => online_view(dir, vk, vid, st, Opener {.c = c, .u = u}),
         Err(m) => match kept_copy(dir, vk) {
             None => Err(m),
-            Some(st) => offline_view(m, View {.vk = vk, .vid = vid, .st = st, .offline = true})
+            Some(st) => offline_view(m, View {.vk = vk, .vid = vid, .st = st, .offline = true, .dir = dir, .ctx = Some(Opener {.c = c, .u = u})})
         }
     };
 }
 
 @requires(filesystem, declassify)
-Result(View, Str) online_view(Str dir, List(Secret(UInt(8))) vk, List(Int) vid, VaultState st) {
+Result(View, Str) online_view(Str dir, List(Secret(UInt(8))) vk, List(Int) vid, VaultState st, Opener x) {
     _ = keep_copy(dir, vk, st);
-    return Ok(View {.vk = vk, .vid = vid, .st = st, .offline = false});
+    return Ok(View {.vk = vk, .vid = vid, .st = st, .offline = false, .dir = dir, .ctx = Some(x)});
 }
 
 pub Result(View, Str) offline_view(Str why, View v) {
@@ -266,15 +275,15 @@ pub Int vault_get(Str dir, Str name) {
     };
 }
 
-@requires(filesystem, declassify)
+@requires(filesystem, network, device, declassify, clock, environment)
 Int print_field(View v, Item it, Str field) { return print_field_after(v, it, field, ""); }
 
 // The field's text after [prefix], on one line.
-@requires(filesystem, declassify)
+@requires(filesystem, network, device, declassify, clock, environment)
 Int print_field_after(View v, Item it, Str field, Str prefix) {
-    Result(List(FieldPlain), SymbolonError) r = item_open(v.vk, v.vid, it);
+    Result(List(FieldPlain), Str) r = view_open(v, it);
     return match r {
-        Err(e) => dfail(err_text(e)),
+        Err(m) => dfail(m),
         Ok(fs) => print_named(fs, field, prefix, 0)
     };
 }
@@ -302,13 +311,15 @@ pub Int vault_list(Str dir, Int form) {
 @requires(filesystem, declassify)
 pub Int list_items(View v, Int form, Int i) {
     if (i >= v.st.items.len()) { return 0; }
-    Result(List(FieldPlain), SymbolonError) r = item_open(v.vk, v.vid, v.st.items[i]);
-    _ = match r { Err(e) => dfail(err_text(e)), Ok(fs) => print_entry(fs, v.st.items[i].fields.contains("secret"), form) };
+    // Listing needs only the standard tier (18.10.2): a protected item's
+    // name, type, folder and site open under vault_key alone.
+    Result(List(FieldPlain), SymbolonError) r = item_open_listing(v.vk, v.vid, v.st.items[i]);
+    _ = match r { Err(e) => dfail(err_text(e)), Ok(fs) => print_entry(fs, v.st.items[i].fields.contains("secret"), form, item_is_protected(v.st.items[i])) };
     return list_items(v, form, i + 1);
 }
 
 @requires(declassify)
-Int print_entry(List(FieldPlain) fs, Bool has_secret, Int form) {
+Int print_entry(List(FieldPlain) fs, Bool has_secret, Int form, Bool prot) {
     Str t = type_of(fs, has_secret);
     Str name = field_text(fs, "name");
     if (form == 0) { println(name); return 0; }
@@ -318,8 +329,11 @@ Int print_entry(List(FieldPlain) fs, Bool has_secret, Int form) {
     // A login's linked apps (SPEC 22.6 item 8), "PACKAGE CERT-SHA256" lines,
     // as a fifth column when there are any: public, like the site.
     Str a = if (t == "login") { field_text(fs, "apps") } else { "" };
+    // A protected item (SPEC 18.10) says so in a sixth column, "protected",
+    // after the apps ("-" when there are none).
+    Str apps = if (str_len(a) == 0) { if (prot) { " -" } else { "" } } else { " " + hex_encode(utf8(a)) };
     println(t + " " + hex_encode(utf8(name)) + " " + (if (str_len(d) == 0) { "-" } else { hex_encode(utf8(d)) }) + " " + (if (str_len(f) == 0) { "-" } else { hex_encode(utf8(f)) })
-            + (if (str_len(a) == 0) { "" } else { " " + hex_encode(utf8(a)) }));
+            + apps + (if (prot) { " protected" } else { "" }));
     return 0;
 }
 

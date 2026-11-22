@@ -30,6 +30,7 @@ import "state.resid";
 import "common.resid";
 import "device.resid";
 import "vaultcli.resid";
+import "protect.resid";
 import "sharecli.resid";
 import "serials.resid";
 import "crypto.resid";
@@ -61,10 +62,11 @@ pub Int seal_publish(Str dir, Opened o, Str name, List(FieldPlain) fs) {
     List(Secret(UInt(8))) vk = o.p.vk;
     List(Int) id = item_id_of(vk, name);
     Option(Item) old = item_by_id(o.st.items, id, 0);
-    UInt(64) version = match old { None => (UInt(64))1, Some(x) => x.version + (UInt(64))1 };
-    Result(Item, SymbolonError) ri = item_seal(vk, o.p.vid, id, version, "password", fs, false, None);
+    // In the item's tier, with its duress flag and handling policy: an edit
+    // never turns a protected item standard (SPEC 18.10).
+    Result(Item, Str) ri = reseal_item(dir, opened_ctx(o), vk, o.p.vid, old, id, "password", fs);
     return match ri {
-        Err(e) => dfail(err_text(e)),
+        Err(m) => dfail(m),
         Ok(it) => publish_items(dir, o, without_item(o.st.items, id, 0, ListBuf()).concat([it]))
     };
 }
@@ -128,8 +130,8 @@ Int rotate_with(Str dir, Opened o, Str name, RecipePayload r, Int log_time, Str 
     Option(Item) it = item_by_id(o.st.items, id, 0);
     return match it {
         None => dfail("no such item"),
-        Some(x) => match item_open(o.p.vk, o.p.vid, x) {
-            Err(e) => dfail(err_text(e)),
+        Some(x) => match open_full(dir, opened_ctx(o), o.p.vk, o.p.vid, x) {
+            Err(m) => dfail(m),
             Ok(fs) => rotate_item(dir, o, name, id, fs, r, log_time, chromium)
         }
     };

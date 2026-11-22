@@ -42,7 +42,7 @@
 //   symbolon device vault import DIR FILE [--format auto|bitwarden-json|csv] [--dry-run]
 //                                              PIN on stdin (not with --dry-run): another password
 //                                              manager's export, as one new vault version
-//   symbolon device vault move DIR NAME TO     PIN on stdin; to the own vault (TO "own") or the shared folder TO
+//   symbolon device vault move DIR NAME TO [--unprotect]  PIN on stdin; to the own vault (TO "own") or the shared folder TO (a protected item only with --unprotect)
 //       list, show, code, set, delete, import and move take a last `--share ID`: in (from) that shared folder
 //   symbolon device share new DIR NAME         PIN on stdin; a shared folder (SPEC 19); prints its ID
 //   symbolon device share list DIR             PIN on stdin; "ID NAME-HEX owner|member PEOPLE" per folder
@@ -392,7 +392,8 @@ Int main() {
     Str share = if (n >= 6 && args.get(n - 2) == "--share") { args.get(n - 1) } else { "" };
     Int ns = if (str_len(share) > 0) { n - 2 } else { n };
     if (a1 == "device" && a2 == "rotate" && (ns == 7 || ns == 8)) { return device_rotate(args.get(3), args.get(4), args.get(5), args.get(6), if (ns == 8) { args.get(7) } else { "chromium" }, share); }
-    if (a1 == "device" && a2 == "vault" && args.get(3) == "move" && ns == 7) { return vault_move(args.get(4), args.get(5), args.get(6), share); }
+    if (a1 == "device" && a2 == "vault" && args.get(3) == "move" && ns == 7) { return vault_move(args.get(4), args.get(5), args.get(6), share, false); }
+    if (a1 == "device" && a2 == "vault" && args.get(3) == "move" && ns == 8 && args.get(7) == "--unprotect") { return vault_move(args.get(4), args.get(5), args.get(6), share, true); }
     if (a1 == "device" && a2 == "vault" && args.get(3) == "list" && ns == 5) { return vault_list_at(args.get(4), 0, share); }
     if (a1 == "device" && a2 == "vault" && args.get(3) == "breach" && ns == 5) { return vault_breach(args.get(4), share); }
     if (a1 == "device" && a2 == "vault" && args.get(3) == "list" && ns == 6 && args.get(5) == "--kinds") { return vault_list_at(args.get(4), 1, share); }

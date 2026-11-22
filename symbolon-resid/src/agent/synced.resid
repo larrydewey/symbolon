@@ -45,6 +45,7 @@ import "state.resid";
 import "common.resid";
 import "device.resid";
 import "vaultcli.resid";
+import "protect.resid";
 import "crypto.resid";
 import "cose.resid";
 import "der.resid";
@@ -136,6 +137,10 @@ pub type Synced = { Str rp; List(Int) cid; List(Secret(UInt(8))) key; List(Int) 
 @requires(declassify)
 pub List(Synced) synced_all(View v, Int i, ListBuf(Synced) acc) {
     if (i >= v.st.items.len()) { return acc.finish(); }
+    // A protected item's fields need the cosigner (SPEC 18.10): a scan of
+    // every item never asks for them, so protected passkeys are opened by
+    // name (protect.resid), not found here.
+    if (item_is_protected(v.st.items[i])) { return synced_all(v, i + 1, acc); }
     Result(List(FieldPlain), SymbolonError) r = item_open(v.vk, v.vid, v.st.items[i]);
     return synced_all(v, i + 1, match r {
         Err(_) => acc,
@@ -270,6 +275,7 @@ pub type SyncedItem = { Item it; List(FieldPlain) fs; };
 @requires(declassify)
 pub Option(SyncedItem) synced_item(List(Item) items, List(Secret(UInt(8))) vk, List(Int) vid, List(Int) cid, Int i) {
     if (i >= items.len()) { return None; }
+    if (item_is_protected(items[i])) { return synced_item(items, vk, vid, cid, i + 1); }
     Result(List(FieldPlain), SymbolonError) r = item_open(vk, vid, items[i]);
     Bool hit = match r { Err(_) => false, Ok(fs) => field_text(fs, "type") == "passkey" && bytes_eq(cose_hex_decode(field_text(fs, "credential_id")), cid) };
     if (!hit) { return synced_item(items, vk, vid, cid, i + 1); }
@@ -299,9 +305,9 @@ pub Int synced_replace(Str dir, Opened o, List(Int) cid, List(Int) new_cid) {
 @requires(filesystem, network, device, declassify, clock, environment)
 Int reseal_replaced(Str dir, Opened o, SyncedItem x, List(Int) new_cid) {
     List(FieldPlain) fs = with_field(with_field(with_field(x.fs, "migrate", "registered"), "replaced_by", hex_encode(new_cid)), "replaced_at", f"{clock_now_seconds()}");
-    Result(Item, SymbolonError) ri = item_seal(o.p.vk, o.p.vid, x.it.id, x.it.version + (UInt(64))1, x.it.kind, fs, x.it.in_duress_subset, x.it.handling_policy);
+    Result(Item, Str) ri = reseal_item(dir, opened_ctx(o), o.p.vk, o.p.vid, Some(x.it), x.it.id, x.it.kind, fs);
     return match ri {
-        Err(e) => dfail(err_text(e)),
+        Err(m) => dfail(m),
         Ok(it) => if (publish_items(dir, o, without_item(o.st.items, x.it.id, 0, ListBuf()).concat([it])) != 0) { 1 } else { replaced_line(new_cid) }
     };
 }

@@ -41,10 +41,11 @@ Bool has_at(List(FieldPlain) fs, Str n, Int i) { return if (i >= fs.len()) { fal
 Int max_fields() { return 40; }
 Int max_value() { return 65536; }
 
-// A field name: 1-32 of a-z, 0-9 and _, not one the item sets itself.
+// A field name: 1-32 of a-z, 0-9 and _, not one the item sets itself
+// (name, type, and the protected tier's marker, SPEC 18.10.2).
 pub Bool field_name_ok(Str n) {
     Int k = str_len(n);
-    if (k == 0 || k > 32 || n == "name" || n == "type") { return false; }
+    if (k == 0 || k > 32 || n == "name" || n == "type" || n == "protected") { return false; }
     return name_chars(utf8(n), 0);
 }
 
@@ -172,11 +173,11 @@ pub Int vault_show(Str dir, Str name, Str share) {
 // "otp"; never the TOTP key, notes, a card's PIN or custom fields.
 pub List(Str) fill_fields() { return ["name", "origin", "username", "current", "cardholder", "number", "expiry", "cvv"]; }
 
-@requires(declassify)
+@requires(filesystem, network, device, declassify, clock, environment)
 Int show_fill_item(View v, Item it, Int now) {
-    Result(List(FieldPlain), SymbolonError) r = item_open(v.vk, v.vid, it);
+    Result(List(FieldPlain), Str) r = view_open(v, it);
     return match r {
-        Err(e) => dfail(err_text(e)),
+        Err(m) => dfail(m),
         Ok(fs) => show_fill_fields(fs, type_of(fs, it.fields.contains("secret")), now)
     };
 }
@@ -205,11 +206,11 @@ Int print_otp(Int code, Int digits) {
     return 0;
 }
 
-@requires(declassify)
+@requires(filesystem, network, device, declassify, clock, environment)
 Int show_item(View v, Item it) {
-    Result(List(FieldPlain), SymbolonError) r = item_open(v.vk, v.vid, it);
+    Result(List(FieldPlain), Str) r = view_open(v, it);
     return match r {
-        Err(e) => dfail(err_text(e)),
+        Err(m) => dfail(m),
         Ok(fs) => show_fields(fs, type_of(fs, it.fields.contains("secret")), 0)
     };
 }
@@ -238,11 +239,11 @@ pub Int vault_code(Str dir, Str name, Str share) {
     };
 }
 
-@requires(declassify)
+@requires(filesystem, network, device, declassify, clock, environment)
 Int code_item(View v, Item it, Int now) {
-    Result(List(FieldPlain), SymbolonError) r = item_open(v.vk, v.vid, it);
+    Result(List(FieldPlain), Str) r = view_open(v, it);
     return match r {
-        Err(e) => dfail(err_text(e)),
+        Err(m) => dfail(m),
         Ok(fs) => code_of_field(field_secret(fs, "totp", 0), now)
     };
 }

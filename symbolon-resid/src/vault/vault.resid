@@ -261,6 +261,21 @@ pub Result(Item, SymbolonError) item_unprotect(List(Secret(UInt(8))) vault_key, 
     return item_seal(vault_key, vault_id, it.id, it.version + 1, it.kind, plain, false, it.handling_policy);
 }
 
+// An item written again with new fields: the next version of `old` (or
+// version 1), in the same tier, with its duress flag and handling policy.
+// A protected item needs its pitem_key (pik); a standard one ignores pik.
+@requires(declassify)
+pub Result(Item, SymbolonError) item_reseal(List(Secret(UInt(8))) vault_key, List(Secret(UInt(8))) pik, List(Int) vault_id, Option(Item) old, List(Int) item_id, Str kind, List(FieldPlain) fs) {
+    return match old {
+        None => item_seal(vault_key, vault_id, item_id, (UInt(64))1, kind, fs, false, None),
+        Some(x) => if (item_is_protected(x)) {
+            protected_item_seal(vault_key, pik, vault_id, item_id, x.version + (UInt(64))1, kind, fs, x.handling_policy)
+        } else {
+            item_seal(vault_key, vault_id, item_id, x.version + (UInt(64))1, kind, fs, x.in_duress_subset, x.handling_policy)
+        }
+    };
+}
+
 // New key, version + 1, same content (rotation 18.6, duress subset 18.5).
 // A protected item needs its OPRF output: protected_item_reencrypt.
 @requires(declassify)

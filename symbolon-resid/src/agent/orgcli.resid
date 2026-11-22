@@ -1079,7 +1079,7 @@ Result(Int, Str) rec_open(Str dir, Str cid) {
     VaultState st = fetch_coll(dir, o.x, ro, cid, false)?;
     _ = audit(dir, o.x, o.st.org.org_id, "recovery", cid, "opened by " + hex_encode(o.x.c.log_id));
     println("opened " + cid + f" {st.items.len()}");
-    return Ok(list_items(View {.vk = op.pt, .vid = coll_vid(ro.coll_id), .st = st, .offline = false}, 0, 0));
+    return Ok(list_items(View {.vk = op.pt, .vid = coll_vid(ro.coll_id), .st = st, .offline = false, .dir = "", .ctx = None}, 0, 0));
 }
 
 // ─── Audit ──────────────────────────────────────────────────────

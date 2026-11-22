@@ -186,3 +186,31 @@ test "rotation keeps y, protecting and unprotecting are new versions, plain re-e
     List(FieldPlain) open_again = must_fields(item_open(vk2, vid, back));
     assert(field_bytes(open_again, "current", 0) == utf8("hunter2"));
 }
+
+@requires(declassify)
+test "an edit keeps the item's tier, duress flag and handling policy" {
+    List(Secret(UInt(8))) vk = random_secret(32);
+    List(Int) vid = random_bytes(32);
+    List(Int) iid = random_bytes(16);
+    List(Secret(UInt(8))) none = [];
+    List(Secret(UInt(8))) pik = protected_item_key(vk, random_secret(32), vid, iid);
+    // new: standard, version 1
+    Item fresh = must_item(item_reseal(vk, none, vid, None, iid, "password", [fp("name", "Mail"), fp("current", "a")]));
+    assert(fresh.version == 1);
+    assert(!item_is_protected(fresh));
+    // a standard item keeps its duress flag and policy
+    Item flagged = must_item(item_seal(vk, vid, iid, 3, "password", [fp("name", "Mail"), fp("current", "a")], true, Some("ask")));
+    Item edited = must_item(item_reseal(vk, none, vid, Some(flagged), iid, "password", [fp("name", "Mail"), fp("current", "b")]));
+    assert(edited.version == 4);
+    assert(edited.in_duress_subset);
+    assert((edited.handling_policy else { "" }) == "ask");
+    assert(field_bytes(must_fields(item_open(vk, vid, edited)), "current", 0) == utf8("b"));
+    // a protected item stays protected, and needs its pitem_key to be written
+    Item prot = must_item(protected_item_seal(vk, pik, vid, iid, 7, "password", [fp("name", "Bank"), fp("current", "x")], Some("ask")));
+    Item pedit = must_item(item_reseal(vk, pik, vid, Some(prot), iid, "password", [fp("name", "Bank"), fp("current", "y")]));
+    assert(item_is_protected(pedit));
+    assert(pedit.version == 8);
+    assert((pedit.handling_policy else { "" }) == "ask");
+    assert(field_bytes(must_fields(protected_item_open(vk, pik, vid, pedit)), "current", 0) == utf8("y"));
+    assert(match item_reseal(vk, none, vid, Some(prot), iid, "password", [fp("name", "Bank")]) { Ok(_) => false, Err(_) => true });
+}
