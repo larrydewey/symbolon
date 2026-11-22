@@ -28,7 +28,7 @@ Party test_device(Int n) {
 Quorum quorum2() {
     return Quorum {
         .parties = [test_device(2), test_device(3)], .t = 2, .root_pubkey = pubk(9),
-        .epoch = 0, .transcript_digest = id32(99) };
+        .epoch = 0, .transcript_digest = id32(99), .kv_commits = [] };
 }
 
 Policy policy(UInt(64) delay) {
@@ -289,4 +289,56 @@ test "a log that does not verify proposes nothing" {
     expect(party_ids_str(il_proposed(id32(1), [e0([2, 3]), ev], 2000, lambda(x) { false }), 0, "")).toEqual("");
     // Negative control: the same events under the right log id do.
     expect(party_ids_str(il_proposed(log_id(), [e0([2, 3]), ev], 2000, lambda(x) { false }), 0, "")).toEqual(hex_encode(id32(4)) + ";");
+}
+
+// ─── SPEC 18.10.1: the vault OPRF key's commitments (quorum field 6) ───
+
+Quorum quorum_kv(UInt(32) epoch, List(List(Int)) ks) {
+    Quorum q = quorum2();
+    return Quorum {.parties = q.parties, .t = q.t, .root_pubkey = q.root_pubkey, .epoch = epoch, .transcript_digest = id32(98), .kv_commits = ks};
+}
+
+SignedEvent reshare_ev(Int tag, UInt(64) seq, List(Int) prev_enc, Quorum nq, UInt(64) time) {
+    return next(tag, seq, prev_enc, ReshareBody(nq), [2, 3], time);
+}
+
+List(List(Int)) kv_of(Result(VerifiedHead, SymbolonError) r) {
+    return match r { Ok(v) => v.head.quorum.kv_commits, Err(_) => [] };
+}
+
+test "a re-share may add the vault OPRF key; later ones keep C_0 and may change the rest" {
+    List(Int) l = log_id();
+    SignedEvent add = reshare_ev(1, 1, enc(0), quorum_kv(1, [pubk(30), pubk(31)]), 2000);
+    Result(VerifiedHead, SymbolonError) r1 = il_verify(l, [e0([2, 3]), add], 2000, lambda(x) { false });
+    expect(ok(r1)).toBeTrue();
+    expect(kv_of(r1).len()).toEqual(2);
+    SignedEvent keep = reshare_ev(2, 2, enc(1), quorum_kv(2, [pubk(30), pubk(32)]), 3000);
+    expect(ok(il_verify(l, [e0([2, 3]), add, keep], 3000, lambda(x) { false }))).toBeTrue();
+}
+
+test "a re-share that drops the vault OPRF key or changes C_0 is refused" {
+    List(Int) l = log_id();
+    SignedEvent add = reshare_ev(1, 1, enc(0), quorum_kv(1, [pubk(30), pubk(31)]), 2000);
+    List(List(Int)) none = [];
+    SignedEvent drop = reshare_ev(2, 2, enc(1), quorum_kv(2, none), 3000);
+    expect(ok(il_verify(l, [e0([2, 3]), add, drop], 3000, lambda(x) { false }))).toBeFalse();
+    SignedEvent moved = reshare_ev(2, 2, enc(1), quorum_kv(2, [pubk(33), pubk(31)]), 3000);
+    expect(ok(il_verify(l, [e0([2, 3]), add, moved], 3000, lambda(x) { false }))).toBeFalse();
+}
+
+test "field 6 holds exactly t commitments that are points" {
+    List(Int) l = log_id();
+    SignedEvent short = reshare_ev(1, 1, enc(0), quorum_kv(1, [pubk(30)]), 2000);
+    expect(ok(il_verify(l, [e0([2, 3]), short], 2000, lambda(x) { false }))).toBeFalse();
+    SignedEvent junk = reshare_ev(1, 1, enc(0), quorum_kv(1, [pubk(30), [4, 1, 2]]), 2000);
+    expect(ok(il_verify(l, [e0([2, 3]), junk], 2000, lambda(x) { false }))).toBeFalse();
+}
+
+test "a kit recovery keeps the vault OPRF key" {
+    List(Int) l = log_id();
+    SignedEvent add = with_digests(reshare_ev(1, 1, enc(0), quorum_kv(1, [pubk(30), pubk(31)]), 2000), [sha256_bytes(pubk(20))]);
+    SignedEvent ev = recover_ev(2, 2, enc(1), 20, 3000);
+    Result(VerifiedHead, SymbolonError) late = il_verify(l, [e0_kit([2, 3]), add, ev], 3000 + 86400, lambda(x) { false });
+    expect(epoch_of(late)).toEqual(2);
+    expect(kv_of(late).len()).toEqual(2);
 }

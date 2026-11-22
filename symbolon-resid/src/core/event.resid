@@ -42,10 +42,18 @@ Option(List(Int)) parties_cbor(List(Party) ps, Int i, List(Int) acc) {
 }
 
 pub Option(List(Int)) quorum_cbor(Quorum q, List(Int) acc) {
-    List(Int) a = parties_cbor(q.parties, 0, cbe_array(q.parties.len(), cbe_uint(1, cbe_map(5, acc))))?;
+    Bool kv = q.kv_commits.len() > 0;
+    List(Int) a = parties_cbor(q.parties, 0, cbe_array(q.parties.len(), cbe_uint(1, cbe_map(if (kv) { 6 } else { 5 }, acc))))?;
     List(Int) b = cbe_uint(q.t, cbe_uint(2, a));
     List(Int) c = cose_key(q.root_pubkey, cbe_uint(3, b))?;
-    return Some(cbe_bytes(q.transcript_digest, cbe_uint(5, cbe_uint((Int)q.epoch, cbe_uint(4, c)))));
+    List(Int) d = cbe_bytes(q.transcript_digest, cbe_uint(5, cbe_uint((Int)q.epoch, cbe_uint(4, c))));
+    // Field 6 only when present: a quorum without it encodes as before.
+    return if (kv) { keys_cbor(q.kv_commits, 0, cbe_array(q.kv_commits.len(), cbe_uint(6, d))) } else { Some(d) };
+}
+
+Option(List(Int)) keys_cbor(List(List(Int)) ks, Int i, List(Int) acc) {
+    if (i >= ks.len()) { return Some(acc); }
+    return keys_cbor(ks, i + 1, cose_key(ks[i], acc)?);
 }
 
 List(Int) bytes_list(List(List(Int)) xs, Int i, List(Int) acc) {
@@ -63,7 +71,9 @@ List(Int) cosigner_policy_cbor(CosignerPolicy c, List(Int) acc) {
     return match c {
         NoCosignerPolicy => cb_null(acc),
         // Field 2 is reserved (draft 1); it is written false.
-        CosignerLimit(n) => cb_bool(false, cbe_uint(2, cbe_uint((Int)n, cbe_uint(1, cbe_map(2, acc)))))
+        CosignerLimit(n) => cb_bool(false, cbe_uint(2, cbe_uint((Int)n, cbe_uint(1, cbe_map(2, acc))))),
+        // Field 3 (SPEC 18.10.4): protected-item evaluations per device per hour.
+        CosignerLimits(l) => cbe_uint((Int)l.eval, cbe_uint(3, cb_bool(false, cbe_uint(2, cbe_uint((Int)l.sign, cbe_uint(1, cbe_map(3, acc)))))))
     };
 }
 

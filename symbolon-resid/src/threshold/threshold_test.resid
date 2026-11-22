@@ -16,7 +16,7 @@ Party party_of(Int n, UInt(8) kind) {
 }
 
 Quorum quorum_of(List(Party) ps, UInt(32) epoch) {
-    return Quorum {.parties = ps, .t = 2, .root_pubkey = [], .epoch = epoch, .transcript_digest = []};
+    return Quorum {.parties = ps, .t = 2, .root_pubkey = [], .epoch = epoch, .transcript_digest = [], .kv_commits = []};
 }
 
 LogHead head_at(UInt(32) epoch) {

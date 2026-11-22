@@ -56,10 +56,21 @@ type Quorum = {
     List(Int) root_pubkey;
     UInt(32) epoch;
     List(Int) transcript_digest;
+    // Field 6 (SPEC 18.10.1): the Feldman commitments C_0..C_{t-1} of the
+    // vault OPRF key, SEC1 uncompressed; empty when protected items are not
+    // set up for this identity yet (the field is then left out).
+    List(List(Int)) kv_commits;         //@ default
 };
 
+// Signatures and protected-item evaluations per device per hour
+// (cosigner-policy fields 1 and 3, SPEC 18.10.4).
 //@ serial
-type CosignerPolicy = NoCosignerPolicy | CosignerLimit(UInt(32));
+type Limits = { UInt(32) sign; UInt(32) eval; };
+
+// CosignerLimits: both limits; CosignerLimit, a policy without field 3,
+// allows 60 evaluations.
+//@ serial
+type CosignerPolicy = NoCosignerPolicy | CosignerLimit(UInt(32)) | CosignerLimits(Limits);
 
 //@ serial
 type Policy = {

@@ -208,7 +208,7 @@ LogHead ref_log_head(UInt(64) seq) {{
                       .hpke_key = [], .label = "d", .attestation = NoAttestation }};
     return LogHead {{
         .log_id = {L(log_id)}, .sequence = seq, .digest = [],
-        .quorum = Quorum {{ .parties = [p], .t = 1, .root_pubkey = [], .epoch = 0, .transcript_digest = [] }},
+        .quorum = Quorum {{ .parties = [p], .t = 1, .root_pubkey = [], .epoch = 0, .transcript_digest = [], .kv_commits = [] }},
         .policy = Policy {{ .device_sigs_for_authority = 1, .recovery_delay_sec = 86400, .guardians = [],
                            .guardian_threshold = 0, .witnesses = [], .duress_window_sec = 0,
                            .cosigner_policy = NoCosignerPolicy }} }};

@@ -204,7 +204,7 @@ pub Int after_session(Str dir, DeviceConfig c, Unlocked u, VerifiedHead vh, List
     CgConfig ncfg = ocfg else { CgConfig {.id = 0, .threshold = 0, .ecdsa = [], .elgamal = [], .p = [], .q = [], .rid = [], .chain_key = [], .public = []} };
     if (ncfg.ecdsa.len() == 0 || res.offline.len() != 1) { return dfail("the re-share gave no share"); }
     Quorum q = vh.head.quorum;
-    Quorum nq = Quorum {.parties = np, .t = q.t, .root_pubkey = q.root_pubkey, .epoch = q.epoch + 1, .transcript_digest = res.transcript};
+    Quorum nq = Quorum {.parties = np, .t = q.t, .root_pubkey = q.root_pubkey, .epoch = q.epoch + 1, .transcript_digest = res.transcript, .kv_commits = []};
     List(SignedEvent) es = fetch_log(relay_ep(c), c.log_id, 0, []);
     EventPayload p = next_event(vh, ReshareBody(nq), field6_in_force(es, vh.pending, es.len() - 1));
     List(Int) enc = payload_cbor(p) else { [] };
@@ -332,7 +332,7 @@ Int join_session(Str dir, DeviceConfig c, Unlocked u, Remote x, ReshareInvite in
     Endpoint relay = relay_ep(c);
     DeviceConfig c1 = with_log(c, c.witnesses, inv.log_id, w.cur.next, c.peers);
     Result(VerifiedHead, SymbolonError) rv = verified_log(relay, inv.log_id);
-    VerifiedHead vh = match rv { Ok(v) => v, Err(_) => VerifiedHead {.head = LogHead {.log_id = [], .sequence = 0, .digest = [], .quorum = Quorum {.parties = [], .t = 0, .root_pubkey = [], .epoch = 0, .transcript_digest = []}, .policy = policy_of_e0([])}, .witness_cosigs = [], .pending = []} };
+    VerifiedHead vh = match rv { Ok(v) => v, Err(_) => VerifiedHead {.head = LogHead {.log_id = [], .sequence = 0, .digest = [], .quorum = Quorum {.parties = [], .t = 0, .root_pubkey = [], .epoch = 0, .transcript_digest = [], .kv_commits = []}, .policy = policy_of_e0([])}, .witness_cosigs = [], .pending = []} };
     if (vh.head.log_id.len() == 0) { return dfail("the log does not verify"); }
     Int me_new = pos1(inv.new_parties, c.party, 0);
     if (me_new == 0 || (Int)vh.head.quorum.epoch + 1 != inv.epoch) { return dfail("this device is not in that re-share"); }

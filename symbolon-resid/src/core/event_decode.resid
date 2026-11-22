@@ -120,17 +120,39 @@ RParties r_parties_n(List(Int) b, Int p, Int n, ListBuf(Party) acc) {
 
 type RQuorum = { Quorum v; Int next; };
 
-Quorum no_quorum() { return Quorum {.parties = [], .t = 0, .root_pubkey = [], .epoch = 0, .transcript_digest = []}; }
+Quorum no_quorum() { return Quorum {.parties = [], .t = 0, .root_pubkey = [], .epoch = 0, .transcript_digest = [], .kv_commits = []}; }
 
+// Five fields, or six with the vault OPRF key's commitments (SPEC 18.10.1).
 RQuorum r_quorum(List(Int) b, Int p) {
-    Int a = map_at(b, p, 5);
+    Int a5 = map_at(b, p, 5);
+    Int a6 = map_at(b, p, 6);
+    Int a = if (a5 >= 0) { a5 } else { a6 };
     RParties ps = r_parties(b, r_key(b, a, 1));
     RU t = r_uint(b, r_key(b, ps.next, 2));
     RB root = r_cose_key(b, r_key(b, t.next, 3));
     RU ep = r_uint(b, r_key(b, root.next, 4));
     RB td = r_bytes(b, r_key(b, ep.next, 5));
-    if (a < 0 || td.next < 0 || t.v > 255 || ep.v > 4294967295) { return RQuorum {.v = no_quorum(), .next = -1}; }
-    return RQuorum {.v = Quorum {.parties = ps.v, .t = (UInt(8))t.v, .root_pubkey = root.v, .epoch = (UInt(32))ep.v, .transcript_digest = td.v}, .next = td.next};
+    RKeys kv = if (a6 >= 0) { r_keys(b, r_key(b, td.next, 6)) } else { RKeys {.v = [], .next = td.next} };
+    if (a < 0 || td.next < 0 || kv.next < 0 || t.v > 255 || ep.v > 4294967295) { return RQuorum {.v = no_quorum(), .next = -1}; }
+    if (a6 >= 0 && kv.v.len() == 0) { return RQuorum {.v = no_quorum(), .next = -1}; }
+    return RQuorum {.v = Quorum {.parties = ps.v, .t = (UInt(8))t.v, .root_pubkey = root.v, .epoch = (UInt(32))ep.v, .transcript_digest = td.v, .kv_commits = kv.v}, .next = kv.next};
+}
+
+type RKeys = { List(List(Int)) v; Int next; };
+
+// An array of 1-16 COSE_Keys.
+RKeys r_keys(List(Int) b, Int p) {
+    if (p < 0) { return RKeys {.v = [], .next = -1}; }
+    Rd h = rd(b, p);
+    if (h.major != 4 || h.val < 1 || h.val > 16) { return RKeys {.v = [], .next = -1}; }
+    return r_keys_n(b, h.next, h.val, ListBuf());
+}
+
+RKeys r_keys_n(List(Int) b, Int p, Int n, ListBuf(List(Int)) acc) {
+    if (n == 0) { return RKeys {.v = acc.finish(), .next = p}; }
+    RB k = r_cose_key(b, p);
+    if (k.next < 0) { _ = acc.finish(); return RKeys {.v = [], .next = -1}; }
+    return r_keys_n(b, k.next, n - 1, acc.push(k.v));
 }
 
 type RBl = { List(List(Int)) v; Int next; };
@@ -186,12 +208,18 @@ RPolicy r_policy(List(Int) b, Int p) {
         return RPolicy {.v = Policy {.device_sigs_for_authority = (UInt(8))dev.v, .recovery_delay_sec = (UInt(64))delay.v, .guardians = gs.v,
             .guardian_threshold = (UInt(8))gt.v, .witnesses = ws.v, .duress_window_sec = (UInt(64))dw.v, .cosigner_policy = NoCosignerPolicy}, .next = cp + 1};
     }
-    Int m = map_at(b, cp, 2);
+    // Two fields, or three with the evaluation limit (SPEC 18.10.4).
+    Int m2 = map_at(b, cp, 2);
+    Int m3 = map_at(b, cp, 3);
+    Int m = if (m2 >= 0) { m2 } else { m3 };
     RU lim = r_uint(b, r_key(b, m, 1));
     Int f = r_key(b, lim.next, 2);
     if (m < 0 || f < 0 || f >= b.len() || b[f] != 244 || lim.v > 4294967295) { return bad; }
+    RU ev = if (m3 >= 0) { r_uint(b, r_key(b, f + 1, 3)) } else { RU {.v = 0, .next = f + 1} };
+    if (ev.next < 0 || ev.v > 4294967295) { return bad; }
+    CosignerPolicy cpol = if (m3 >= 0) { CosignerLimits(Limits {.sign = (UInt(32))lim.v, .eval = (UInt(32))ev.v}) } else { CosignerLimit((UInt(32))lim.v) };
     return RPolicy {.v = Policy {.device_sigs_for_authority = (UInt(8))dev.v, .recovery_delay_sec = (UInt(64))delay.v, .guardians = gs.v,
-        .guardian_threshold = (UInt(8))gt.v, .witnesses = ws.v, .duress_window_sec = (UInt(64))dw.v, .cosigner_policy = CosignerLimit((UInt(32))lim.v)}, .next = f + 1};
+        .guardian_threshold = (UInt(8))gt.v, .witnesses = ws.v, .duress_window_sec = (UInt(64))dw.v, .cosigner_policy = cpol}, .next = ev.next};
 }
 
 type RBody = { Option(EventBody) v; Int next; };

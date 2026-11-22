@@ -7,7 +7,7 @@ LogHead head_of(Int log, UInt(64) seq, Int dig) {
         .witnesses = [], .duress_window_sec = 0, .cosigner_policy = NoCosignerPolicy };
     return LogHead {
         .log_id = [log], .sequence = seq, .digest = [dig],
-        .quorum = Quorum {.parties = [], .t = 1, .root_pubkey = [], .epoch = 0, .transcript_digest = []},
+        .quorum = Quorum {.parties = [], .t = 1, .root_pubkey = [], .epoch = 0, .transcript_digest = [], .kv_commits = []},
         .policy = p };
 }
 

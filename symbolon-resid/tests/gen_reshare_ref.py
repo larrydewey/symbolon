@@ -214,7 +214,7 @@ test "re-share to a new device: same key, kit share by the dealers, transcripts 
     expect(hex_encode(sec1_uncompressed(cv_mul_base(mixed))) == hex_encode(x)).toBeFalse();
     // The new device (4) and the cosigner (3) sign, 4 designated.
     Quorum q = Quorum {{ .parties = [party_of(1, party_kind_device()), party_of(2, party_kind_kit()), party_of(3, party_kind_cosigner()), party_of(4, party_kind_device())],
-                         .t = 2, .root_pubkey = x, .epoch = 2, .transcript_digest = r4.transcript }};
+                         .t = 2, .root_pubkey = x, .epoch = 2, .transcript_digest = r4.transcript, .kv_commits = [] }};
     List(UInt(64)) tau = sc_of_bytes(sha256_bytes([8, 8]));
     List(Int) digest = sha256_bytes([4, 3, 2, 1]);
     List(List(Int)) signers = [[4, 4, 4, 4], [3, 3, 3, 3]];

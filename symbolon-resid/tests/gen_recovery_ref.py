@@ -83,24 +83,27 @@ class Party:
                 f'.label = "{self.label}", .attestation = {att} }}')
 
 
-def quorum_cbor(ps, t, root, epoch, td):
-    return cmap([(ikey(1), arr([p.cbor() for p in ps])), (ikey(2), uint(t)), (ikey(3), cose_key(root)), (ikey(4), uint(epoch)), (ikey(5), bstr(td))])
+def quorum_cbor(ps, t, root, epoch, td, kv=()):
+    f6 = [(ikey(6), arr([cose_key(k) for k in kv]))] if kv else []
+    return cmap([(ikey(1), arr([p.cbor() for p in ps])), (ikey(2), uint(t)), (ikey(3), cose_key(root)), (ikey(4), uint(epoch)), (ikey(5), bstr(td))] + f6)
 
 
-def quorum_resid(ps, t, root, epoch, td):
+def quorum_resid(ps, t, root, epoch, td, kv=()):
     return (f'Quorum {{ .parties = [{", ".join(p.resid() for p in ps)}], .t = {t}, .root_pubkey = {L(root)}, '
-            f'.epoch = {epoch}, .transcript_digest = {L(td)} }}')
+            f'.epoch = {epoch}, .transcript_digest = {L(td)}, .kv_commits = [{", ".join(L(k) for k in kv)}] }}')
 
 
 def policy_cbor(p):
-    cp = NULL if p['limit'] is None else cmap([(ikey(1), uint(p['limit'])), (ikey(2), FALSE)])
+    f3 = [(ikey(3), uint(p['eval']))] if p.get('eval') is not None else []
+    cp = NULL if p['limit'] is None else cmap([(ikey(1), uint(p['limit'])), (ikey(2), FALSE)] + f3)
     ws = arr([cmap([(ikey(1), tstr(u)), (ikey(2), cose_key(k))]) for u, k in p['witnesses']])
     return cmap([(ikey(1), uint(p['dev'])), (ikey(2), uint(p['delay'])), (ikey(3), arr([bstr(g) for g in p['guardians']])),
                  (ikey(4), uint(p['gt'])), (ikey(5), ws), (ikey(6), uint(p['duress'])), (ikey(7), cp)])
 
 
 def policy_resid(p):
-    cp = 'NoCosignerPolicy' if p['limit'] is None else f'CosignerLimit({p["limit"]})'
+    cp = ('NoCosignerPolicy' if p['limit'] is None else f'CosignerLimit({p["limit"]})' if p.get('eval') is None
+          else f'CosignerLimits(Limits {{ .sign = {p["limit"]}, .eval = {p["eval"]} }})')
     ws = ', '.join(f'WitnessRef {{ .url = "{u}", .key = {L(k)} }}' for u, k in p['witnesses'])
     gs = ', '.join(L(g) for g in p['guardians'])
     return (f'Policy {{ .device_sigs_for_authority = {p["dev"]}, .recovery_delay_sec = {p["delay"]}, .guardians = [{gs}], '
@@ -387,6 +390,26 @@ test "non-canonical, truncated or padded payloads are refused" {{
     expect(redecoded({L(e1 + bytes([0]))})).toEqual("refused");
     expect(redecoded({L(bytes([0xa7]) + e1[1:].replace(bytes([1, 0x58, 0x20]), bytes([1, 0x59, 0, 0x20]), 1))})).toEqual("refused");
     expect(redecoded([])).toEqual("refused");
+}}
+'''
+# ─── SPEC 18.10: quorum field 6 and cosigner-policy field 3 ────
+# (drawn after every value above, so the earlier vectors are unchanged)
+kv = [newkey()[1] for _ in range(2)]
+pol_kv = dict(pol, eval=7)
+kv_body_c = arr([uint(0), quorum_cbor(q0, 2, root, 1, td, kv), policy_cbor(pol_kv)])
+kv_body_r = f'InceptionBody({quorum_resid(q0, 2, root, 1, td, kv)}, {policy_resid(pol_kv)})'
+kv_e0 = payload_cbor(None, 0, None, kv_body_c, [sha(kit_pub)], 1000)
+out += f'''
+test "a quorum with the vault OPRF key's commitments and a policy with an evaluation limit equal the reference (SPEC 7, 18.10)" {{
+    EventPayload p = {resid_payload(None, 0, None, kv_body_r, [sha(kit_pub)], 1000)};
+    expect(enc_hex(p)).toEqual({H(kv_e0)});
+    EventPayload d = payload_decode({L(kv_e0)}) else {{ e0() }};
+    EventBody b = d.body;
+    expect(match b {{ InceptionBody(q, _) => q.kv_commits.len() == 2 && hx(q.kv_commits[1]) == {H(kv[1])}, _ => false }}).toBeTrue();
+    Option(Policy) op = match b {{ InceptionBody(_, pl) => Some(pl), _ => None }};
+    CosignerPolicy cp = match op {{ Some(pl) => pl.cosigner_policy, None => NoCosignerPolicy }};
+    expect(match cp {{ CosignerLimits(l) => l.sign == 20 && l.eval == 7, _ => false }}).toBeTrue();
+    expect(redecoded({L(kv_e0)})).toEqual({H(kv_e0)});
 }}
 '''
 open(os.path.join(HERE, '..', 'src', 'recovery', 'recovery_ref_test.resid'), 'w').write(out)

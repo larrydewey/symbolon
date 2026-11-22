@@ -87,7 +87,7 @@ Quorum auth_quorum() {{
     return Quorum {{
         .parties = [test_party({L(dev_id)}, party_kind_device(), {L(dk_pub)}),
                     test_party({L(kit_id)}, party_kind_kit(), {L(dk_pub)})],
-        .t = 1, .root_pubkey = [], .epoch = 0, .transcript_digest = [] }};
+        .t = 1, .root_pubkey = [], .epoch = 0, .transcript_digest = [], .kv_commits = [] }};
 }}
 
 test "auth signing bytes equal the reference" {{

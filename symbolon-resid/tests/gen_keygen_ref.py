@@ -152,7 +152,7 @@ test "2-of-3 key generation over the wire: one key, every pair of shares reconst
     expect(hex_encode(from_pair(cs, 2, 3))).toEqual(hex_encode(x));
     // A signing session of parties 1 and 3, 1 designated with a tweak.
     Quorum q = Quorum {{ .parties = [party_of(1, party_kind_device()), party_of(2, party_kind_kit()), party_of(3, party_kind_cosigner())],
-                         .t = 2, .root_pubkey = x, .epoch = 1, .transcript_digest = [] }};
+                         .t = 2, .root_pubkey = x, .epoch = 1, .transcript_digest = [], .kv_commits = [] }};
     List(UInt(64)) tau = sc_of_bytes(sha256_bytes([7, 7]));
     List(Int) digest = sha256_bytes([1, 2, 3, 4]);
     List(List(Int)) signers = [[1, 1, 1, 1], [3, 3, 3, 3]];

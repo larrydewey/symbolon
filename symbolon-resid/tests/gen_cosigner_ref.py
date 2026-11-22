@@ -96,7 +96,7 @@ LogHead head_at(UInt(64) seq, List(Int) dig) {{
         .parties = [pt({L(a_id)}, party_kind_device(), {L(a_pub)}), pt({L(b_id)}, party_kind_device(), {L(b_pub)}),
                     pt({L(c_id)}, party_kind_device(), {L(c_pub)}), pt({L(kit_id)}, party_kind_kit(), {L(a_pub)}),
                     pt({L(cos_id)}, party_kind_cosigner(), {L(x_pub)})],
-        .t = 2, .root_pubkey = [], .epoch = {EPOCH}, .transcript_digest = [] }};
+        .t = 2, .root_pubkey = [], .epoch = {EPOCH}, .transcript_digest = [], .kv_commits = [] }};
     Policy p = Policy {{
         .device_sigs_for_authority = 2, .recovery_delay_sec = 86400, .guardians = [], .guardian_threshold = 0,
         .witnesses = [], .duress_window_sec = 600, .cosigner_policy = CosignerLimit(3) }};

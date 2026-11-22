@@ -327,7 +327,7 @@ Int after_keygen(Str dir, DeviceConfig c, Unlocked u, KitKeys kit, List(PartyKey
     if (x.len() != 65) { return dfail("keygen gave no key"); }
     Quorum q = Quorum {.parties = [party_from(parties[0], party_kind_device(), "this device"), party_from(parties[1], party_kind_kit(), "recovery kit"),
                                    party_from(parties[2], party_kind_cosigner(), "cosigner")],
-                       .t = 2, .root_pubkey = x, .epoch = 1, .transcript_digest = sha256_bytes(utf8("cmp/keygen"))};
+                       .t = 2, .root_pubkey = x, .epoch = 1, .transcript_digest = sha256_bytes(utf8("cmp/keygen")), .kv_commits = []};
     Policy pol = Policy {.device_sigs_for_authority = 1, .recovery_delay_sec = 259200, .guardians = [], .guardian_threshold = 0,
                          .witnesses = witness_refs(a.witnesses, 0, []), .duress_window_sec = 3600, .cosigner_policy = CosignerLimit(60)};
     EventPayload e0 = EventPayload {.log_id = None, .sequence = 0, .predecessor_digest = None, .suite = 1, .body = InceptionBody(q, pol),

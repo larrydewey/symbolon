@@ -115,7 +115,8 @@ Int recent_count(List(SessionRecord) rs, List(Int) party, Int since, Int i, Int 
 Bool under_limit(CosignerPolicy p, List(SessionRecord) rs, List(Int) party, Int now) {
     return match p {
         NoCosignerPolicy => true,
-        CosignerLimit(n) => recent_count(rs, party, now - 3600, 0, 0) < (Int)n
+        CosignerLimit(n) => recent_count(rs, party, now - 3600, 0, 0) < (Int)n,
+        CosignerLimits(l) => recent_count(rs, party, now - 3600, 0, 0) < (Int)l.sign
     };
 }
 

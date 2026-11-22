@@ -164,7 +164,7 @@ Party party_of(List(Int) id, UInt(8) kind) {{
 Quorum quorum() {{
     return Quorum {{ .parties = [party_of({L(pid[0])}, party_kind_device()), party_of({L(pid[1])}, party_kind_device()),
                                  party_of({L(pid[2])}, party_kind_cosigner())],
-                     .t = 2, .root_pubkey = {L(X)}, .epoch = 3, .transcript_digest = [] }};
+                     .t = 2, .root_pubkey = {L(X)}, .epoch = 3, .transcript_digest = [], .kv_commits = [] }};
 }}
 
 List(CgPublicCfg) publics() {{ return [{pubs}]; }}

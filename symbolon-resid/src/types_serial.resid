@@ -162,63 +162,109 @@ Decode(Party, F) = derive_party_decode;
 
 // ── Quorum (line 53)
 /// The serialized field names of `Quorum`, in declaration order.
-pub List(Str) derive_quorum_names() { return ["parties", "t", "root_pubkey", "epoch", "transcript_digest"]; }
+pub List(Str) derive_quorum_names() { return ["parties", "t", "root_pubkey", "epoch", "transcript_digest", "kv_commits"]; }
 /// Encodes a `Quorum` through the encoder `s`.
 @needs(Encoder(F))
 pub Result(F, SerialError) derive_quorum_encode(Quorum v, F s) {
-    Int n = 5;
+    Int n = 6;
     F s0 = write_struct_begin(s, "Quorum", n)?;
     F s1 = write_named(s0, "parties", v.parties)?;
     F s2 = write_named(s1, "t", v.t)?;
     F s3 = write_named(s2, "root_pubkey", v.root_pubkey)?;
     F s4 = write_named(s3, "epoch", v.epoch)?;
     F s5 = write_named(s4, "transcript_digest", v.transcript_digest)?;
-    return write_struct_end(s5);
+    F s6 = write_named(s5, "kv_commits", v.kv_commits)?;
+    return write_struct_end(s6);
 }
 Encode(Quorum, F) = derive_quorum_encode;
 /// Decodes a `Quorum` from the decoder `s`, with the input left over.
 @needs(Decoder(F))
 pub Result(Parsed(Quorum, F), SerialError) derive_quorum_decode(F s) {
     F s0 = read_struct_begin(s, "Quorum", derive_quorum_names())?;
-    return derive_quorum_fields(s0, None, None, None, None, None);
+    return derive_quorum_fields(s0, None, None, None, None, None, None);
 }
 @needs(Decoder(F))
-Result(Parsed(Quorum, F), SerialError) derive_quorum_fields(F s, Option(List(Party)) f_parties, Option(UInt(8)) f_t, Option(List(Int)) f_root_pubkey, Option(UInt(32)) f_epoch, Option(List(Int)) f_transcript_digest) {
+Result(Parsed(Quorum, F), SerialError) derive_quorum_fields(F s, Option(List(Party)) f_parties, Option(UInt(8)) f_t, Option(List(Int)) f_root_pubkey, Option(UInt(32)) f_epoch, Option(List(Int)) f_transcript_digest, Option(List(List(Int))) f_kv_commits) {
     Parsed(FieldKey, F) k = read_field(s, derive_quorum_names())?;
     FieldKey key = k.value;
     return match key {
-        KnownField(i) => derive_quorum_field(k.rest, i, f_parties, f_t, f_root_pubkey, f_epoch, f_transcript_digest),
-        UnknownField(name) => derive_quorum_fields(skip_unknown(k.rest, name, derive_quorum_names(), false)?, f_parties, f_t, f_root_pubkey, f_epoch, f_transcript_digest),
-        EndOfFields => derive_quorum_done(k.rest, f_parties, f_t, f_root_pubkey, f_epoch, f_transcript_digest)
+        KnownField(i) => derive_quorum_field(k.rest, i, f_parties, f_t, f_root_pubkey, f_epoch, f_transcript_digest, f_kv_commits),
+        UnknownField(name) => derive_quorum_fields(skip_unknown(k.rest, name, derive_quorum_names(), false)?, f_parties, f_t, f_root_pubkey, f_epoch, f_transcript_digest, f_kv_commits),
+        EndOfFields => derive_quorum_done(k.rest, f_parties, f_t, f_root_pubkey, f_epoch, f_transcript_digest, f_kv_commits)
     };
 }
 @needs(Decoder(F))
-Result(Parsed(Quorum, F), SerialError) derive_quorum_field(F s, Int i, Option(List(Party)) f_parties, Option(UInt(8)) f_t, Option(List(Int)) f_root_pubkey, Option(UInt(32)) f_epoch, Option(List(Int)) f_transcript_digest) {
-    if (i == 0) { Parsed(Option(List(Party)), F) p = read_slot(s, f_parties, "parties")?; return derive_quorum_fields(p.rest, p.value, f_t, f_root_pubkey, f_epoch, f_transcript_digest); }
-    if (i == 1) { Parsed(Option(UInt(8)), F) p = read_slot(s, f_t, "t")?; return derive_quorum_fields(p.rest, f_parties, p.value, f_root_pubkey, f_epoch, f_transcript_digest); }
-    if (i == 2) { Parsed(Option(List(Int)), F) p = read_slot(s, f_root_pubkey, "root_pubkey")?; return derive_quorum_fields(p.rest, f_parties, f_t, p.value, f_epoch, f_transcript_digest); }
-    if (i == 3) { Parsed(Option(UInt(32)), F) p = read_slot(s, f_epoch, "epoch")?; return derive_quorum_fields(p.rest, f_parties, f_t, f_root_pubkey, p.value, f_transcript_digest); }
-    Parsed(Option(List(Int)), F) p = read_slot(s, f_transcript_digest, "transcript_digest")?; return derive_quorum_fields(p.rest, f_parties, f_t, f_root_pubkey, f_epoch, p.value);
+Result(Parsed(Quorum, F), SerialError) derive_quorum_field(F s, Int i, Option(List(Party)) f_parties, Option(UInt(8)) f_t, Option(List(Int)) f_root_pubkey, Option(UInt(32)) f_epoch, Option(List(Int)) f_transcript_digest, Option(List(List(Int))) f_kv_commits) {
+    if (i == 0) { Parsed(Option(List(Party)), F) p = read_slot(s, f_parties, "parties")?; return derive_quorum_fields(p.rest, p.value, f_t, f_root_pubkey, f_epoch, f_transcript_digest, f_kv_commits); }
+    if (i == 1) { Parsed(Option(UInt(8)), F) p = read_slot(s, f_t, "t")?; return derive_quorum_fields(p.rest, f_parties, p.value, f_root_pubkey, f_epoch, f_transcript_digest, f_kv_commits); }
+    if (i == 2) { Parsed(Option(List(Int)), F) p = read_slot(s, f_root_pubkey, "root_pubkey")?; return derive_quorum_fields(p.rest, f_parties, f_t, p.value, f_epoch, f_transcript_digest, f_kv_commits); }
+    if (i == 3) { Parsed(Option(UInt(32)), F) p = read_slot(s, f_epoch, "epoch")?; return derive_quorum_fields(p.rest, f_parties, f_t, f_root_pubkey, p.value, f_transcript_digest, f_kv_commits); }
+    if (i == 4) { Parsed(Option(List(Int)), F) p = read_slot(s, f_transcript_digest, "transcript_digest")?; return derive_quorum_fields(p.rest, f_parties, f_t, f_root_pubkey, f_epoch, p.value, f_kv_commits); }
+    Parsed(Option(List(List(Int))), F) p = read_slot(s, f_kv_commits, "kv_commits")?; return derive_quorum_fields(p.rest, f_parties, f_t, f_root_pubkey, f_epoch, f_transcript_digest, p.value);
 }
-Result(Parsed(Quorum, F), SerialError) derive_quorum_done(F s, Option(List(Party)) f_parties, Option(UInt(8)) f_t, Option(List(Int)) f_root_pubkey, Option(UInt(32)) f_epoch, Option(List(Int)) f_transcript_digest) {
+Result(Parsed(Quorum, F), SerialError) derive_quorum_done(F s, Option(List(Party)) f_parties, Option(UInt(8)) f_t, Option(List(Int)) f_root_pubkey, Option(UInt(32)) f_epoch, Option(List(Int)) f_transcript_digest, Option(List(List(Int))) f_kv_commits) {
     List(Party) d_parties = require(f_parties, "parties")?;
     UInt(8) d_t = require(f_t, "t")?;
     List(Int) d_root_pubkey = require(f_root_pubkey, "root_pubkey")?;
     UInt(32) d_epoch = require(f_epoch, "epoch")?;
     List(Int) d_transcript_digest = require(f_transcript_digest, "transcript_digest")?;
-    return parsed(Quorum {.parties = d_parties, .t = d_t, .root_pubkey = d_root_pubkey, .epoch = d_epoch, .transcript_digest = d_transcript_digest}, s);
+    List(List(Int)) d_kv_commits_absent = [];
+    List(List(Int)) d_kv_commits = or_default(f_kv_commits, d_kv_commits_absent);
+    return parsed(Quorum {.parties = d_parties, .t = d_t, .root_pubkey = d_root_pubkey, .epoch = d_epoch, .transcript_digest = d_transcript_digest, .kv_commits = d_kv_commits}, s);
 }
 Decode(Quorum, F) = derive_quorum_decode;
 
-// ── CosignerPolicy (line 62)
+// ── Limits (line 68)
+/// The serialized field names of `Limits`, in declaration order.
+pub List(Str) derive_limits_names() { return ["sign", "eval"]; }
+/// Encodes a `Limits` through the encoder `s`.
+@needs(Encoder(F))
+pub Result(F, SerialError) derive_limits_encode(Limits v, F s) {
+    Int n = 2;
+    F s0 = write_struct_begin(s, "Limits", n)?;
+    F s1 = write_named(s0, "sign", v.sign)?;
+    F s2 = write_named(s1, "eval", v.eval)?;
+    return write_struct_end(s2);
+}
+Encode(Limits, F) = derive_limits_encode;
+/// Decodes a `Limits` from the decoder `s`, with the input left over.
+@needs(Decoder(F))
+pub Result(Parsed(Limits, F), SerialError) derive_limits_decode(F s) {
+    F s0 = read_struct_begin(s, "Limits", derive_limits_names())?;
+    return derive_limits_fields(s0, None, None);
+}
+@needs(Decoder(F))
+Result(Parsed(Limits, F), SerialError) derive_limits_fields(F s, Option(UInt(32)) f_sign, Option(UInt(32)) f_eval) {
+    Parsed(FieldKey, F) k = read_field(s, derive_limits_names())?;
+    FieldKey key = k.value;
+    return match key {
+        KnownField(i) => derive_limits_field(k.rest, i, f_sign, f_eval),
+        UnknownField(name) => derive_limits_fields(skip_unknown(k.rest, name, derive_limits_names(), false)?, f_sign, f_eval),
+        EndOfFields => derive_limits_done(k.rest, f_sign, f_eval)
+    };
+}
+@needs(Decoder(F))
+Result(Parsed(Limits, F), SerialError) derive_limits_field(F s, Int i, Option(UInt(32)) f_sign, Option(UInt(32)) f_eval) {
+    if (i == 0) { Parsed(Option(UInt(32)), F) p = read_slot(s, f_sign, "sign")?; return derive_limits_fields(p.rest, p.value, f_eval); }
+    Parsed(Option(UInt(32)), F) p = read_slot(s, f_eval, "eval")?; return derive_limits_fields(p.rest, f_sign, p.value);
+}
+Result(Parsed(Limits, F), SerialError) derive_limits_done(F s, Option(UInt(32)) f_sign, Option(UInt(32)) f_eval) {
+    UInt(32) d_sign = require(f_sign, "sign")?;
+    UInt(32) d_eval = require(f_eval, "eval")?;
+    return parsed(Limits {.sign = d_sign, .eval = d_eval}, s);
+}
+Decode(Limits, F) = derive_limits_decode;
+
+// ── CosignerPolicy (line 73)
 /// The serialized variant names of `CosignerPolicy`, in declaration order.
-pub List(Str) derive_cosigner_policy_variants() { return ["NoCosignerPolicy", "CosignerLimit"]; }
+pub List(Str) derive_cosigner_policy_variants() { return ["NoCosignerPolicy", "CosignerLimit", "CosignerLimits"]; }
 /// Encodes a `CosignerPolicy` through the encoder `s`.
 @needs(Encoder(F))
 pub Result(F, SerialError) derive_cosigner_policy_encode(CosignerPolicy v, F s) {
     return match v {
         NoCosignerPolicy => write_unit_variant(s, "CosignerPolicy", 0, "NoCosignerPolicy"),
-        CosignerLimit(x) => write_newtype_variant(s, "CosignerPolicy", 1, "CosignerLimit", x)
+        CosignerLimit(x) => write_newtype_variant(s, "CosignerPolicy", 1, "CosignerLimit", x),
+        CosignerLimits(x) => write_newtype_variant(s, "CosignerPolicy", 2, "CosignerLimits", x)
     };
 }
 Encode(CosignerPolicy, F) = derive_cosigner_policy_encode;
@@ -229,11 +275,12 @@ pub Result(Parsed(CosignerPolicy, F), SerialError) derive_cosigner_policy_decode
     Int i = t.value;
     if (i == 0) { CosignerPolicy u0 = NoCosignerPolicy; return read_unit_payload(t.rest, u0); }
     if (i == 1) { Parsed(UInt(32), F) p1 = read_newtype_payload(t.rest, "CosignerLimit")?; CosignerPolicy u1 = CosignerLimit(p1.value); return parsed(u1, p1.rest); }
+    if (i == 2) { Parsed(Limits, F) p2 = read_newtype_payload(t.rest, "CosignerLimits")?; CosignerPolicy u2 = CosignerLimits(p2.value); return parsed(u2, p2.rest); }
     return Err(custom_error(f"variant index {i} out of range"));
 }
 Decode(CosignerPolicy, F) = derive_cosigner_policy_decode;
 
-// ── Policy (line 65)
+// ── Policy (line 76)
 /// The serialized field names of `Policy`, in declaration order.
 pub List(Str) derive_policy_names() { return ["device_sigs_for_authority", "recovery_delay_sec", "guardians", "guardian_threshold", "witnesses", "duress_window_sec", "cosigner_policy"]; }
 /// Encodes a `Policy` through the encoder `s`.
@@ -289,7 +336,7 @@ Result(Parsed(Policy, F), SerialError) derive_policy_done(F s, Option(UInt(8)) f
 }
 Decode(Policy, F) = derive_policy_decode;
 
-// ── LogHead (line 122)
+// ── LogHead (line 133)
 /// The serialized field names of `LogHead`, in declaration order.
 pub List(Str) derive_log_head_names() { return ["log_id", "sequence", "digest", "quorum", "policy"]; }
 /// Encodes a `LogHead` through the encoder `s`.
@@ -339,7 +386,7 @@ Result(Parsed(LogHead, F), SerialError) derive_log_head_done(F s, Option(List(In
 }
 Decode(LogHead, F) = derive_log_head_decode;
 
-// ── WitnessCosignature (line 131)
+// ── WitnessCosignature (line 142)
 /// The serialized field names of `WitnessCosignature`, in declaration order.
 pub List(Str) derive_witness_cosignature_names() { return ["log_id", "sequence", "digest", "witness_key", "signature", "witness_time"]; }
 /// Encodes a `WitnessCosignature` through the encoder `s`.
@@ -392,7 +439,7 @@ Result(Parsed(WitnessCosignature, F), SerialError) derive_witness_cosignature_do
 }
 Decode(WitnessCosignature, F) = derive_witness_cosignature_decode;
 
-// ── VerifiedHead (line 142)
+// ── VerifiedHead (line 153)
 /// The serialized field names of `VerifiedHead`, in declaration order.
 pub List(Str) derive_verified_head_names() { return ["head", "witness_cosigs", "pending"]; }
 /// Encodes a `VerifiedHead` through the encoder `s`.
@@ -436,7 +483,7 @@ Result(Parsed(VerifiedHead, F), SerialError) derive_verified_head_done(F s, Opti
 }
 Decode(VerifiedHead, F) = derive_verified_head_decode;
 
-// ── Item (line 150)
+// ── Item (line 161)
 /// The serialized field names of `Item`, in declaration order.
 pub List(Str) derive_item_names() { return ["id", "version", "kind", "fields", "in_duress_subset", "handling_policy"]; }
 /// Encodes a `Item` through the encoder `s`.
@@ -490,7 +537,7 @@ Result(Parsed(Item, F), SerialError) derive_item_done(F s, Option(List(Int)) f_i
 }
 Decode(Item, F) = derive_item_decode;
 
-// ── VaultHead (line 163)
+// ── VaultHead (line 174)
 /// The serialized field names of `VaultHead`, in declaration order.
 pub List(Str) derive_vault_head_names() { return ["vault_id", "version", "merkle_root", "log_id", "log_sequence", "suite", "signer", "sig"]; }
 /// Encodes a `VaultHead` through the encoder `s`.
@@ -549,7 +596,7 @@ Result(Parsed(VaultHead, F), SerialError) derive_vault_head_done(F s, Option(Lis
 }
 Decode(VaultHead, F) = derive_vault_head_decode;
 
-// ── VaultState (line 175)
+// ── VaultState (line 186)
 /// The serialized field names of `VaultState`, in declaration order.
 pub List(Str) derive_vault_state_names() { return ["head", "items"]; }
 /// Encodes a `VaultState` through the encoder `s`.

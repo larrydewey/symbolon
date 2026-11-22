@@ -119,7 +119,7 @@ List(Int) idn(Int n) { return sha256_bytes([n]); }
 Quorum q2() {
     Party a = Party {.id = idn(2), .kind = party_kind_device(), .auth_key = ec_public_key(P256, privk(2)),
                      .hpke_key = [], .label = "a", .attestation = NoAttestation};
-    return Quorum {.parties = [a], .t = 1, .root_pubkey = [], .epoch = 0, .transcript_digest = []};
+    return Quorum {.parties = [a], .t = 1, .root_pubkey = [], .epoch = 0, .transcript_digest = [], .kv_commits = []};
 }
 
 LogHead log_head(UInt(64) seq) {

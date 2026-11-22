@@ -134,7 +134,19 @@ Bool quorum_ok(Quorum q) {
     if (t < 1 || t > n) { return false; }
     if (!key_ok(q.root_pubkey)) { return false; }
     if (!ids_distinct(q.parties, 0)) { return false; }
+    // Field 6 (SPEC 18.10.1): none, or t commitments that are points.
+    if (q.kv_commits.len() > 0 && (q.kv_commits.len() != t || !keys_ok(q.kv_commits, 0))) { return false; }
     return parties_ok(q.parties, 0);
+}
+
+Bool keys_ok(List(List(Int)) ks, Int i) { return i >= ks.len() || (key_ok(ks[i]) && keys_ok(ks, i + 1)); }
+
+// SPEC 18.10.1: once the quorum has a vault OPRF key, every later quorum
+// has one with the same C_0 (k_v never changes across epochs); a re-share
+// may add field 6 to a quorum without it (protected items turned on).
+Bool kv_kept(Quorum old, Quorum new) {
+    if (old.kv_commits.len() == 0) { return true; }
+    return new.kv_commits.len() > 0 && bytes_eq(new.kv_commits[0], old.kv_commits[0]);
 }
 
 // Distinct witness keys (SPEC 20.3: at least three; independence of their
@@ -285,7 +297,7 @@ LogState apply_effect(LogState s, EventBody body, List(Int) event_digest, List(L
         RecoverBody(r) => LogState {
             .quorum = Quorum {
                 .parties = r.new_parties, .t = s.quorum.t, .root_pubkey = s.quorum.root_pubkey,
-                .epoch = s.quorum.epoch + 1, .transcript_digest = event_digest },
+                .epoch = s.quorum.epoch + 1, .transcript_digest = event_digest, .kv_commits = s.quorum.kv_commits },
             .policy = s.policy, .recovery_digests = next_digests,
             .proposed = [], .removed = [], .pending = s.pending,
             .vetoes = 0, .prev_digest = s.prev_digest, .next_seq = s.next_seq,
@@ -434,6 +446,7 @@ Result(LogState, SymbolonError) do_reshare(LogState s, SignedEvent e, List(Int) 
     if (!quorum_ok(nq)) { return refuse("malformed quorum"); }
     if (!bytes_eq(nq.root_pubkey, s.quorum.root_pubkey)) { return refuse("reshare changed the root key"); }
     if (nq.epoch != s.quorum.epoch + 1) { return refuse("reshare epoch is not the next epoch"); }
+    if (!kv_kept(s.quorum, nq)) { return refuse("reshare changed or dropped the vault OPRF key (C_0)"); }
     if (!reshare_parties_ok(s, nq.parties, 0)) { return refuse("reshare party set"); }
     List(Party) everyone = s.quorum.parties.concat(nq.parties);
     List(List(Int)) all_signers = valid_signers(e.sigs, everyone, false, e.encoded, 0, []);
