@@ -30,6 +30,8 @@ import "device.resid";
 import "fidokey.resid";
 import "duresscli.resid";
 import "serials.resid";
+import "kvagent.resid";
+import "../vault/kvshare.resid";
 import "word.resid";
 import "crypto.resid";
 import "clock.resid";
@@ -70,6 +72,47 @@ pub Result(VerifiedHead, Str) publish_event(DeviceConfig c, EventPayload p, List
     if (cs.len() < 2) { return Err("too few witnesses co-signed"); }
     if (!log_put(relay_ep(c), c.log_id, p.sequence, cbor_of_event(StoredEvent {.encoded = enc, .sigs = sigs, .cosigs = cs}))) { return Err("the relay refused the event"); }
     return match verified_log(relay_ep(c), c.log_id) { Ok(v) => Ok(v), Err(e) => Err("the log does not verify: " + err_text(e)) };
+}
+
+// ─── `device protection enable DIR [PRIMES]` (SPEC 18.10.1) ─────
+// Gives a quorum without one a vault OPRF key: a re-share to the same
+// parties at the next epoch (a refresh of x too, so it takes minutes, once)
+// in which this device and the cosigner deal a fresh k_v. The kit's half
+// a_v goes to the relay and the cosigner keeps b_v, as at an enrollment.
+// Every online party takes part in a re-share, so with another device in
+// the quorum that device would have to join it: turned on while this is
+// the only device, or at inception, which deals k_v from the start.
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+pub Int device_protection_enable(Str dir, Str primes_file) {
+    Option(DeviceConfig) oc = load_config(dir);
+    return match oc { None => dfail("not set up"), Some(c) => protection_unlocked(dir, c, read_pin(), primes_file) };
+}
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+Int protection_unlocked(Str dir, DeviceConfig c, Str pin, Str primes_file) {
+    Unlocked u = unlock_dir(dir, c, pin);
+    if (u.kind != 1) { return dfail("wrong PIN"); }
+    Result(VerifiedHead, SymbolonError) rv = verified_log(relay_ep(c), c.log_id);
+    Option(CgConfig) cg = load_share(dir, u.real.dek);
+    return match rv {
+        Err(e) => dfail(err_text(e)),
+        Ok(vh) => match cg {
+            None => dfail("no share"),
+            Some(x) => protection_refresh(dir, c, u, x, vh, pin, primes_file)
+        }
+    };
+}
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+Int protection_refresh(Str dir, DeviceConfig c, Unlocked u, CgConfig x, VerifiedHead vh, Str pin, Str primes_file) {
+    Quorum q = vh.head.quorum;
+    if (q.kv_commits.len() > 0) { println("protected items are on already"); return 0; }
+    if (match cosigner_of(q.parties, 0) { None => true, Some(_) => false }) { return dfail("protected items need a cosigner (SPEC 18.10.5: without one, not built yet)"); }
+    if (count_devices(q.parties, 0, 0) > 1) { return dfail("other devices would have to join the re-share: turn protected items on from a quorum with this device only"); }
+    if (vh.pending.len() > 0) { return dfail("a change is pending in the log: let it take effect or veto it first"); }
+    println("device: turning protected items on (a re-share with the cosigner; this can take minutes)...");
+    return reshare_in(dir, c, u, x, vh, q.parties, pin, primes_file, KvGenerate);
 }
 
 // ─── `device enroll DIR NEW_DEVICE_KEYS [PRIMES]` ───────────────
@@ -126,7 +169,7 @@ Int propose(Str dir, DeviceConfig c, Unlocked u, CgConfig x, VerifiedHead vh, Pa
             return dfail("that device was proposed earlier with other keys");
         }
         println("device: the new device was proposed by an earlier try; re-sharing");
-        return reshare_in(dir, c, u, x, vh, q.parties.concat([np]), pin, primes_file);
+        return reshare_in(dir, c, u, x, vh, q.parties.concat([np]), pin, primes_file, kv_mode_of(dir, u, q, c.party, false));
     }
     EventPayload p = next_event(vh, ProposePartyBody(np, sha256_bytes(cbor_of_keys(nk))), field6_in_force(es, vh.pending, es.len() - 1));
     List(Int) enc = payload_cbor(p) else { [] };
@@ -135,7 +178,7 @@ Int propose(Str dir, DeviceConfig c, Unlocked u, CgConfig x, VerifiedHead vh, Pa
         Err(m) => dfail(m),
         Ok(sig) => match publish_event(c, p, enc, [EventSig {.signer = c.party, .sig = sig}]) {
             Err(m) => dfail("propose-party: " + m),
-            Ok(vh2) => reshare_in(dir, c, u, x, vh2, q.parties.concat([np]), pin, primes_file)
+            Ok(vh2) => reshare_in(dir, c, u, x, vh2, q.parties.concat([np]), pin, primes_file, kv_mode_of(dir, u, q, c.party, false))
         }
     };
 }
@@ -158,10 +201,22 @@ pub Option(Party) kit_of(List(Party) ps, Int i) {
     return kit_of(ps, i + 1);
 }
 
+// How this device deals the vault OPRF key in a re-share of quorum q
+// (SPEC 18.10.1): its share re-shared when q has the key (KvNone if the
+// share is missing, which the re-share then refuses), a fresh secret when
+// q has none and `enable` asks for one, else not at all.
+@requires(filesystem, declassify)
+pub KvMode kv_mode_of(Str dir, Unlocked u, Quorum q, List(Int) me, Bool enable) {
+    if (q.kv_commits.len() == 0) { return if (enable) { KvGenerate } else { KvNone }; }
+    Option(KvKept) k = kv_load(dir, u.real.dek);
+    return match k { None => KvNone, Some(x) => if (x.epoch == (Int)q.epoch && x.id == pos1(q.parties, me, 0)) { KvReshare(x.share) } else { KvNone } };
+}
+
 // X and the cosigner deal (t = 2 of the old quorum); every online party of
 // the new quorum receives.
 @requires(filesystem, network, device, declassify, clock, environment)
-Int reshare_in(Str dir, DeviceConfig c, Unlocked u, CgConfig x, VerifiedHead vh, List(Party) np, Str pin, Str primes_file) {
+pub Int reshare_in(Str dir, DeviceConfig c, Unlocked u, CgConfig x, VerifiedHead vh, List(Party) np, Str pin, Str primes_file, KvMode kv) {
+    if (vh.head.quorum.kv_commits.len() > 0 && !kv_on(kv)) { return dfail("this device holds no share of the vault OPRF key to re-share"); }
     Quorum q = vh.head.quorum;
     Party cos = cosigner_of(q.parties, 0) else { none_party() };
     if (cos.id.len() == 0) { return dfail("no cosigner to re-share with"); }
@@ -184,7 +239,7 @@ Int reshare_in(Str dir, DeviceConfig c, Unlocked u, CgConfig x, VerifiedHead vh,
         .degree = inv.degree, .old = [x], .root = q.root_pubkey, .session_id = sid, .seed = random_bytes(32), .primes = primes_of(primes_file)};
     return match rs_start(rc) {
         Err(e) => dfail("re-share: " + e.why),
-        Ok(s0) => after_session(dir, c, u, vh, np, inv, rem, pin,
+        Ok(s0) => after_session(dir, c, u, vh, np, inv, rem, pin, kv,
             run_session(relay, sid, [Seat {.me = me, .st = s0.state, .round = 1, .out = s0.out, .done = false}], rem, [Cursor {.party = c.party, .next = start}], [],
                         lambda(t, msgs) { rs_adapt(t, msgs) }, 1800))
     };
@@ -197,14 +252,16 @@ pub Bool send_all_invites(Endpoint relay, Local me, List(Remote) rs, Packet w, I
 }
 
 @requires(filesystem, network, device, declassify, clock, environment)
-pub Int after_session(Str dir, DeviceConfig c, Unlocked u, VerifiedHead vh, List(Party) np, ReshareInvite inv, List(Remote) rem, Str pin, Run(RsState) r) {
+pub Int after_session(Str dir, DeviceConfig c, Unlocked u, VerifiedHead vh, List(Party) np, ReshareInvite inv, List(Remote) rem, Str pin, KvMode kv, Run(RsState) r) {
     if (str_len(r.fail) > 0) { return dfail("re-share: " + r.fail); }
+    KvDone kd = kv_reshare(relay_ep(c), Local {.party = c.party, .cg = 0, .hpke_sk = device_hpke(u.real.dek).sk}, vh.head.quorum, np, inv, rem, kv, mailbox_end(relay_ep(c), c.party, c.mbox_next));
+    if (str_len(kd.why) > 0) { return dfail(kd.why); }
     RsResult res = rs_result(r.seats[0].st) else { RsResult {.cfg = None, .offline = [], .transcript = []} };
     Option(CgConfig) ocfg = res.cfg;
     CgConfig ncfg = ocfg else { CgConfig {.id = 0, .threshold = 0, .ecdsa = [], .elgamal = [], .p = [], .q = [], .rid = [], .chain_key = [], .public = []} };
     if (ncfg.ecdsa.len() == 0 || res.offline.len() != 1) { return dfail("the re-share gave no share"); }
     Quorum q = vh.head.quorum;
-    Quorum nq = Quorum {.parties = np, .t = q.t, .root_pubkey = q.root_pubkey, .epoch = q.epoch + 1, .transcript_digest = res.transcript, .kv_commits = []};
+    Quorum nq = Quorum {.parties = np, .t = q.t, .root_pubkey = q.root_pubkey, .epoch = q.epoch + 1, .transcript_digest = res.transcript, .kv_commits = kd.out.commits};
     List(SignedEvent) es = fetch_log(relay_ep(c), c.log_id, 0, []);
     EventPayload p = next_event(vh, ReshareBody(nq), field6_in_force(es, vh.pending, es.len() - 1));
     List(Int) enc = payload_cbor(p) else { [] };
@@ -218,7 +275,31 @@ pub Int after_session(Str dir, DeviceConfig c, Unlocked u, VerifiedHead vh, List
     List(Int) mine = match ms { Ok(s) => s, Err(_) => [] };
     return match publish_event(c, p, enc, [EventSig {.signer = c.party, .sig = mine}].concat(theirs)) {
         Err(m) => dfail("reshare: " + m),
-        Ok(vh2) => finish_enroll(dir, c, u, vh2, ncfg, res, rem)
+        Ok(vh2) => finish_enroll(dir, c, u, vh2, ncfg, res, rem, kd)
+    };
+}
+
+// The vault OPRF key's round of a re-share: this device deals (as
+// inv.dealers[0]) to every online receiver, the cosigner answers with its
+// dealing; both checked, and this device's new share and the new field 6.
+pub type KvDone = { Bool on; KvOut out; KvDealing mine; Int me; Int kit; Str why; };
+
+@requires(network, declassify, clock)
+KvDone kv_reshare(Endpoint relay, Local me, Quorum q, List(Party) np, ReshareInvite inv, List(Remote) rem, KvMode kv, Int start) {
+    KvOut none = KvOut {.share = kv_scalar(classify((UInt(576)) 0)), .commits = []};
+    Int me_new = pos1(np, me.party, 0);
+    Int kit = if (inv.offline.len() > 0) { inv.offline[0] } else { 0 };
+    KvDealing mine = kv_dealing(kv, inv.degree + 1, np.len(), inv.dealers, inv.dealers[0]);
+    if (!kv_on(kv)) { return KvDone {.on = false, .out = none, .mine = mine, .me = me_new, .kit = kit, .why = ""}; }
+    Party cos = cosigner_of(np, 0) else { none_party() };
+    Remote cr = Remote {.party = cos.id, .cg = pos1(np, cos.id, 0), .hpke_pub = cos.hpke_key};
+    if (!kv_send(relay, me, rem, inv.session_id, inv.dealers[0], mine, 0)) { return KvDone {.on = false, .out = none, .mine = mine, .me = me_new, .kit = kit, .why = "cannot reach the relay"}; }
+    List(KvGot) got = kv_collect(relay, me, [cr], Cursor {.party = me.party, .next = start}, inv.session_id, 120);
+    if (got.len() == 0) { return KvDone {.on = false, .out = none, .mine = mine, .me = me_new, .kit = kit, .why = "the cosigner did not deal the vault OPRF key"}; }
+    List(List(Int)) old = if (q.kv_commits.len() > 0) { kv_from_sec1(q.kv_commits) } else { [] };
+    return match kv_combine(me_new, got, Some(mine), inv.dealers[0], old, inv.dealers) {
+        Err(m) => KvDone {.on = false, .out = none, .mine = mine, .me = me_new, .kit = kit, .why = "vault OPRF key: " + m},
+        Ok(o) => KvDone {.on = true, .out = o, .mine = mine, .me = me_new, .kit = kit, .why = ""}
     };
 }
 
@@ -234,7 +315,7 @@ List(EventSig) collect_sigs(Endpoint relay, Local me, List(Remote) rem, Cursor c
 // cosigner, the kit secrets under the new k_K), the secrets to the new
 // device, and this device's new share.
 @requires(filesystem, network, device, declassify, clock)
-Int finish_enroll(Str dir, DeviceConfig c, Unlocked u, VerifiedHead vh, CgConfig ncfg, RsResult res, List(Remote) rem) {
+Int finish_enroll(Str dir, DeviceConfig c, Unlocked u, VerifiedHead vh, CgConfig ncfg, RsResult res, List(Remote) rem, KvDone kd) {
     Quorum nq = vh.head.quorum;
     Party kit = kit_of(nq.parties, 0) else { none_party() };
     Party cos = cosigner_of(nq.parties, 0) else { none_party() };
@@ -250,6 +331,9 @@ Int finish_enroll(Str dir, DeviceConfig c, Unlocked u, VerifiedHead vh, CgConfig
         && send_to(relay, me, Remote {.party = cos.id, .cg = 0, .hpke_pub = cos.hpke_key}, WKitKey(kb))
         && send_secrets(relay, me, rem, cos.id, u, 0)
         && store_share(dir, u.real.dek, ncfg) && store_dshare(dir, u.real, ncfg)
+        // k_v: this device's new share, and its part for the kit (a_v)
+        && (!kd.on || (kv_store(dir, u.real.dek, KvKept {.epoch = (Int)nq.epoch, .id = kd.me, .share = kd.out.share})
+                       && kv_put_kit_half(relay, kit, c.log_id, nq.epoch, kd.mine, kd.kit)))
         && save_config(dir, with_log(c, c.witnesses, c.log_id, mailbox_end(relay, c.party, c.mbox_next), c.peers));
     if (!ok) { return dfail("cannot finish the enrollment"); }
     println(f"enrolled: epoch {nq.epoch}, {nq.parties.len()} parties");
@@ -342,14 +426,14 @@ Int join_session(Str dir, DeviceConfig c, Unlocked u, Remote x, ReshareInvite in
         .old = [], .root = vh.head.quorum.root_pubkey, .session_id = inv.session_id, .seed = random_bytes(32), .primes = primes_of(primes_file)};
     return match rs_start(rc) {
         Err(e) => dfail("re-share: " + e.why),
-        Ok(s0) => join_after(dir, c1, u, x, inv, vh, pin,
+        Ok(s0) => join_after(dir, c1, u, x, inv, vh, pin, w.cur,
             run_session(relay, inv.session_id, [Seat {.me = me, .st = s0.state, .round = 1, .out = s0.out, .done = false}], rem, [w.cur], w.all,
                         lambda(t, msgs) { rs_adapt(t, msgs) }, 1800))
     };
 }
 
 @requires(filesystem, network, device, declassify, clock, provision, environment)
-Int join_after(Str dir, DeviceConfig c, Unlocked u, Remote x, ReshareInvite inv, VerifiedHead vh, Str pin, Run(RsState) r) {
+Int join_after(Str dir, DeviceConfig c, Unlocked u, Remote x, ReshareInvite inv, VerifiedHead vh, Str pin, Cursor before, Run(RsState) r) {
     if (str_len(r.fail) > 0) { return dfail("re-share: " + r.fail); }
     RsResult res = rs_result(r.seats[0].st) else { RsResult {.cfg = None, .offline = [], .transcript = []} };
     Option(CgConfig) ocfg = res.cfg;
@@ -367,18 +451,37 @@ Int join_after(Str dir, DeviceConfig c, Unlocked u, Remote x, ReshareInvite inv,
         Some(p) => reshare_matches(p, res, inv)
     };
     if (!ok) { return dfail("not the reshare event of this re-share"); }
+    // The vault OPRF key (SPEC 18.10.1): when the event names one, a
+    // dealing from each dealer, read from before the session (its drains
+    // skip them), that add up to the event's field 6.
+    List(List(Int)) want = match op { Some(p) => kv_named(p), None => [] };
+    Result(KvOut, Str) kvr = if (want.len() == 0) { Err("") } else {
+        kv_combine(pos1(inv.new_parties, c.party, 0), kv_collect(relay, me, [x, cos_remote(vh)], before, inv.session_id, 120), None, 0,
+                   if (vh.head.quorum.kv_commits.len() > 0) { kv_from_sec1(vh.head.quorum.kv_commits) } else { [] }, inv.dealers)
+    };
+    Option(KvOut) kvo = match kvr { Ok(o) => if (flat_keys(o.commits, 0, []) == flat_keys(want, 0, [])) { Some(o) } else { None }, Err(_) => None };
+    if (want.len() > 0 && match kvo { None => true, Some(_) => false }) {
+        return dfail("the vault OPRF key's dealings do not match the reshare event" + match kvr { Err(m) => ": " + m, Ok(_) => "" });
+    }
     Result(List(Int), Str) s = dk_sign(c, u.real, u.st, enc);
     List(Int) sig = match s { Ok(v) => v, Err(_) => [] };
     if (sig.len() != 64 || !send_to(relay, me, x, WEventSig(sig))) { return dfail("cannot sign the reshare event"); }
     Waited sec = wait_wire(relay, me, [x], ev.cur, clock_now_seconds(), 600, 3);
     Option(Packet) sw = sec.w;
     return match sw {
-        Some(wv) => match wv { WEnrollSecrets(es) => joined(dir, c, u, pin, ncfg, es, vh, sec.cur), _ => dfail("no secrets") },
+        Some(wv) => match wv { WEnrollSecrets(es) => joined(dir, c, u, pin, ncfg, es, vh, sec.cur, kvo, inv), _ => dfail("no secrets") },
         None => dfail("no secrets from the enrolling device")
     };
 }
 
 List(Int) sign_event_of(Packet w) { return match w { WSignEvent(b) => b, _ => [] }; }
+
+List(List(Int)) kv_named(EventPayload p) {
+    EventBody b = p.body;
+    return match b { ReshareBody(nq) => nq.kv_commits, _ => [] };
+}
+
+List(Int) flat_keys(List(List(Int)) xs, Int i, List(Int) acc) { return if (i >= xs.len()) { acc } else { flat_keys(xs, i + 1, acc.concat(xs[i])) }; }
 
 Bool reshare_matches(EventPayload p, RsResult res, ReshareInvite inv) {
     EventBody b = p.body;
@@ -388,7 +491,7 @@ Bool reshare_matches(EventPayload p, RsResult res, ReshareInvite inv) {
 // The new device's profile, resealed with the quorum's chain code and vault
 // key, and its share and configuration stored.
 @requires(filesystem, network, device, declassify, clock, provision, environment)
-Int joined(Str dir, DeviceConfig c, Unlocked u, Str pin, CgConfig ncfg, EnrollSecrets es, VerifiedHead vh, Cursor cur) {
+Int joined(Str dir, DeviceConfig c, Unlocked u, Str pin, CgConfig ncfg, EnrollSecrets es, VerifiedHead vh, Cursor cur, Option(KvOut) kvo, ReshareInvite inv) {
     if (es.cc.len() != 32 || es.vault_key.len() != 32) { return dfail("malformed secrets"); }
     RealProfile real = RealProfile {.share = u.real.share, .cc = secret_bytes(es.cc), .vault_key = secret_bytes(es.vault_key), .dek = u.real.dek, .duress_hpke_pub = u.real.duress_hpke_pub};
     List(Secret(UInt(8))) k = unlock_key_for(c, u.st, true);
@@ -398,6 +501,7 @@ Int joined(Str dir, DeviceConfig c, Unlocked u, Str pin, CgConfig ncfg, EnrollSe
     List(Int) blob = seal_blob(k, random_bytes(12), rp);
     Bool ok = write_blob(dir, if (a_real) { "a" } else { "b" }, blob, u.wrap)
         && store_share(dir, u.real.dek, ncfg) && store_dshare(dir, real, ncfg)
+        && match kvo { None => true, Some(o) => kv_store(dir, u.real.dek, KvKept {.epoch = inv.epoch, .id = pos1(inv.new_parties, c.party, 0), .share = o.share}) }
         && send_duress_key(dir, relay_ep(c), Local {.party = c.party, .cg = 0, .hpke_sk = device_hpke(u.real.dek).sk}, cos_remote(vh))
         && save_config(dir, with_log(c, eps_of(vh.head.policy.witnesses, 0, []), c.log_id, cur.next, c.peers));
     if (!ok) { return dfail("cannot store the enrollment"); }

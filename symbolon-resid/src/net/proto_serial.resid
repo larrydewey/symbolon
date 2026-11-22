@@ -337,9 +337,300 @@ Result(Parsed(EnrollSecrets, F), SerialError) derive_enroll_secrets_done(F s, Op
 }
 Decode(EnrollSecrets, F) = derive_enroll_secrets_decode;
 
-// ── Packet (line 59)
+// ── KvDealMsg (line 63)
+/// The serialized field names of `KvDealMsg`, in declaration order.
+pub List(Str) derive_kv_deal_msg_names() { return ["session_id", "dealer", "commits", "part"]; }
+/// Encodes a `KvDealMsg` through the encoder `s`.
+@needs(Encoder(F))
+pub Result(F, SerialError) derive_kv_deal_msg_encode(KvDealMsg v, F s) {
+    Int n = 4;
+    F s0 = write_struct_begin(s, "KvDealMsg", n)?;
+    F s1 = write_named(s0, "session_id", v.session_id)?;
+    F s2 = write_named(s1, "dealer", v.dealer)?;
+    F s3 = write_named(s2, "commits", v.commits)?;
+    F s4 = write_named(s3, "part", v.part)?;
+    return write_struct_end(s4);
+}
+Encode(KvDealMsg, F) = derive_kv_deal_msg_encode;
+/// Decodes a `KvDealMsg` from the decoder `s`, with the input left over.
+@needs(Decoder(F))
+pub Result(Parsed(KvDealMsg, F), SerialError) derive_kv_deal_msg_decode(F s) {
+    F s0 = read_struct_begin(s, "KvDealMsg", derive_kv_deal_msg_names())?;
+    return derive_kv_deal_msg_fields(s0, None, None, None, None);
+}
+@needs(Decoder(F))
+Result(Parsed(KvDealMsg, F), SerialError) derive_kv_deal_msg_fields(F s, Option(List(Int)) f_session_id, Option(Int) f_dealer, Option(List(List(Int))) f_commits, Option(List(Int)) f_part) {
+    Parsed(FieldKey, F) k = read_field(s, derive_kv_deal_msg_names())?;
+    FieldKey key = k.value;
+    return match key {
+        KnownField(i) => derive_kv_deal_msg_field(k.rest, i, f_session_id, f_dealer, f_commits, f_part),
+        UnknownField(name) => derive_kv_deal_msg_fields(skip_unknown(k.rest, name, derive_kv_deal_msg_names(), false)?, f_session_id, f_dealer, f_commits, f_part),
+        EndOfFields => derive_kv_deal_msg_done(k.rest, f_session_id, f_dealer, f_commits, f_part)
+    };
+}
+@needs(Decoder(F))
+Result(Parsed(KvDealMsg, F), SerialError) derive_kv_deal_msg_field(F s, Int i, Option(List(Int)) f_session_id, Option(Int) f_dealer, Option(List(List(Int))) f_commits, Option(List(Int)) f_part) {
+    if (i == 0) { Parsed(Option(List(Int)), F) p = read_slot(s, f_session_id, "session_id")?; return derive_kv_deal_msg_fields(p.rest, p.value, f_dealer, f_commits, f_part); }
+    if (i == 1) { Parsed(Option(Int), F) p = read_slot(s, f_dealer, "dealer")?; return derive_kv_deal_msg_fields(p.rest, f_session_id, p.value, f_commits, f_part); }
+    if (i == 2) { Parsed(Option(List(List(Int))), F) p = read_slot(s, f_commits, "commits")?; return derive_kv_deal_msg_fields(p.rest, f_session_id, f_dealer, p.value, f_part); }
+    Parsed(Option(List(Int)), F) p = read_slot(s, f_part, "part")?; return derive_kv_deal_msg_fields(p.rest, f_session_id, f_dealer, f_commits, p.value);
+}
+Result(Parsed(KvDealMsg, F), SerialError) derive_kv_deal_msg_done(F s, Option(List(Int)) f_session_id, Option(Int) f_dealer, Option(List(List(Int))) f_commits, Option(List(Int)) f_part) {
+    List(Int) d_session_id = require(f_session_id, "session_id")?;
+    Int d_dealer = require(f_dealer, "dealer")?;
+    List(List(Int)) d_commits = require(f_commits, "commits")?;
+    List(Int) d_part = require(f_part, "part")?;
+    return parsed(KvDealMsg {.session_id = d_session_id, .dealer = d_dealer, .commits = d_commits, .part = d_part}, s);
+}
+Decode(KvDealMsg, F) = derive_kv_deal_msg_decode;
+
+// ── EvalRequest (line 71)
+/// The serialized field names of `EvalRequest`, in declaration order.
+pub List(Str) derive_eval_request_names() { return ["session_id", "log_id", "epoch", "purpose", "blinded", "event_seq", "requester", "sig"]; }
+/// Encodes a `EvalRequest` through the encoder `s`.
+@needs(Encoder(F))
+pub Result(F, SerialError) derive_eval_request_encode(EvalRequest v, F s) {
+    Int n = 8;
+    F s0 = write_struct_begin(s, "EvalRequest", n)?;
+    F s1 = write_named(s0, "session_id", v.session_id)?;
+    F s2 = write_named(s1, "log_id", v.log_id)?;
+    F s3 = write_named(s2, "epoch", v.epoch)?;
+    F s4 = write_named(s3, "purpose", v.purpose)?;
+    F s5 = write_named(s4, "blinded", v.blinded)?;
+    F s6 = write_named(s5, "event_seq", v.event_seq)?;
+    F s7 = write_named(s6, "requester", v.requester)?;
+    F s8 = write_named(s7, "sig", v.sig)?;
+    return write_struct_end(s8);
+}
+Encode(EvalRequest, F) = derive_eval_request_encode;
+/// Decodes a `EvalRequest` from the decoder `s`, with the input left over.
+@needs(Decoder(F))
+pub Result(Parsed(EvalRequest, F), SerialError) derive_eval_request_decode(F s) {
+    F s0 = read_struct_begin(s, "EvalRequest", derive_eval_request_names())?;
+    return derive_eval_request_fields(s0, None, None, None, None, None, None, None, None);
+}
+@needs(Decoder(F))
+Result(Parsed(EvalRequest, F), SerialError) derive_eval_request_fields(F s, Option(List(Int)) f_session_id, Option(List(Int)) f_log_id, Option(Int) f_epoch, Option(Int) f_purpose, Option(List(List(Int))) f_blinded, Option(Int) f_event_seq, Option(List(Int)) f_requester, Option(List(Int)) f_sig) {
+    Parsed(FieldKey, F) k = read_field(s, derive_eval_request_names())?;
+    FieldKey key = k.value;
+    return match key {
+        KnownField(i) => derive_eval_request_field(k.rest, i, f_session_id, f_log_id, f_epoch, f_purpose, f_blinded, f_event_seq, f_requester, f_sig),
+        UnknownField(name) => derive_eval_request_fields(skip_unknown(k.rest, name, derive_eval_request_names(), false)?, f_session_id, f_log_id, f_epoch, f_purpose, f_blinded, f_event_seq, f_requester, f_sig),
+        EndOfFields => derive_eval_request_done(k.rest, f_session_id, f_log_id, f_epoch, f_purpose, f_blinded, f_event_seq, f_requester, f_sig)
+    };
+}
+@needs(Decoder(F))
+Result(Parsed(EvalRequest, F), SerialError) derive_eval_request_field(F s, Int i, Option(List(Int)) f_session_id, Option(List(Int)) f_log_id, Option(Int) f_epoch, Option(Int) f_purpose, Option(List(List(Int))) f_blinded, Option(Int) f_event_seq, Option(List(Int)) f_requester, Option(List(Int)) f_sig) {
+    if (i == 0) { Parsed(Option(List(Int)), F) p = read_slot(s, f_session_id, "session_id")?; return derive_eval_request_fields(p.rest, p.value, f_log_id, f_epoch, f_purpose, f_blinded, f_event_seq, f_requester, f_sig); }
+    if (i == 1) { Parsed(Option(List(Int)), F) p = read_slot(s, f_log_id, "log_id")?; return derive_eval_request_fields(p.rest, f_session_id, p.value, f_epoch, f_purpose, f_blinded, f_event_seq, f_requester, f_sig); }
+    if (i == 2) { Parsed(Option(Int), F) p = read_slot(s, f_epoch, "epoch")?; return derive_eval_request_fields(p.rest, f_session_id, f_log_id, p.value, f_purpose, f_blinded, f_event_seq, f_requester, f_sig); }
+    if (i == 3) { Parsed(Option(Int), F) p = read_slot(s, f_purpose, "purpose")?; return derive_eval_request_fields(p.rest, f_session_id, f_log_id, f_epoch, p.value, f_blinded, f_event_seq, f_requester, f_sig); }
+    if (i == 4) { Parsed(Option(List(List(Int))), F) p = read_slot(s, f_blinded, "blinded")?; return derive_eval_request_fields(p.rest, f_session_id, f_log_id, f_epoch, f_purpose, p.value, f_event_seq, f_requester, f_sig); }
+    if (i == 5) { Parsed(Option(Int), F) p = read_slot(s, f_event_seq, "event_seq")?; return derive_eval_request_fields(p.rest, f_session_id, f_log_id, f_epoch, f_purpose, f_blinded, p.value, f_requester, f_sig); }
+    if (i == 6) { Parsed(Option(List(Int)), F) p = read_slot(s, f_requester, "requester")?; return derive_eval_request_fields(p.rest, f_session_id, f_log_id, f_epoch, f_purpose, f_blinded, f_event_seq, p.value, f_sig); }
+    Parsed(Option(List(Int)), F) p = read_slot(s, f_sig, "sig")?; return derive_eval_request_fields(p.rest, f_session_id, f_log_id, f_epoch, f_purpose, f_blinded, f_event_seq, f_requester, p.value);
+}
+Result(Parsed(EvalRequest, F), SerialError) derive_eval_request_done(F s, Option(List(Int)) f_session_id, Option(List(Int)) f_log_id, Option(Int) f_epoch, Option(Int) f_purpose, Option(List(List(Int))) f_blinded, Option(Int) f_event_seq, Option(List(Int)) f_requester, Option(List(Int)) f_sig) {
+    List(Int) d_session_id = require(f_session_id, "session_id")?;
+    List(Int) d_log_id = require(f_log_id, "log_id")?;
+    Int d_epoch = require(f_epoch, "epoch")?;
+    Int d_purpose = require(f_purpose, "purpose")?;
+    List(List(Int)) d_blinded = require(f_blinded, "blinded")?;
+    Int d_event_seq = require(f_event_seq, "event_seq")?;
+    List(Int) d_requester = require(f_requester, "requester")?;
+    List(Int) d_sig = require(f_sig, "sig")?;
+    return parsed(EvalRequest {.session_id = d_session_id, .log_id = d_log_id, .epoch = d_epoch, .purpose = d_purpose, .blinded = d_blinded, .event_seq = d_event_seq, .requester = d_requester, .sig = d_sig}, s);
+}
+Decode(EvalRequest, F) = derive_eval_request_decode;
+
+// ── EvalAnswer (line 76)
+/// The serialized field names of `EvalAnswer`, in declaration order.
+pub List(Str) derive_eval_answer_names() { return ["session_id", "elements", "proof"]; }
+/// Encodes a `EvalAnswer` through the encoder `s`.
+@needs(Encoder(F))
+pub Result(F, SerialError) derive_eval_answer_encode(EvalAnswer v, F s) {
+    Int n = 3;
+    F s0 = write_struct_begin(s, "EvalAnswer", n)?;
+    F s1 = write_named(s0, "session_id", v.session_id)?;
+    F s2 = write_named(s1, "elements", v.elements)?;
+    F s3 = write_named(s2, "proof", v.proof)?;
+    return write_struct_end(s3);
+}
+Encode(EvalAnswer, F) = derive_eval_answer_encode;
+/// Decodes a `EvalAnswer` from the decoder `s`, with the input left over.
+@needs(Decoder(F))
+pub Result(Parsed(EvalAnswer, F), SerialError) derive_eval_answer_decode(F s) {
+    F s0 = read_struct_begin(s, "EvalAnswer", derive_eval_answer_names())?;
+    return derive_eval_answer_fields(s0, None, None, None);
+}
+@needs(Decoder(F))
+Result(Parsed(EvalAnswer, F), SerialError) derive_eval_answer_fields(F s, Option(List(Int)) f_session_id, Option(List(List(Int))) f_elements, Option(List(Int)) f_proof) {
+    Parsed(FieldKey, F) k = read_field(s, derive_eval_answer_names())?;
+    FieldKey key = k.value;
+    return match key {
+        KnownField(i) => derive_eval_answer_field(k.rest, i, f_session_id, f_elements, f_proof),
+        UnknownField(name) => derive_eval_answer_fields(skip_unknown(k.rest, name, derive_eval_answer_names(), false)?, f_session_id, f_elements, f_proof),
+        EndOfFields => derive_eval_answer_done(k.rest, f_session_id, f_elements, f_proof)
+    };
+}
+@needs(Decoder(F))
+Result(Parsed(EvalAnswer, F), SerialError) derive_eval_answer_field(F s, Int i, Option(List(Int)) f_session_id, Option(List(List(Int))) f_elements, Option(List(Int)) f_proof) {
+    if (i == 0) { Parsed(Option(List(Int)), F) p = read_slot(s, f_session_id, "session_id")?; return derive_eval_answer_fields(p.rest, p.value, f_elements, f_proof); }
+    if (i == 1) { Parsed(Option(List(List(Int))), F) p = read_slot(s, f_elements, "elements")?; return derive_eval_answer_fields(p.rest, f_session_id, p.value, f_proof); }
+    Parsed(Option(List(Int)), F) p = read_slot(s, f_proof, "proof")?; return derive_eval_answer_fields(p.rest, f_session_id, f_elements, p.value);
+}
+Result(Parsed(EvalAnswer, F), SerialError) derive_eval_answer_done(F s, Option(List(Int)) f_session_id, Option(List(List(Int))) f_elements, Option(List(Int)) f_proof) {
+    List(Int) d_session_id = require(f_session_id, "session_id")?;
+    List(List(Int)) d_elements = require(f_elements, "elements")?;
+    List(Int) d_proof = require(f_proof, "proof")?;
+    return parsed(EvalAnswer {.session_id = d_session_id, .elements = d_elements, .proof = d_proof}, s);
+}
+Decode(EvalAnswer, F) = derive_eval_answer_decode;
+
+// ── EvalLogRequest (line 83)
+/// The serialized field names of `EvalLogRequest`, in declaration order.
+pub List(Str) derive_eval_log_request_names() { return ["session_id", "log_id", "epoch", "requester", "sig"]; }
+/// Encodes a `EvalLogRequest` through the encoder `s`.
+@needs(Encoder(F))
+pub Result(F, SerialError) derive_eval_log_request_encode(EvalLogRequest v, F s) {
+    Int n = 5;
+    F s0 = write_struct_begin(s, "EvalLogRequest", n)?;
+    F s1 = write_named(s0, "session_id", v.session_id)?;
+    F s2 = write_named(s1, "log_id", v.log_id)?;
+    F s3 = write_named(s2, "epoch", v.epoch)?;
+    F s4 = write_named(s3, "requester", v.requester)?;
+    F s5 = write_named(s4, "sig", v.sig)?;
+    return write_struct_end(s5);
+}
+Encode(EvalLogRequest, F) = derive_eval_log_request_encode;
+/// Decodes a `EvalLogRequest` from the decoder `s`, with the input left over.
+@needs(Decoder(F))
+pub Result(Parsed(EvalLogRequest, F), SerialError) derive_eval_log_request_decode(F s) {
+    F s0 = read_struct_begin(s, "EvalLogRequest", derive_eval_log_request_names())?;
+    return derive_eval_log_request_fields(s0, None, None, None, None, None);
+}
+@needs(Decoder(F))
+Result(Parsed(EvalLogRequest, F), SerialError) derive_eval_log_request_fields(F s, Option(List(Int)) f_session_id, Option(List(Int)) f_log_id, Option(Int) f_epoch, Option(List(Int)) f_requester, Option(List(Int)) f_sig) {
+    Parsed(FieldKey, F) k = read_field(s, derive_eval_log_request_names())?;
+    FieldKey key = k.value;
+    return match key {
+        KnownField(i) => derive_eval_log_request_field(k.rest, i, f_session_id, f_log_id, f_epoch, f_requester, f_sig),
+        UnknownField(name) => derive_eval_log_request_fields(skip_unknown(k.rest, name, derive_eval_log_request_names(), false)?, f_session_id, f_log_id, f_epoch, f_requester, f_sig),
+        EndOfFields => derive_eval_log_request_done(k.rest, f_session_id, f_log_id, f_epoch, f_requester, f_sig)
+    };
+}
+@needs(Decoder(F))
+Result(Parsed(EvalLogRequest, F), SerialError) derive_eval_log_request_field(F s, Int i, Option(List(Int)) f_session_id, Option(List(Int)) f_log_id, Option(Int) f_epoch, Option(List(Int)) f_requester, Option(List(Int)) f_sig) {
+    if (i == 0) { Parsed(Option(List(Int)), F) p = read_slot(s, f_session_id, "session_id")?; return derive_eval_log_request_fields(p.rest, p.value, f_log_id, f_epoch, f_requester, f_sig); }
+    if (i == 1) { Parsed(Option(List(Int)), F) p = read_slot(s, f_log_id, "log_id")?; return derive_eval_log_request_fields(p.rest, f_session_id, p.value, f_epoch, f_requester, f_sig); }
+    if (i == 2) { Parsed(Option(Int), F) p = read_slot(s, f_epoch, "epoch")?; return derive_eval_log_request_fields(p.rest, f_session_id, f_log_id, p.value, f_requester, f_sig); }
+    if (i == 3) { Parsed(Option(List(Int)), F) p = read_slot(s, f_requester, "requester")?; return derive_eval_log_request_fields(p.rest, f_session_id, f_log_id, f_epoch, p.value, f_sig); }
+    Parsed(Option(List(Int)), F) p = read_slot(s, f_sig, "sig")?; return derive_eval_log_request_fields(p.rest, f_session_id, f_log_id, f_epoch, f_requester, p.value);
+}
+Result(Parsed(EvalLogRequest, F), SerialError) derive_eval_log_request_done(F s, Option(List(Int)) f_session_id, Option(List(Int)) f_log_id, Option(Int) f_epoch, Option(List(Int)) f_requester, Option(List(Int)) f_sig) {
+    List(Int) d_session_id = require(f_session_id, "session_id")?;
+    List(Int) d_log_id = require(f_log_id, "log_id")?;
+    Int d_epoch = require(f_epoch, "epoch")?;
+    List(Int) d_requester = require(f_requester, "requester")?;
+    List(Int) d_sig = require(f_sig, "sig")?;
+    return parsed(EvalLogRequest {.session_id = d_session_id, .log_id = d_log_id, .epoch = d_epoch, .requester = d_requester, .sig = d_sig}, s);
+}
+Decode(EvalLogRequest, F) = derive_eval_log_request_decode;
+
+// ── EvalLogEntry (line 86)
+/// The serialized field names of `EvalLogEntry`, in declaration order.
+pub List(Str) derive_eval_log_entry_names() { return ["time", "device", "count"]; }
+/// Encodes a `EvalLogEntry` through the encoder `s`.
+@needs(Encoder(F))
+pub Result(F, SerialError) derive_eval_log_entry_encode(EvalLogEntry v, F s) {
+    Int n = 3;
+    F s0 = write_struct_begin(s, "EvalLogEntry", n)?;
+    F s1 = write_named(s0, "time", v.time)?;
+    F s2 = write_named(s1, "device", v.device)?;
+    F s3 = write_named(s2, "count", v.count)?;
+    return write_struct_end(s3);
+}
+Encode(EvalLogEntry, F) = derive_eval_log_entry_encode;
+/// Decodes a `EvalLogEntry` from the decoder `s`, with the input left over.
+@needs(Decoder(F))
+pub Result(Parsed(EvalLogEntry, F), SerialError) derive_eval_log_entry_decode(F s) {
+    F s0 = read_struct_begin(s, "EvalLogEntry", derive_eval_log_entry_names())?;
+    return derive_eval_log_entry_fields(s0, None, None, None);
+}
+@needs(Decoder(F))
+Result(Parsed(EvalLogEntry, F), SerialError) derive_eval_log_entry_fields(F s, Option(Int) f_time, Option(List(Int)) f_device, Option(Int) f_count) {
+    Parsed(FieldKey, F) k = read_field(s, derive_eval_log_entry_names())?;
+    FieldKey key = k.value;
+    return match key {
+        KnownField(i) => derive_eval_log_entry_field(k.rest, i, f_time, f_device, f_count),
+        UnknownField(name) => derive_eval_log_entry_fields(skip_unknown(k.rest, name, derive_eval_log_entry_names(), false)?, f_time, f_device, f_count),
+        EndOfFields => derive_eval_log_entry_done(k.rest, f_time, f_device, f_count)
+    };
+}
+@needs(Decoder(F))
+Result(Parsed(EvalLogEntry, F), SerialError) derive_eval_log_entry_field(F s, Int i, Option(Int) f_time, Option(List(Int)) f_device, Option(Int) f_count) {
+    if (i == 0) { Parsed(Option(Int), F) p = read_slot(s, f_time, "time")?; return derive_eval_log_entry_fields(p.rest, p.value, f_device, f_count); }
+    if (i == 1) { Parsed(Option(List(Int)), F) p = read_slot(s, f_device, "device")?; return derive_eval_log_entry_fields(p.rest, f_time, p.value, f_count); }
+    Parsed(Option(Int), F) p = read_slot(s, f_count, "count")?; return derive_eval_log_entry_fields(p.rest, f_time, f_device, p.value);
+}
+Result(Parsed(EvalLogEntry, F), SerialError) derive_eval_log_entry_done(F s, Option(Int) f_time, Option(List(Int)) f_device, Option(Int) f_count) {
+    Int d_time = require(f_time, "time")?;
+    List(Int) d_device = require(f_device, "device")?;
+    Int d_count = require(f_count, "count")?;
+    return parsed(EvalLogEntry {.time = d_time, .device = d_device, .count = d_count}, s);
+}
+Decode(EvalLogEntry, F) = derive_eval_log_entry_decode;
+
+// ── EvalLogAnswer (line 89)
+/// The serialized field names of `EvalLogAnswer`, in declaration order.
+pub List(Str) derive_eval_log_answer_names() { return ["session_id", "now", "limit", "entries"]; }
+/// Encodes a `EvalLogAnswer` through the encoder `s`.
+@needs(Encoder(F))
+pub Result(F, SerialError) derive_eval_log_answer_encode(EvalLogAnswer v, F s) {
+    Int n = 4;
+    F s0 = write_struct_begin(s, "EvalLogAnswer", n)?;
+    F s1 = write_named(s0, "session_id", v.session_id)?;
+    F s2 = write_named(s1, "now", v.now)?;
+    F s3 = write_named(s2, "limit", v.limit)?;
+    F s4 = write_named(s3, "entries", v.entries)?;
+    return write_struct_end(s4);
+}
+Encode(EvalLogAnswer, F) = derive_eval_log_answer_encode;
+/// Decodes a `EvalLogAnswer` from the decoder `s`, with the input left over.
+@needs(Decoder(F))
+pub Result(Parsed(EvalLogAnswer, F), SerialError) derive_eval_log_answer_decode(F s) {
+    F s0 = read_struct_begin(s, "EvalLogAnswer", derive_eval_log_answer_names())?;
+    return derive_eval_log_answer_fields(s0, None, None, None, None);
+}
+@needs(Decoder(F))
+Result(Parsed(EvalLogAnswer, F), SerialError) derive_eval_log_answer_fields(F s, Option(List(Int)) f_session_id, Option(Int) f_now, Option(Int) f_limit, Option(List(EvalLogEntry)) f_entries) {
+    Parsed(FieldKey, F) k = read_field(s, derive_eval_log_answer_names())?;
+    FieldKey key = k.value;
+    return match key {
+        KnownField(i) => derive_eval_log_answer_field(k.rest, i, f_session_id, f_now, f_limit, f_entries),
+        UnknownField(name) => derive_eval_log_answer_fields(skip_unknown(k.rest, name, derive_eval_log_answer_names(), false)?, f_session_id, f_now, f_limit, f_entries),
+        EndOfFields => derive_eval_log_answer_done(k.rest, f_session_id, f_now, f_limit, f_entries)
+    };
+}
+@needs(Decoder(F))
+Result(Parsed(EvalLogAnswer, F), SerialError) derive_eval_log_answer_field(F s, Int i, Option(List(Int)) f_session_id, Option(Int) f_now, Option(Int) f_limit, Option(List(EvalLogEntry)) f_entries) {
+    if (i == 0) { Parsed(Option(List(Int)), F) p = read_slot(s, f_session_id, "session_id")?; return derive_eval_log_answer_fields(p.rest, p.value, f_now, f_limit, f_entries); }
+    if (i == 1) { Parsed(Option(Int), F) p = read_slot(s, f_now, "now")?; return derive_eval_log_answer_fields(p.rest, f_session_id, p.value, f_limit, f_entries); }
+    if (i == 2) { Parsed(Option(Int), F) p = read_slot(s, f_limit, "limit")?; return derive_eval_log_answer_fields(p.rest, f_session_id, f_now, p.value, f_entries); }
+    Parsed(Option(List(EvalLogEntry)), F) p = read_slot(s, f_entries, "entries")?; return derive_eval_log_answer_fields(p.rest, f_session_id, f_now, f_limit, p.value);
+}
+Result(Parsed(EvalLogAnswer, F), SerialError) derive_eval_log_answer_done(F s, Option(List(Int)) f_session_id, Option(Int) f_now, Option(Int) f_limit, Option(List(EvalLogEntry)) f_entries) {
+    List(Int) d_session_id = require(f_session_id, "session_id")?;
+    Int d_now = require(f_now, "now")?;
+    Int d_limit = require(f_limit, "limit")?;
+    List(EvalLogEntry) d_entries = require(f_entries, "entries")?;
+    return parsed(EvalLogAnswer {.session_id = d_session_id, .now = d_now, .limit = d_limit, .entries = d_entries}, s);
+}
+Decode(EvalLogAnswer, F) = derive_eval_log_answer_decode;
+
+// ── Packet (line 92)
 /// The serialized variant names of `Packet`, in declaration order.
-pub List(Str) derive_packet_variants() { return ["WKeygen", "WSign", "WSession", "WRefused", "WKitHalf", "WSignEvent", "WEventSig", "WReshare", "WEnrollSecrets", "WKitKey", "WKitRelease", "WDuressKey"]; }
+pub List(Str) derive_packet_variants() { return ["WKeygen", "WSign", "WSession", "WRefused", "WKitHalf", "WSignEvent", "WEventSig", "WReshare", "WEnrollSecrets", "WKitKey", "WKitRelease", "WDuressKey", "WKvDeal", "WKvHalf", "WEval", "WEvalAnswer", "WEvalLog", "WEvalLogAnswer"]; }
 /// Encodes a `Packet` through the encoder `s`.
 @needs(Encoder(F))
 pub Result(F, SerialError) derive_packet_encode(Packet v, F s) {
@@ -355,7 +646,13 @@ pub Result(F, SerialError) derive_packet_encode(Packet v, F s) {
         WEnrollSecrets(x) => write_newtype_variant(s, "Packet", 8, "WEnrollSecrets", x),
         WKitKey(x) => write_newtype_variant(s, "Packet", 9, "WKitKey", x),
         WKitRelease(x) => write_newtype_variant(s, "Packet", 10, "WKitRelease", x),
-        WDuressKey(x) => write_newtype_variant(s, "Packet", 11, "WDuressKey", x)
+        WDuressKey(x) => write_newtype_variant(s, "Packet", 11, "WDuressKey", x),
+        WKvDeal(x) => write_newtype_variant(s, "Packet", 12, "WKvDeal", x),
+        WKvHalf(x) => write_newtype_variant(s, "Packet", 13, "WKvHalf", x),
+        WEval(x) => write_newtype_variant(s, "Packet", 14, "WEval", x),
+        WEvalAnswer(x) => write_newtype_variant(s, "Packet", 15, "WEvalAnswer", x),
+        WEvalLog(x) => write_newtype_variant(s, "Packet", 16, "WEvalLog", x),
+        WEvalLogAnswer(x) => write_newtype_variant(s, "Packet", 17, "WEvalLogAnswer", x)
     };
 }
 Encode(Packet, F) = derive_packet_encode;
@@ -376,11 +673,17 @@ pub Result(Parsed(Packet, F), SerialError) derive_packet_decode(F s) {
     if (i == 9) { Parsed(List(Int), F) p9 = read_newtype_payload(t.rest, "WKitKey")?; Packet u9 = WKitKey(p9.value); return parsed(u9, p9.rest); }
     if (i == 10) { Parsed(List(Int), F) p10 = read_newtype_payload(t.rest, "WKitRelease")?; Packet u10 = WKitRelease(p10.value); return parsed(u10, p10.rest); }
     if (i == 11) { Parsed(List(Int), F) p11 = read_newtype_payload(t.rest, "WDuressKey")?; Packet u11 = WDuressKey(p11.value); return parsed(u11, p11.rest); }
+    if (i == 12) { Parsed(KvDealMsg, F) p12 = read_newtype_payload(t.rest, "WKvDeal")?; Packet u12 = WKvDeal(p12.value); return parsed(u12, p12.rest); }
+    if (i == 13) { Parsed(WrappedBlob, F) p13 = read_newtype_payload(t.rest, "WKvHalf")?; Packet u13 = WKvHalf(p13.value); return parsed(u13, p13.rest); }
+    if (i == 14) { Parsed(EvalRequest, F) p14 = read_newtype_payload(t.rest, "WEval")?; Packet u14 = WEval(p14.value); return parsed(u14, p14.rest); }
+    if (i == 15) { Parsed(EvalAnswer, F) p15 = read_newtype_payload(t.rest, "WEvalAnswer")?; Packet u15 = WEvalAnswer(p15.value); return parsed(u15, p15.rest); }
+    if (i == 16) { Parsed(EvalLogRequest, F) p16 = read_newtype_payload(t.rest, "WEvalLog")?; Packet u16 = WEvalLog(p16.value); return parsed(u16, p16.rest); }
+    if (i == 17) { Parsed(EvalLogAnswer, F) p17 = read_newtype_payload(t.rest, "WEvalLogAnswer")?; Packet u17 = WEvalLogAnswer(p17.value); return parsed(u17, p17.rest); }
     return Err(custom_error(f"variant index {i} out of range"));
 }
 Decode(Packet, F) = derive_packet_decode;
 
-// ── Envelope (line 76)
+// ── Envelope (line 115)
 /// The serialized field names of `Envelope`, in declaration order.
 pub List(Str) derive_envelope_names() { return ["from", "to", "enc", "ct"]; }
 /// Encodes a `Envelope` through the encoder `s`.

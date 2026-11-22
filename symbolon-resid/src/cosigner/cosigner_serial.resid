@@ -2,51 +2,59 @@
 import "cosigner.resid";
 import "serial.resid";
 
-// ── SessionRecord (line 38)
+// ── SessionRecord (line 44)
 /// The serialized field names of `SessionRecord`, in declaration order.
-pub List(Str) derive_session_record_names() { return ["time", "requester", "message_hash"]; }
+pub List(Str) derive_session_record_names() { return ["time", "requester", "message_hash", "kind", "count"]; }
 /// Encodes a `SessionRecord` through the encoder `s`.
 @needs(Encoder(F))
 pub Result(F, SerialError) derive_session_record_encode(SessionRecord v, F s) {
-    Int n = 3;
+    Int n = 5;
     F s0 = write_struct_begin(s, "SessionRecord", n)?;
     F s1 = write_named(s0, "time", v.time)?;
     F s2 = write_named(s1, "requester", v.requester)?;
     F s3 = write_named(s2, "message_hash", v.message_hash)?;
-    return write_struct_end(s3);
+    F s4 = write_named(s3, "kind", v.kind)?;
+    F s5 = write_named(s4, "count", v.count)?;
+    return write_struct_end(s5);
 }
 Encode(SessionRecord, F) = derive_session_record_encode;
 /// Decodes a `SessionRecord` from the decoder `s`, with the input left over.
 @needs(Decoder(F))
 pub Result(Parsed(SessionRecord, F), SerialError) derive_session_record_decode(F s) {
     F s0 = read_struct_begin(s, "SessionRecord", derive_session_record_names())?;
-    return derive_session_record_fields(s0, None, None, None);
+    return derive_session_record_fields(s0, None, None, None, None, None);
 }
 @needs(Decoder(F))
-Result(Parsed(SessionRecord, F), SerialError) derive_session_record_fields(F s, Option(Int) f_time, Option(List(Int)) f_requester, Option(List(Int)) f_message_hash) {
+Result(Parsed(SessionRecord, F), SerialError) derive_session_record_fields(F s, Option(Int) f_time, Option(List(Int)) f_requester, Option(List(Int)) f_message_hash, Option(Int) f_kind, Option(Int) f_count) {
     Parsed(FieldKey, F) k = read_field(s, derive_session_record_names())?;
     FieldKey key = k.value;
     return match key {
-        KnownField(i) => derive_session_record_field(k.rest, i, f_time, f_requester, f_message_hash),
-        UnknownField(name) => derive_session_record_fields(skip_unknown(k.rest, name, derive_session_record_names(), false)?, f_time, f_requester, f_message_hash),
-        EndOfFields => derive_session_record_done(k.rest, f_time, f_requester, f_message_hash)
+        KnownField(i) => derive_session_record_field(k.rest, i, f_time, f_requester, f_message_hash, f_kind, f_count),
+        UnknownField(name) => derive_session_record_fields(skip_unknown(k.rest, name, derive_session_record_names(), false)?, f_time, f_requester, f_message_hash, f_kind, f_count),
+        EndOfFields => derive_session_record_done(k.rest, f_time, f_requester, f_message_hash, f_kind, f_count)
     };
 }
 @needs(Decoder(F))
-Result(Parsed(SessionRecord, F), SerialError) derive_session_record_field(F s, Int i, Option(Int) f_time, Option(List(Int)) f_requester, Option(List(Int)) f_message_hash) {
-    if (i == 0) { Parsed(Option(Int), F) p = read_slot(s, f_time, "time")?; return derive_session_record_fields(p.rest, p.value, f_requester, f_message_hash); }
-    if (i == 1) { Parsed(Option(List(Int)), F) p = read_slot(s, f_requester, "requester")?; return derive_session_record_fields(p.rest, f_time, p.value, f_message_hash); }
-    Parsed(Option(List(Int)), F) p = read_slot(s, f_message_hash, "message_hash")?; return derive_session_record_fields(p.rest, f_time, f_requester, p.value);
+Result(Parsed(SessionRecord, F), SerialError) derive_session_record_field(F s, Int i, Option(Int) f_time, Option(List(Int)) f_requester, Option(List(Int)) f_message_hash, Option(Int) f_kind, Option(Int) f_count) {
+    if (i == 0) { Parsed(Option(Int), F) p = read_slot(s, f_time, "time")?; return derive_session_record_fields(p.rest, p.value, f_requester, f_message_hash, f_kind, f_count); }
+    if (i == 1) { Parsed(Option(List(Int)), F) p = read_slot(s, f_requester, "requester")?; return derive_session_record_fields(p.rest, f_time, p.value, f_message_hash, f_kind, f_count); }
+    if (i == 2) { Parsed(Option(List(Int)), F) p = read_slot(s, f_message_hash, "message_hash")?; return derive_session_record_fields(p.rest, f_time, f_requester, p.value, f_kind, f_count); }
+    if (i == 3) { Parsed(Option(Int), F) p = read_slot(s, f_kind, "kind")?; return derive_session_record_fields(p.rest, f_time, f_requester, f_message_hash, p.value, f_count); }
+    Parsed(Option(Int), F) p = read_slot(s, f_count, "count")?; return derive_session_record_fields(p.rest, f_time, f_requester, f_message_hash, f_kind, p.value);
 }
-Result(Parsed(SessionRecord, F), SerialError) derive_session_record_done(F s, Option(Int) f_time, Option(List(Int)) f_requester, Option(List(Int)) f_message_hash) {
+Result(Parsed(SessionRecord, F), SerialError) derive_session_record_done(F s, Option(Int) f_time, Option(List(Int)) f_requester, Option(List(Int)) f_message_hash, Option(Int) f_kind, Option(Int) f_count) {
     Int d_time = require(f_time, "time")?;
     List(Int) d_requester = require(f_requester, "requester")?;
     List(Int) d_message_hash = require(f_message_hash, "message_hash")?;
-    return parsed(SessionRecord {.time = d_time, .requester = d_requester, .message_hash = d_message_hash}, s);
+    Int d_kind_absent = 0;
+    Int d_kind = or_default(f_kind, d_kind_absent);
+    Int d_count_absent = 0;
+    Int d_count = or_default(f_count, d_count_absent);
+    return parsed(SessionRecord {.time = d_time, .requester = d_requester, .message_hash = d_message_hash, .kind = d_kind, .count = d_count}, s);
 }
 Decode(SessionRecord, F) = derive_session_record_decode;
 
-// ── DuressKey (line 42)
+// ── DuressKey (line 50)
 /// The serialized field names of `DuressKey`, in declaration order.
 pub List(Str) derive_duress_key_names() { return ["party", "subkey"]; }
 /// Encodes a `DuressKey` through the encoder `s`.
@@ -87,7 +95,7 @@ Result(Parsed(DuressKey, F), SerialError) derive_duress_key_done(F s, Option(Lis
 }
 Decode(DuressKey, F) = derive_duress_key_decode;
 
-// ── DuressState (line 45)
+// ── DuressState (line 53)
 /// The serialized field names of `DuressState`, in declaration order.
 pub List(Str) derive_duress_state_names() { return ["party", "started_at"]; }
 /// Encodes a `DuressState` through the encoder `s`.
@@ -128,7 +136,7 @@ Result(Parsed(DuressState, F), SerialError) derive_duress_state_done(F s, Option
 }
 Decode(DuressState, F) = derive_duress_state_decode;
 
-// ── CosignerState (line 48)
+// ── CosignerState (line 56)
 /// The serialized field names of `CosignerState`, in declaration order.
 pub List(Str) derive_cosigner_state_names() { return ["verified", "duress_keys", "duress", "seen_sessions", "records"]; }
 /// Encodes a `CosignerState` through the encoder `s`.

@@ -1,0 +1,206 @@
+// The vault OPRF key k_v between parties (SPEC 18.10.1): one round of
+// dealings over the relay, next to a key generation or a re-share.
+//
+// Each dealer sends every online receiver of the new quorum a WKvDeal: the
+// session id, its dealer index, its commitments and the receiver's part,
+// inside the receiver's HPKE mode_auth envelope (src/net/envelope.resid), so
+// only that receiver reads its part and it knows who dealt it. The kit is
+// offline: the device dealer's part for it (a_v) is wrapped to the kit's
+// key at the relay, and the cosigner keeps its own (b_v), released only
+// after a recovery took effect (as x's halves a and b, SPEC 10.6).
+//
+// Dealers: the requesting device and the cosigner, as for x. Generating,
+// each deals a random secret; re-sharing, each deals lambda_d k_d, checked
+// against the quorum's commitments (kv_reshare_ok), so C_0 never changes.
+// A part that does not fit its dealer's commitments ends the session and
+// names the dealer.
+//
+// A device's share is kept in kv.enc under its DEK (real profile only: the
+// duress profile holds no k_v share, 18.10.6), with the epoch and its index.
+
+import "../types.resid";
+import "../vault/kvshare.resid";
+import "../vault/toprf.resid";
+import "../threshold/threshold.resid";
+import "../net/proto.resid";
+import "../net/services.resid";
+import "state.resid";
+import "common.resid";
+import "session.resid";
+import "aesgcmg.resid";
+import "cggmp_secret_scalar.resid";
+import "word.resid";
+import "crypto.resid";
+
+// ─── A device's share under its DEK ─────────────────────────────
+
+// The share of epoch `epoch` at index `id`.
+pub type KvKept = { Int epoch; Int id; KvScalar share; };
+
+List(Int) kv_aad() { return utf8("symbolon v1 vault oprf share"); }
+
+List(Int) be4(Int v) { return [(v >> 24) & 255, (v >> 16) & 255, (v >> 8) & 255, v & 255]; }
+Int from_be4(List(Int) b, Int at) { return (b[at] << 24) | (b[at + 1] << 16) | (b[at + 2] << 8) | b[at + 3]; }
+
+@requires(filesystem, declassify)
+pub Bool kv_store(Str dir, List(Secret(UInt(8))) dek, KvKept k) {
+    List(Int) iv = random_bytes(12);
+    List(Secret(UInt(8))) pt = secret_bytes(be4(k.epoch).concat(be4(k.id))).concat(kv_share_bytes(k.share.v));
+    List(Secret(UInt(8))) ct = aes_gcmg_seal(dek, iv, pt, kv_aad());
+    return put_secret_file(dir + "/kv.enc", iv.concat(reveal(ct)));
+}
+
+@requires(filesystem, declassify)
+pub Option(KvKept) kv_load(Str dir, List(Secret(UInt(8))) dek) {
+    List(Int) b = get_file(dir + "/kv.enc");
+    if (b.len() < 28) { return None; }
+    Option(List(Secret(UInt(8)))) pt = aes_gcmg_decrypt(dek, b[0..12], b[12..b.len()], kv_aad());
+    return match pt {
+        None => None,
+        Some(p) => if (p.len() != 40) { None } else {
+            Some(KvKept {.epoch = from_be4(reveal(p[0..4]), 0), .id = from_be4(reveal(p[4..8]), 0), .share = kv_scalar(kv_share_from(p[8..40]))})
+        }
+    };
+}
+
+// ─── Dealings over the relay ────────────────────────────────────
+
+// How a party deals: not at all (no k_v), a fresh secret, or its share
+// re-shared (lambda_d k_d over the old dealer set).
+pub type KvMode = KvNone | KvGenerate | KvReshare(KvScalar);
+
+pub Bool kv_on(KvMode m) { return match m { KvNone => false, _ => true }; }
+
+// This party's dealing to every new index 1..n at threshold t.
+@requires(declassify)
+pub KvDealing kv_dealing(KvMode m, Int t, Int n, List(Int) dealers, Int me) {
+    List(Int) ids = ids_to(n, 1, ListBuf());
+    return match m {
+        KvReshare(k) => kv_deal(kv_reshare_secret(k.v, dealers, me), t, ids),
+        _ => kv_generate(t, ids)
+    };
+}
+
+List(Int) ids_to(Int n, Int i, ListBuf(Int) acc) { return if (i > n) { acc.finish() } else { ids_to(n, i + 1, acc.push(i)) }; }
+
+// The part of new index j, as the bytes a WKvDeal carries.
+@requires(declassify)
+pub List(Int) part_bytes(KvDealing d, Int j) { return reveal(kv_share_bytes(d.parts[j - 1].v)); }
+
+// Each remote (cg = its new index) gets its own part.
+@requires(network, declassify, clock(readonly))
+pub Bool kv_send(Endpoint relay, Local me, List(Remote) to, List(Int) sid, Int dealer, KvDealing d, Int i) {
+    if (i >= to.len()) { return true; }
+    KvDealMsg m = KvDealMsg {.session_id = sid, .dealer = dealer, .commits = d.commits, .part = part_bytes(d, to[i].cg)};
+    return send_to(relay, me, to[i], WKvDeal(m)) && kv_send(relay, me, to, sid, dealer, d, i + 1);
+}
+
+// A dealing received: who sent it, and what.
+pub type KvGot = { List(Int) from; KvDealMsg m; };
+
+List(KvGot) deals_in(List(Got) gs, List(Int) sid, Int i, List(KvGot) acc) {
+    if (i >= gs.len()) { return acc; }
+    Packet w = gs[i].w;
+    List(KvGot) next = match w {
+        WKvDeal(m) => if (bytes_eq(m.session_id, sid) && !has_from(acc, gs[i].from, 0)) { acc.concat([KvGot {.from = gs[i].from, .m = m}]) } else { acc },
+        _ => acc
+    };
+    return deals_in(gs, sid, i + 1, next);
+}
+
+Bool has_from(List(KvGot) gs, List(Int) p, Int i) { return i < gs.len() && (bytes_eq(gs[i].from, p) || has_from(gs, p, i + 1)); }
+
+// The dealings of session `sid` from every party in `from`, read from the
+// mailbox at `cur` on: a session's own drains skip other packets, so this
+// reads again from before the session. Waits up to `limit_s` seconds;
+// returns what came.
+@requires(network, declassify, clock)
+pub List(KvGot) kv_collect(Endpoint relay, Local me, List(Remote) from, Cursor cur, List(Int) sid, Int limit_s) {
+    return kv_wait(relay, me, from, cur, sid, [], clock_now_seconds() + limit_s);
+}
+
+@requires(network, declassify, clock)
+List(KvGot) kv_wait(Endpoint relay, Local me, List(Remote) from, Cursor cur, List(Int) sid, List(KvGot) have, Int until) {
+    Drained d = drain(relay, me, from, cur, ListBuf());
+    List(KvGot) now = deals_in(d.got, sid, 0, have);
+    if (now.len() >= from.len() || clock_now_seconds() > until) { return now; }
+    _ = clock_sleep_ms(200);
+    return kv_wait(relay, me, from, d.cur, sid, now, until);
+}
+
+// ─── Combining ──────────────────────────────────────────────────
+
+// What a receiver keeps: its share and the new quorum's field 6.
+pub type KvOut = { KvScalar share; List(List(Int)) commits; };
+
+// The dealings of every dealer (`deals` from the others, `mine` its own if
+// it dealt): each part checked against its dealer's commitments at index
+// `me`, and when re-sharing (old commitments given) each dealing checked to
+// be of its dealer's share. Err names the dealer whose dealing is wrong.
+@requires(declassify)
+pub Result(KvOut, Str) kv_combine(Int me, List(KvGot) deals, Option(KvDealing) mine, Int mine_id, List(List(Int)) old_commits, List(Int) dealers) {
+    List(KvScalar) own = match mine { None => [], Some(d) => [d.parts[me - 1]] };
+    List(List(List(Int))) own_c = match mine { None => [], Some(d) => [d.commits] };
+    Bool own_ok = match mine { None => true, Some(d) => old_commits.len() == 0 || kv_reshare_ok(old_commits, dealers, mine_id, d.commits) };
+    if (!own_ok) { return Err("this device's share does not fit the quorum's vault OPRF key"); }
+    return combine_at(me, deals, old_commits, dealers, 0, own, own_c);
+}
+
+@requires(declassify)
+Result(KvOut, Str) combine_at(Int me, List(KvGot) deals, List(List(Int)) old_commits, List(Int) dealers, Int i, List(KvScalar) parts, List(List(List(Int))) cs) {
+    if (i >= deals.len()) {
+        List(List(Int)) sum = kv_sum_commits(cs);
+        if (sum.len() == 0 || parts.len() != dealers.len()) { return Err("the vault OPRF key's dealings do not add up"); }
+        return Ok(KvOut {.share = kv_scalar(kv_share_of(parts)), .commits = kv_to_sec1(sum)});
+    }
+    KvDealMsg m = deals[i].m;
+    Secret(UInt(576)) part = kv_share_from(secret_bytes(m.part));
+    Bool fits = m.part.len() == 32 && dealers.contains(m.dealer) && kv_part_ok(m.commits, me, part)
+        && (old_commits.len() == 0 || kv_reshare_ok(old_commits, dealers, m.dealer, m.commits));
+    if (!fits) { return Err(f"dealer {m.dealer}'s part of the vault OPRF key does not fit its commitments"); }
+    return combine_at(me, deals, old_commits, dealers, i + 1, parts.concat([kv_scalar(part)]), cs.concat([m.commits]));
+}
+
+// ─── The kit's half a_v at the relay (SPEC 10.6) ────────────────
+
+pub Str kitv_blob(List(Int) log_id) { return "kitv-" + hex_encode(log_id) + "-a"; }
+
+// a_v wrapped to the kit's HPKE key for epoch `epoch`.
+@requires(network, declassify, clock(readonly))
+pub Bool kv_put_kit_half(Endpoint relay, Party kit, List(Int) log_id, UInt(32) epoch, KvDealing d, Int kit_id) {
+    Option(Wrapped) w = offline_wrap(kit.hpke_key, log_id, epoch, kit.id, part_bytes(d, kit_id), random_bytes(32));
+    return match w { None => false, Some(x) => blob_put(relay, kitv_blob(log_id), cbor_of_blob(WrappedBlob {.enc = x.enc, .ct = x.ct})) };
+}
+
+// The cosigner's b_v for a recovered device (WKvHalf), read from `cur` on.
+@requires(network, declassify, clock)
+pub Option(WrappedBlob) kv_wait_half(Endpoint relay, Local me, Remote from, Cursor cur, Int until) {
+    Drained d = drain(relay, me, [from], cur, ListBuf());
+    Option(WrappedBlob) h = half_in(d.got, 0);
+    if (match h { Some(_) => true, None => false } || clock_now_seconds() > until) { return h; }
+    _ = clock_sleep_ms(200);
+    return kv_wait_half(relay, me, from, d.cur, until);
+}
+
+Option(WrappedBlob) half_in(List(Got) gs, Int i) {
+    if (i >= gs.len()) { return None; }
+    Packet w = gs[i].w;
+    Option(WrappedBlob) h = match w { WKvHalf(b) => Some(b), _ => None };
+    return match h { Some(_) => h, None => half_in(gs, i + 1) };
+}
+
+// The kit's k_v share at index `kit`: a_v (wrapped to the kit at the relay)
+// plus b_v (the cosigner's, released to `me` after the recovery), checked
+// against the commitments the recovered quorum carries.
+@requires(network, declassify, clock)
+pub Result(KvScalar, Str) kv_kit_share(Endpoint relay, List(Int) log_id, List(Int) kit_hpke_priv, UInt(32) kit_epoch, List(Int) kit_party,
+                                       List(Int) my_hpke_priv, UInt(32) my_epoch, List(Int) me, Option(WrappedBlob) bw, List(List(Int)) commits, Int kit) {
+    Option(WrappedBlob) aw = blob_of_cbor(blob_get(relay, kitv_blob(log_id)) else { [] });
+    List(Int) a = match aw { None => [], Some(b) => offline_unwrap(kit_hpke_priv, log_id, kit_epoch, kit_party, Wrapped {.enc = b.enc, .ct = b.ct}) else { [] } };
+    List(Int) b = match bw { None => [], Some(x) => offline_unwrap(my_hpke_priv, log_id, my_epoch, me, Wrapped {.enc = x.enc, .ct = x.ct}) else { [] } };
+    if (a.len() != 32) { return Err("the kit's half of the vault OPRF key is not at the relay"); }
+    if (b.len() != 32) { return Err("the cosigner did not release its half of the vault OPRF key"); }
+    Secret(UInt(576)) k = cggmp_secret_scalar_add(kv_share_from(secret_bytes(a)), kv_share_from(secret_bytes(b)));
+    if (!kv_part_ok(kv_from_sec1(commits), kit, k)) { return Err("the kit's halves of the vault OPRF key do not fit the quorum's commitments"); }
+    return Ok(kv_scalar(k));
+}

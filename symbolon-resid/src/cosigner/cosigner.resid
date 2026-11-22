@@ -21,6 +21,10 @@ pub UInt(8) request_enroll() { return 2; }
 pub UInt(8) request_recovery() { return 3; }
 pub UInt(8) request_kit_session() { return 4; }
 pub UInt(8) request_policy_change() { return 5; }
+// A protected-item evaluation (SPEC 18.10.3): its own hourly budget, in
+// blinded elements (18.10.4); like every request but signing, refused
+// during a duress window, as an outage.
+pub UInt(8) request_eval() { return 6; }
 
 pub type CosignRequest = {
     List(Int) session_id;                // 32 fresh bytes
@@ -35,7 +39,11 @@ pub type CosignRequest = {
 // Refused requests are not recorded, so a duress device reading the log
 // cannot tell a duress refusal from a network failure.
 //@ serial
-pub type SessionRecord = { Int time; List(Int) requester; List(Int) message_hash; };
+// kind: the request's (request_eval's counts against the evaluation
+// budget); count: its blinded elements (0 in records kept before either).
+pub type SessionRecord = { Int time; List(Int) requester; List(Int) message_hash; Int kind; //@ default
+    Int count; //@ default
+};
 
 // A device's duress sub-key, registered with the cosigner at setup.
 //@ serial
@@ -106,19 +114,29 @@ Bool seen(List(List(Int)) ss, List(Int) id, Int i) {
     return seen(ss, id, i + 1);
 }
 
-Int recent_count(List(SessionRecord) rs, List(Int) party, Int since, Int i, Int acc) {
+// Sessions (evals false) or blinded elements (evals true) of `party` since `since`.
+Int recent_count(List(SessionRecord) rs, List(Int) party, Int since, Bool evals, Int i, Int acc) {
     if (i >= rs.len()) { return acc; }
-    Int add = if (rs[i].time > since && bytes_eq(rs[i].requester, party)) { 1 } else { 0 };
-    return recent_count(rs, party, since, i + 1, acc + add);
+    Bool is_eval = rs[i].kind == (Int)request_eval();
+    Bool mine = rs[i].time > since && bytes_eq(rs[i].requester, party) && is_eval == evals;
+    Int add = if (!mine) { 0 } else { if (evals) { if (rs[i].count > 0) { rs[i].count } else { 1 } } else { 1 } };
+    return recent_count(rs, party, since, evals, i + 1, acc + add);
 }
 
-Bool under_limit(CosignerPolicy p, List(SessionRecord) rs, List(Int) party, Int now) {
+// Signatures per hour (field 1); evaluations, in blinded elements, per hour
+// (field 3, 60 when the policy predates it).
+Bool under_limit(CosignerPolicy p, List(SessionRecord) rs, List(Int) party, Int now, UInt(8) kind, Int n) {
+    Bool ev = kind == request_eval();
+    Int used = recent_count(rs, party, now - 3600, ev, 0, 0);
     return match p {
         NoCosignerPolicy => true,
-        CosignerLimit(n) => recent_count(rs, party, now - 3600, 0, 0) < (Int)n,
-        CosignerLimits(l) => recent_count(rs, party, now - 3600, 0, 0) < (Int)l.sign
+        CosignerLimit(s) => if (ev) { used + n <= 60 } else { used < (Int)s },
+        CosignerLimits(l) => if (ev) { used + n <= (Int)l.eval } else { used < (Int)l.sign }
     };
 }
+
+// Blinded elements of `party` in the past hour, and the policy's budget.
+pub Int evals_used(List(SessionRecord) rs, List(Int) party, Int now) { return recent_count(rs, party, now - 3600, true, 0, 0); }
 
 // The error a device sees when the cosigner cannot be reached. Every refusal
 // during a duress window is this one, so a coercer cannot tell it from a
@@ -164,7 +182,10 @@ Int which_key(CosignerState s, Party p, CosignRequest r) {
     };
 }
 
-pub CosignOutcome cosign_decide(CosignerState s0, CosignRequest r, Int now) {
+pub CosignOutcome cosign_decide(CosignerState s0, CosignRequest r, Int now) { return cosign_decide_n(s0, r, now, 1); }
+
+// `n`: the blinded elements of an evaluation request (1 otherwise).
+pub CosignOutcome cosign_decide_n(CosignerState s0, CosignRequest r, Int now, Int n) {
     LogHead h = s0.verified.head;
     CosignerState s = with_duress(s0, window_at(s0.duress, h.policy, now));
     if (r.session_id.len() != 32 || r.message.len() != 32) { return refuse_as(s, ErrPolicyViolation("malformed request")); }
@@ -173,11 +194,11 @@ pub CosignOutcome cosign_decide(CosignerState s0, CosignRequest r, Int now) {
     Option(Party) op = party_by_id(h.quorum.parties, r.requester, 0);
     return match op {
         None => refuse_as(s, ErrPolicyViolation("requester is not a device of the current quorum")),
-        Some(p) => decide_party(s, p, r, now)
+        Some(p) => decide_party(s, p, r, now, n)
     };
 }
 
-CosignOutcome decide_party(CosignerState s, Party p, CosignRequest r, Int now) {
+CosignOutcome decide_party(CosignerState s, Party p, CosignRequest r, Int now, Int n) {
     LogHead h = s.verified.head;
     if (p.kind != party_kind_device()) { return refuse_as(s, ErrPolicyViolation("requester is not a device of the current quorum")); }
     Int key = which_key(s, p, r);
@@ -193,9 +214,9 @@ CosignOutcome decide_party(CosignerState s, Party p, CosignRequest r, Int now) {
     if (r.epoch != h.quorum.epoch) { return refuse_as(s2, ErrStaleEpoch(r.epoch, h.quorum.epoch)); }
     Bool in_duress = match d { None => false, Some(_) => true };
     if (in_duress && r.kind != request_sign()) { return Refuse(s2, transient()); }
-    if (r.kind > request_policy_change()) { return refuse_as(s2, ErrPolicyViolation("unknown request kind")); }
-    if (!under_limit(h.policy.cosigner_policy, s2.records, p.id, now)) { return refuse_as(s2, ErrPolicyViolation("rate limit")); }
-    return Proceed(with_record(s2, SessionRecord {.time = now, .requester = p.id, .message_hash = sha256_bytes(r.message)}));
+    if (r.kind > request_eval()) { return refuse_as(s2, ErrPolicyViolation("unknown request kind")); }
+    if (!under_limit(h.policy.cosigner_policy, s2.records, p.id, now, r.kind, n)) { return refuse_as(s2, ErrPolicyViolation("rate limit")); }
+    return Proceed(with_record(s2, SessionRecord {.time = now, .requester = p.id, .message_hash = sha256_bytes(r.message), .kind = (Int)r.kind, .count = n}));
 }
 
 // ============================================================================

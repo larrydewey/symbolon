@@ -32,6 +32,8 @@ import "cosignerd.resid";
 import "duresscli.resid";
 import "keystore.resid";
 import "cggmp_store.resid";
+import "kvagent.resid";
+import "../vault/kvshare.resid";
 import "dev/tpm.resid";
 import "dev/tpm_wire.resid";
 import "hpkeg.resid";
@@ -303,7 +305,7 @@ Int init_unlocked(Str dir, DeviceConfig c, PartyKeys cos, InitArgs a, Str pin) {
                 run_session(relay, sid, [Seat {.me = dev, .st = k1.state, .round = 1, .out = k1.out, .done = false},
                                          Seat {.me = kitl, .st = k2.state, .round = 1, .out = k2.out, .done = false}],
                             [cr], [Cursor {.party = me.party, .next = start}, Cursor {.party = kp.party, .next = 0}], [],
-                            lambda(st, msgs) { kg_adapt(st, msgs) }, 1800), pin, seed)
+                            lambda(st, msgs) { kg_adapt(st, msgs) }, 1800), pin, seed, sid)
         }
     };
 }
@@ -318,8 +320,10 @@ List(WitnessRef) witness_refs(List(WitnessEp) ws, Int i, List(WitnessRef) acc) {
 }
 
 @requires(filesystem, network, device, declassify, clock, environment)
-Int after_keygen(Str dir, DeviceConfig c, Unlocked u, KitKeys kit, List(PartyKeys) parties, Remote cr, InitArgs a, Run(KgState) r, Str pin, List(Int) seed) {
+Int after_keygen(Str dir, DeviceConfig c, Unlocked u, KitKeys kit, List(PartyKeys) parties, Remote cr, InitArgs a, Run(KgState) r, Str pin, List(Int) seed, List(Int) sid) {
     if (str_len(r.fail) > 0) { return dfail("keygen: " + r.fail); }
+    KvInit kv = kv_inception(relay_ep(c), Local {.party = c.party, .cg = 1, .hpke_sk = device_hpke(u.real.dek).sk}, cr, sid, mailbox_end(relay_ep(c), c.party, c.mbox_next));
+    if (str_len(kv.why) > 0) { return dfail(kv.why); }
     CgConfig none = CgConfig {.id = 0, .threshold = 0, .ecdsa = [], .elgamal = [], .p = [], .q = [], .rid = [], .chain_key = [], .public = []};
     CgConfig mine = kg_result(r.seats[0].st) else { none };
     CgConfig kitc = kg_result(r.seats[1].st) else { none };
@@ -327,19 +331,45 @@ Int after_keygen(Str dir, DeviceConfig c, Unlocked u, KitKeys kit, List(PartyKey
     if (x.len() != 65) { return dfail("keygen gave no key"); }
     Quorum q = Quorum {.parties = [party_from(parties[0], party_kind_device(), "this device"), party_from(parties[1], party_kind_kit(), "recovery kit"),
                                    party_from(parties[2], party_kind_cosigner(), "cosigner")],
-                       .t = 2, .root_pubkey = x, .epoch = 1, .transcript_digest = sha256_bytes(utf8("cmp/keygen")), .kv_commits = []};
+                       .t = 2, .root_pubkey = x, .epoch = 1, .transcript_digest = sha256_bytes(utf8("cmp/keygen")), .kv_commits = kv.out.commits};
+    // The evaluation limit (policy field 3) with the vault OPRF key: a
+    // cosigner that cannot deal k_v predates both.
     Policy pol = Policy {.device_sigs_for_authority = 1, .recovery_delay_sec = 259200, .guardians = [], .guardian_threshold = 0,
-                         .witnesses = witness_refs(a.witnesses, 0, []), .duress_window_sec = 3600, .cosigner_policy = CosignerLimit(60)};
+                         .witnesses = witness_refs(a.witnesses, 0, []), .duress_window_sec = 3600,
+                         .cosigner_policy = if (kv.on) { CosignerLimits(Limits {.sign = 60, .eval = 60}) } else { CosignerLimit(60) }};
     EventPayload e0 = EventPayload {.log_id = None, .sequence = 0, .predecessor_digest = None, .suite = 1, .body = InceptionBody(q, pol),
                                     .next_recovery_key_digests = [recovery_key_digest(kit.sign_pub)], .advisory_time = (UInt(64))clock_now_seconds()};
     List(Int) enc = payload_cbor(e0) else { [] };
     if (enc.len() == 0) { return dfail("inception does not encode"); }
-    return sign_inception_event(dir, c, u, kit, parties, cr, a, mine, kitc, q, e0, enc, pin, seed);
+    return sign_inception_event(dir, c, u, kit, parties, cr, a, mine, kitc, q, e0, enc, pin, seed, kv);
+}
+
+// The inception's vault OPRF key (SPEC 18.10.1): this device (index 1) and
+// the cosigner (index 3) each deal a fresh secret to indices 1, 2 (the
+// kit) and 3. A cosigner that does not answer within a minute predates
+// protected items: inception goes on without k_v, which `device
+// protection enable` adds later.
+pub type KvInit = { Bool on; KvOut out; KvDealing mine; Str why; };
+
+@requires(network, declassify, clock)
+KvInit kv_inception(Endpoint relay, Local dev, Remote cr, List(Int) sid, Int start) {
+    KvDealing mine = kv_dealing(KvGenerate, 2, 3, [1, 3], 1);
+    KvOut none = KvOut {.share = kv_scalar(classify((UInt(576)) 0)), .commits = []};
+    if (!kv_send(relay, dev, [cr], sid, 1, mine, 0)) { return KvInit {.on = false, .out = none, .mine = mine, .why = "cannot reach the relay"}; }
+    List(KvGot) got = kv_collect(relay, dev, [cr], Cursor {.party = dev.party, .next = start}, sid, 60);
+    if (got.len() == 0) {
+        eprintln("device: the cosigner does not deal a vault OPRF key; protected items stay off (device protection enable)");
+        return KvInit {.on = false, .out = none, .mine = mine, .why = ""};
+    }
+    return match kv_combine(1, got, Some(mine), 1, [], [1, 3]) {
+        Err(m) => KvInit {.on = false, .out = none, .mine = mine, .why = "vault OPRF key: " + m},
+        Ok(o) => KvInit {.on = true, .out = o, .mine = mine, .why = ""}
+    };
 }
 
 @requires(filesystem, network, device, declassify, clock, environment)
 Int sign_inception_event(Str dir, DeviceConfig c, Unlocked u, KitKeys kit, List(PartyKeys) parties, Remote cr, InitArgs a,
-                         CgConfig mine, CgConfig kitc, Quorum q, EventPayload e0, List(Int) enc, Str pin, List(Int) seed) {
+                         CgConfig mine, CgConfig kitc, Quorum q, EventPayload e0, List(Int) enc, Str pin, List(Int) seed, KvInit kv) {
     Endpoint relay = relay_ep(c);
     Local dev = Local {.party = c.party, .cg = 1, .hpke_sk = device_hpke(u.real.dek).sk};
     Int start = mailbox_end(relay, c.party, c.mbox_next);
@@ -357,7 +387,7 @@ Int sign_inception_event(Str dir, DeviceConfig c, Unlocked u, KitKeys kit, List(
     Result(VerifiedHead, SymbolonError) v = il_verify(l, [se], last_time([se], policy_of_e0([se])), lambda(p) { false });
     return match v {
         Err(e) => dfail("the inception does not verify: " + err_text(e)),
-        Ok(vh) => publish(dir, c, u, kit, parties, cr, a, mine, kitc, StoredEvent {.encoded = enc, .sigs = sigs, .cosigs = cs}, l, seed)
+        Ok(vh) => publish(dir, c, u, kit, parties, cr, a, mine, kitc, StoredEvent {.encoded = enc, .sigs = sigs, .cosigs = cs}, l, seed, kv)
     };
 }
 
@@ -402,7 +432,7 @@ pub Str err_text(SymbolonError e) {
 // and prints the kit's seed.
 @requires(filesystem, network, device, declassify, clock)
 Int publish(Str dir, DeviceConfig c, Unlocked u, KitKeys kit, List(PartyKeys) parties, Remote cr, InitArgs a,
-            CgConfig mine, CgConfig kitc, StoredEvent se, List(Int) l, List(Int) seed) {
+            CgConfig mine, CgConfig kitc, StoredEvent se, List(Int) l, List(Int) seed, KvInit kv) {
     Endpoint relay = relay_ep(c);
     if (!log_put(relay, l, 0, cbor_of_event(se))) { return dfail("the relay refused the inception"); }
     List(Int) kk = random_bytes(32);
@@ -415,6 +445,10 @@ Int publish(Str dir, DeviceConfig c, Unlocked u, KitKeys kit, List(PartyKeys) pa
            && blob_put(relay, "kit-" + hex_encode(l) + "-secrets", secrets)
            && send_to(relay, dev, cr, WKitHalf(WrappedBlob {.enc = wb.enc, .ct = wb.ct}))
            && store_share(dir, u.real.dek, mine) && store_dshare(dir, u.real, mine)
+           // k_v: this device's share (never in the duress profile), and
+           // its part for the kit, a_v, wrapped to the kit (SPEC 18.10.1).
+           && (!kv.on || (kv_store(dir, u.real.dek, KvKept {.epoch = 1, .id = 1, .share = kv.out.share})
+                          && kv_put_kit_half(relay, party_from(parties[1], party_kind_kit(), "recovery kit"), l, 1, kv.mine, 2)))
            && send_duress_key(dir, relay, dev, cr)
            && filesystem.write_bytes(dir + "/log/0", cbor_of_event(se))
            && save_config(dir, with_log(c, a.witnesses, l, mailbox_end(relay, c.party, c.mbox_next), parties));
@@ -650,6 +684,9 @@ Int status_of(DeviceConfig c) {
 
 Int print_head(VerifiedHead vh) {
     println(f"head sequence {vh.head.sequence} epoch {vh.head.quorum.epoch} parties {vh.head.quorum.parties.len()} threshold {vh.head.quorum.t} pending {vh.pending.len()}");
+    // Whether the quorum has a vault OPRF key (SPEC 18.10): protected items
+    // can be used only then; its public key C_0 names it.
+    println("protected " + (if (vh.head.quorum.kv_commits.len() > 0) { "on " + hex_encode(vh.head.quorum.kv_commits[0]) } else { "off" }));
     return 0;
 }
 

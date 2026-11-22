@@ -70,6 +70,10 @@ grep -q '^log ' "$W/init.log" || fail "no log id printed"
 grep -q 'RECOVERY KIT' "$W/init.log" || fail "no kit printed"
 run 120 "$BIN" device status "$W/dev" > "$W/status.log" 2>&1 || fail "status"
 grep -q 'head sequence 0 epoch 1 parties 3 threshold 2' "$W/status.log" || fail "status: $(cat "$W/status.log")"
+# The inception dealt the vault OPRF key (SPEC 18.10.1); its public key C_0
+# stays the same through every re-share and the recovery below.
+C0=$(sed -n 's/^protected on //p' "$W/status.log")
+[ -n "$C0" ] || fail "the inception has no vault OPRF key: $(cat "$W/status.log")"
 
 printf '2468\n' | run 300 "$BIN" device register "$W/dev" login.example.com > "$W/reg.log" 2>&1 || fail "register"
 CID=$(awk '/^credential-id/ {print $2}' "$W/reg.log"); PUB=$(awk '/^public-key/ {print $2}' "$W/reg.log")
@@ -334,6 +338,7 @@ printf '2468\n' | run 1800 "$BIN" device enroll "$W/dev" "$DEV2" "$W/devrs.prime
 wait $JP || fail "join"
 run 120 "$BIN" device status "$W/dev2" > "$W/status2.log" 2>&1 || fail "status (second)"
 grep -q 'epoch 2 parties 4 threshold 2' "$W/status2.log" || fail "status after enrollment: $(cat "$W/status2.log")"
+grep -q "protected on $C0" "$W/status2.log" || fail "the enrollment changed or dropped the vault OPRF key: $(cat "$W/status2.log")"
 MSG2=$(python3 -c 'import hashlib; print(hashlib.sha256(b"second device").hexdigest())')
 printf '1111\n' | run 600 "$BIN" device sign "$W/dev2" login.example.com "$CID" "$MSG2" > "$W/sign2.log" 2>&1 || fail "sign from the enrolled device"
 printf '2468\n' | run 600 "$BIN" device sign "$W/dev" login.example.com "$CID" "$MSG" > "$W/sign3.log" 2>&1 || fail "sign at epoch 2"
@@ -378,6 +383,7 @@ echo "recovery finish (release, kit share, re-share; a minute or two)..."
 printf '3333\n' | run 1800 "$BIN" device recover-finish "$W/dev3" "$KIT" "$W/dev3.primes" > "$W/finish.log" 2>&1 || fail "recover-finish: $(tail -3 "$W/finish.log")"
 run 120 "$BIN" device status "$W/dev3" > "$W/status3.log" 2>&1 || fail "status (recovered)"
 grep -q 'parties 3 threshold 2' "$W/status3.log" || fail "status after recovery: $(cat "$W/status3.log")"
+grep -q "protected on $C0" "$W/status3.log" || fail "the recovery changed or dropped the vault OPRF key: $(cat "$W/status3.log")"
 MSG3=$(python3 -c 'import hashlib; print(hashlib.sha256(b"recovered device").hexdigest())')
 printf '3333\n' | run 600 "$BIN" device sign "$W/dev3" login.example.com "$CID" "$MSG3" > "$W/sign4.log" 2>&1 || fail "sign from the recovered device: $(tail -2 "$W/sign4.log")"
 python3 - "$PUB" "$MSG3" "$(tail -1 "$W/sign4.log")" <<'PY' || fail "the recovered device's signature does not verify"

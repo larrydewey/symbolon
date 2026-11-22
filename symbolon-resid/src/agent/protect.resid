@@ -15,11 +15,21 @@ import "../duress/duress.resid";
 import "state.resid";
 import "common.resid";
 import "device.resid";
+import "session.resid";
+import "kvagent.resid";
+import "../vault/kvshare.resid";
+import "../vault/toprf.resid";
+import "../cosigner/cosigner.resid";
+import "../net/proto.resid";
+import "../net/services.resid";
+import "crypto.resid";
 
 // What opening a protected item needs from this device: its configuration
 // and its unlocked real profile (the device key signs the request, and the
 // device's own k_v share is under its DEK).
 pub type Opener = { DeviceConfig c; Unlocked u; };
+
+Party no_party() { return Party {.id = [], .kind = 0, .auth_key = [], .hpke_key = [], .label = "", .attestation = NoAttestation}; }
 
 pub Str needs_cosigner() { return "this item is protected: opening it needs the cosigner"; }
 
@@ -29,8 +39,129 @@ pub Result(List(Secret(UInt(8))), Str) protected_key(Str dir, Option(Opener) x, 
     if (!item_is_protected(it)) { return Err("not a protected item"); }
     return match x {
         None => Err(needs_cosigner()),
-        Some(_) => Err(needs_cosigner())
+        Some(o) => match protected_keys(dir, o, vk, vid, [it.id], 0) {
+            Err(m) => Err(m),
+            Ok(ks) => if (ks.len() == 1) { Ok(ks[0]) } else { Err(needs_cosigner()) }
+        }
     };
+}
+
+// The pitem_keys of the items `ids`, in one evaluation request of
+// `purpose` (0 open, 1 re-key, 2 credential rotation; SPEC 18.10.3):
+//  1. each input "symbolon v1 protected" || vault_id || item_id blinded;
+//  2. the cosigner's evaluations, proven with one DLEQ proof against its
+//     key K_C from the quorum's commitments;
+//  3. this device's own evaluations with its share, unproven;
+//  4. combined at zero over {this device, the cosigner} and finalized.
+// y and pitem_key stay in this process (secret, never stored).
+@requires(filesystem, network, device, declassify, clock, environment)
+pub Result(List(List(Secret(UInt(8)))), Str) protected_keys(Str dir, Opener o, List(Secret(UInt(8))) vk, List(Int) vid, List(List(Int)) ids, Int purpose) {
+    if (ids.len() == 0 || ids.len() > 256) { return Err("between 1 and 256 items at a time"); }
+    Endpoint relay = relay_ep(o.c);
+    Result(VerifiedHead, SymbolonError) rv = verified_log_dir(dir, relay, o.c.log_id);
+    return match rv {
+        Err(e) => Err(needs_cosigner() + " (" + err_text(e) + ")"),
+        Ok(vh) => keys_with(dir, o, vh, vk, vid, ids, purpose)
+    };
+}
+
+@requires(filesystem, network, device, declassify, clock, environment)
+Result(List(List(Secret(UInt(8)))), Str) keys_with(Str dir, Opener o, VerifiedHead vh, List(Secret(UInt(8))) vk, List(Int) vid, List(List(Int)) ids, Int purpose) {
+    Quorum q = vh.head.quorum;
+    Endpoint relay = relay_ep(o.c);
+    if (q.kv_commits.len() == 0) { return Err("protected items are off for this identity (device protection enable)"); }
+    Int me = pos1(q.parties, o.c.party, 0);
+    Option(KvKept) mine = kv_load(dir, o.u.real.dek);
+    Bool current = match mine { None => false, Some(k) => k.epoch == (Int)q.epoch && k.id == me };
+    if (!current) { return Err("this device holds no current share of the vault OPRF key"); }
+    Party cos = cosigner_of(q.parties, 0) else { no_party() };
+    if (cos.id.len() == 0) { return Err("protected items need a cosigner"); }
+    Int ci = pos1(q.parties, cos.id, 0);
+    List(List(Int)) inputs = inputs_of(vid, ids, 0, ListBuf());
+    List(ToprfBlind) bl = blind_all(inputs, 0, ListBuf());
+    List(List(Int)) bs = blinded_of(bl, 0, ListBuf());
+    List(Int) sid = random_bytes(32);
+    EvalRequest r0 = EvalRequest {.session_id = sid, .log_id = o.c.log_id, .epoch = (Int)q.epoch, .purpose = purpose, .blinded = bs, .event_seq = -1, .requester = o.c.party, .sig = []};
+    Result(List(Int), Str) rs = dk_sign(o.c, o.u.real, o.u.st, request_tbs(sid, eval_message(r0), q.epoch, o.c.party, request_eval()));
+    List(Int) sig = match rs { Ok(v) => v, Err(_) => [] };
+    if (sig.len() != 64) { return Err("the device key did not sign the request"); }
+    Local lm = Local {.party = o.c.party, .cg = 0, .hpke_sk = device_hpke(o.u.real.dek).sk};
+    Remote cr = Remote {.party = cos.id, .cg = ci, .hpke_pub = cos.hpke_key};
+    Int start = mailbox_end(relay, o.c.party, o.c.mbox_next);
+    EvalRequest r = EvalRequest {.session_id = sid, .log_id = r0.log_id, .epoch = r0.epoch, .purpose = purpose, .blinded = bs, .event_seq = -1, .requester = r0.requester, .sig = sig};
+    if (!send_to(relay, lm, cr, WEval(r))) { return Err(needs_cosigner() + " (the relay is unreachable)"); }
+    Answered a = wait_answer(relay, lm, cr, Cursor {.party = o.c.party, .next = start}, sid, clock_now_seconds() + 30);
+    _ = save_config(dir, with_log(o.c, o.c.witnesses, o.c.log_id, a.next, o.c.peers));
+    Option(EvalAnswer) oa = a.answer;
+    return match oa {
+        None => Err(needs_cosigner() + ", which did not answer (offline, or refusing: the hourly limit, or a duress window)"),
+        Some(ans) => finish_keys(o, mine, me, ci, q, vk, vid, ids, inputs, bl, bs, ans)
+    };
+}
+
+@requires(declassify)
+Result(List(List(Secret(UInt(8)))), Str) finish_keys(Opener o, Option(KvKept) mine, Int me, Int ci, Quorum q, List(Secret(UInt(8))) vk, List(Int) vid,
+                                                     List(List(Int)) ids, List(List(Int)) inputs, List(ToprfBlind) bl, List(List(Int)) bs, EvalAnswer ans) {
+    P256Aff kc = toprf_party_key(kv_from_sec1(q.kv_commits), ci);
+    if (ans.elements.len() != bs.len() || !toprf_verify(kc, bs, ans.elements, ans.proof)) { return Err("the cosigner's evaluation does not verify"); }
+    KvKept k = mine else { KvKept {.epoch = 0, .id = 0, .share = kv_scalar(classify((UInt(576)) 0))} };
+    ToprfEval own = toprf_evaluate(k.share.v, bs);
+    if (!own.ok) { return Err("this device's share does not evaluate"); }
+    return Ok(keys_at(vk, vid, ids, inputs, bl, own.elements, ans.elements, me, ci, 0, []));
+}
+
+@requires(declassify)
+List(List(Secret(UInt(8)))) keys_at(List(Secret(UInt(8))) vk, List(Int) vid, List(List(Int)) ids, List(List(Int)) inputs, List(ToprfBlind) bl,
+                                    List(List(Int)) mine, List(List(Int)) theirs, Int me, Int ci, Int i, List(List(Secret(UInt(8)))) acc) {
+    if (i >= ids.len()) { return acc; }
+    P256Aff z = toprf_combine([me, ci], [mine[i], theirs[i]]);
+    List(Secret(UInt(8))) y = toprf_finalize(inputs[i], bl[i].r, z);
+    return keys_at(vk, vid, ids, inputs, bl, mine, theirs, me, ci, i + 1, acc.concat([protected_item_key(vk, y, vid, ids[i])]));
+}
+
+List(List(Int)) inputs_of(List(Int) vid, List(List(Int)) ids, Int i, ListBuf(List(Int)) acc) {
+    if (i >= ids.len()) { return acc.finish(); }
+    return inputs_of(vid, ids, i + 1, acc.push(toprf_item_input(vid, ids[i])));
+}
+
+@requires(declassify)
+List(ToprfBlind) blind_all(List(List(Int)) inputs, Int i, ListBuf(ToprfBlind) acc) {
+    if (i >= inputs.len()) { return acc.finish(); }
+    return blind_all(inputs, i + 1, acc.push(toprf_blind(inputs[i])));
+}
+
+List(List(Int)) blinded_of(List(ToprfBlind) bl, Int i, ListBuf(List(Int)) acc) {
+    if (i >= bl.len()) { return acc.finish(); }
+    return blinded_of(bl, i + 1, acc.push(bl[i].blinded));
+}
+
+// The cosigner's answer to session `sid`, or None on a refusal or after `until`.
+pub type Answered = { Option(EvalAnswer) answer; Int next; };
+
+@requires(network, declassify, clock)
+Answered wait_answer(Endpoint relay, Local me, Remote from, Cursor cur, List(Int) sid, Int until) {
+    Drained d = drain(relay, me, [from], cur, ListBuf());
+    Int seen = answer_in(d.got, sid, 0);
+    if (seen == 2) { return Answered {.answer = None, .next = d.cur.next}; }
+    if (seen == 1) { return Answered {.answer = first_answer_for(d.got, sid, 0), .next = d.cur.next}; }
+    if (clock_now_seconds() > until) { return Answered {.answer = None, .next = d.cur.next}; }
+    _ = clock_sleep_ms(150);
+    return wait_answer(relay, me, from, d.cur, sid, until);
+}
+
+// 1 an answer for sid, 2 a refusal of it, 0 neither.
+Int answer_in(List(Got) gs, List(Int) sid, Int i) {
+    if (i >= gs.len()) { return 0; }
+    Packet w = gs[i].w;
+    Int k = match w { WEvalAnswer(a) => if (bytes_eq(a.session_id, sid)) { 1 } else { 0 }, WRefused(s) => if (bytes_eq(s, sid)) { 2 } else { 0 }, _ => 0 };
+    return if (k > 0) { k } else { answer_in(gs, sid, i + 1) };
+}
+
+Option(EvalAnswer) first_answer_for(List(Got) gs, List(Int) sid, Int i) {
+    if (i >= gs.len()) { return None; }
+    Packet w = gs[i].w;
+    Option(EvalAnswer) a = match w { WEvalAnswer(x) => if (bytes_eq(x.session_id, sid)) { Some(x) } else { None }, _ => None };
+    return match a { Some(_) => a, None => first_answer_for(gs, sid, i + 1) };
 }
 
 // Every field of an item: a standard item under vault_key alone, a
@@ -60,4 +191,92 @@ pub Result(Item, Str) reseal_item(Str dir, Option(Opener) x, List(Secret(UInt(8)
         Err(m) => Err(m),
         Ok(pik) => match item_reseal(vk, pik, vid, old, id, kind, fs) { Ok(it) => Ok(it), Err(e) => Err(err_text(e)) }
     };
+}
+
+// ─── `device openings DIR` (SPEC 18.10.4) ───────────────────────
+// The PIN on standard input. Asks the cosigner for the evaluation records of
+// the past week and prints, first "limit N" (blinded elements per device
+// per hour), then per device of the quorum:
+//   device PARTY-HEX LABEL-HEX hour H day D week W usual|unusual
+// H, D and W count the device's protected openings in the past hour, day
+// and week. A day well above the device's usual (more than 20, and more
+// than three times its daily average over the six days before) is
+// "unusual": the most likely cause is malware in an unlocked device, so
+// every device shows it.
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+pub Int device_openings(Str dir) {
+    Option(DeviceConfig) oc = load_config(dir);
+    return match oc {
+        None => dfail("not set up"),
+        Some(c) => openings_unlocked(dir, c, unlock_dir(dir, c, read_pin()))
+    };
+}
+
+@requires(filesystem, network, device, declassify, clock, environment)
+Int openings_unlocked(Str dir, DeviceConfig c, Unlocked u) {
+    if (u.kind != 1) { return dfail("wrong PIN"); }
+    Result(VerifiedHead, SymbolonError) rv = verified_log_dir(dir, relay_ep(c), c.log_id);
+    return match rv { Err(e) => dfail(err_text(e)), Ok(vh) => openings_ask(dir, c, u, vh) };
+}
+
+@requires(filesystem, network, device, declassify, clock, environment)
+Int openings_ask(Str dir, DeviceConfig c, Unlocked u, VerifiedHead vh) {
+    Quorum q = vh.head.quorum;
+    Party cos = cosigner_of(q.parties, 0) else { no_party() };
+    if (cos.id.len() == 0) { return dfail("no cosigner keeps evaluation records"); }
+    List(Int) sid = random_bytes(32);
+    Result(List(Int), Str) rs = dk_sign(c, u.real, u.st, request_tbs(sid, eval_log_message(), q.epoch, c.party, request_eval()));
+    List(Int) sig = match rs { Ok(v) => v, Err(_) => [] };
+    if (sig.len() != 64) { return dfail("the device key did not sign the request"); }
+    Endpoint relay = relay_ep(c);
+    Local lm = Local {.party = c.party, .cg = 0, .hpke_sk = device_hpke(u.real.dek).sk};
+    Remote cr = Remote {.party = cos.id, .cg = 0, .hpke_pub = cos.hpke_key};
+    Int start = mailbox_end(relay, c.party, c.mbox_next);
+    if (!send_to(relay, lm, cr, WEvalLog(EvalLogRequest {.session_id = sid, .log_id = c.log_id, .epoch = (Int)q.epoch, .requester = c.party, .sig = sig}))) { return dfail("cannot reach the relay"); }
+    LogAnswered a = wait_log(relay, lm, cr, Cursor {.party = c.party, .next = start}, sid, clock_now_seconds() + 30);
+    _ = save_config(dir, with_log(c, c.witnesses, c.log_id, a.next, c.peers));
+    Option(EvalLogAnswer) oa = a.answer;
+    return match oa {
+        None => dfail("the cosigner did not answer"),
+        Some(x) => print_openings(q.parties, x, 0)
+    };
+}
+
+Int print_openings(List(Party) ps, EvalLogAnswer a, Int i) {
+    if (i == 0) { println(f"limit {a.limit}"); }
+    if (i >= ps.len()) { return 0; }
+    if (ps[i].kind == party_kind_device()) {
+        Int h = used_since(a.entries, ps[i].id, a.now - 3600, a.now, 0, 0);
+        Int d = used_since(a.entries, ps[i].id, a.now - 86400, a.now, 0, 0);
+        Int w = used_since(a.entries, ps[i].id, a.now - 7 * 86400, a.now, 0, 0);
+        Int before = w - d;
+        Bool unusual = d > 20 && d * 6 > 3 * before;
+        println("device " + hex_encode(ps[i].id) + " " + hex_encode(utf8(ps[i].label)) + f" hour {h} day {d} week {w} " + (if (unusual) { "unusual" } else { "usual" }));
+    }
+    return print_openings(ps, a, i + 1);
+}
+
+Int used_since(List(EvalLogEntry) es, List(Int) dev, Int since, Int now, Int i, Int acc) {
+    if (i >= es.len()) { return acc; }
+    Bool mine = es[i].time > since && es[i].time <= now && bytes_eq(es[i].device, dev);
+    return used_since(es, dev, since, now, i + 1, acc + (if (mine) { es[i].count } else { 0 }));
+}
+
+pub type LogAnswered = { Option(EvalLogAnswer) answer; Int next; };
+
+@requires(network, declassify, clock)
+LogAnswered wait_log(Endpoint relay, Local me, Remote from, Cursor cur, List(Int) sid, Int until) {
+    Drained d = drain(relay, me, [from], cur, ListBuf());
+    Option(EvalLogAnswer) a = log_in(d.got, sid, 0);
+    Bool refused = answer_in(d.got, sid, 0) == 2;
+    if (refused || clock_now_seconds() > until || match a { Some(_) => true, None => false }) { return LogAnswered {.answer = a, .next = d.cur.next}; }
+    _ = clock_sleep_ms(150);
+    return wait_log(relay, me, from, d.cur, sid, until);
+}
+
+Option(EvalLogAnswer) log_in(List(Got) gs, List(Int) sid, Int i) {
+    if (i >= gs.len()) { return None; }
+    Packet w = gs[i].w;
+    Option(EvalLogAnswer) a = match w { WEvalLogAnswer(x) => if (bytes_eq(x.session_id, sid)) { Some(x) } else { None }, _ => None };
+    return match a { Some(_) => a, None => log_in(gs, sid, i + 1) };
 }

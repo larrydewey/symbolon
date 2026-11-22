@@ -42,6 +42,10 @@
 //   symbolon device vault import DIR FILE [--format auto|bitwarden-json|csv] [--dry-run]
 //                                              PIN on stdin (not with --dry-run): another password
 //                                              manager's export, as one new vault version
+//   symbolon device openings DIR                  PIN on stdin; each device's protected-item openings (hour, day, week) from the cosigner's records, and whether a day is unusual
+//   symbolon device protection enable DIR [PRIMES]  PIN on stdin; a re-share that gives the quorum a vault OPRF key (protected items, SPEC 18.10)
+//   symbolon device vault protect DIR NAME   PIN on stdin; the item into the protected tier (SPEC 18.10): opening it then needs the cosigner
+//   symbolon device vault unprotect DIR NAME PIN on stdin; back to the standard tier
 //   symbolon device vault move DIR NAME TO [--unprotect]  PIN on stdin; to the own vault (TO "own") or the shared folder TO (a protected item only with --unprotect)
 //       list, show, code, set, delete, import and move take a last `--share ID`: in (from) that shared folder
 //   symbolon device share new DIR NAME         PIN on stdin; a shared folder (SPEC 19); prints its ID
@@ -103,6 +107,7 @@ import "agent/enroll.resid";
 import "agent/recover.resid";
 import "agent/rotatecli.resid";
 import "agent/vaultitems.resid";
+import "agent/protect.resid";
 import "agent/breachcli.resid";
 import "agent/importers.resid";
 import "agent/sharecli.resid";
@@ -380,10 +385,14 @@ Int main() {
     if (a1 == "device" && a2 == "register" && (n == 5 || n == 6)) { return device_register(args.get(3), args.get(4), has_flag("--duress", 5)); }
     if (a1 == "device" && a2 == "sign" && n == 7) { return device_sign(args.get(3), args.get(4), args.get(5), args.get(6)); }
     if (a1 == "device" && a2 == "status" && n == 4) { return device_status(args.get(3)); }
+    if (a1 == "device" && a2 == "openings" && n == 4) { return device_openings(args.get(3)); }
+    if (a1 == "device" && a2 == "protection" && args.get(3) == "enable" && (n == 5 || n == 6)) { return device_protection_enable(args.get(4), if (n == 6) { args.get(5) } else { "" }); }
     if (a1 == "device" && a2 == "forget" && n == 4) { return device_forget(args.get(3)); }
     if (a1 == "device" && a2 == "vault" && n == 8 && args.get(3) == "login") { return vault_login(args.get(4), args.get(5), args.get(6), args.get(7)); }
     if (a1 == "device" && a2 == "vault" && args.get(3) == "put" && n == 6) { return vault_put(args.get(4), args.get(5)); }
     if (a1 == "device" && a2 == "vault" && args.get(3) == "get" && n == 6) { return vault_get(args.get(4), args.get(5)); }
+    if (a1 == "device" && a2 == "vault" && args.get(3) == "protect" && n == 6) { return vault_protect(args.get(4), args.get(5), true); }
+    if (a1 == "device" && a2 == "vault" && args.get(3) == "unprotect" && n == 6) { return vault_protect(args.get(4), args.get(5), false); }
     // `--share ID` comes last: the folder the vault command works in.
     if (a1 == "device" && a2 == "vault" && n >= 5 && (args.get(3) == "list" || args.get(3) == "show" || args.get(3) == "code")) {
         Str no = fill_refusal(args.get(4));

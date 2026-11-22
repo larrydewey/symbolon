@@ -11,6 +11,7 @@ import "state.resid";
 import "common.resid";
 import "device.resid";
 import "vaultcli.resid";
+import "protect.resid";
 import "rotatecli.resid";
 import "sharecli.resid";
 import "orgcore.resid";
@@ -279,4 +280,40 @@ pub Int vault_delete(Str dir, Str name, Str share) {
 Int delete_item(Str dir, Opened o, List(Int) id) {
     if (match item_by_id(o.st.items, id, 0) { None => true, Some(_) => false }) { return dfail("no such item"); }
     return publish_items(dir, o, without_item(o.st.items, id, 0, ListBuf()));
+}
+
+// `symbolon device vault protect DIR NAME` / `unprotect DIR NAME`: the PIN
+// on standard input. Moves an item of the person's own vault into the
+// protected tier (SPEC 18.10), or back: one evaluation with the cosigner,
+// a new version of the item. Shared folders hold no protected items in
+// this format version (18.10.6). A protected item is never in the duress
+// subset.
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+pub Int vault_protect(Str dir, Str name, Bool on) {
+    Result(Opened, Str) ro = open_vault(dir);
+    return match ro {
+        Err(m) => dfail(m),
+        Ok(o) => match item_by_id(o.st.items, item_id_of(o.p.vk, name), 0) {
+            None => dfail("no such item"),
+            Some(it) => protect_item(dir, o, it, on)
+        }
+    };
+}
+
+@requires(filesystem, network, device, declassify, clock, environment)
+Int protect_item(Str dir, Opened o, Item it, Bool on) {
+    if (on && item_is_protected(it)) { println("already protected"); return 0; }
+    if (!on && !item_is_protected(it)) { println("not protected"); return 0; }
+    if (on && it.in_duress_subset) { return dfail("this item is in the duress subset, and a protected item cannot be: take it out of the subset first"); }
+    Result(List(Secret(UInt(8))), Str) rk = match opened_ctx(o) {
+        None => Err("protected items are in the person's own vault only"),
+        Some(x) => match protected_keys(dir, x, o.p.vk, o.p.vid, [it.id], 0) { Err(m) => Err(m), Ok(ks) => Ok(ks[0]) }
+    };
+    return match rk {
+        Err(m) => dfail(m),
+        Ok(pik) => match (if (on) { item_protect(o.p.vk, pik, o.p.vid, it) } else { item_unprotect(o.p.vk, pik, o.p.vid, it) }) {
+            Err(e) => dfail(err_text(e)),
+            Ok(n) => publish_items(dir, o, without_item(o.st.items, it.id, 0, ListBuf()).concat([n]))
+        }
+    };
 }

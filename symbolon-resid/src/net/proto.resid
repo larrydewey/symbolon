@@ -55,6 +55,39 @@ pub type ReshareInvite = {
 //@ serial
 pub type EnrollSecrets = { List(Int) cc; List(Int) vault_key; };
 
+// One dealer's dealing of the vault OPRF key to one receiver (SPEC
+// 18.10.1): the session it belongs to, the dealer's index, its Feldman
+// commitments (compressed points) and the receiver's part (32 bytes),
+// which only the receiver's envelope opens.
+//@ serial
+pub type KvDealMsg = { List(Int) session_id; Int dealer; List(List(Int)) commits; List(Int) part; };
+
+// A protected-item evaluation request (SPEC 18.10.3): the device's blinded
+// elements B_i (compressed points, at most 256), for purpose 0 (open), 1
+// (re-key) or 2 (credential rotation), the event that requires a re-key
+// (its sequence; -1 for none), and the device's DK signature over
+// request_tbs(session id, eval_message(...), epoch, requester, request_eval).
+//@ serial
+pub type EvalRequest = { List(Int) session_id; List(Int) log_id; Int epoch; Int purpose; List(List(Int)) blinded; Int event_seq;
+                         List(Int) requester; List(Int) sig; };
+
+// The answer: Z_i = k_j B_i for each element, with one batched DLEQ proof.
+//@ serial
+pub type EvalAnswer = { List(Int) session_id; List(List(Int)) elements; List(Int) proof; };
+
+// A device asks for the evaluation records of its log (SPEC 18.10.4): its
+// DK signature over request_tbs(session id, SHA-256("symbolon v1 eval
+// log"), epoch, requester, request_eval()). The answer: every evaluation
+// of the past seven days, by any device of the log.
+//@ serial
+pub type EvalLogRequest = { List(Int) session_id; List(Int) log_id; Int epoch; List(Int) requester; List(Int) sig; };
+
+//@ serial
+pub type EvalLogEntry = { Int time; List(Int) device; Int count; };
+
+//@ serial
+pub type EvalLogAnswer = { List(Int) session_id; Int now; Int limit; List(EvalLogEntry) entries; };
+
 //@ serial
 pub type Packet =
     WKeygen(KeygenInvite)
@@ -68,7 +101,13 @@ pub type Packet =
   | WEnrollSecrets(EnrollSecrets)
   | WKitKey(List(Int))                    // the cosigner's half k_b of the kit key for a new epoch
   | WKitRelease(List(Int))                // a recovered device asks for the cosigner's half (log id)
-  | WDuressKey(List(Int));                // the sender's duress DK sub-key (SPEC 14.2); every device sends one
+  | WDuressKey(List(Int))                 // the sender's duress DK sub-key (SPEC 14.2); every device sends one
+  | WKvDeal(KvDealMsg)                    // a dealing of the vault OPRF key (SPEC 18.10.1)
+  | WKvHalf(WrappedBlob)                  // the cosigner's half b_v of the kit's k_v share, to a recovered device
+  | WEval(EvalRequest)                    // a protected-item evaluation request (SPEC 18.10.3)
+  | WEvalAnswer(EvalAnswer)               // its answer; a refusal is WRefused(session id)
+  | WEvalLog(EvalLogRequest)              // the evaluation records, asked for
+  | WEvalLogAnswer(EvalLogAnswer);        // and given
 
 // What the relay carries: sender and recipient party ids, and the HPKE
 // mode_auth encapsulation and ciphertext of one Packet value.
@@ -82,6 +121,19 @@ pub List(Int) reshare_message(ReshareInvite r) {
     return sha256_bytes(r.log_id.concat(r.session_id).concat(ids_bytes(r.new_parties, 0, [])).concat(small(r.dealers)).concat(small(r.receivers))
         .concat(small(r.offline)).concat([r.degree & 255, (r.epoch >> 24) & 255, (r.epoch >> 16) & 255, (r.epoch >> 8) & 255, r.epoch & 255]));
 }
+
+// What an evaluation request signs as its message m: SHA-256 of the log
+// id, the purpose, the event sequence and every blinded element.
+pub List(Int) eval_message(EvalRequest r) {
+    List(Int) head = r.log_id.concat([r.purpose & 255]).concat(be8(r.event_seq + 1)).concat([(r.blinded.len() >> 8) & 255, r.blinded.len() & 255]);
+    return sha256_bytes(head.concat(flat_bl(r.blinded, 0, [])));
+}
+
+List(Int) be8(Int v) { return [(v >> 56) & 255, (v >> 48) & 255, (v >> 40) & 255, (v >> 32) & 255, (v >> 24) & 255, (v >> 16) & 255, (v >> 8) & 255, v & 255]; }
+
+List(Int) flat_bl(List(List(Int)) xs, Int i, List(Int) acc) { return if (i >= xs.len()) { acc } else { flat_bl(xs, i + 1, acc.concat([xs[i].len() & 255]).concat(xs[i])) }; }
+
+pub List(Int) eval_log_message() { return sha256_bytes(utf8("symbolon v1 eval log")); }
 
 List(Int) ids_bytes(List(Party) ps, Int i, List(Int) acc) {
     if (i >= ps.len()) { return acc; }

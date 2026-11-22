@@ -27,6 +27,8 @@ import "../duress/duress.resid";
 import "cosignerd.resid";
 import "vaultcli.resid";
 import "duresscli.resid";
+import "kvagent.resid";
+import "../vault/kvshare.resid";
 import "word.resid";
 import "crypto.resid";
 import "clock.resid";
@@ -262,14 +264,23 @@ Int release_then(Str dir, DeviceConfig c, Unlocked u, KitKeys kit, VerifiedHead 
     Half full = kit_assemble(ha, hb) else { Half {.share = [], .key = []} };
     if (full.key.len() != 32) { return dfail("the kit's halves do not assemble"); }
     Result(KitSecrets, SymbolonError) ks = kit_secrets_open(secret_bytes(full.key), c.log_id, pre.epoch, blob_get(relay, "kit-" + hex_encode(c.log_id) + "-secrets") else { [] });
+    // The kit's share of the vault OPRF key (SPEC 18.10.1): a_v from the
+    // relay and the cosigner's b_v, released with its kit half.
+    Bool has_kv = vh.head.quorum.kv_commits.len() > 0;
+    Result(KvScalar, Str) kvs = if (!has_kv) { Err("") } else {
+        kv_kit_share(relay, c.log_id, kit.hpke_priv, pre.epoch, oldkit.id, reveal(device_hpke(u.real.dek).sk), vh.head.quorum.epoch, c.party,
+                     kv_wait_half(relay, me, cr, Cursor {.party = c.party, .next = start}, clock_now_seconds() + 60), vh.head.quorum.kv_commits, pos1(pre.parties, oldkit.id, 0))
+    };
+    if (has_kv && match kvs { Err(_) => true, Ok(_) => false }) { return dfail(match kvs { Err(m) => m, Ok(_) => "" }); }
+    KvMode kvm = match kvs { Ok(k) => KvReshare(k), Err(_) => KvNone };
     return match ks {
         Err(e) => dfail(err_text(e)),
-        Ok(s) => reshare_as_kit(dir, c, u, s, full.share, vh, pre, oldkit, cos, pin, primes_file, w.cur)
+        Ok(s) => reshare_as_kit(dir, c, u, s, full.share, vh, pre, oldkit, cos, pin, primes_file, w.cur, kvm)
     };
 }
 
 @requires(filesystem, network, device, declassify, clock, provision, environment)
-Int reshare_as_kit(Str dir, DeviceConfig c, Unlocked u0, KitSecrets s, List(UInt(64)) xk, VerifiedHead vh, Quorum pre, Party oldkit, Party cos, Str pin, Str primes_file, Cursor cur) {
+Int reshare_as_kit(Str dir, DeviceConfig c, Unlocked u0, KitSecrets s, List(UInt(64)) xk, VerifiedHead vh, Quorum pre, Party oldkit, Party cos, Str pin, Str primes_file, Cursor cur, KvMode kvm) {
     // The recovered chain code and vault key replace this device's own.
     Unlocked u = Unlocked {.kind = 1, .duress = u0.duress, .st = u0.st, .wrap = u0.wrap, .real = RealProfile {.share = u0.real.share, .cc = s.cc, .vault_key = s.vault_rk, .dek = u0.real.dek, .duress_hpke_pub = u0.real.duress_hpke_pub}};
     Quorum q = vh.head.quorum;
@@ -293,7 +304,7 @@ Int reshare_as_kit(Str dir, DeviceConfig c, Unlocked u0, KitSecrets s, List(UInt
         .old = [kitcfg], .root = q.root_pubkey, .session_id = sid, .seed = random_bytes(32), .primes = primes_of(primes_file)};
     return match rs_start(rc) {
         Err(e) => dfail("re-share: " + e.why),
-        Ok(s0) => sealed_after(dir, c, u, pin, pre, after_session(dir, c, u, vh, np, inv, rem, pin,
+        Ok(s0) => sealed_after(dir, c, u, pin, pre, after_session(dir, c, u, vh, np, inv, rem, pin, kvm,
             run_session(relay, sid, [Seat {.me = me, .st = s0.state, .round = 1, .out = s0.out, .done = false}], rem, [cur], [],
                         lambda(t, msgs) { rs_adapt(t, msgs) }, 1800)))
     };
