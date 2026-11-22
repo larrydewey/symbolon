@@ -13,7 +13,7 @@ BIN="${BIN:-$PWD/target/symbolon}"
 [ -x "$BIN" ] || { echo "build target/symbolon first"; exit 2; }
 W="$(mktemp -d)"
 PG=""; PGT=""
-cleanup() { pkill -f -- "$W/" 2>/dev/null; [ -n "$PG" ] && docker rm -f "$PG" > /dev/null 2>&1; [ -n "$PGT" ] && docker rm -f "$PGT" > /dev/null 2>&1; [ -n "${KEEP:-}" ] && echo "kept $W" || rm -rf "$W"; }
+cleanup() { [ -f "$W/s3.pid" ] && kill "$(cat "$W/s3.pid")" 2>/dev/null; pkill -f -- "$W/" 2>/dev/null; [ -n "$PG" ] && docker rm -f "$PG" > /dev/null 2>&1; [ -n "$PGT" ] && docker rm -f "$PGT" > /dev/null 2>&1; [ -n "${KEEP:-}" ] && echo "kept $W" || rm -rf "$W"; }
 trap cleanup EXIT
 trap "exit 1" INT TERM HUP
 fail() { echo "FAIL: $*"; for f in "$W"/*.log; do echo "== $f"; tail -5 "$f"; done; KEEP=1; exit 1; }
@@ -95,7 +95,7 @@ pkill -f -- "relay (serve|child) $W/pgtls" 2>/dev/null; sleep 1
 
 # S3.
 S3P=$((BASE + 6))
-( setsid python3 tests/s3_oracle.py "$S3P" AKIDTEST secretkey123 symbolon eu-west-1 > "$W/s3.log" 2>&1 & )
+( setsid python3 tests/s3_oracle.py "$S3P" AKIDTEST secretkey123 symbolon eu-west-1 > "$W/s3.log" 2>&1 & echo $! > "$W/s3.pid" )
 wait_port "$S3P" || fail "s3 oracle"
 printf 's3://AKIDTEST:wrongsecret@127.0.0.1:%s/symbolon?region=eu-west-1' "$S3P" > "$W/bads3.store"
 timeout 30 "$BIN" relay serve "$W/bad2" $((BASE + 8)) --store "@$W/bads3.store" > "$W/bads3.log" 2>&1 && fail "a relay started with a wrong S3 secret"
