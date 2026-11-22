@@ -327,6 +327,16 @@ printf '%s\n2468\n' "$OPJ" | run 600 "$BIN" device vault import "$W/dev" - --for
 [ "$(field 'Example login' current)" = op-pass-1 ] && [ "$(field 'Example login' origin)" = https://login.example.com ] && [ "$(field 'Example login' totp)" = "otpauth://totp/x?secret=JBSWY3DPEHPK3PXP" ] \
   && [ "$(field 'Example login' custom_0)" = "$(printf 'Security: answer\0371\037blue')" ] && [ "$(field 'Travel card' expiry)" = 04/30 ] && [ "$(field 'Travel card' cvv)" = 321 ] \
   && [ "$(field 'Door code' text)" = '1234#' ] && [ "$(field 'Me (2)' full_name)" = "Jo Example" ] && [ "$(field 'Wi-Fi key' secret)" = w1f1-pass ] || fail "imported 1password-op items"
+# Another app's export through Android's Credential Exchange (CXF 1.0).
+CXJ=$(python3 -c 'import json,sys; print(json.dumps(json.load(open(sys.argv[1]))))' $FX/cxf.json)
+printf '%s\n' "$CXJ" | run 60 "$BIN" device vault import "$W/dev" - --format cxf --dry-run > "$W/imx.log" 2>&1 || fail "cxf dry run: $(cat "$W/imx.log")"
+grep -qx "total 6" "$W/imx.log" && grep -qx "item login $(hx Payroll) $(hx Work)" "$W/imx.log" && grep -qx "item secret $(hx 'Build box') $(hx Work/Servers)" "$W/imx.log" \
+  && grep -qx "item passkey $(hx 'webauthn.example passkey (jo)') -" "$W/imx.log" || fail "cxf dry run: $(cat "$W/imx.log")"
+printf '%s\n2468\n' "$CXJ" | run 600 "$BIN" device vault import "$W/dev" - --format cxf > "$W/imx2.log" 2>&1 || fail "import cxf: $(cat "$W/imx2.log")"
+[ "$(field Payroll current)" = cx-pass-1 ] && [ "$(field Payroll totp)" = JBSWY3DPEHPK3PXP ] && [ "$(field Payroll notes)" = "payroll note" ] \
+  && [ "$(field Payroll custom_1)" = "$(printf 'PIN\0371\0379876')" ] && [ "$(field Visa expiry)" = 04/30 ] && [ "$(field 'Home Wi-Fi (2)' ssid)" = HomeNet ] \
+  && [ "$(field 'webauthn.example passkey (jo)' public_key)" = "$(cat $FX/cxf.pub)" ] && [ "$(field 'webauthn.example passkey (jo)' source)" = credential-exchange ] \
+  && field 'Build box' secret | grep -q "BEGIN PRIVATE KEY" || fail "imported cxf items"
 printf '2468\n' | run 300 "$BIN" device vault list "$W/dev" --long > "$W/imlong.log" 2>&1
 grep -qx "card $(hx Mastercard) $(hx 4444) $(hx Finance/Cards)" "$W/imlong.log" || fail "list --long folder: $(cat "$W/imlong.log")"
 run 60 "$BIN" device vault import "$W/dev" $FX/bitwarden_encrypted.json --dry-run > "$W/ime.log" 2>&1 && fail "a password-protected export was read"

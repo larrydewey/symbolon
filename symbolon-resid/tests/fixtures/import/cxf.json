@@ -1,0 +1,204 @@
+{
+ "version": {
+  "major": 1,
+  "minor": 0
+ },
+ "exporterRpId": "passwords.google.com",
+ "exporterDisplayName": "Google Password Manager",
+ "timestamp": 1795400000,
+ "accounts": [
+  {
+   "id": "YWNjdDE",
+   "username": "jo",
+   "email": "jo@example.com",
+   "collections": [
+    {
+     "id": "YzE",
+     "title": "Work",
+     "items": [
+      {
+       "item": "aTE"
+      }
+     ],
+     "subCollections": [
+      {
+       "id": "YzI",
+       "title": "Servers",
+       "items": [
+        {
+         "item": "aTU"
+        }
+       ]
+      }
+     ]
+    }
+   ],
+   "items": [
+    {
+     "id": "aTE",
+     "title": "Payroll",
+     "scope": {
+      "urls": [
+       "https://payroll.example.com/login"
+      ],
+      "androidApps": []
+     },
+     "credentials": [
+      {
+       "type": "basic-auth",
+       "username": {
+        "fieldType": "string",
+        "value": "jo"
+       },
+       "password": {
+        "fieldType": "concealed-string",
+        "value": "cx-pass-1"
+       }
+      },
+      {
+       "type": "totp",
+       "secret": "JBSWY3DPEHPK3PXP",
+       "period": 30,
+       "digits": 6,
+       "algorithm": "sha1",
+       "issuer": "Payroll"
+      },
+      {
+       "type": "note",
+       "content": {
+        "fieldType": "string",
+        "value": "payroll note"
+       }
+      },
+      {
+       "type": "custom-fields",
+       "fields": [
+        {
+         "label": "Employee ID",
+         "fieldType": "string",
+         "value": "E-42"
+        },
+        {
+         "label": "PIN",
+         "fieldType": "concealed-string",
+         "value": "9876"
+        }
+       ]
+      }
+     ]
+    },
+    {
+     "id": "aTI",
+     "title": "Passkey site",
+     "scope": {
+      "urls": [
+       "https://webauthn.example"
+      ]
+     },
+     "credentials": [
+      {
+       "type": "passkey",
+       "credentialId": "AAECAwQFBgcICQoLDA0ODw",
+       "rpId": "webauthn.example",
+       "username": "jo",
+       "userDisplayName": "Jo",
+       "userHandle": "am8taGFuZGxl",
+       "key": "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgHy49TFtqeYgfLj1MW2p5iB8uPUxbanmIHy49TFtqeYihRANCAAS9fHO4iy6bTO2mICKy2ovhMZOltW7cJuffeELiTNC16wYFrae9qDrGorgNfjFAQPpH_xa4O6yFztsBRFG7fOca"
+      }
+     ]
+    },
+    {
+     "id": "aTM",
+     "title": "Visa",
+     "credentials": [
+      {
+       "type": "credit-card",
+       "number": {
+        "fieldType": "string",
+        "value": "4111111111111111"
+       },
+       "fullName": {
+        "fieldType": "string",
+        "value": "Jo Example"
+       },
+       "cardType": {
+        "fieldType": "string",
+        "value": "Visa"
+       },
+       "verificationNumber": {
+        "fieldType": "concealed-string",
+        "value": "321"
+       },
+       "expiryDate": {
+        "fieldType": "year-month",
+        "value": "2030-04"
+       }
+      }
+     ]
+    },
+    {
+     "id": "aTQ",
+     "title": "Home Wi-Fi",
+     "credentials": [
+      {
+       "type": "wifi",
+       "ssid": {
+        "fieldType": "string",
+        "value": "HomeNet"
+       },
+       "passphrase": {
+        "fieldType": "concealed-string",
+        "value": "w1f1-pass"
+       },
+       "networkSecurityType": {
+        "fieldType": "wifi-network-security-type",
+        "value": "wpa2-personal"
+       }
+      }
+     ]
+    },
+    {
+     "id": "aTU",
+     "title": "Build box",
+     "credentials": [
+      {
+       "type": "ssh-key",
+       "keyType": "ssh-ed25519",
+       "privateKey": "MC4CAQAwBQYDK2VwBCIEIAABAgMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4f",
+       "keyComment": "build@ci"
+      }
+     ]
+    },
+    {
+     "id": "aTY",
+     "title": "Home",
+     "credentials": [
+      {
+       "type": "address",
+       "streetAddress": {
+        "fieldType": "string",
+        "value": "1 Main St"
+       },
+       "city": {
+        "fieldType": "string",
+        "value": "Springfield"
+       },
+       "postalCode": {
+        "fieldType": "string",
+        "value": "12345"
+       },
+       "country": {
+        "fieldType": "country-code",
+        "value": "US"
+       },
+       "tel": {
+        "fieldType": "string",
+        "value": "5551234567"
+       }
+      }
+     ]
+    }
+   ]
+  }
+ ]
+}

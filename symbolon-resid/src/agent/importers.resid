@@ -551,12 +551,16 @@ Str lp_phone(Str p) {
 
 // ─── Telling the format, and reading ────────────────────────────────
 
-pub Bool import_format_ok(Str f) { return f == "auto" || f == "bitwarden-json" || f == "csv" || f == "1password-op"; }
+pub Bool import_format_ok(Str f) { return f == "auto" || f == "bitwarden-json" || f == "csv" || f == "1password-op" || f == "cxf"; }
 
 Result(ImpRead, Str) read_export(Str text, Str format) {
     Str t = str_trim(text);
     Str bom = str_from_code(65279);
     Str body = if (str_starts_with(t, bom)) { str_trim(str_slice(t, 1, str_len(t))) } else { t };
+    if (format == "cxf") {
+        Result(Value, SerialError) r2 = from_json(body);
+        return match r2 { Err(e) => Err("the other app's export is not valid JSON: " + error_text(e)), Ok(v) => cxf_items(v) };
+    }
     if (format == "1password-op") {
         Result(Value, SerialError) r1 = from_json(body);
         return match r1 { Err(e) => Err("1Password's output is not valid JSON: " + error_text(e)), Ok(v) => op_items(v) };
@@ -672,6 +676,181 @@ Imp op_item(Value it) {
         }
     }
     return note_item(name, notes, folder, op_rest(fs, ["notesPlain"], 0, ListBuf()));
+}
+
+// ─── Credential Exchange (FIDO CXF 1.0) ─────────────────────────────
+// What another app hands over through Android's Credential Exchange: a
+// header {version, exporterRpId, exporterDisplayName, timestamp,
+// accounts: [{id, username, email, collections: [{id, title, items:
+// [{item}], subCollections}], items: [{id, title, scope: {urls}, credentials:
+// [{type, ...}]}]}]}. Most values are EditableFields, {fieldType, value}.
+// An item's folder is the first collection that lists it. A passkey comes
+// across as a Synced passkey (as from a Bitwarden export); a login also
+// keeps its one-time-code seed, a note, custom fields. Values are
+// classified as they are read.
+
+Result(ImpRead, Str) cxf_items(Value top) {
+    List(Value) accts = jl(top, "accounts");
+    if (accts.len() == 0) { return Err("the other app sent no accounts"); }
+    List(Imp) got = cxf_accounts(accts, 0, ListBuf());
+    return Ok(ImpRead {.items = got, .warnings = synced_warnings(got)});
+}
+
+List(Imp) cxf_accounts(List(Value) as, Int i, ListBuf(Imp) acc) {
+    if (i >= as.len()) { return acc.finish(); }
+    List(Value) colls = jl(as[i], "collections");
+    return cxf_accounts(as, i + 1, cxf_list(jl(as[i], "items"), colls, 0, acc));
+}
+
+ListBuf(Imp) cxf_list(List(Value) xs, List(Value) colls, Int i, ListBuf(Imp) acc) {
+    if (i >= xs.len()) { return acc; }
+    return cxf_list(xs, colls, i + 1, cxf_item(xs[i], cxf_folder(colls, jt(xs[i], "id"), "", 0), acc));
+}
+
+// The title path of the first collection (or sub-collection) that lists
+// the item.
+Str cxf_folder(List(Value) cs, Str id, Str parent, Int i) {
+    if (i >= cs.len()) { return ""; }
+    Str here = if (str_len(parent) == 0) { jt(cs[i], "title") } else { parent + "/" + jt(cs[i], "title") };
+    if (cxf_links(jl(cs[i], "items"), id, 0)) { return here; }
+    Str sub = cxf_folder(jl(cs[i], "subCollections"), id, here, 0);
+    if (str_len(sub) > 0) { return sub; }
+    return cxf_folder(cs, id, parent, i + 1);
+}
+
+Bool cxf_links(List(Value) ls, Str id, Int i) {
+    if (i >= ls.len()) { return false; }
+    return jt(ls[i], "item") == id || cxf_links(ls, id, i + 1);
+}
+
+// An EditableField's value ({fieldType, value}), or a plain string.
+Str ef(Value v, Str key) {
+    Value f = jo(v, key);
+    return match f { VStr(s) => s, VUnit => "", _ => jt(f, "value") };
+}
+
+Value cxf_cred(List(Value) cs, Str t, Int i) {
+    if (i >= cs.len()) { return VUnit; }
+    if (jt(cs[i], "type") == t) { return cs[i]; }
+    return cxf_cred(cs, t, i + 1);
+}
+
+Bool has_cred(List(Value) cs, Str t) { return match cxf_cred(cs, t, 0) { VUnit => false, _ => true }; }
+
+List(Str) cxf_urls(List(Value) us, Int i, ListBuf(Str) acc) {
+    if (i >= us.len()) { return acc.finish(); }
+    Str u = str_trim(val_text(us[i]));
+    return cxf_urls(us, i + 1, if (str_len(u) == 0) { acc } else { acc.push(u) });
+}
+
+// A TOTP credential as an otpauth:// address (its seed alone when it uses
+// the defaults: SHA-1, 6 digits, 30 seconds).
+Str cxf_totp(Value t) {
+    Str sec = jt(t, "secret");
+    if (str_len(sec) == 0) { return ""; }
+    Str alg = str_to_upper(jt(t, "algorithm"));
+    Str dig = jt(t, "digits");
+    Str per = jt(t, "period");
+    Bool plain = (str_len(alg) == 0 || alg == "SHA1") && (str_len(dig) == 0 || dig == "6") && (str_len(per) == 0 || per == "30");
+    if (plain) { return sec; }
+    return "otpauth://totp/" + (if (str_len(jt(t, "issuer")) > 0) { jt(t, "issuer") } else { "imported" }) + "?secret=" + sec + "&algorithm=" + (if (str_len(alg) == 0) { "SHA1" } else { alg })
+         + "&digits=" + (if (str_len(dig) == 0) { "6" } else { dig }) + "&period=" + (if (str_len(per) == 0) { "30" } else { per });
+}
+
+// Every custom-fields credential's fields.
+ListBuf(ImpCustom) cxf_customs(List(Value) cs, Int i, ListBuf(ImpCustom) acc) {
+    if (i >= cs.len()) { return acc; }
+    if (jt(cs[i], "type") != "custom-fields") { return cxf_customs(cs, i + 1, acc); }
+    return cxf_customs(cs, i + 1, cxf_fields(jl(cs[i], "fields"), 0, acc));
+}
+
+ListBuf(ImpCustom) cxf_fields(List(Value) fs, Int i, ListBuf(ImpCustom) acc) {
+    if (i >= fs.len()) { return acc; }
+    Str label = if (str_len(str_trim(jt(fs[i], "label"))) == 0) { "Field" } else { jt(fs[i], "label") };
+    return cxf_fields(fs, i + 1, cput(acc, label, jt(fs[i], "value"), jt(fs[i], "fieldType") == "concealed-string"));
+}
+
+// "YYYY-MM" as MM/YY.
+Str ym_expiry(Str v) { return if (str_len(v) >= 7) { str_slice(v, 5, 7) + "/" + str_slice(v, 2, 4) } else { "" }; }
+
+ListBuf(Imp) cxf_item(Value it, Str folder, ListBuf(Imp) acc) {
+    Str name = jt(it, "title");
+    List(Value) cs = jl(it, "credentials");
+    Str notes = ef(cxf_cred(cs, "note", 0), "content");
+    ListBuf(ImpCustom) custom = cxf_customs(cs, 0, ListBuf());
+    List(Str) urls = cxf_urls(jl(jo(it, "scope"), "urls"), 0, ListBuf());
+    ListBuf(Imp) a = cxf_passkeys(cs, name, folder, 0, acc);
+    if (has_cred(cs, "basic-auth") || has_cred(cs, "totp")) {
+        Value b = cxf_cred(cs, "basic-auth", 0);
+        return a.push(login_item(name, urls, ef(b, "username"), ef(b, "password"), cxf_totp(cxf_cred(cs, "totp", 0)), notes, folder, custom));
+    }
+    if (has_cred(cs, "credit-card")) {
+        Value c = cxf_cred(cs, "credit-card", 0);
+        return a.push(card_item(name, ef(c, "fullName"), ef(c, "number"), ym_expiry(ef(c, "expiryDate")), ef(c, "verificationNumber"), ef(c, "pin"), notes, folder,
+                                cput(custom, "Brand", ef(c, "cardType"), false)));
+    }
+    if (has_cred(cs, "wifi")) {
+        Value w = cxf_cred(cs, "wifi", 0);
+        ListBuf(ImpField) fs = fput(fput(fput(fput(ListBuf(), "ssid", ef(w, "ssid")), "password", ef(w, "passphrase")), "security", ef(w, "networkSecurityType")), "notes", notes);
+        return a.push(imp(name_or(name, "", ef(w, "ssid")), "wifi", folder, fs, custom));
+    }
+    if (has_cred(cs, "ssh-key") || has_cred(cs, "api-key") || has_cred(cs, "generated-password")) {
+        Value k = cxf_cred(cs, "ssh-key", 0);
+        Value ak = cxf_cred(cs, "api-key", 0);
+        Str key = if (has_cred(cs, "ssh-key")) { cxf_pem(jt(k, "privateKey")) } else { if (has_cred(cs, "api-key")) { ef(ak, "key") } else { jt(cxf_cred(cs, "generated-password", 0), "password") } };
+        ListBuf(ImpCustom) more = cput(cput(custom, "Key type", jt(k, "keyType"), false), "Comment", jt(k, "keyComment"), false);
+        return a.push(imp(name_or(name, "", "Secret"), "secret", folder, fput(fput(ListBuf(), "secret", key), "notes", notes), more));
+    }
+    Str doc_t = if (has_cred(cs, "passport")) { "passport" } else { if (has_cred(cs, "drivers-license")) { "drivers-license" } else { "identity-document" } };
+    if (has_cred(cs, "address") || has_cred(cs, doc_t) || has_cred(cs, "person-name")) {
+        Value ad = cxf_cred(cs, "address", 0);
+        Value d = cxf_cred(cs, doc_t, 0);
+        Value pn = cxf_cred(cs, "person-name", 0);
+        Str full0 = words([ef(pn, "title"), ef(pn, "given"), ef(pn, "givenInformal"), ef(pn, "given2"), ef(pn, "surname")]);
+        Str full = if (str_len(full0) > 0) { full0 } else { ef(d, "fullName") };
+        Str addr = lines([ef(ad, "streetAddress"), words([ef(ad, "city"), ef(ad, "territory"), ef(ad, "postalCode")]), ef(ad, "country")]);
+        ListBuf(ImpField) fs = fput(fput(fput(fput(ListBuf(), "full_name", full), "phone", ef(ad, "tel")), "address", addr), "document", ef(d, "documentNumber"));
+        return a.push(imp(name_or(name, "", full), "identity", folder, fput(fs, "notes", notes), custom));
+    }
+    // A passkey alone needs no item of its own besides the passkey.
+    if (has_cred(cs, "passkey") && str_len(str_trim(notes)) == 0 && cxf_customs(cs, 0, ListBuf()).finish().len() == 0) {
+        _ = custom.finish();
+        return a;
+    }
+    return a.push(note_item(name, notes, folder, custom));
+}
+
+// A PKCS#8 key in base64url as PEM, as an SSH or key file holds it.
+Str cxf_pem(Str b64u) {
+    List(Int) der = unb64url(b64u);
+    if (der.len() == 0) { return ""; }
+    return "-----BEGIN PRIVATE KEY-----\n" + pem_lines(base64_encode(der), 0, StrBuf()) + "-----END PRIVATE KEY-----\n";
+}
+
+Str pem_lines(Str b, Int i, StrBuf acc) {
+    if (i >= str_len(b)) { return acc.finish(); }
+    Int e = if (i + 64 < str_len(b)) { i + 64 } else { str_len(b) };
+    return pem_lines(b, e, acc.push(str_slice(b, i, e)).push("\n"));
+}
+
+// Passkeys, each a Synced passkey: CXF's field names on bw_passkey's
+// reading (the key is base64url PKCS#8, as in a Bitwarden export).
+ListBuf(Imp) cxf_passkeys(List(Value) cs, Str login, Str folder, Int i, ListBuf(Imp) acc) {
+    if (i >= cs.len()) { return acc; }
+    if (jt(cs[i], "type") != "passkey") { return cxf_passkeys(cs, login, folder, i + 1, acc); }
+    Value p = cs[i];
+    Value as_bw = VMap([ventry(VStr("rpId"), VStr(jt(p, "rpId"))), ventry(VStr("userName"), VStr(jt(p, "username"))), ventry(VStr("userDisplayName"), VStr(jt(p, "userDisplayName"))),
+                        ventry(VStr("credentialId"), VStr("b64." + jt(p, "credentialId"))), ventry(VStr("userHandle"), VStr(jt(p, "userHandle"))), ventry(VStr("keyValue"), VStr(jt(p, "key"))),
+                        ventry(VStr("keyAlgorithm"), VStr("ECDSA")), ventry(VStr("keyCurve"), VStr("P-256")), ventry(VStr("counter"), VStr("0"))]);
+    Imp x = bw_passkey(as_bw, login, folder);
+    // The CXF source is not Bitwarden.
+    List(ImpField) fs = with_source(x.fields, 0, ListBuf());
+    return cxf_passkeys(cs, login, folder, i + 1, acc.push(Imp {.name = x.name, .kind = x.kind, .folder = x.folder, .fields = fs, .custom = x.custom, .why = x.why}));
+}
+
+List(ImpField) with_source(List(ImpField) fs, Int i, ListBuf(ImpField) acc) {
+    if (i >= fs.len()) { return acc.finish(); }
+    return with_source(fs, i + 1, acc.push(if (fs[i].name == "source") { ImpField {.name = "source", .value = sv("credential-exchange")} } else { fs[i] }));
 }
 
 // ─── Checking and sealing ───────────────────────────────────────────
