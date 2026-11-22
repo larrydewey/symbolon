@@ -500,7 +500,11 @@ unlock_key  = HKDF(hw_secret, salt_local, "symbolon v1 unlock", 32)
 ```
 
 `unlock_key` decrypts the device's share, chain code, vault keys and DEK.
-The TPM's lockout limits PIN guesses. The DK MUST be usable only after
+The TPM's lockout limits PIN guesses. A TPM holds one Symbolon device: its
+device key and unlock keys sit at fixed persistent handles, so a second
+`device new` on the same TPM is refused rather than replacing them, and
+`device forget` removes only keys whose device key is the one its
+configuration names. The DK MUST be usable only after
 local unlock (a TPM policy bound to `pin_stretch`, or the platform's
 user-verification gate), so that a thief holding a locked device can
 neither sign log events, veto, nor request co-signatures (A-04). The
@@ -1335,6 +1339,32 @@ addresses, Wi-Fi, passports, licences and social security numbers become
 the matching types; others become notes that keep every field. The first
 web address of a login gives its `origin`; the others, and app addresses,
 become custom fields. Parsing uses the resid-json and resid-csv packages.
+
+Signing in instead of exporting (Bitwarden and Vaultwarden): `device vault
+signin-bitwarden DIR SERVER [--dry-run] [--share ID]` signs in as
+Bitwarden's own apps do (prelogin; the master key by PBKDF2-SHA256 or
+Argon2id over the email; the login hash; `/identity/connect/token` with a
+random device identifier kept in DIR; a two-step code from an
+authenticator app, email, a YubiKey OTP or a recovery code, and the
+new-device email code, asked for through a line conversation with the
+app), downloads `/api/sync` and decrypts it on the device: the stretched
+master key (HKDF-Expand "enc"/"mac") opens the user key (EncString type 2,
+AES-256-CBC with HMAC-SHA-256, the MAC checked first), the user key the
+RSA private key, that each organization's key (RSA-OAEP-SHA-1, type 4; or
+SHA-256, type 3), and an item with its own key is opened with it. Items in
+the trash are left behind. The account's key derivation must be at least
+100,000 PBKDF2 iterations, or Argon2id with at least 2 passes and 16 MiB:
+a server that lowered it would be asking for a login hash cheap to guess
+(a malicious-server downgrade), so a weaker account is refused with a way
+to raise it. Every value except what Symbolon lists in the clear anyway (an
+item's name, its folder, its site, a custom field's label, a passkey's
+site and credential ID) is decrypted into secret bytes and stays secret
+until the vault seals it; a passkey's key is read with the standard
+library's constant-time base64 and secret PKCS#8 reader. The master
+password, master key, session and decrypted vault are never written down.
+Accounts on Bitwarden's newer key format ("user crypto v2", COSE keys)
+and two-step login by Duo or a security key are refused for now, with the
+export file as the way in.
 
 A Bitwarden export's passkeys (`fido2Credentials`) are imported as Synced
 passkeys (Section 5.2, 22.3): a Symbolon passkey's key is split between the

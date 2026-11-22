@@ -5,6 +5,31 @@ description: Bring your passwords from another manager, add a new phone, recover
 
 ## From another password manager
 
+### Bitwarden or Vaultwarden: sign in
+
+No export file needed: in the app, **More › Import › Bitwarden or
+Vaultwarden**. Choose bitwarden.com, bitwarden.eu or your own server's
+address, enter your email and master password, and the code from your
+authenticator app (or email) if Bitwarden asks for one. Symbolon downloads
+your encrypted vault and opens it on your phone or computer; nothing is
+saved unencrypted, and your master password is used once and not kept.
+Check the preview, then import with your PIN.
+
+```sh
+symbolon device vault signin-bitwarden ~/.symbolon https://vault.example.com --dry-run
+```
+
+(On the command line it is a conversation: the email, then the master
+password, then a code if asked, on standard input.)
+
+If your account still uses fewer than 100,000 key-derivation iterations,
+raise them first in Bitwarden (Settings › Security › Keys): Symbolon refuses
+weaker settings, which a malicious server could otherwise lower on purpose.
+Duo and security-key two-step login, and accounts on Bitwarden's newest key
+format, need the export file for now.
+
+### Everything else: the export file
+
 Symbolon reads the export file your password manager makes and brings
 everything across in one go: logins, cards, identities, notes, bank
 accounts, Wi-Fi networks and secrets, keeping your folders. It is added to
