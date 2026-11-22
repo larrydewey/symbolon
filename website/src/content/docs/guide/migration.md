@@ -28,6 +28,28 @@ weaker settings, which a malicious server could otherwise lower on purpose.
 Duo and security-key two-step login, and accounts on Bitwarden's newest key
 format, need the export file for now.
 
+### LastPass: sign in (experimental)
+
+**More › Import › LastPass**: your email and master password, then the code
+from your authenticator app, or approve the sign-in on your phone if LastPass
+asks. LastPass offers no supported way for other apps to sign in, so
+Symbolon speaks the protocol of LastPass's own command-line tool; if it
+stops working, use the CSV export below.
+
+### 1Password, Google Password Manager and others on your phone
+
+On Android: **More › Import › Another app on this phone**. Android asks which
+app to take your passwords from (1Password, Google Password Manager,
+Bitwarden, Dashlane...); confirm in that app, and its passwords and passkeys
+come across with no export file. It needs a current Google Play services.
+
+### 1Password on Linux
+
+**More › Import › 1Password** reads your items through 1Password's own
+command-line tool, `op`. Install it, then in the 1Password app turn on
+Settings › Developer › "Integrate with 1Password CLI"; 1Password asks you to
+unlock it when Symbolon reads.
+
 ### Everything else: the export file
 
 Symbolon reads the export file your password manager makes and brings

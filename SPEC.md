@@ -1366,6 +1366,29 @@ Accounts on Bitwarden's newer key format ("user crypto v2", COSE keys)
 and two-step login by Duo or a security key are refused for now, with the
 export file as the way in.
 
+Signing in to LastPass (experimental): `device vault signin-lastpass DIR
+[--dry-run] [--share ID]` speaks the protocol of LastPass's own command-line
+client, as LastPass offers no supported one for other apps: the iteration
+count, the key PBKDF2-SHA256(password, email, n) and the login hash, the
+login with an authenticator code or a push approval (polled), the account
+blob, and its fields in AES-256-CBC, -GCM or (old accounts) -ECB; a shared
+folder's key is RSA-OAEP-SHA-1 to the account's private key. The same
+floor on the key derivation, and the same rule for secrets, as for
+Bitwarden; a typed secure note's framing (line breaks and "Key:" labels) is
+published, its values are not.
+
+1Password: on Linux, through its command-line tool `op` (with the desktop
+app's CLI integration): the app reads `op item get --reveal --format json`
+and hands it to `device vault import DIR - --format 1password-op` on
+standard input (one line, then the PIN; never a file). On Android, and
+for any other app that supports it (Google Password Manager, Bitwarden,
+Dashlane), through Android's Credential Exchange: the person picks the app
+and confirms there, and the FIDO CXF 1.0 it hands over goes to `--format
+cxf` the same way (logins, one-time-code seeds, passkeys as Synced
+passkeys, cards, Wi-Fi, keys, addresses, identity documents; an item's
+folder is the first collection that lists it). As with an export file,
+these arrive as text and are classified as they are read.
+
 A Bitwarden export's passkeys (`fido2Credentials`) are imported as Synced
 passkeys (Section 5.2, 22.3): a Symbolon passkey's key is split between the
 device and the cosigner, and a whole private key is never split after the
