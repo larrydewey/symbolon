@@ -1,4 +1,7 @@
+import 'dart:convert';
 import 'dart:io';
+
+import 'package:flutter/services.dart';
 
 import 'package:file_picker/file_picker.dart';
 import 'package:material_ui/material_ui.dart';
@@ -82,7 +85,8 @@ class ImportPreview {
 class _ImportPageState extends State<ImportPage> {
   _Source? source;
   String? file;
-  String? opLine;                      // 1Password's items, read through its CLI, until imported
+  String? opLine;                      // another app's items (1Password's CLI, or Credential Exchange), until imported
+  String opFormat = '1password-op';
   ImportPreview? preview;
   int? imported;
 
@@ -104,6 +108,35 @@ class _ImportPageState extends State<ImportPage> {
     });
   }
 
+  // Another app on this phone (Android's Credential Exchange): the person
+  // picks it and confirms there; its items arrive as CXF JSON.
+  Future<void> _exchange() async {
+    String? json;
+    try {
+      json = await const MethodChannel('symbolon/platform').invokeMethod<String>('importCredentials');
+    } on PlatformException catch (e) {
+      if (!mounted || e.code == 'cancelled') return;
+      final why = switch (e.code) {
+        'none' => 'No app on this phone offered its passwords. Update the other app, or use its export file.',
+        'unavailable' => 'This phone cannot hand passwords between apps yet (it needs a current Google Play services).',
+        _ => 'The other app did not hand its passwords over${e.message == null ? '' : ': ${e.message}'}.',
+      };
+      ScaffoldMessenger.of(context).showSnackBar(errorBar(why));
+      return;
+    }
+    if (json == null || !mounted) return;
+    // One line for the agent's standard input.
+    final line = jsonEncode(jsonDecode(json));
+    final res = await runTask(context, 'Reading what came across', () => app.cli.vaultImportLinePreview(app.dir, line, 'cxf'), usually: 'a few seconds');
+    if (!mounted || !res.ok) return;
+    setState(() {
+      opLine = line;
+      opFormat = 'cxf';
+      file = null;
+      preview = ImportPreview.parse(res.lines);
+    });
+  }
+
   // 1Password on Linux: its CLI reads the items (1Password asks to be
   // unlocked); they go to the agent on standard input.
   Future<void> _onePassword() async {
@@ -111,6 +144,7 @@ class _ImportPageState extends State<ImportPage> {
       try {
         final line = await readOnePassword();
         opLine = line;
+        opFormat = '1password-op';
         return await app.cli.vaultImportLinePreview(app.dir, line, '1password-op');
       } on OpProblem catch (e) {
         return CliResult(1, '', 'device: ${e.message}');
@@ -134,7 +168,7 @@ class _ImportPageState extends State<ImportPage> {
     if ((f == null && op == null) || p == null || p.items.isEmpty) return;
     final passkeys = widget.share.isEmpty && p.items.any((i) => i.type == 'passkey');
     final r = await app.withPin(context, (pin) => runTask(context, 'Importing ${p.items.length} items', () async {
-          final r = op != null ? await app.cli.vaultImportLine(app.dir, op, '1password-op', pin, share: widget.share) : await app.cli.vaultImport(app.dir, f!, pin, share: widget.share);
+          final r = op != null ? await app.cli.vaultImportLine(app.dir, op, opFormat, pin, share: widget.share) : await app.cli.vaultImport(app.dir, f!, pin, share: widget.share);
           // Imported passkeys are offered at sign-in, and listed to be
           // replaced, from the same list as Symbolon's own.
           if (r.ok && passkeys) {
@@ -204,6 +238,17 @@ class _ImportPageState extends State<ImportPage> {
             onTap: () => _signIn(lastpass: true),
           ),
         ),
+        if (Platform.isAndroid)
+          Card(
+            child: ListTile(
+              key: const Key('source-exchange'),
+              leading: const Icon(Icons.swap_horiz),
+              title: const Text('Another app on this phone'),
+              subtitle: const Text('Google Password Manager, 1Password, Bitwarden, Dashlane...: the app hands its passwords and passkeys over after you confirm'),
+              trailing: const Icon(Icons.chevron_right),
+              onTap: _exchange,
+            ),
+          ),
         if (Platform.isLinux)
           Card(
             child: ListTile(

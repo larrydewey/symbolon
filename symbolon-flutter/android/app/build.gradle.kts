@@ -70,7 +70,11 @@ flutter {
 
 dependencies {
     // The passkey provider (Android 14+ Credential Manager).
-    implementation("androidx.credentials:credentials:1.5.0")
+    implementation("androidx.credentials:credentials:1.6.0")
+    // Importing from another app on this phone (Credential Exchange, CXF):
+    // the other app hands its items over after the person confirms.
+    implementation("androidx.credentials.providerevents:providerevents:1.0.0-beta01")
+    implementation("androidx.credentials.providerevents:providerevents-play-services:1.0.0-beta01")
     // Fingerprint or face unlock (the PIN kept under a key it opens).
     implementation("androidx.biometric:biometric:1.1.0")
     // The QR decoder (Apache-2.0, no dependencies), with the platform camera: QrScanner.kt.

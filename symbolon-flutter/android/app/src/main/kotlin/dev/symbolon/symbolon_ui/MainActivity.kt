@@ -15,6 +15,15 @@ import androidx.credentials.GetPublicKeyCredentialOption
 import androidx.credentials.PublicKeyCredential
 import androidx.credentials.exceptions.CreateCredentialException
 import androidx.credentials.exceptions.GetCredentialException
+import androidx.credentials.providerevents.ProviderEventsManager
+import androidx.credentials.providerevents.exception.ImportCredentialsCancellationException
+import androidx.credentials.providerevents.exception.ImportCredentialsException
+import androidx.credentials.providerevents.exception.ImportCredentialsNoExportOptionException
+import androidx.credentials.providerevents.exception.ImportCredentialsProviderConfigurationException
+import androidx.credentials.providerevents.exception.ImportCredentialsUnknownErrorException
+import androidx.credentials.providerevents.transfer.CredentialTypes
+import androidx.credentials.providerevents.transfer.ImportCredentialsRequest
+import androidx.credentials.providerevents.transfer.ProviderImportCredentialsResponse
 import io.flutter.embedding.android.FlutterFragmentActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
@@ -106,6 +115,28 @@ class MainActivity : FlutterFragmentActivity() {
                         "disable_duress" to b.getBoolean("disable_duress", false),
                     ))
                 }
+                // Credential Exchange: another app on this phone (Google
+                // Password Manager, 1Password, Bitwarden...) hands its items
+                // over after the person picks it and confirms. The answer
+                // is the CXF JSON, for the agent (--format cxf).
+                "importCredentials" -> if (Build.VERSION.SDK_INT < 26) result.error("unsupported", "Android 8 or later is needed", null)
+                    else ProviderEventsManager.create(this).importCredentialsAsync(this,
+                        ImportCredentialsRequest(setOf(CredentialTypes.CREDENTIAL_TYPE_BASIC_AUTH, CredentialTypes.CREDENTIAL_TYPE_PUBLIC_KEY,
+                            CredentialTypes.CREDENTIAL_TYPE_TOTP, CredentialTypes.CREDENTIAL_TYPE_NOTE, CredentialTypes.CREDENTIAL_TYPE_CREDIT_CARD,
+                            CredentialTypes.CREDENTIAL_TYPE_ADDRESS, CredentialTypes.CREDENTIAL_TYPE_SSH_KEY, CredentialTypes.CREDENTIAL_TYPE_CUSTOM_FIELDS,
+                            CredentialTypes.CREDENTIAL_TYPE_WIFI, CredentialTypes.CREDENTIAL_TYPE_API_KEY, CredentialTypes.CREDENTIAL_TYPE_IDENTITY_DOCUMENT,
+                            CredentialTypes.CREDENTIAL_TYPE_PASSPORT, CredentialTypes.CREDENTIAL_TYPE_DRIVERS_LICENSE, CredentialTypes.CREDENTIAL_TYPE_PERSON_NAME,
+                            CredentialTypes.CREDENTIAL_TYPE_GENERATED_PASSWORD), emptySet()),
+                        CancellationSignal(), mainExecutor, object : CredentialManagerCallback<ProviderImportCredentialsResponse, ImportCredentialsException> {
+                            override fun onResult(r: ProviderImportCredentialsResponse) = result.success(r.response.responseJson)
+                            override fun onError(e: ImportCredentialsException) = result.error(when {
+                                // Backing out of the system's picker can arrive as an unknown error with no message.
+                                e is ImportCredentialsCancellationException || (e is ImportCredentialsUnknownErrorException && e.message == null) -> "cancelled"
+                                e is ImportCredentialsNoExportOptionException -> "none"
+                                e is ImportCredentialsProviderConfigurationException -> "unavailable"
+                                else -> "error"
+                            }, e.message, null)
+                        })
                 // Android 14+: whether passkey providers can be chosen, and
                 // the system page where the user turns Symbolon on.
                 "providerSupported" -> result.success(Build.VERSION.SDK_INT >= 34)
