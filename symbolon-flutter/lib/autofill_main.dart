@@ -405,6 +405,8 @@ class _AutofillPageState extends State<AutofillPage> {
           child: ListTile(
             leading: Icon(it.type == 'card' ? Icons.credit_card : Icons.person_outline),
             title: Text(it.name),
+            // A protected item (SPEC 18.10.6): filled once the cosigner answers.
+            trailing: it.protected ? Tooltip(message: 'Protected item: asks your cosigner', child: Icon(Icons.shield_outlined, key: Key('af-protected-${it.name}'))) : null,
             subtitle: breachedUnder(Text(it.type == 'card' ? '•••• ${it.detail}' : (it.detail.isEmpty ? 'Saved for this app' : it.detail)),
                 it.type == 'card' ? null : widget.settings.breachedCount(it.name), Key('af-breached-${it.name}')),
           ),

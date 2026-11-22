@@ -3,6 +3,7 @@ import 'dart:io';
 import 'package:material_ui/material_ui.dart';
 
 import '../app.dart';
+import '../cli.dart';
 import '../widgets.dart';
 import 'scan_page.dart';
 
@@ -19,6 +20,38 @@ class DevicesPage extends StatefulWidget {
 class _DevicesPageState extends State<DevicesPage> {
   final linkText = TextEditingController();
   App get app => widget.app;
+  bool? protectedOn;          // the quorum has a vault OPRF key (SPEC 18.10)
+  (int, List<Openings>)? openings;
+
+  @override
+  void initState() {
+    super.initState();
+    _status();
+  }
+
+  Future<void> _status() async {
+    final r = await app.cli.status(app.dir);
+    if (!mounted) return;
+    setState(() => protectedOn = DeviceStatus.parse(r)?.protectedItems);
+  }
+
+  // Protected items (SPEC 18.10): turned on by a re-share with the cosigner.
+  Future<void> enableProtection() async {
+    final r = await app.withPin(context, (p) => runTask(context, 'Turning protected items on', () => app.cli.protectionEnable(app.dir, p),
+        detail: 'Your identity is re-shared with your cosigner, which gives it the key protected items need.', usually: '1-3 minutes'));
+    if (r == null || !mounted) return;
+    if (!r.ok) return toast(context, friendlyError(r));
+    toast(context, 'Protected items are on');
+    _status();
+  }
+
+  // Each device's protected openings, from the cosigner's records (SPEC 18.10.4).
+  Future<void> checkOpenings() async {
+    final r = await app.withPin(context, (p) => runTask(context, 'Asking the cosigner', () => app.cli.openings(app.dir, p), usually: 'a few seconds'));
+    if (r == null || !mounted) return;
+    if (!r.ok) return toast(context, friendlyError(r));
+    setState(() => openings = Openings.parse(r));
+  }
 
   @override
   void dispose() {
@@ -83,6 +116,27 @@ class _DevicesPageState extends State<DevicesPage> {
           ],
           Field(linkText, Platform.isAndroid || Platform.isIOS ? 'Or paste its link' : 'Paste its link', hint: 'symbolon://link?…', url: true, fieldKey: const Key('add-link'), action: TextInputAction.done),
           WideButton('Add the device', key: const Key('add-device'), icon: Icons.add, tonal: true, onPressed: add),
+        ]),
+        Section('Protected items', subtitle: 'Items you protect open only with your cosigner, so one stolen or infected device cannot open them on its own.', children: [
+          if (protectedOn == false) ...[
+            const Text('Protected items are not on for your identity yet. Turning them on re-shares your identity with your cosigner; '
+                'do it before adding another device.'),
+            const SizedBox(height: 12),
+            WideButton('Turn protected items on', key: const Key('protection-enable'), icon: Icons.shield_outlined, tonal: true, onPressed: enableProtection),
+          ],
+          if (protectedOn == true) ...[
+            WideButton('Check protected openings', key: const Key('openings-check'), icon: Icons.fact_check_outlined, tonal: true, onPressed: checkOpenings),
+            if (openings case (final limit, final list)) ...[
+              const SizedBox(height: 8),
+              for (final o in list)
+                ListTile(
+                  key: Key('openings-${o.label}'),
+                  leading: Icon(o.unusual ? Icons.warning_amber : Icons.devices, color: o.unusual ? Colors.orange : null),
+                  title: Text(o.label.isEmpty ? 'Device' : o.label),
+                  subtitle: Text('${o.hour} in the past hour (limit $limit), ${o.day} today, ${o.week} this week${o.unusual ? ': unusually many' : ''}'),
+                ),
+            ],
+          ],
         ]),
         Section('Retire this device', subtitle: 'Before you sell, give away or wipe it, once another device has joined your identity.', children: [
           OutlinedButton.icon(

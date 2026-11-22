@@ -479,6 +479,8 @@ class _FillConsentPageState extends State<FillConsentPage> {
           child: ListTile(
             leading: Icon(card ? Icons.credit_card : Icons.person_outline),
             title: Text(it.name),
+            // A protected item (SPEC 18.10.6): filled once the cosigner answers.
+            trailing: it.protected ? Tooltip(message: 'Protected item: asks your cosigner', child: Icon(Icons.shield_outlined, key: Key('fc-protected-${it.name}'))) : null,
             subtitle: breachedUnder(Text(card ? (it.detail.isEmpty ? 'Card' : '•••• ${it.detail}') : it.detail),
                 card ? null : widget.settings.breachedCount(it.name), Key('fc-breached-${it.name}')),
           ),

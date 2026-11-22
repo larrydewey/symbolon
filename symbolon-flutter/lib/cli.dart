@@ -216,6 +216,18 @@ class SymbolonCli {
   Future<CliResult> vaultDelete(String dir, String name, String pin, {String share = ''}) =>
       run(['device', 'vault', 'delete', dir, name, ..._in(share)], input: [pin], timeout: const Duration(minutes: 5));
 
+  /// Moves an item of the own vault into the protected tier ([on]) or back
+  /// (SPEC 18.10): opening a protected item then needs the cosigner.
+  Future<CliResult> vaultProtect(String dir, String name, bool on, String pin) =>
+      run(['device', 'vault', on ? 'protect' : 'unprotect', dir, name], input: [pin], timeout: const Duration(minutes: 5));
+
+  /// Each device's protected openings from the cosigner's records: "limit
+  /// N", then "device PARTY-HEX LABEL-HEX hour H day D week W usual|unusual".
+  Future<CliResult> openings(String dir, String pin) => run(['device', 'openings', dir], input: [pin], timeout: const Duration(minutes: 2));
+
+  /// Gives a quorum without one a vault OPRF key (a re-share with the cosigner).
+  Future<CliResult> protectionEnable(String dir, String pin) => run(['device', 'protection', 'enable', dir], input: [pin]);
+
   // ─── Organizations (SPEC 29) ────────────────────────────────────────
 
   /// "org ID NAME-HEX", "version V gov G", "role R", "policy ...",
@@ -285,8 +297,9 @@ class SymbolonCli {
       run(['device', 'share', 'duress', dir, id, on ? 'on' : 'off'], input: [pin], timeout: const Duration(minutes: 5));
 
   /// Moves an item to the own vault ([to] "") or the shared folder [to], from the own vault ([from] "") or a folder.
-  Future<CliResult> vaultMove(String dir, String name, String to, String pin, {String from = ''}) =>
-      run(['device', 'vault', 'move', dir, name, to.isEmpty ? 'own' : to, ..._in(from)], input: [pin], timeout: const Duration(minutes: 5));
+  /// [unprotect]: a protected item goes into a shared folder unprotected (it holds no protected items).
+  Future<CliResult> vaultMove(String dir, String name, String to, String pin, {String from = '', bool unprotect = false}) =>
+      run(['device', 'vault', 'move', dir, name, to.isEmpty ? 'own' : to, if (unprotect) '--unprotect', ..._in(from)], input: [pin], timeout: const Duration(minutes: 5));
 
   /// Publishes the name others see; prints "LOG-ID FINGERPRINT".
   Future<CliResult> shareCard(String dir, String name, String pin) => run(['device', 'share', 'card', dir, name], input: [pin], timeout: const Duration(minutes: 5));
@@ -368,8 +381,9 @@ class DeviceStatus {
   final bool keystore;      // the Android Keystore profile
   final String? log;
   final int? sequence, epoch, parties, threshold, pending;
+  final bool protectedItems; // the quorum has a vault OPRF key (SPEC 18.10)
   const DeviceStatus(
-      {required this.party, required this.unprotected, this.keystore = false, this.log, this.sequence, this.epoch, this.parties, this.threshold, this.pending});
+      {required this.party, required this.unprotected, this.keystore = false, this.log, this.sequence, this.epoch, this.parties, this.threshold, this.pending, this.protectedItems = false});
 
   static DeviceStatus? parse(CliResult r) {
     final party = r.field('party');
@@ -393,6 +407,36 @@ class DeviceStatus {
       parties: at('parties'),
       threshold: at('threshold'),
       pending: at('pending'),
+      protectedItems: (r.field('protected') ?? '').startsWith('on'),
     );
+  }
+}
+
+/// One device's protected openings, as `device openings` reports them.
+class Openings {
+  final String party;
+  final String label;
+  final int hour, day, week;
+  final bool unusual;
+  const Openings(this.party, this.label, this.hour, this.day, this.week, this.unusual);
+
+  /// The limit (per device per hour) and one entry per device.
+  static (int, List<Openings>) parse(CliResult r) {
+    var limit = 0;
+    final out = <Openings>[];
+    for (final l in r.lines) {
+      final p = l.trim().split(' ');
+      if (p.length == 2 && p[0] == 'limit') limit = int.tryParse(p[1]) ?? 0;
+      if (p.length == 10 && p[0] == 'device') {
+        String label;
+        try {
+          label = utf8.decode([for (var i = 0; i + 1 < p[2].length; i += 2) int.parse(p[2].substring(i, i + 2), radix: 16)]);
+        } on FormatException {
+          label = '';
+        }
+        out.add(Openings(p[1], label, int.tryParse(p[4]) ?? 0, int.tryParse(p[6]) ?? 0, int.tryParse(p[8]) ?? 0, p[9] == 'unusual'));
+      }
+    }
+    return (limit, out);
   }
 }

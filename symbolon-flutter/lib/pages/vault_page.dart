@@ -230,6 +230,7 @@ class _VaultPageState extends State<VaultPage> {
                   title: Text(it.name),
                   subtitle: Wrap(spacing: 8, crossAxisAlignment: WrapCrossAlignment.center, children: [
                     KindTag(it.kind.label, it.kind.color),
+                    if (it.protected) Icon(Icons.shield_outlined, size: 16, key: Key('protected-tag-${it.name}'), semanticLabel: 'Protected'),
                     if (it.type == 'login' && app.settings.breachedCount(it.name, share: share) != null) KindTag('Breached', Colors.red.shade700, key: Key('breached-tag-${it.name}')),
                     if (it.type == 'login' || it.type == 'card') Text(it.subtitle, style: Theme.of(context).textTheme.bodySmall),
                     if (it.folder.isNotEmpty && folder != it.folder)

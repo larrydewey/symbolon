@@ -71,6 +71,11 @@ String friendlyError(CliResult r) {
   final l = p.toLowerCase();
   if (l.contains('wrong pin')) return 'Wrong PIN.';
   if (r.code == 124 || l.contains('timed out')) return 'This took too long and was stopped. Check that this device can reach the relay and the cosigner, then try again.';
+  if (l.contains('needs the cosigner')) {
+    return 'This item is protected: opening it needs your cosigner, which did not answer. It may be offline, past this device\'s hourly limit, '
+        'or refusing (for example during a duress window).';
+  }
+  if (l.contains('protected items are off')) return 'Protected items are not on for your identity yet. Turn them on under More, then Devices.';
   if (l.contains('cosigner is unreachable') || l.contains('did not sign') || l.contains('cosigner did not')) {
     return 'The cosigner did not answer. It may be offline or refusing (for example during a duress window).';
   }

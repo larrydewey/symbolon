@@ -5,6 +5,7 @@ import '../brand.dart';
 import '../cli.dart';
 import '../widgets.dart';
 import 'autofill_card.dart';
+import 'devices_page.dart';
 import 'hardware_page.dart';
 import 'provider_card.dart';
 import 'recovery_page.dart';
@@ -24,6 +25,7 @@ class HomePage extends StatefulWidget {
 class _HomePageState extends State<HomePage> {
   CliResult? result;
   bool loading = true;
+  List<Openings> unusual = const [];
 
   @override
   void initState() {
@@ -39,6 +41,20 @@ class _HomePageState extends State<HomePage> {
       result = r;
       loading = false;
     });
+    await _openings(r);
+  }
+
+  // Protected openings well above a device's usual (SPEC 18.10.4): shown on
+  // every device, as the likely sign of malware in an unlocked one. Asked
+  // only while the app is unlocked, so the home page never asks for the PIN.
+  Future<void> _openings(CliResult status) async {
+    final app = widget.app;
+    if (!app.session.unlocked || !(DeviceStatus.parse(status)?.protectedItems ?? false)) return;
+    final pin = await app.session.get(context);
+    if (pin == null || !mounted) return;
+    final o = await app.cli.openings(app.dir, pin);
+    if (!mounted || !o.ok) return;
+    setState(() => unusual = Openings.parse(o).$2.where((d) => d.unusual).toList());
   }
 
   Future<void> setup() async {
@@ -146,6 +162,30 @@ class _HomePageState extends State<HomePage> {
                   const SizedBox(height: 12),
                   WideButton('Review in Recovery', key: const Key('review-recovery'), tonal: true, onPressed: () async {
                     await Navigator.of(context).push(MaterialPageRoute<void>(builder: (_) => RecoveryPage(app: widget.app)));
+                    refresh();
+                  }),
+                ]),
+              ),
+            ),
+          if (unusual.isNotEmpty)
+            Card(
+              key: const Key('unusual-openings'),
+              margin: const EdgeInsets.only(bottom: 16),
+              color: Color.alphaBlend(Colors.orange.withValues(alpha: 0.18), Theme.of(context).colorScheme.surfaceContainerLow),
+              child: Padding(
+                padding: const EdgeInsets.all(16),
+                child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+                  Row(children: [
+                    const Icon(Icons.warning_amber, color: Colors.orange),
+                    const SizedBox(width: 12),
+                    Expanded(child: Text('Unusually many protected openings', style: t.titleMedium)),
+                  ]),
+                  const SizedBox(height: 8),
+                  Text('${unusual.map((d) => d.label.isEmpty ? 'A device' : d.label).join(', ')} opened ${unusual.map((d) => d.day).join(', ')} protected '
+                      'items today, far more than usual. If that was not you, that device may be stolen or infected: remove it from your identity.'),
+                  const SizedBox(height: 12),
+                  WideButton('Review devices', key: const Key('review-devices'), tonal: true, onPressed: () async {
+                    await Navigator.of(context).push(MaterialPageRoute<void>(builder: (_) => DevicesPage(app: widget.app)));
                     refresh();
                   }),
                 ]),

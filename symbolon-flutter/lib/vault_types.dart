@@ -153,20 +153,23 @@ class VaultItem {
   final String detail;     // a login's origin, a card's last four digits
   final String folder;     // "" when in no folder; levels joined by "/"
   final String apps;       // a login's linked Android apps: "PACKAGE CERT-SHA256" lines (SPEC 22.6 item 8)
-  const VaultItem(this.name, this.type, {this.detail = '', this.folder = '', this.apps = ''});
+  final bool protected;    // in the protected tier: opening it needs the cosigner (SPEC 18.10)
+  const VaultItem(this.name, this.type, {this.detail = '', this.folder = '', this.apps = '', this.protected = false});
 
   ItemType get kind => typeOf(type);
 
   /// The linked apps, each (package, certificate SHA-256 in hex).
   List<(String, String)> get appLinks => appLinksOf(apps);
 
-  /// "TYPE NAME-HEX DETAIL-HEX [FOLDER-HEX [APPS-HEX]]"; null for a line that is not one.
+  /// "TYPE NAME-HEX DETAIL-HEX [FOLDER-HEX [APPS-HEX [protected]]]"; null for a line that is not one.
   static VaultItem? parse(String line) {
     final p = line.trim().split(' ');
-    if (p.length < 3 || p.length > 5) return null;
+    if (p.length < 3 || p.length > 6) return null;
+    if (p.length == 6 && p[5] != 'protected') return null;
     String un(String h) => h == '-' ? '' : unhex(h);
     try {
-      return VaultItem(unhex(p[1]), p[0], detail: un(p[2]), folder: p.length >= 4 ? un(p[3]) : '', apps: p.length == 5 ? un(p[4]) : '');
+      return VaultItem(unhex(p[1]), p[0],
+          detail: un(p[2]), folder: p.length >= 4 ? un(p[3]) : '', apps: p.length >= 5 ? un(p[4]) : '', protected: p.length == 6);
     } on FormatException {
       return null;
     }

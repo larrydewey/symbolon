@@ -125,6 +125,34 @@ class _ItemPageState extends State<ItemPage> with ClosesOnLock {
     }
   }
 
+  // The protected tier (SPEC 18.10): what changes is said first.
+  Future<void> protect() async {
+    if (widget.offline) return toast(context, 'Changes need a connection to your relay.');
+    final on = !widget.item.protected;
+    final name = widget.item.name;
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text(on ? 'Protect $name?' : 'Stop protecting $name?'),
+        content: Text(on
+            ? 'Opening it will need your cosigner as well as this device: a device that is stolen, or runs malware while unlocked, '
+                'cannot open it on its own, and every opening is recorded and shown on your other devices.\n\n'
+                'It will not open offline, each fill waits for the cosigner, and it cannot be in the duress subset.'
+            : 'It will open with this device alone again, offline too, and openings are no longer recorded.'),
+        actions: [
+          TextButton(onPressed: () => Navigator.of(ctx).pop(false), child: const Text('Cancel')),
+          FilledButton(key: const Key('confirm-protect'), onPressed: () => Navigator.of(ctx).pop(true), child: Text(on ? 'Protect' : 'Stop protecting')),
+        ],
+      ),
+    );
+    if (ok != true || !mounted) return;
+    final r = await app.withPin(context, (p) => runTask(context, on ? 'Protecting $name' : 'Unprotecting $name', () => app.cli.vaultProtect(app.dir, name, on, p), usually: 'a few seconds'));
+    if (r != null && r.ok && mounted) {
+      toast(context, on ? '$name is protected' : '$name is no longer protected');
+      Navigator.of(context).pop(const ItemChange(null));
+    }
+  }
+
   Future<void> move() async {
     if (widget.offline) return toast(context, 'Changes need a connection to your relay.');
     final name = widget.item.name;
@@ -152,7 +180,23 @@ class _ItemPageState extends State<ItemPage> with ClosesOnLock {
       ),
     );
     if (to == null || !mounted) return;
-    final m = await app.withPin(context, (p) => runTask(context, 'Moving $name', () => app.cli.vaultMove(app.dir, name, to.id, p, from: widget.share), usually: 'a few seconds'));
+    // A shared folder holds no protected items (SPEC 18.10.6): it would go there unprotected.
+    final unprotect = widget.item.protected && to.id.isNotEmpty;
+    if (unprotect) {
+      final go = await showDialog<bool>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: Text('Move $name unprotected?'),
+          content: const Text('Shared folders do not hold protected items: in the folder it opens without the cosigner, for everyone in it.'),
+          actions: [
+            TextButton(onPressed: () => Navigator.of(ctx).pop(false), child: const Text('Cancel')),
+            FilledButton(key: const Key('confirm-unprotect-move'), onPressed: () => Navigator.of(ctx).pop(true), child: const Text('Move')),
+          ],
+        ),
+      );
+      if (go != true || !mounted) return;
+    }
+    final m = await app.withPin(context, (p) => runTask(context, 'Moving $name', () => app.cli.vaultMove(app.dir, name, to.id, p, from: widget.share, unprotect: unprotect), usually: 'a few seconds'));
     if (m != null && m.ok && mounted) {
       await app.settings.clearBreached(name, share: widget.share);
       if (!mounted) return;
@@ -209,6 +253,12 @@ class _ItemPageState extends State<ItemPage> with ClosesOnLock {
       appBar: AppBar(title: Text(t.label), actions: [
         if (fs != null && type.editable) IconButton(key: const Key('item-move'), tooltip: 'Move', icon: const Icon(Icons.drive_file_move_outline), onPressed: move),
         if (fs != null && type.editable) IconButton(key: const Key('item-edit'), tooltip: 'Edit', icon: const Icon(Icons.edit), onPressed: edit),
+        if (fs != null && widget.share.isEmpty && type.editable)
+          IconButton(
+              key: const Key('item-protect'),
+              tooltip: widget.item.protected ? 'Stop protecting' : 'Protect',
+              icon: Icon(widget.item.protected ? Icons.shield : Icons.shield_outlined),
+              onPressed: protect),
         if (fs != null && (type.editable || type.id == 'passkey')) IconButton(key: const Key('item-delete'), tooltip: 'Delete', icon: const Icon(Icons.delete_outline), onPressed: delete),
       ]),
       body: fs == null
@@ -219,6 +269,17 @@ class _ItemPageState extends State<ItemPage> with ClosesOnLock {
                 const SizedBox(width: 12),
                 Expanded(child: Text(it.name, style: Theme.of(context).textTheme.titleLarge)),
               ]),
+              if (it.protected)
+                Card(
+                  key: const Key('item-protected'),
+                  margin: const EdgeInsets.only(top: 12),
+                  child: const ListTile(
+                    leading: Icon(Icons.shield),
+                    title: Text('Protected item'),
+                    subtitle: Text('Opening it takes your cosigner as well as this device, so a stolen or infected device '
+                        'opens it only at the cosigner\'s hourly limit, and every opening is recorded.'),
+                  ),
+                ),
               if ((fs['folder'] ?? '').isNotEmpty)
                 Padding(
                   padding: const EdgeInsets.only(top: 8),

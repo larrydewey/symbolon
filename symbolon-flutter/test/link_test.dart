@@ -85,7 +85,8 @@ void main() {
     await t.enterText(find.byKey(const Key('add-link')), 'symbolon://pair?h=1&p=2&c=x');
     await t.tap(find.byKey(const Key('add-device')));
     await t.pump();
-    expect(await t.runAsync(() => agent.argsLog.exists()), isFalse);
+    // (The page asks for the status, whether protected items are on; no link-add ran.)
+    expect((await t.runAsync(() async => await agent.argsLog.exists() ? await agent.argsLog.readAsString() : ''))!, isNot(contains('link-add')));
     await t.pump(const Duration(seconds: 5));
     const link = 'symbolon://link?a=192.168.1.20&p=40123&s=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA';
     await t.enterText(find.byKey(const Key('add-link')), link);

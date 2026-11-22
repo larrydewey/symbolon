@@ -32,7 +32,17 @@ case "$1 $2" in
     echo "party 00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
     echo "profile TPM"
     echo "log fa8f008b293b5457ef989520c8bbcbc959a09c0a8619b1d190f78271bf6b5795"
-    echo "head sequence 3 epoch 2 parties 4 threshold 2 pending 1" ;;
+    echo "head sequence 3 epoch 2 parties 4 threshold 2 pending 1"
+    [ -f "$D/protection-off" ] && echo "protected off" || echo "protected on 04aa" ;;
+  "device openings")
+    [ "$PIN" = "2468" ] || { echo "device: wrong PIN" >&2; exit 1; }
+    echo "limit 60"
+    echo "device 0011 $(printf phone | od -An -tx1 | tr -d ' \n') hour 2 day 5 week 20 usual"
+    [ -f "$D/unusual" ] && echo "device 0022 $(printf laptop | od -An -tx1 | tr -d ' \n') hour 60 day 140 week 150 unusual"
+    exit 0 ;;
+  "device protection")
+    [ "$PIN" = "2468" ] || { echo "device: wrong PIN" >&2; exit 1; }
+    rm -f "$D/protection-off"; echo "enrolled: epoch 3, 3 parties" ;;
   "device register")
     [ "$PIN" = "2468" ] || { echo "device: wrong PIN" >&2; exit 1; }
     echo "credential-id aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -93,7 +103,7 @@ case "$1 $2" in
     [ -f "$D/offline" ] && case "$3" in list|show|get) echo "device: local copy: no log at the relay; showing vault version 2 as this device last verified it" >&2 ;; *) echo "device: no log at the relay" >&2; exit 1 ;; esac
     case "$3" in
       list) case "$5" in
-        --long) printf 'login 6d61696c 68747470733a2f2f6d61696c2e6578616d706c652e636f6d 576f726b2f456d61696c %s\nsecret 62616e6b -\ncard 76697361 31313131 46696e616e6365\n' "$(printf 'com.example.mail %s' "$(printf 'ab%.0s' $(seq 32))" | od -v -An -tx1 | tr -d ' \n')" ;;
+        --long) printf 'login 6d61696c 68747470733a2f2f6d61696c2e6578616d706c652e636f6d 576f726b2f456d61696c %s\nsecret 62616e6b - - - protected\ncard 76697361 31313131 46696e616e6365\n' "$(printf 'com.example.mail %s' "$(printf 'ab%.0s' $(seq 32))" | od -v -An -tx1 | tr -d ' \n')" ;;
         --kinds) printf 'login mail\nsecret bank\n' ;;
         *) printf 'mail\nbank\n' ;; esac ;;
       show) [ -n "${SYMBOLON_FILL:-}" ] && [ "$5" = mail ] && {
