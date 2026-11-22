@@ -7,6 +7,7 @@ import '../app.dart';
 import '../settings.dart';
 import '../vault_types.dart';
 import '../widgets.dart';
+import 'signin_import_page.dart';
 
 /// Moving in from another password manager: how to export from it, the
 /// file, what will come across (checked by the agent without the PIN), and
@@ -45,13 +46,13 @@ const _sources = [
 ];
 
 /// What the agent said it would import.
-class _Preview {
+class ImportPreview {
   final List<VaultItem> items = [];
   final List<(String, String)> skipped = [];   // name, why
   final List<String> warnings = [];
 
-  static _Preview parse(List<String> lines) {
-    final p = _Preview();
+  static ImportPreview parse(List<String> lines) {
+    final p = ImportPreview();
     for (final l in lines) {
       final f = l.trim().split(' ');
       try {
@@ -79,7 +80,7 @@ class _Preview {
 class _ImportPageState extends State<ImportPage> {
   _Source? source;
   String? file;
-  _Preview? preview;
+  ImportPreview? preview;
   int? imported;
 
   App get app => widget.app;
@@ -96,7 +97,7 @@ class _ImportPageState extends State<ImportPage> {
     }
     setState(() {
       file = path;
-      preview = _Preview.parse(res.lines);
+      preview = ImportPreview.parse(res.lines);
     });
   }
 
@@ -146,8 +147,27 @@ class _ImportPageState extends State<ImportPage> {
     );
   }
 
+  Future<void> _signIn() async {
+    final ok = await Navigator.of(context).push<bool>(MaterialPageRoute(builder: (_) => SignInImportPage(app: app, share: widget.share)));
+    if (ok == true && mounted) Navigator.of(context).pop(true);
+  }
+
   List<Widget> _pickSource() => [
-        const Section('Where are you coming from?', children: [
+        const Section('Sign in instead', children: [
+          Text('No export file: Symbolon signs in to your old password manager and opens its vault on this device.'),
+        ]),
+        Card(
+          child: ListTile(
+            key: const Key('source-signin-bitwarden'),
+            leading: const Icon(Icons.login),
+            title: const Text('Bitwarden or Vaultwarden'),
+            subtitle: const Text('Sign in with your email and master password'),
+            trailing: const Icon(Icons.chevron_right),
+            onTap: _signIn,
+          ),
+        ),
+        const SizedBox(height: 8),
+        const Section('Or import an export file', children: [
           Text('Symbolon reads the export file your password manager makes. Everything comes across in one go: logins, cards, '
               'identities, notes, folders and custom fields.'),
         ]),
@@ -168,7 +188,7 @@ class _ImportPageState extends State<ImportPage> {
         Section('Export from ${source!.name}', children: [
           Text(source!.steps),
           const SizedBox(height: 12),
-          const _Warning('The export holds your passwords unencrypted. Save it on this device, not in a cloud folder, and delete it '
+          const ImportWarning('The export holds your passwords unencrypted. Save it on this device, not in a cloud folder, and delete it '
               'once the import is done.'),
           const SizedBox(height: 16),
           WideButton('Choose the export file', key: const Key('import-pick'), icon: Icons.file_open, onPressed: pick),
@@ -178,9 +198,31 @@ class _ImportPageState extends State<ImportPage> {
 
   List<Widget> _preview() {
     final p = preview!;
-    final t = Theme.of(context).textTheme;
-    final types = p.byType.entries.toList()..sort((a, b) => b.value.compareTo(a.value));
     return [
+      ...importPreviewView(context, p),
+      if (p.items.isNotEmpty) WideButton('Import ${p.items.length} item${p.items.length == 1 ? '' : 's'}', key: const Key('import-go'), icon: Icons.move_to_inbox, onPressed: go),
+      TextButton(onPressed: () => setState(() => preview = null), child: const Text('Choose another file')),
+    ];
+  }
+
+  List<Widget> _done() => [
+        Section('$imported item${imported == 1 ? '' : 's'} imported', key: const Key('import-done'), children: [
+          const ListTile(contentPadding: EdgeInsets.zero, leading: Icon(Icons.check_circle, color: Colors.green), title: Text('Your vault has them now, on every device.')),
+          const SizedBox(height: 8),
+          const ImportWarning('Now delete the export file (and empty the trash): anyone who finds it can read every password in it. '
+              'Then, once you have checked your vault, you can close the old account.'),
+          const SizedBox(height: 16),
+          WideButton('Done', key: const Key('import-finish'), icon: Icons.check, onPressed: () => Navigator.of(context).pop(true)),
+        ]),
+      ];
+}
+
+/// What an import will bring in: counts by type, warnings, what is left
+/// out and the items (the file import and the sign-in import share it).
+List<Widget> importPreviewView(BuildContext context, ImportPreview p) {
+  final t = Theme.of(context).textTheme;
+  final types = p.byType.entries.toList()..sort((a, b) => b.value.compareTo(a.value));
+  return [
       Section(p.items.isEmpty ? 'Nothing to import' : 'Ready to import ${p.items.length} item${p.items.length == 1 ? '' : 's'}', children: [
         Wrap(spacing: 8, runSpacing: 8, children: [
           for (final e in types) Chip(avatar: Icon(typeOf(e.key).icon, size: 18, color: typeOf(e.key).color), label: Text('${e.value} ${(e.value == 1 ? typeOf(e.key).label : typeOf(e.key).plural).toLowerCase()}')),
@@ -189,7 +231,7 @@ class _ImportPageState extends State<ImportPage> {
         const SizedBox(height: 12),
         const Text('They are added to your vault; nothing in it is replaced. A name already in use gets a number, as "Email (2)".'),
       ]),
-      for (final w in p.warnings) _Warning(w),
+      for (final w in p.warnings) ImportWarning(w),
       if (p.skipped.isNotEmpty)
         Section('Left out (${p.skipped.length})', children: [
           for (final s in p.skipped) ListTile(contentPadding: EdgeInsets.zero, dense: true, title: Text(s.$1), subtitle: Text(s.$2)),
@@ -206,26 +248,12 @@ class _ImportPageState extends State<ImportPage> {
             ),
           if (p.items.length > 200) Text('and ${p.items.length - 200} more', style: t.bodySmall),
         ]),
-      if (p.items.isNotEmpty) WideButton('Import ${p.items.length} item${p.items.length == 1 ? '' : 's'}', key: const Key('import-go'), icon: Icons.move_to_inbox, onPressed: go),
-      TextButton(onPressed: () => setState(() => preview = null), child: const Text('Choose another file')),
     ];
-  }
-
-  List<Widget> _done() => [
-        Section('$imported item${imported == 1 ? '' : 's'} imported', key: const Key('import-done'), children: [
-          const ListTile(contentPadding: EdgeInsets.zero, leading: Icon(Icons.check_circle, color: Colors.green), title: Text('Your vault has them now, on every device.')),
-          const SizedBox(height: 8),
-          const _Warning('Now delete the export file (and empty the trash): anyone who finds it can read every password in it. '
-              'Then, once you have checked your vault, you can close the old account.'),
-          const SizedBox(height: 16),
-          WideButton('Done', key: const Key('import-finish'), icon: Icons.check, onPressed: () => Navigator.of(context).pop(true)),
-        ]),
-      ];
 }
 
-class _Warning extends StatelessWidget {
+class ImportWarning extends StatelessWidget {
   final String text;
-  const _Warning(this.text);
+  const ImportWarning(this.text, {super.key});
 
   @override
   Widget build(BuildContext context) => Card(

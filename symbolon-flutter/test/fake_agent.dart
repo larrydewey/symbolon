@@ -10,6 +10,7 @@ class FakeAgent {
   String get path => '${dir.path}/symbolon';
   File get argsLog => File('${dir.path}/args.log');
   File get stdinLog => File('${dir.path}/stdin.log');
+  File get signinLog => File('${dir.path}/signin.log');
 
   static Future<FakeAgent> create() async {
     final d = await Directory.systemTemp.createTemp('fake-symbolon');
@@ -18,6 +19,20 @@ class FakeAgent {
 D="$(dirname "$0")"
 echo "$*" >> "$D/args.log"
 [ -n "${SYMBOLON_FILL:-}" ] && echo "$3 $SYMBOLON_FILL" >> "$D/fill.log"
+# Signing in to Bitwarden is a conversation: lines come one at a time.
+if [ "$1 $2 $3" = "device vault signin-bitwarden" ]; then
+  hx() { printf '%s' "$1" | od -An -tx1 | tr -d ' \n'; }
+  read -r EMAIL; read -r PW
+  printf '%s\n%s\n' "$EMAIL" "$PW" > "$D/signin.log"
+  [ "$PW" = "wrong" ] && { echo "fail $(hx 'the email or master password is wrong')"; exit 1; }
+  echo "need 2fa 0,1"
+  read -r CODE; echo "$CODE" >> "$D/signin.log"
+  echo "item login $(hx bank) $(hx Work)"; echo "item card $(hx visa) -"; echo "total 2"; echo "ready"
+  read -r GO; read -r P; printf '%s\n%s\n' "$GO" "$P" >> "$D/signin.log"
+  [ "$GO" = "import" ] || exit 1
+  [ "$P" = "2468" ] || { echo "device: wrong PIN" >&2; exit 1; }
+  echo "vault version 2, 2 items"; echo "total 2"; exit 0
+fi
 IN=$(cat)
 printf '%s\n--\n' "$IN" >> "$D/stdin.log"
 PIN=$(printf '%s\n' "$IN" | head -1)

@@ -51,6 +51,43 @@ class CliResult {
   }
 }
 
+/// A run of the agent kept open for a conversation, one line each way
+/// (signing in to another password manager: the server may ask for a code
+/// partway through). Secrets go to its standard input only.
+class AgentConversation {
+  final Process _p;
+  final StreamIterator<String> _out;
+  final StringBuffer _err = StringBuffer();
+  AgentConversation._(this._p) : _out = StreamIterator(_p.stdout.transform(utf8.decoder).transform(const LineSplitter())) {
+    _p.stderr.transform(utf8.decoder).listen(_err.write);
+  }
+
+  /// The next line the agent writes, or null when it has finished.
+  Future<String?> next({Duration timeout = const Duration(minutes: 10)}) async {
+    final more = await _out.moveNext().timeout(timeout, onTimeout: () {
+      _p.kill();
+      return false;
+    });
+    return more ? _out.current : null;
+  }
+
+  void send(String line) => _p.stdin.writeln(line);
+
+  /// Ends the conversation: standard input closed, the agent waited for
+  /// (killed after [grace]).
+  Future<int> close({Duration grace = const Duration(seconds: 5)}) async {
+    try {
+      await _p.stdin.close();
+    } catch (_) {}
+    return _p.exitCode.timeout(grace, onTimeout: () {
+      _p.kill();
+      return 124;
+    });
+  }
+
+  String get errors => _err.toString();
+}
+
 /// Runs the agent. [binary] is the path to `symbolon`.
 class SymbolonCli {
   final String binary;
@@ -204,6 +241,19 @@ class SymbolonCli {
   /// The export at [file] into the vault, as one new version.
   Future<CliResult> vaultImport(String dir, String file, String pin, {String share = ''}) =>
       run(['device', 'vault', 'import', dir, file, ..._in(share)], input: [pin], timeout: const Duration(minutes: 15));
+
+  /// Signs in to Bitwarden or Vaultwarden at [server] ("bitwarden.com",
+  /// "bitwarden.eu" or an https:// address) and imports its vault: a
+  /// conversation (bwsignin.resid). [extraEnv]: the trust anchors and DNS
+  /// servers, as for the breach check.
+  Future<AgentConversation?> signinBitwarden(String dir, String server, {String share = '', Map<String, String> extraEnv = const {}}) async {
+    try {
+      final p = await Process.start(binary, ['device', 'vault', 'signin-bitwarden', dir, server, ..._in(share)], environment: {...env, ...extraEnv});
+      return AgentConversation._(p);
+    } on ProcessException {
+      return null;
+    }
+  }
 
   /// Each login's password against Pwned Passwords (SPEC 26.1):
   /// "breached NAME-HEX COUNT" lines, "protected N not checked", then
