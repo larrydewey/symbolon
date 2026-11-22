@@ -5,7 +5,9 @@
 // all of it as one new vault version: one signature, however many items.
 //
 // Sources: Bitwarden and Vaultwarden (JSON, or CSV), LastPass (CSV, its
-// typed secure notes included), and the CSV that Chrome, Edge, Firefox,
+// typed secure notes included), 1Password through its CLI (`op item get
+// --reveal --format json`, as a JSON array on standard input: FILE "-"
+// and --format 1password-op), and the CSV that Chrome, Edge, Firefox,
 // Safari, 1Password, KeePassXC, Proton Pass and Dashlane write. The format
 // is told from the text unless --format names it.
 //
@@ -482,14 +484,14 @@ ListBuf(ImpCustom) lp_rest(List(Kv) ps, List(Str) used, Int i, ListBuf(ImpCustom
     return lp_rest(ps, used, i + 1, if (skip) { acc } else { cput(acc, ps[i].key, ps[i].value, looks_secret(ps[i].key)) });
 }
 
-Bool looks_secret(Str key) {
+pub Bool looks_secret(Str key) {
     Str k = str_to_lower(key);
     return str_contains(k, "password") || str_contains(k, "pin") || str_contains(k, "secret") || str_contains(k, "code") || str_contains(k, "key")
         || str_contains(k, "account number") || k == "number";
 }
 
 // LastPass dates: "January,2027" or "January,15,2027".
-Str lp_expiry(Str d) {
+pub Str lp_expiry(Str d) {
     List(Str) p = str_split(d, ",");
     return if (p.len() < 2) { "" } else { expiry_of(p[0], p[p.len() - 1]) };
 }
@@ -549,12 +551,16 @@ Str lp_phone(Str p) {
 
 // ─── Telling the format, and reading ────────────────────────────────
 
-pub Bool import_format_ok(Str f) { return f == "auto" || f == "bitwarden-json" || f == "csv"; }
+pub Bool import_format_ok(Str f) { return f == "auto" || f == "bitwarden-json" || f == "csv" || f == "1password-op"; }
 
 Result(ImpRead, Str) read_export(Str text, Str format) {
     Str t = str_trim(text);
     Str bom = str_from_code(65279);
     Str body = if (str_starts_with(t, bom)) { str_trim(str_slice(t, 1, str_len(t))) } else { t };
+    if (format == "1password-op") {
+        Result(Value, SerialError) r1 = from_json(body);
+        return match r1 { Err(e) => Err("1Password's output is not valid JSON: " + error_text(e)), Ok(v) => op_items(v) };
+    }
     Bool json = format == "bitwarden-json" || (format == "auto" && str_starts_with(body, "{"));
     if (json) {
         Result(Value, SerialError) r = from_json(body);
@@ -565,6 +571,107 @@ Result(ImpRead, Str) read_export(Str text, Str format) {
     }
     Result(CsvTable, Str) rt = csv_table(text);
     return match rt { Err(m) => Err(m), Ok(tab) => any_csv(tab) };
+}
+
+// ─── 1Password, through its CLI ────────────────────────────────────
+// A JSON array of `op item get --reveal --format json` items: {"title",
+// "category" (LOGIN, PASSWORD, CREDIT_CARD, SECURE_NOTE, IDENTITY, SSH_KEY,
+// ...), "vault": {"name"}, "urls": [{"href", "primary"}], "fields": [{"id",
+// "type" (STRING, CONCEALED, OTP, ...), "purpose" (USERNAME, PASSWORD,
+// NOTES), "label", "value", "section": {"label"}}]}. The vault's name is
+// the folder. Values are classified as they are read (fput, cput).
+
+Result(ImpRead, Str) op_items(Value top) {
+    List(Value) xs = match top { VSeq(v) => v, _ => [] };
+    if (xs.len() == 0) { return Err("1Password listed no items"); }
+    List(Imp) got = op_map(xs, 0, ListBuf());
+    return Ok(ImpRead {.items = got, .warnings = []});
+}
+
+List(Imp) op_map(List(Value) xs, Int i, ListBuf(Imp) acc) {
+    if (i >= xs.len()) { return acc.finish(); }
+    return op_map(xs, i + 1, acc.push(op_item(xs[i])));
+}
+
+// The value of the field with this purpose, or this id.
+Str op_purpose(List(Value) fs, Str p, Int i) {
+    if (i >= fs.len()) { return ""; }
+    if (jt(fs[i], "purpose") == p) { return jt(fs[i], "value"); }
+    return op_purpose(fs, p, i + 1);
+}
+
+Str op_id(List(Value) fs, Str id, Int i) {
+    if (i >= fs.len()) { return ""; }
+    if (jt(fs[i], "id") == id) { return jt(fs[i], "value"); }
+    return op_id(fs, id, i + 1);
+}
+
+// The first one-time-code field's secret (an otpauth:// address or the
+// seed itself).
+Str op_otp(List(Value) fs, Int i) {
+    if (i >= fs.len()) { return ""; }
+    if (jt(fs[i], "type") == "OTP") { return jt(fs[i], "value"); }
+    return op_otp(fs, i + 1);
+}
+
+// Every field not taken by the item's own fields, as a custom field.
+ListBuf(ImpCustom) op_rest(List(Value) fs, List(Str) used, Int i, ListBuf(ImpCustom) acc) {
+    if (i >= fs.len()) { return acc; }
+    Value f = fs[i];
+    Str id = jt(f, "id");
+    Str p = jt(f, "purpose");
+    Bool skip = used.contains(id) || p == "USERNAME" || p == "PASSWORD" || p == "NOTES" || jt(f, "type") == "OTP";
+    Str sec = jt(jo(f, "section"), "label");
+    Str label0 = if (str_len(str_trim(jt(f, "label"))) == 0) { id } else { jt(f, "label") };
+    Str label = if (str_len(str_trim(sec)) == 0) { label0 } else { sec + ": " + label0 };
+    return op_rest(fs, used, i + 1, if (skip) { acc } else { cput(acc, label, jt(f, "value"), jt(f, "type") == "CONCEALED") });
+}
+
+List(Str) op_urls(List(Value) us, Int i, ListBuf(Str) acc) {
+    if (i >= us.len()) { return acc.finish(); }
+    Str h = str_trim(jt(us[i], "href"));
+    return op_urls(us, i + 1, if (str_len(h) == 0) { acc } else { acc.push(h) });
+}
+
+// "YYYYMM" (as the CLI writes a card's expiry) as MM/YY.
+Str op_expiry(Str v) {
+    Str d = digits_only(v);
+    return if (str_len(d) == 6) { str_slice(d, 4, 6) + "/" + str_slice(d, 2, 4) } else { lp_expiry(v) };
+}
+
+Imp op_item(Value it) {
+    Str cat = jt(it, "category");
+    Str name = jt(it, "title");
+    Str folder = jt(jo(it, "vault"), "name");
+    List(Value) fs = jl(it, "fields");
+    Str notes = op_purpose(fs, "NOTES", 0);
+    if (cat == "LOGIN") {
+        return login_item(name, op_urls(jl(it, "urls"), 0, ListBuf()), op_purpose(fs, "USERNAME", 0), op_purpose(fs, "PASSWORD", 0), op_otp(fs, 0), notes, folder,
+                          op_rest(fs, [], 0, ListBuf()));
+    }
+    if (cat == "PASSWORD" || cat == "API_CREDENTIAL" || cat == "DATABASE" || cat == "SERVER") {
+        Str pw = if (str_len(op_purpose(fs, "PASSWORD", 0)) > 0) { op_purpose(fs, "PASSWORD", 0) } else { op_id(fs, "credential", 0) };
+        if (cat == "PASSWORD" || str_len(pw) > 0) {
+            return imp(name_or(name, "", "Password"), "secret", folder, fput(fput(ListBuf(), "secret", pw), "notes", notes), op_rest(fs, ["password", "credential"], 0, ListBuf()));
+        }
+    }
+    if (cat == "CREDIT_CARD") {
+        return card_item(name, op_id(fs, "cardholder", 0), op_id(fs, "ccnum", 0), op_expiry(op_id(fs, "expiry", 0)), op_id(fs, "cvv", 0), op_id(fs, "pin", 0), notes, folder,
+                         op_rest(fs, ["cardholder", "ccnum", "expiry", "cvv", "pin"], 0, ListBuf()));
+    }
+    if (cat == "IDENTITY") {
+        Str full = words([op_id(fs, "firstname", 0), op_id(fs, "initial", 0), op_id(fs, "lastname", 0)]);
+        ListBuf(ImpField) f2 = fput(fput(fput(fput(fput(ListBuf(), "full_name", full), "email", op_id(fs, "email", 0)), "phone", op_id(fs, "defphone", 0)),
+                                    "address", op_id(fs, "address", 0)), "notes", notes);
+        return imp(name_or(name, "", full), "identity", folder, f2, op_rest(fs, ["firstname", "initial", "lastname", "email", "defphone", "address"], 0, ListBuf()));
+    }
+    if (cat == "SSH_KEY") {
+        Str key = op_id(fs, "private_key", 0);
+        if (str_len(str_trim(key)) > 0) {
+            return imp(name_or(name, "", "SSH key"), "secret", folder, fput(fput(ListBuf(), "secret", key), "notes", notes), op_rest(fs, ["private_key"], 0, ListBuf()));
+        }
+    }
+    return note_item(name, notes, folder, op_rest(fs, ["notesPlain"], 0, ListBuf()));
 }
 
 // ─── Checking and sealing ───────────────────────────────────────────
@@ -668,8 +775,11 @@ Result(List(Item), Str) seal_fail(ListBuf(Item) acc, Str m) { acc.discard(); ret
 // that shared folder.
 @requires(filesystem, network, device, declassify, clock, provision, environment)
 pub Int vault_import(Str dir, Str file, Str format, Bool dry, Str share) {
-    if (!import_format_ok(format)) { return dfail("unknown format " + format + " (auto, bitwarden-json, csv)"); }
-    List(Int) b = get_file(file);
+    if (!import_format_ok(format)) { return dfail("unknown format " + format + " (auto, bitwarden-json, csv, 1password-op)"); }
+    // "-": the export on standard input, as one line (the app hands over
+    // 1Password CLI output this way, never through a file); the PIN, when
+    // one is needed, on the line after it.
+    List(Int) b = if (file == "-") { str_to_bytes(read_pin()) } else { get_file(file) };
     if (b.len() == 0) { return dfail("cannot read " + file); }
     if (b.len() > 16777216) { return dfail("the export is larger than 16 MiB"); }
     Result(ImpRead, Str) rr = read_export(text_of(b), format);

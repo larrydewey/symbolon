@@ -318,6 +318,15 @@ grep -qx "total 8" "$W/iml.log" || fail "import lastpass: $(cat "$W/iml.log")"
 printf '2468\n' | run 600 "$BIN" device vault import "$W/dev" $FX/1password.csv > /dev/null 2>&1 || fail "import 1password"
 printf '2468\n' | run 600 "$BIN" device vault import "$W/dev" $FX/1password.csv > /dev/null 2>&1 || fail "import 1password again"
 [ "$(field 'Dropbox (2)' current)" = oppw ] || fail "a second import did not number the clashing name"
+# 1Password through its CLI: the app hands `op item get --reveal` output
+# over standard input as one line, then the PIN.
+OPJ=$(python3 -c 'import json,sys; print(json.dumps(json.load(open(sys.argv[1]))))' $FX/1password-op.json)
+printf '%s\n' "$OPJ" | run 60 "$BIN" device vault import "$W/dev" - --format 1password-op --dry-run > "$W/imo.log" 2>&1 || fail "1password-op dry run: $(cat "$W/imo.log")"
+grep -qx "total 6" "$W/imo.log" && grep -qx "item card $(hx 'Travel card') $(hx Shared)" "$W/imo.log" && grep -qx "item secret $(hx 'Build key') $(hx Personal)" "$W/imo.log" || fail "1password-op dry run: $(cat "$W/imo.log")"
+printf '%s\n2468\n' "$OPJ" | run 600 "$BIN" device vault import "$W/dev" - --format 1password-op > "$W/imo2.log" 2>&1 || fail "import 1password-op: $(cat "$W/imo2.log")"
+[ "$(field 'Example login' current)" = op-pass-1 ] && [ "$(field 'Example login' origin)" = https://login.example.com ] && [ "$(field 'Example login' totp)" = "otpauth://totp/x?secret=JBSWY3DPEHPK3PXP" ] \
+  && [ "$(field 'Example login' custom_0)" = "$(printf 'Security: answer\0371\037blue')" ] && [ "$(field 'Travel card' expiry)" = 04/30 ] && [ "$(field 'Travel card' cvv)" = 321 ] \
+  && [ "$(field 'Door code' text)" = '1234#' ] && [ "$(field 'Me (2)' full_name)" = "Jo Example" ] && [ "$(field 'Wi-Fi key' secret)" = w1f1-pass ] || fail "imported 1password-op items"
 printf '2468\n' | run 300 "$BIN" device vault list "$W/dev" --long > "$W/imlong.log" 2>&1
 grep -qx "card $(hx Mastercard) $(hx 4444) $(hx Finance/Cards)" "$W/imlong.log" || fail "list --long folder: $(cat "$W/imlong.log")"
 run 60 "$BIN" device vault import "$W/dev" $FX/bitwarden_encrypted.json --dry-run > "$W/ime.log" 2>&1 && fail "a password-protected export was read"
@@ -327,7 +336,7 @@ for f in bitwarden.csv chrome.csv firefox.csv keepassxc.csv; do run 60 "$BIN" de
 # What came in is deleted again, so the steps below see the vault as before.
 printf '2468\n' | run 300 "$BIN" device vault list "$W/dev" 2>/dev/null | grep -vx 'bank\|mail' | while IFS= read -r n; do printf '2468\n' | run 300 "$BIN" device vault delete "$W/dev" "$n" > /dev/null 2>&1 || fail "delete $n"; done
 [ "$(printf '2468\n' | run 300 "$BIN" device vault list "$W/dev" 2>&1 | sort | tr '\n' ' ')" = "bank mail " ] || fail "vault list after the imports were removed"
-echo "vault: Bitwarden, LastPass and 1Password exports imported with folders; bad exports refused"
+echo "vault: Bitwarden, LastPass and 1Password exports (and 1Password CLI output) imported with folders; bad exports refused"
 # Enrollment (SPEC 11.1, 11.3): a second device joins; the quorum
 # re-shares to epoch 2; both devices sign for the same credential; the new
 # one reads the vault.
