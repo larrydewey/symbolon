@@ -2231,7 +2231,7 @@ secret mode. The threshold protocol's implementation MUST check every
 proof and parameter its paper requires, with a negative test for each
 check, and MUST be fuzzed on every message parser.
 
-### 23.4 What Resid lacks (checked 2026-11-19, against Resid v0.10.1; still so in v0.11.0)
+### 23.4 What Resid lacks (checked 2026-11-19, against Resid v0.10.1; still so in v0.12.0)
 
 | Missing | Needed by |
 |---|---|
