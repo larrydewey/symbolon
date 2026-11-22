@@ -1,0 +1,531 @@
+// Moving in from LastPass by signing in (SPEC 18.9), experimental:
+// `symbolon device vault signin-lastpass DIR [--dry-run] [--share ID]`.
+//
+// LastPass offers no supported way for another app to read a vault. This
+// speaks the protocol of LastPass's own open-source command-line client
+// (lastpass-cli: endpoints-login.c, kdf.c, blob.c, cipher.c), so a change
+// on LastPass's side can break it; the app then points to the CSV export.
+//
+// The conversation, as for Bitwarden (bwsignin.resid):
+//   in   the email, then the master password
+//   out  "need code NAME" (google, microsoft, yubikey or sesame: a code
+//        from that authenticator); in "code X VALUE", or "cancel"
+//   out  "wait push NAME": approve the sign-in on your phone (LastPass
+//        Authenticator, Duo...); the agent waits and asks again itself
+//   out  "fail TEXT-HEX" and exit 1 on any failure
+//   then the importer's preview, "ready", "import" and the PIN.
+//
+// Crypto (kdf.c, cipher.c): key = PBKDF2-SHA256(password, email, n);
+// login hash = hex(PBKDF2-SHA256(key, password, 1)). Each encrypted field
+// is AES-256: "!" + IV + CBC, "#" + IV + GCM, or ECB (old accounts). The
+// RSA private key (privatekeyenc) opens each shared folder's key
+// (RSA-OAEP-SHA-1, the key as hex text). As for Bitwarden, everything but
+// what Symbolon lists in the clear (names, folders, sites, field labels)
+// stays Secret until the vault seals it; a typed secure note's framing
+// (its line breaks and "Key:" labels) is published, its values are not.
+
+import "../types.resid";
+import "state.resid";
+import "common.resid";
+import "device.resid";
+import "vaultcli.resid";
+import "importers.resid";
+import "bwsignin.resid";
+import "tlsclient.resid";
+import "chain.resid";
+import "crypto.resid";
+import "cose.resid";
+import "word.resid";
+import "hash.resid";
+import "sha256g.resid";
+import "aesgcmg.resid";
+import "aescbcg.resid";
+import "rsaoaep.resid";
+import "rsakey.resid";
+
+type LpSvc = { Str base; TrustStore store; };
+
+@requires(filesystem, environment)
+Result(LpSvc, Str) lp_service() {
+    Str u = environment.get("SYMBOLON_LASTPASS_URL");
+    Str base = if (str_len(u) > 0) { u } else { "https://lastpass.com" };
+    if (!str_starts_with(base, "https://")) { return Err("SYMBOLON_LASTPASS_URL must be an https:// address"); }
+    Result(TrustStore, Str) rs = public_roots();
+    return match rs { Err(m) => Err(m), Ok(st) => Ok(LpSvc {.base = base, .store = st}) };
+}
+
+type LpReply = { Int status; List(Int) body; Str err; };
+
+@requires(network, clock(readonly), declassify)
+LpReply lp_post(LpSvc s, Str path, Str form, Str cookie) {
+    Str h = "Content-Type: application/x-www-form-urlencoded\r\n" + (if (str_len(cookie) > 0) { "Cookie: PHPSESSID=" + cookie + "\r\n" } else { "" });
+    HttpsGet g = tls_https_request(s.base + path, "", s.store, ["http/1.1"], 60000, "POST", h, str_to_bytes(form));
+    return LpReply {.status = g.status, .body = g.bytes, .err = g.err};
+}
+
+// ─── XML attributes ─────────────────────────────────────────────────
+// login.php answers <response><ok .../></response> or <response><error
+// .../></response>; only attributes are read.
+
+Str xml_attr(Str x, Str elem, Str attr) {
+    Int e = str_index_of(x, "<" + elem + " ", 0);
+    if (e < 0) { return ""; }
+    Int end = str_index_of(x, ">", e);
+    Str tag = str_slice(x, e, if (end < 0) { str_len(x) } else { end });
+    Int a = str_index_of(tag, " " + attr + "=\"", 0);
+    if (a < 0) { return ""; }
+    Int v = a + str_len(attr) + 3;
+    Int q = str_index_of(tag, "\"", v);
+    return if (q < 0) { "" } else { xml_unescape(str_slice(tag, v, q)) };
+}
+
+Str xml_unescape(Str s) { return str_replace(str_replace(str_replace(str_replace(str_replace(s, "&quot;", "\""), "&apos;", "'"), "&lt;", "<"), "&gt;", ">"), "&amp;", "&"); }
+
+// ─── Signing in ─────────────────────────────────────────────────────
+
+type LpSession = { Str session; Str token; Str private_key; };
+type LpTok = LpOk(LpSession) | LpCode(Str) | LpPush(Str, Str) | LpMoved(Str) | LpFail(Str);
+
+@requires(network, clock(readonly), declassify)
+LpTok lp_login(LpSvc s, Str email, Str hash, Int iters, Str extra) {
+    Str form = "xml=2&username=" + bw_form(email) + "&hash=" + hash + f"&iterations={iters}" + "&includeprivatekeyenc=1&method=cli&outofbandsupported=1" + extra;
+    LpReply r = lp_post(s, "/login.php", form, "");
+    if (str_len(r.err) > 0) { return LpFail(r.err); }
+    Str x = text_of(r.body);
+    Str sid = xml_attr(x, "ok", "sessionid");
+    if (str_len(sid) > 0) { return LpOk(LpSession {.session = sid, .token = xml_attr(x, "ok", "token"), .private_key = xml_attr(x, "ok", "privatekeyenc")}); }
+    Str cause = xml_attr(x, "error", "cause");
+    Str server = xml_attr(x, "error", "server");
+    if (server == "lastpass.eu" && !str_contains(s.base, "lastpass.eu")) { return LpMoved("https://lastpass.eu"); }
+    if (cause == "googleauthrequired" || cause == "googleauthfailed") { return LpCode("google"); }
+    if (cause == "microsoftauthrequired" || cause == "microsoftauthfailed") { return LpCode("microsoft"); }
+    if (cause == "otprequired" || cause == "otpfailed") { return LpCode("yubikey"); }
+    if (cause == "sesameotprequired" || cause == "sesameotpfailed") { return LpCode("sesame"); }
+    if (cause == "outofbandrequired") { return LpPush(xml_attr(x, "error", "outofbandname"), xml_attr(x, "error", "retryid")); }
+    if (cause == "unknownemail" || cause == "unknownpassword") { return LpFail("the email or master password is wrong"); }
+    if (cause == "multifactorresponsefailed") { return LpFail("the sign-in was not approved"); }
+    Str m = str_trim(str_replace(xml_attr(x, "error", "message"), " Upgrade your browser extension so you can enter it.", ""));
+    return LpFail(if (str_len(m) > 0) { m } else { f"LastPass refused the sign-in ({r.status})" });
+}
+
+// The code and push loop; `failed` says the last code was wrong.
+@requires(network, clock, declassify)
+LpTok lp_answer(LpSvc s, Str email, Str hash, Int iters, LpTok t, Int rounds) {
+    if (rounds <= 0) { return LpFail("too many tries"); }
+    return match t {
+        LpCode(kind) => lp_ask(s, email, hash, iters, kind, rounds),
+        LpPush(name, id) => lp_wait(s, email, hash, iters, name, id, 0, rounds),
+        _ => t
+    };
+}
+
+@requires(network, clock, declassify)
+LpTok lp_ask(LpSvc s, Str email, Str hash, Int iters, Str kind, Int rounds) {
+    println("need code " + kind);
+    List(Str) w = str_split(str_trim(read_line()), " ");
+    if (w.len() < 3 || w[0] != "code") { return LpFail("cancelled"); }
+    Str v = str_replace(w[w.len() - 1], " ", "");
+    Str p = if (kind == "sesame") { "&sesameotp=" } else { "&otp=" };
+    return lp_answer(s, email, hash, iters, lp_login(s, email, hash, iters, p + bw_form(v)), rounds - 1);
+}
+
+// An approval on another device: asked for once, then polled every two
+// seconds for about two minutes.
+@requires(network, clock, declassify)
+LpTok lp_wait(LpSvc s, Str email, Str hash, Int iters, Str name, Str id, Int polls, Int rounds) {
+    if (polls == 0) { println("wait push " + (if (str_len(name) > 0) { hex_encode(str_to_bytes(name)) } else { "-" })); }
+    if (polls > 60) { return LpFail("the sign-in was not approved in time"); }
+    if (polls > 0) { _ = clock_sleep_ms(2000); }
+    Str extra = if (polls == 0) { "&outofbandrequest=1" } else { "&outofbandretry=1&outofbandretryid=" + bw_form(id) };
+    LpTok t = lp_login(s, email, hash, iters, extra);
+    return match t {
+        LpPush(n2, id2) => lp_wait(s, email, hash, iters, name, if (str_len(id2) > 0) { id2 } else { id }, polls + 1, rounds),
+        LpCode(k) => lp_answer(s, email, hash, iters, t, rounds - 1),
+        _ => t
+    };
+}
+
+// ─── Fields ─────────────────────────────────────────────────────────
+
+// AES-256-ECB with PKCS#7 (old LastPass accounts), on a secret key.
+@requires(declassify)
+Option(List(Secret(UInt(8)))) ecb_open(List(Secret(UInt(8))) key, List(Int) ct) {
+    if (key.len() != 32 || ct.len() == 0 || ct.len() % 16 != 0) { return None; }
+    List(Secret(UInt(32))) rk = aesg_key_expand(key);
+    return pkcs7g_unpad(ecb_blocks(rk, ct, 0, ListBuf()));
+}
+
+@requires(declassify)
+List(Secret(UInt(8))) ecb_blocks(List(Secret(UInt(32))) rk, List(Int) ct, Int p, ListBuf(Secret(UInt(8))) out) {
+    if (p >= ct.len()) { return out.finish(); }
+    Secret(UInt(128)) x = classify(aesg_le_pack_pub(ct[p..p + 16], 15, (UInt(128)) 0));
+    return ecb_blocks(rk, ct, p + 16, aesg_le_bytes(aesg_decrypt_sw(rk, x), 0, out));
+}
+
+// One encrypted item of the blob: "!" IV(16) CBC, "#" IV(12) GCM, or ECB.
+@requires(declassify)
+Option(List(Secret(UInt(8)))) lp_open_bin(List(Secret(UInt(8))) key, List(Int) b) {
+    List(Secret(UInt(8))) none = [];
+    if (b.len() == 0) { return Some(none); }
+    if (b[0] == 33 && b.len() % 16 == 1 && b.len() >= 33) { return aes_cbcg_decrypt(key, b[1..17], b[17..b.len()]); }
+    if (b[0] == 35 && b.len() >= 29) {
+        Option(List(Secret(UInt(8)))) g = aes_gcmg_decrypt(key, b[1..13], b[13..b.len()], []);
+        return match g { Some(p) => Some(p), None => if (b.len() % 16 == 0) { ecb_open(key, b) } else { None } };
+    }
+    return ecb_open(key, b);
+}
+
+// The text form: "!" base64(IV) "|" base64(data), "#" likewise, or
+// base64 of ECB data.
+@requires(declassify)
+Option(List(Secret(UInt(8)))) lp_open_text(List(Secret(UInt(8))) key, Str t) {
+    List(Secret(UInt(8))) none = [];
+    if (str_len(t) == 0) { return Some(none); }
+    Str m = str_slice(t, 0, 1);
+    if (m == "!" || m == "#") {
+        List(Str) ps = str_split(str_slice(t, 1, str_len(t)), "|");
+        if (ps.len() != 2) { return None; }
+        List(Int) iv = base64_decode(ps[0]);
+        List(Int) d = base64_decode(ps[1]);
+        return if (m == "!") { aes_cbcg_decrypt(key, iv, d) } else { aes_gcmg_decrypt(key, iv, d, []) };
+    }
+    return ecb_open(key, base64_decode(t));
+}
+
+@requires(declassify)
+List(Secret(UInt(8))) sec_bin(List(Secret(UInt(8))) key, List(Int) b) {
+    List(Secret(UInt(8))) none = [];
+    return lp_open_bin(key, b) else { none };
+}
+
+// Listing text (a name, a folder, a site): published by design.
+@requires(declassify)
+Str txt_bin(List(Secret(UInt(8))) key, List(Int) b) { return str_trim(text_of(reveal(sec_bin(key, b)))); }
+
+// Hex text, secret, to its bytes, in constant time; [] when it is not
+// hex (one published bit).
+@requires(declassify)
+List(Secret(UInt(8))) sunhex(List(Secret(UInt(8))) t) {
+    List(Secret(UInt(8))) none = [];
+    if (t.len() % 2 != 0) { return none; }
+    HexAcc h = unhex_at(t, 0, ListBuf(), classify((UInt(32)) 0));
+    UInt(32) bad = ct_public(declassify(h.bad, "whether a decrypted key's hex text is hex (one bit)"));
+    return if (bad == (UInt(32)) 0) { h.out } else { none };
+}
+
+type HexAcc = { List(Secret(UInt(8))) out; Secret(UInt(32)) bad; };
+
+// A hex digit's value, and 256 added when it is not one.
+Secret(UInt(32)) hexval(Secret(UInt(8)) c8) {
+    Secret(UInt(32)) c = (UInt(32)) c8;
+    Secret(UInt(32)) dg = b64g_in(c, 48, 57);
+    Secret(UInt(32)) lo = b64g_in(c, 97, 102);
+    Secret(UInt(32)) up = b64g_in(c, 65, 70);
+    Secret(UInt(32)) v = (wrapping_usub((UInt(32)) 0, dg) & wrapping_usub(c, (UInt(32)) 48)) | (wrapping_usub((UInt(32)) 0, lo) & wrapping_usub(c, (UInt(32)) 87)) | (wrapping_usub((UInt(32)) 0, up) & wrapping_usub(c, (UInt(32)) 55));
+    return (v & (UInt(32)) 15) | (((dg | lo | up) ^ (UInt(32)) 1) << (UInt(32)) 8);
+}
+
+HexAcc unhex_at(List(Secret(UInt(8))) t, Int i, ListBuf(Secret(UInt(8))) acc, Secret(UInt(32)) bad) {
+    if (i >= t.len()) { return HexAcc {.out = acc.finish(), .bad = bad}; }
+    Secret(UInt(32)) a = hexval(t[i]);
+    Secret(UInt(32)) b = hexval(t[i + 1]);
+    return unhex_at(t, i + 2, acc.push(wrapping_u8(((a & (UInt(32)) 15) << (UInt(32)) 4) | (b & (UInt(32)) 15))), bad | (a >> (UInt(32)) 8) | (b >> (UInt(32)) 8));
+}
+
+// The RSA private key from privatekeyenc: text form, or (old accounts) hex
+// of AES-256-CBC with the key's first 16 bytes as the IV; inside,
+// "LastPassPrivateKey<" HEX-DER ">LastPassPrivateKey".
+@requires(declassify)
+Option(RsaKey) lp_private_key(List(Secret(UInt(8))) key, Str enc) {
+    if (str_len(enc) == 0) { return None; }
+    Str m = str_slice(enc, 0, 1);
+    Option(List(Secret(UInt(8)))) pt = if (m == "!" || m == "#") { lp_open_text(key, enc) } else { cbc_key_iv(key, cose_hex_decode(enc)) };
+    List(Secret(UInt(8))) none = [];
+    List(Secret(UInt(8))) p = pt else { none };
+    Str pre = "LastPassPrivateKey<";
+    Str post = ">LastPassPrivateKey";
+    Int a = str_len(pre);
+    Int z = p.len() - str_len(post);
+    if (z <= a) { return None; }
+    if (!ct_same(p[0..a], sv(pre)) || !ct_same(p[z..p.len()], sv(post))) { return None; }
+    List(Secret(UInt(8))) der = sunhex(p[a..z]);
+    return if (der.len() == 0) { None } else { rsa_key_parse_secret(der) };
+}
+
+// AES-256-CBC whose IV is the key's first 16 bytes (secret): decrypted
+// with a zero IV, then the first block xored with the key.
+@requires(declassify)
+Option(List(Secret(UInt(8)))) cbc_key_iv(List(Secret(UInt(8))) key, List(Int) ct) {
+    Option(List(Secret(UInt(8)))) raw = aes_cbcg_decrypt_raw(key, [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], ct);
+    List(Secret(UInt(8))) none = [];
+    List(Secret(UInt(8))) r = raw else { none };
+    if (r.len() < 16) { return None; }
+    return pkcs7g_unpad(xor_first(r, key, 0, ListBuf()).concat(r[16..r.len()]));
+}
+
+List(Secret(UInt(8))) xor_first(List(Secret(UInt(8))) r, List(Secret(UInt(8))) k, Int i, ListBuf(Secret(UInt(8))) acc) {
+    if (i >= 16) { return acc.finish(); }
+    return xor_first(r, k, i + 1, acc.push(r[i] ^ k[i]));
+}
+
+// ─── The blob ───────────────────────────────────────────────────────
+// Chunks: a 4-letter name, a 32-bit big-endian length, the data; an
+// account's data is items, each a 32-bit length and its bytes.
+
+type Chunk = { Str name; List(Int) data; };
+
+Int be32(List(Int) b, Int p) { return ((b[p] & 255) << 24) | ((b[p + 1] & 255) << 16) | ((b[p + 2] & 255) << 8) | (b[p + 3] & 255); }
+
+List(Chunk) chunks(List(Int) b, Int p, ListBuf(Chunk) acc) {
+    if (p + 8 > b.len()) { return acc.finish(); }
+    Int n = be32(b, p + 4);
+    if (n < 0 || p + 8 + n > b.len()) { return acc.finish(); }
+    return chunks(b, p + 8 + n, acc.push(Chunk {.name = text_of(b[p..p + 4]), .data = b[p + 8..p + 8 + n]}));
+}
+
+List(List(Int)) items(List(Int) d, Int p, ListBuf(List(Int)) acc) {
+    if (p + 4 > d.len()) { return acc.finish(); }
+    Int n = be32(d, p);
+    if (n < 0 || p + 4 + n > d.len()) { return acc.finish(); }
+    return items(d, p + 4 + n, acc.push(d[p + 4..p + 4 + n]));
+}
+
+List(Int) item_at(List(List(Int)) xs, Int i) { return if (i < xs.len()) { xs[i] } else { [] }; }
+
+// An account as read, before its custom fields are known.
+type LpAcct = { Str name; Str folder; Str url; List(Secret(UInt(8))) note; List(Secret(UInt(8))) user; List(Secret(UInt(8))) pass; List(ImpCustom) custom; Bool deleted; };
+
+// Where the walk is: the key in use (the account key, or a shared
+// folder's), the shared folder's name, the account being filled.
+type Walk = { List(Secret(UInt(8))) key; Str share; Option(LpAcct) cur; List(Imp) done; Int bad_shares; };
+
+@requires(declassify)
+Walk walk(List(Chunk) cs, Int i, List(Secret(UInt(8))) user_key, Option(RsaKey) rk, Walk w) {
+    if (i >= cs.len()) { return flush(w); }
+    Chunk c = cs[i];
+    // Under a shared folder that did not open, its accounts are skipped.
+    if (w.key.len() == 0 && (c.name == "ACCT" || c.name == "ACFL" || c.name == "ACOF")) { return walk(cs, i + 1, user_key, rk, w); }
+    if (c.name == "ACCT") { return walk(cs, i + 1, user_key, rk, with_cur(flush(w), Some(read_acct(w.key, w.share, items(c.data, 0, ListBuf()))))); }
+    if (c.name == "ACFL" || c.name == "ACOF") { return walk(cs, i + 1, user_key, rk, add_field(w, items(c.data, 0, ListBuf()))); }
+    if (c.name == "SHAR") { return walk(cs, i + 1, user_key, rk, enter_share(flush(w), rk, items(c.data, 0, ListBuf()))); }
+    return walk(cs, i + 1, user_key, rk, w);
+}
+
+Walk with_cur(Walk w, Option(LpAcct) a) { return Walk {.key = w.key, .share = w.share, .cur = a, .done = w.done, .bad_shares = w.bad_shares}; }
+
+@requires(declassify)
+Walk flush(Walk w) {
+    Option(LpAcct) c = w.cur;
+    return match c {
+        None => w,
+        Some(a) => Walk {.key = w.key, .share = w.share, .cur = None, .done = if (a.deleted) { w.done } else { w.done.concat([lp_imp(a)]) }, .bad_shares = w.bad_shares}
+    };
+}
+
+// ACCT (lastpass-cli blob.c, in order): id, name, group, url (hex, or
+// encrypted), extra (the note), fav, sharedfromaid, username, password,
+// ... deleted (26th).
+@requires(declassify)
+LpAcct read_acct(List(Secret(UInt(8))) key, Str share, List(List(Int)) xs) {
+    Str group = str_replace(txt_bin(key, item_at(xs, 2)), "\\", "/");
+    List(Int) u = item_at(xs, 3);
+    Str url = if (u.len() > 0 && (u[0] == 33 || u[0] == 35)) { txt_bin(key, u) } else { text_of(cose_hex_decode(text_of(u))) };
+    Str folder = if (str_len(share) == 0) { group } else { if (str_len(group) == 0) { share } else { share + "/" + group } };
+    return LpAcct {.name = txt_bin(key, item_at(xs, 1)), .folder = folder, .url = str_trim(url), .note = sec_bin(key, item_at(xs, 4)),
+                   .user = sec_bin(key, item_at(xs, 7)), .pass = sec_bin(key, item_at(xs, 8)), .custom = [], .deleted = text_of(item_at(xs, 25)) == "1"};
+}
+
+// ACFL/ACOF: name, type, value (encrypted for text kinds), checked.
+@requires(declassify)
+Walk add_field(Walk w, List(List(Int)) xs) {
+    Option(LpAcct) c = w.cur;
+    return match c {
+        None => w,
+        Some(a) => with_cur(w, Some(LpAcct {.name = a.name, .folder = a.folder, .url = a.url, .note = a.note, .user = a.user, .pass = a.pass,
+                                             .custom = a.custom.concat(field_of(w.key, xs)), .deleted = a.deleted}))
+    };
+}
+
+@requires(declassify)
+List(ImpCustom) field_of(List(Secret(UInt(8))) key, List(List(Int)) xs) {
+    Str label = str_trim(text_of(item_at(xs, 0)));
+    Str t = text_of(item_at(xs, 1));
+    Bool enc = t == "email" || t == "tel" || t == "text" || t == "password" || t == "textarea";
+    List(Secret(UInt(8))) v = if (enc) { sec_bin(key, item_at(xs, 2)) } else { secret_bytes(item_at(xs, 2)) };
+    if (v.len() == 0) { return []; }
+    return [ImpCustom {.label = if (str_len(label) == 0) { "Field" } else { label }, .hidden = t == "password", .value = v}];
+}
+
+// SHAR: id, the folder key (hex of RSA-OAEP-SHA-1 to the account's key;
+// its plaintext is the AES key as hex text), the name (text form, under
+// the folder key), readonly. A folder that does not open is left out:
+// its accounts are walked under no key and come out empty.
+@requires(declassify)
+Walk enter_share(Walk w, Option(RsaKey) rk, List(List(Int)) xs) {
+    List(Secret(UInt(8))) none = [];
+    List(Int) ct = cose_hex_decode(text_of(item_at(xs, 1)));
+    List(Secret(UInt(8))) k = match rk {
+        None => none,
+        Some(r) => match rsa_oaep_decrypt(Sha1, Sha1, r, ct, []) { None => none, Some(h) => sunhex(h) }
+    };
+    if (k.len() != 32) { return Walk {.key = none, .share = "", .cur = None, .done = w.done, .bad_shares = w.bad_shares + 1}; }
+    Str name = match lp_open_text(k, text_of(item_at(xs, 2))) { None => "Shared", Some(b) => str_trim(text_of(reveal(b))) };
+    return Walk {.key = k, .share = if (str_len(name) == 0) { "Shared" } else { name }, .cur = None, .done = w.done, .bad_shares = w.bad_shares};
+}
+
+// ─── Accounts as items ──────────────────────────────────────────────
+
+@requires(declassify)
+Imp lp_imp(LpAcct a) {
+    ListBuf(ImpCustom) cs = push_customs(a.custom, 0, ListBuf());
+    if (a.url == "http://sn") { return lp_note(a.name, a.note, a.folder, cs); }
+    List(Str) uris = if (str_len(a.url) == 0 || a.url == "http://") { [] } else { [a.url] };
+    Int w = first_web(uris, 0);
+    Str origin = if (w < 0) { "" } else { web_origin(uris[w]) };
+    ListBuf(ImpField) fs = fputs(fputs(fputs(fput(ListBuf(), "origin", origin), "username", a.user), "current", a.pass), "notes", a.note);
+    return imp(name_or(a.name, origin, ""), "login", a.folder, fs, extra_sites(uris, w, origin, 0, cs));
+}
+
+ListBuf(ImpCustom) push_customs(List(ImpCustom) xs, Int i, ListBuf(ImpCustom) acc) {
+    if (i >= xs.len()) { return acc; }
+    return push_customs(xs, i + 1, acc.push(xs[i]));
+}
+
+// A secure note's framing: the start and end of each line, published one
+// class bit at a time (a line break, a colon, or anything else), never a
+// value's byte.
+@requires(declassify)
+List(Int) note_classes(List(Secret(UInt(8))) t, Int i, ListBuf(Int) acc) {
+    if (i >= t.len()) { return acc.finish(); }
+    Secret(UInt(32)) c = (UInt(32)) t[i];
+    Secret(UInt(32)) k = b64g_in(c, 10, 10) | (b64g_in(c, 13, 13) << (UInt(32)) 1) | (b64g_in(c, 58, 58) << (UInt(32)) 2);
+    UInt(32) v = ct_public(declassify(k, "a secure note's framing: where its lines break and its labels end"));
+    return note_classes(t, i + 1, acc.push((Int) v));
+}
+
+type Pair = { Str key; List(Secret(UInt(8))) value; };
+
+// "Key:value" lines; "Notes:" runs to the end. Keys are LastPass's labels
+// (published), values stay secret.
+@requires(declassify)
+List(Pair) note_pairs(List(Secret(UInt(8))) t, List(Int) cls, Int i, ListBuf(Pair) acc) {
+    if (i >= t.len()) { return acc.finish(); }
+    Int eol = line_end(cls, i);
+    Int colon = first_colon(cls, i, eol);
+    Int next = skip_breaks(cls, eol);
+    if (colon < 0) { return note_pairs(t, cls, next, acc); }
+    Str key = text_of(reveal(t[i..colon]));
+    if (key == "Notes") { return acc.push(Pair {.key = key, .value = t[colon + 1..t.len()]}).finish(); }
+    return note_pairs(t, cls, next, acc.push(Pair {.key = key, .value = t[colon + 1..eol]}));
+}
+
+Int line_end(List(Int) cls, Int i) { return if (i >= cls.len() || (cls[i] & 3) != 0) { i } else { line_end(cls, i + 1) }; }
+Int skip_breaks(List(Int) cls, Int i) { return if (i < cls.len() && (cls[i] & 3) != 0) { skip_breaks(cls, i + 1) } else { i }; }
+Int first_colon(List(Int) cls, Int i, Int end) { return if (i >= end) { 0 - 1 } else { if ((cls[i] & 4) != 0) { i } else { first_colon(cls, i + 1, end) } }; }
+
+List(Secret(UInt(8))) pv(List(Pair) ps, Str k) { return pv_at(ps, k, 0); }
+List(Secret(UInt(8))) pv_at(List(Pair) ps, Str k, Int i) {
+    List(Secret(UInt(8))) none = [];
+    if (i >= ps.len()) { return none; }
+    return if (ps[i].key == k) { ps[i].value } else { pv_at(ps, k, i + 1) };
+}
+
+ListBuf(ImpCustom) rest_of(List(Pair) ps, List(Str) used, Int i, ListBuf(ImpCustom) acc) {
+    if (i >= ps.len()) { return acc; }
+    Bool skip = ps[i].key == "NoteType" || ps[i].key == "Notes" || ps[i].key == "Language" || used.contains(ps[i].key);
+    return rest_of(ps, used, i + 1, if (skip) { acc } else { cputs(acc, ps[i].key, ps[i].value, looks_secret(ps[i].key)) });
+}
+
+@requires(declassify)
+Imp lp_note(Str name, List(Secret(UInt(8))) text, Str folder, ListBuf(ImpCustom) cs) {
+    List(Int) cls = note_classes(text, 0, ListBuf());
+    List(Pair) ps = note_pairs(text, cls, 0, ListBuf());
+    Str t = if (ps.len() > 0 && ps[0].key == "NoteType") { text_of(reveal(ps[0].value)) } else { "" };
+    Str n = name_or(name, "", "");
+    if (str_len(t) == 0) { return imp(n, "note", folder, fputs(ListBuf(), "text", if (text.len() == 0) { sv(n) } else { text }), cs); }
+    List(Secret(UInt(8))) notes = pv(ps, "Notes");
+    if (t == "Credit Card" && pv(ps, "Number").len() > 0) {
+        ListBuf(ImpField) fs = fputs(fputs(fputs(fputs(ListBuf(), "cardholder", pv(ps, "Name on Card")), "number", pv(ps, "Number")), "cvv", pv(ps, "Security Code")), "notes", notes);
+        // The expiry ("January,2027") is read to write it as MM/YY: a
+        // month and a year, which the card's listing shows anyway.
+        Str exp = lp_expiry(text_of(reveal(pv(ps, "Expiration Date"))));
+        return imp(name_or(name, "", "Card"), "card", folder, fput(fs, "expiry", exp), rest_of(ps, ["Name on Card", "Number", "Security Code", "Expiration Date"], 0, cs));
+    }
+    if (t == "Bank Account") {
+        ListBuf(ImpField) fs = fputs(fputs(fputs(fputs(fputs(fputs(ListBuf(), "bank_name", pv(ps, "Bank Name")), "account_number", pv(ps, "Account Number")),
+                                                    "routing", pv(ps, "Routing Number")), "swift", pv(ps, "SWIFT Code")), "iban", pv(ps, "IBAN Number")), "notes", notes);
+        return imp(name_or(name, "", "Bank account"), "bank", folder, fs, rest_of(ps, ["Bank Name", "Account Number", "Routing Number", "SWIFT Code", "IBAN Number"], 0, cs));
+    }
+    if (t == "Address") {
+        List(Secret(UInt(8))) none = [];
+        List(Secret(UInt(8))) full = sjoin([pv(ps, "Title"), pv(ps, "First Name"), pv(ps, "Middle Name"), pv(ps, "Last Name")], " ", 0, none);
+        List(Secret(UInt(8))) place = sjoin([pv(ps, "City / Town"), pv(ps, "State"), pv(ps, "Zip / Postal Code")], " ", 0, none);
+        List(Secret(UInt(8))) addr = sjoin([pv(ps, "Address 1"), pv(ps, "Address 2"), pv(ps, "Address 3"), place, pv(ps, "Country")], "\n", 0, none);
+        ListBuf(ImpField) fs = fputs(fputs(fputs(fputs(fputs(ListBuf(), "full_name", full), "email", pv(ps, "Email Address")), "phone", pv(ps, "Phone")), "address", addr), "notes", notes);
+        List(Str) used = ["Title", "First Name", "Middle Name", "Last Name", "Email Address", "Phone", "Address 1", "Address 2", "Address 3", "City / Town", "State", "Zip / Postal Code", "Country"];
+        return imp(name_or(name, "", "Address"), "identity", folder, fs, rest_of(ps, used, 0, cs));
+    }
+    if (t == "Wi-Fi Password" && pv(ps, "SSID").len() > 0) {
+        ListBuf(ImpField) fs = fputs(fputs(fputs(fputs(ListBuf(), "ssid", pv(ps, "SSID")), "password", pv(ps, "Password")), "security", pv(ps, "Authentication")), "notes", notes);
+        return imp(name_or(name, "", "Wi-Fi"), "wifi", folder, fs, rest_of(ps, ["SSID", "Password", "Authentication"], 0, cs));
+    }
+    if (t == "Passport" || t == "Driver's License") {
+        ListBuf(ImpField) fs = fputs(fputs(fputs(ListBuf(), "full_name", pv(ps, "Name")), "document", pv(ps, "Number")), "notes", notes);
+        return imp(name_or(name, "", t), "identity", folder, fs, rest_of(ps, ["Name", "Number"], 0, cs));
+    }
+    if (t == "Social Security") {
+        ListBuf(ImpField) fs = fputs(fputs(ListBuf(), "full_name", pv(ps, "Name")), "notes", notes);
+        return imp(name_or(name, "", t), "identity", folder, fs, rest_of(ps, ["Name"], 0, cs));
+    }
+    return imp(n, "note", folder, fputs(ListBuf(), "text", if (notes.len() == 0) { sv(n) } else { notes }), cput(rest_of(ps, [], 0, cs), "Kind", t, false));
+}
+
+// ─── The command ────────────────────────────────────────────────────
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+pub Int vault_signin_lastpass(Str dir, Bool dry, Str share) {
+    Option(DeviceConfig) oc = load_config(dir);
+    if (match oc { None => true, Some(_) => false }) { return bw_fail("this device is not set up"); }
+    Result(LpSvc, Str) rs = lp_service();
+    return match rs { Err(m) => bw_fail(m), Ok(s) => lp_signin(dir, s, dry, share) };
+}
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+Int lp_signin(Str dir, LpSvc s, Bool dry, Str share) {
+    Str email = str_to_lower(str_trim(read_line()));
+    Str password = read_line();
+    if (str_len(email) == 0 || str_len(password) == 0) { return bw_fail("the email and master password are needed"); }
+    LpReply ir = lp_post(s, "/iterations.php", "email=" + bw_form(email), "");
+    if (str_len(ir.err) > 0) { return bw_fail(ir.err); }
+    Int iters = str_parse_int(str_trim(text_of(ir.body)));
+    // As for Bitwarden: a server that lowered this would be asking for a
+    // login hash cheap to guess.
+    if (iters < 100000) { return bw_fail(f"the account's key derivation is weak ({iters} iterations): raise it in LastPass (Account settings, Advanced settings, Password iterations) to 600000, then sign in again"); }
+    if (iters > 2000000) { return bw_fail("the account's key derivation settings are out of range"); }
+    List(Secret(UInt(8))) pw = secret_bytes(str_to_bytes(password));
+    List(Secret(UInt(8))) key = pbkdf2_sha256g(pw, secret_bytes(str_to_bytes(email)), iters, 32);
+    Str hash = hex_encode(reveal(pbkdf2_sha256g(key, pw, 1, 32)));
+    return lp_logged(dir, s, email, hash, iters, key, lp_answer(s, email, hash, iters, lp_login(s, email, hash, iters, ""), 8), dry, share);
+}
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+Int lp_logged(Str dir, LpSvc s, Str email, Str hash, Int iters, List(Secret(UInt(8))) key, LpTok t, Bool dry, Str share) {
+    return match t {
+        LpOk(ss) => lp_fetch(dir, s, key, ss, dry, share),
+        LpMoved(base) => lp_logged(dir, LpSvc {.base = base, .store = s.store}, email, hash, iters, key, lp_answer(LpSvc {.base = base, .store = s.store}, email, hash, iters, lp_login(LpSvc {.base = base, .store = s.store}, email, hash, iters, ""), 8), dry, share),
+        LpFail(m) => bw_fail(m),
+        _ => bw_fail("the sign-in did not finish")
+    };
+}
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+Int lp_fetch(Str dir, LpSvc s, List(Secret(UInt(8))) key, LpSession ss, Bool dry, Str share) {
+    LpReply r = lp_post(s, "/getaccts.php", "mobile=1&requestsrc=cli&hasplugin=1.6.2&token=" + bw_form(ss.token), ss.session);
+    if (str_len(r.err) > 0) { return bw_fail(r.err); }
+    if (r.status != 200 || r.body.len() < 8) { return bw_fail(f"LastPass did not send the vault ({r.status})"); }
+    List(Chunk) cs = chunks(r.body, 0, ListBuf());
+    Option(RsaKey) rk = lp_private_key(key, ss.private_key);
+    Walk w = walk(cs, 0, key, rk, Walk {.key = key, .share = "", .cur = None, .done = [], .bad_shares = 0});
+    List(Str) warn = if (w.bad_shares > 0) { [f"{w.bad_shares} shared folder(s) did not open: their items are left out"] } else { [] };
+    return preview_then(dir, ImpRead {.items = w.done, .warnings = warn}, dry, share);
+}

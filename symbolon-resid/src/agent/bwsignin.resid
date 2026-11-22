@@ -70,7 +70,7 @@ Str bw_strip(Str s) {
 // The trust anchors for public HTTPS: SYMBOLON_CA (the app sets it on
 // Android), else the breach check's variable, else the system bundle.
 @requires(filesystem, environment)
-Result(TrustStore, Str) public_roots() {
+pub Result(TrustStore, Str) public_roots() {
     Str a = environment.get("SYMBOLON_CA");
     Str b = environment.get("SYMBOLON_BREACH_CA");
     List(Str) tries = [a, b, "/etc/ssl/certs/ca-certificates.crt", "/etc/ssl/cert.pem", "/etc/pki/tls/certs/ca-bundle.crt"];
@@ -169,7 +169,7 @@ Int bw_int(Value v, Str key, Int dflt) {
 Str bw_json_str(Str s) { return "\"" + str_replace(str_replace(str_replace(str_replace(s, "\\", "\\\\"), "\"", "\\\""), "\n", "\\n"), "\r", "\\r") + "\""; }
 
 // application/x-www-form-urlencoded (RFC 3986 unreserved kept).
-Str bw_form(Str s) { return bw_form_at(str_to_bytes(s), 0, StrBuf()); }
+pub Str bw_form(Str s) { return bw_form_at(str_to_bytes(s), 0, StrBuf()); }
 
 Str bw_form_at(List(Int) b, Int i, StrBuf acc) {
     if (i >= b.len()) { return acc.finish(); }
@@ -322,12 +322,12 @@ List(Str) map_codes(List(Int) ps, Int i, ListBuf(Str) acc) {
     return map_codes(ps, i + 1, acc.push(f"{ps[i]}"));
 }
 
-Int bw_fail(Str m) {
+pub Int bw_fail(Str m) {
     println("fail " + hex_encode(str_to_bytes(m)));
     return 1;
 }
 
-Str read_line() {
+pub Str read_line() {
     Str l = resid_read_line();
     Int n = str_len(l);
     return if (n > 0 && str_slice(l, n - 1, n) == "\n") { str_slice(l, 0, n - 1) } else { l };
@@ -464,7 +464,7 @@ Int count_entries(BwKey k, List(VEntry) es, Int i, Int n) {
 
 // Secret pieces joined with `sep`, the empty ones left out (lengths are
 // public).
-List(Secret(UInt(8))) sjoin(List(List(Secret(UInt(8)))) ps, Str sep, Int i, List(Secret(UInt(8))) acc) {
+pub List(Secret(UInt(8))) sjoin(List(List(Secret(UInt(8)))) ps, Str sep, Int i, List(Secret(UInt(8))) acc) {
     if (i >= ps.len()) { return acc; }
     if (ps[i].len() == 0) { return sjoin(ps, sep, i + 1, acc); }
     return sjoin(ps, sep, i + 1, if (acc.len() == 0) { ps[i] } else { acc.concat(sv(sep)).concat(ps[i]) });
@@ -484,7 +484,7 @@ Secret(UInt(8)) hex_digit(Secret(UInt(32)) n) {
     return wrapping_u8(wrapping_uadd(wrapping_uadd(n, (UInt(32)) 48), wrapping_usub((UInt(32)) 0, above9) & (UInt(32)) 39));
 }
 
-List(Secret(UInt(8))) shex(List(Secret(UInt(8))) b, Int i, ListBuf(Secret(UInt(8))) acc) {
+pub List(Secret(UInt(8))) shex(List(Secret(UInt(8))) b, Int i, ListBuf(Secret(UInt(8))) acc) {
     if (i >= b.len()) { return acc.finish(); }
     Secret(UInt(32)) x = (UInt(32)) b[i];
     return shex(b, i + 1, acc.push(hex_digit(x >> (UInt(32)) 4)).push(hex_digit(x & (UInt(32)) 15)));
@@ -771,7 +771,7 @@ ImpRead with_notes(ImpRead r, Int orgs_failed, Int bad, Int locked) {
 }
 
 @requires(filesystem, network, device, declassify, clock, provision, environment)
-Int preview_then(Str dir, ImpRead got, Bool dry, Str share) {
+pub Int preview_then(Str dir, ImpRead got, Bool dry, Str share) {
     if (got.items.len() == 0) { return bw_fail("the vault has no items to bring across"); }
     Int rc = import_items(dir, got, true, share);
     println("ready");

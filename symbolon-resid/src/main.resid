@@ -39,11 +39,14 @@
 //   symbolon device vault set DIR NAME TYPE    PIN, then "FIELD VALUE-HEX" lines, on stdin (card, identity,
 //                                              note, bank, wifi, secret, login)
 //   symbolon device vault delete DIR NAME      PIN on stdin
-//   symbolon device vault import DIR FILE [--format auto|bitwarden-json|csv] [--dry-run]
+//   symbolon device vault import DIR FILE [--format auto|bitwarden-json|csv|1password-op] [--dry-run]
+//       FILE "-": the export as one line on stdin, then the PIN
 //   symbolon device vault signin-bitwarden DIR SERVER [--dry-run] [--share ID]
 //       signs in to Bitwarden or Vaultwarden (SERVER: bitwarden.com,
 //       bitwarden.eu or https://...) and imports the vault; a line
 //       conversation on stdin/stdout (src/agent/bwsignin.resid)
+//   symbolon device vault signin-lastpass DIR [--dry-run] [--share ID]
+//       the same for LastPass, experimental (src/agent/lpsignin.resid)
 //                                              PIN on stdin (not with --dry-run): another password
 //                                              manager's export, as one new vault version
 //   symbolon device openings DIR                  PIN on stdin; each device's protected-item openings (hour, day, week) from the cosigner's records, and whether a day is unusual
@@ -115,6 +118,7 @@ import "agent/protect.resid";
 import "agent/breachcli.resid";
 import "agent/importers.resid";
 import "agent/bwsignin.resid";
+import "agent/lpsignin.resid";
 import "agent/sharecli.resid";
 import "browser/nmhost.resid";
 import "agent/sshcli.resid";
@@ -423,6 +427,9 @@ Int main() {
     if (a1 == "device" && a2 == "vault" && args.get(3) == "import" && n >= 6) {
         Str fmt = flag_arg("--format", 1, 6);
         return vault_import(args.get(4), args.get(5), if (str_len(fmt) == 0) { "auto" } else { fmt }, has_flag("--dry-run", 6), share);
+    }
+    if (a1 == "device" && a2 == "vault" && args.get(3) == "signin-lastpass" && n >= 5) {
+        return vault_signin_lastpass(args.get(4), has_flag("--dry-run", 5), share);
     }
     if (a1 == "device" && a2 == "vault" && args.get(3) == "signin-bitwarden" && n >= 6) {
         return vault_signin_bitwarden(args.get(4), args.get(5), has_flag("--dry-run", 6), share);

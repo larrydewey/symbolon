@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Drives `symbolon device vault signin-bitwarden` the way the app does, for
-tests/bitwarden_e2e.sh.
+"""Drives `symbolon device vault signin-bitwarden` (and signin-lastpass) the
+way the app does, for tests/bitwarden_e2e.sh and tests/lastpass_e2e.sh.
 
   bw_converse.py WANT.json ACCOUNT PIN -- COMMAND...
 
@@ -40,6 +40,14 @@ def main():
             print(f"need 2fa {w[2]}")
             p.stdin.write(f"code 0 {code}\n")
             p.stdin.flush()
+        elif w[0] == "need" and w[1] == "code":
+            # LastPass: a code from the named authenticator.
+            code = bw_fixture.totp(a["totp"]) if "totp" in a else "000000"
+            print(f"need code {w[2]}")
+            p.stdin.write(f"code {w[2]} {code}\n")
+            p.stdin.flush()
+        elif w[0] == "wait":
+            print(line)
         elif w[0] == "need":
             print(line)
             p.stdin.write("cancel\n")
