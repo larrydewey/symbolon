@@ -41,34 +41,43 @@ import "resid-csv/csv.resid";
 
 // ─── The neutral item ───────────────────────────────────────────────
 
-type ImpField = { Str name; Str value; };
-type ImpCustom = { Str label; Bool hidden; Str value; };
+// A field's value is secret from the moment it is read: a file's text is
+// classified as it is mapped, a signed-in import's plaintext never leaves
+// Secret, and either is sealed as it is (vault.resid's FieldPlain).
+pub type ImpField = { Str name; List(Secret(UInt(8))) value; };
+pub type ImpCustom = { Str label; Bool hidden; List(Secret(UInt(8))) value; };
 
 // An entry as read from a source, before it is checked and sealed; `why`
 // is why it cannot come across, or "".
-type Imp = { Str name; Str kind; Str folder; List(ImpField) fields; List(ImpCustom) custom; Str why; };
+pub type Imp = { Str name; Str kind; Str folder; List(ImpField) fields; List(ImpCustom) custom; Str why; };
 
 // What a source gave: the entries, and what the person should know.
-type ImpRead = { List(Imp) items; List(Str) warnings; };
+pub type ImpRead = { List(Imp) items; List(Str) warnings; };
 
-ListBuf(ImpField) fput(ListBuf(ImpField) acc, Str name, Str value) {
-    return if (str_len(str_trim(value)) == 0) { acc } else { acc.push(ImpField {.name = name, .value = value}) };
+// Text read from an export file, from here on secret.
+pub List(Secret(UInt(8))) sv(Str s) { return secret_bytes(utf8(s)); }
+
+pub ListBuf(ImpField) fput(ListBuf(ImpField) acc, Str name, Str value) {
+    return if (str_len(str_trim(value)) == 0) { acc } else { acc.push(ImpField {.name = name, .value = sv(value)}) };
 }
 
-ListBuf(ImpCustom) cput(ListBuf(ImpCustom) acc, Str label, Str value, Bool hidden) {
-    return if (str_len(str_trim(value)) == 0) { acc } else { acc.push(ImpCustom {.label = label, .hidden = hidden, .value = value}) };
+// A value that is already secret; an empty one is left out.
+pub ListBuf(ImpField) fputs(ListBuf(ImpField) acc, Str name, List(Secret(UInt(8))) value) {
+    return if (value.len() == 0) { acc } else { acc.push(ImpField {.name = name, .value = value}) };
 }
 
-Imp imp(Str name, Str kind, Str folder, ListBuf(ImpField) fs, ListBuf(ImpCustom) cs) {
+pub ListBuf(ImpCustom) cput(ListBuf(ImpCustom) acc, Str label, Str value, Bool hidden) {
+    return if (str_len(str_trim(value)) == 0) { acc } else { acc.push(ImpCustom {.label = label, .hidden = hidden, .value = sv(value)}) };
+}
+
+pub ListBuf(ImpCustom) cputs(ListBuf(ImpCustom) acc, Str label, List(Secret(UInt(8))) value, Bool hidden) {
+    return if (value.len() == 0) { acc } else { acc.push(ImpCustom {.label = label, .hidden = hidden, .value = value}) };
+}
+
+pub Imp imp(Str name, Str kind, Str folder, ListBuf(ImpField) fs, ListBuf(ImpCustom) cs) {
     return Imp {.name = str_trim(name), .kind = kind, .folder = str_trim(folder), .fields = fs.finish(), .custom = cs.finish(), .why = ""};
 }
 
-Str field_of(Imp x, Str n) { return field_at(x.fields, n, 0); }
-Str field_at(List(ImpField) fs, Str n, Int i) {
-    if (i >= fs.len()) { return ""; }
-    if (fs[i].name == n) { return fs[i].value; }
-    return field_at(fs, n, i + 1);
-}
 
 // ─── Small text helpers ─────────────────────────────────────────────
 
@@ -106,14 +115,14 @@ Str month_named(List(Str) names, Str p, Int i) {
 
 // A site address as a login keeps it: a bare host ("example.com", as
 // Bitwarden allows) is read as https.
-Str web_origin(Str uri) {
+pub Str web_origin(Str uri) {
     Str u = str_trim(uri);
     Bool bare = !str_contains(u, "://") && str_contains(u, ".") && !str_contains(u, " ");
     return origin_of(if (bare) { "https://" + u } else { u });
 }
 
 // A name for an entry that has none: the site's host, else the username.
-Str name_or(Str name, Str origin, Str user) {
+pub Str name_or(Str name, Str origin, Str user) {
     if (str_len(str_trim(name)) > 0) { return name; }
     if (str_len(origin) > 0) { return str_replace(str_replace(str_replace(origin, "https://", ""), "http://", ""), "www.", ""); }
     if (str_len(str_trim(user)) > 0) { return user; }
@@ -167,7 +176,7 @@ Value jo(Value v, Str key) { return match value_field(v, key) { Some(x) => x, No
 // An organization's export has "collections" and "collectionIds": an item
 // with no folder takes its first collection's name.
 
-Result(ImpRead, Str) bitwarden_json(Value top) {
+pub Result(ImpRead, Str) bitwarden_json(Value top) {
     if (jt(top, "encrypted") == "true") {
         return Err("this Bitwarden export is password-protected: export again as .json (not encrypted), import it, then delete the file");
     }
@@ -247,13 +256,13 @@ Imp login_item(Str name, List(Str) uris, Str user, Str password, Str totp, Str n
     return imp(name_or(name, origin, user), "login", folder, fs, extra_sites(uris, k, origin, 0, cs));
 }
 
-Int first_web(List(Str) us, Int i) {
+pub Int first_web(List(Str) us, Int i) {
     if (i >= us.len()) { return -1; }
     if (str_len(web_origin(us[i])) > 0) { return i; }
     return first_web(us, i + 1);
 }
 
-ListBuf(ImpCustom) extra_sites(List(Str) us, Int k, Str origin, Int i, ListBuf(ImpCustom) acc) {
+pub ListBuf(ImpCustom) extra_sites(List(Str) us, Int k, Str origin, Int i, ListBuf(ImpCustom) acc) {
     if (i >= us.len()) { return acc; }
     // The origin's own address ("https://x.com" or "https://x.com/") says
     // nothing more; a bare host does not either.
@@ -327,7 +336,7 @@ Imp bw_passkey(Value k, Str login, Str folder) {
 }
 
 // What the person should know about the passkeys that come across.
-List(Str) synced_warnings(List(Imp) xs) {
+pub List(Str) synced_warnings(List(Imp) xs) {
     Int n = synced_count(xs, 0, 0);
     return if (n == 0) { [] } else { [passkey_warning(n)] };
 }
@@ -566,9 +575,9 @@ Result(ImpRead, Str) read_export(Str text, Str format) {
 // An imported passkey also records when it came in (`when`, Unix seconds).
 List(ImpField) stored_fields(Imp x, Str name, Str when) {
     ListBuf(ImpField) e = ListBuf();
-    ListBuf(ImpField) a0 = if (x.kind == "passkey" && str_len(when) > 0) { e.push(ImpField {.name = "imported", .value = when}) } else { e };
-    ListBuf(ImpField) a = a0.push(ImpField {.name = "name", .value = name}).push(ImpField {.name = "type", .value = x.kind});
-    ListBuf(ImpField) b = if (str_len(x.folder) == 0) { a } else { a.push(ImpField {.name = "folder", .value = x.folder}) };
+    ListBuf(ImpField) a0 = if (x.kind == "passkey" && str_len(when) > 0) { e.push(ImpField {.name = "imported", .value = sv(when)}) } else { e };
+    ListBuf(ImpField) a = a0.push(ImpField {.name = "name", .value = sv(name)}).push(ImpField {.name = "type", .value = sv(x.kind)});
+    ListBuf(ImpField) b = if (str_len(x.folder) == 0) { a } else { a.push(ImpField {.name = "folder", .value = sv(x.folder)}) };
     return customs(x.custom, 0, x.fields.len(), push_all(x.fields, 0, b)).finish();
 }
 
@@ -581,7 +590,7 @@ ListBuf(ImpField) push_all(List(ImpField) fs, Int i, ListBuf(ImpField) acc) {
 ListBuf(ImpField) customs(List(ImpCustom) cs, Int i, Int used, ListBuf(ImpField) acc) {
     if (i >= cs.len() || used + i + 3 >= 40) { return acc; }
     Str us = str_from_code(31);
-    Str v = cs[i].label + us + (if (cs[i].hidden) { "1" } else { "0" }) + us + cs[i].value;
+    List(Secret(UInt(8))) v = sv(cs[i].label + us + (if (cs[i].hidden) { "1" } else { "0" }) + us).concat(cs[i].value);
     return customs(cs, i + 1, used, acc.push(ImpField {.name = f"custom_{i}", .value = v}));
 }
 
@@ -594,13 +603,13 @@ Str problem_of(Imp x, List(ImpField) fs) {
 
 Bool fits(List(ImpField) fs, Int i) {
     if (i >= fs.len()) { return true; }
-    if (utf8(fs[i].value).len() > 65536) { return false; }
+    if (fs[i].value.len() > 65536) { return false; }
     return fits(fs, i + 1);
 }
 
 List(FieldPlain) plain_fields(List(ImpField) fs, Int i, ListBuf(FieldPlain) acc) {
     if (i >= fs.len()) { return acc.finish(); }
-    return plain_fields(fs, i + 1, acc.push(FieldPlain {.name = fs[i].name, .value = secret_bytes(utf8(fs[i].value))}));
+    return plain_fields(fs, i + 1, acc.push(FieldPlain {.name = fs[i].name, .value = fs[i].value}));
 }
 
 // A name not yet taken, in the vault (by item id) or by this import:
@@ -671,7 +680,7 @@ pub Int vault_import(Str dir, Str file, Str format, Bool dry, Str share) {
 }
 
 @requires(filesystem, network, device, declassify, clock, provision, environment)
-Int import_items(Str dir, ImpRead got, Bool dry, Str share) {
+pub Int import_items(Str dir, ImpRead got, Bool dry, Str share) {
     if (dry) {
         List(Secret(UInt(8))) none = [];
         Set(Str) taken = {};

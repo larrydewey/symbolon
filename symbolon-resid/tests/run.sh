@@ -32,5 +32,6 @@ echo "tests/ssh_e2e.sh: $(tests/ssh_e2e.sh 2>&1 | grep -E "PASS|FAIL|SKIP" | hea
 echo "tests/fido_e2e.sh: $(tests/fido_e2e.sh 2>&1 | grep -E "PASS|FAIL|SKIP" | head -1)"
 echo "tests/link_e2e.sh: $(tests/link_e2e.sh 2>&1 | grep -E "PASS|FAIL|SKIP" | head -1)"
 echo "tests/protected_e2e.sh: $(tests/protected_e2e.sh 2>&1 | grep -E "PASS|FAIL|SKIP" | head -1)"
+echo "tests/bitwarden_e2e.sh: $(tests/bitwarden_e2e.sh 2>&1 | grep -E "PASS|FAIL|SKIP" | head -1)"
 echo "tests/fido_usb.sh (by hand, a key plugged in): $(tests/fido_usb.sh 2>&1 | grep -E "PASS|FAIL|SKIP" | head -1)"
 exit $fail

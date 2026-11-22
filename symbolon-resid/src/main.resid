@@ -40,6 +40,10 @@
 //                                              note, bank, wifi, secret, login)
 //   symbolon device vault delete DIR NAME      PIN on stdin
 //   symbolon device vault import DIR FILE [--format auto|bitwarden-json|csv] [--dry-run]
+//   symbolon device vault signin-bitwarden DIR SERVER [--dry-run] [--share ID]
+//       signs in to Bitwarden or Vaultwarden (SERVER: bitwarden.com,
+//       bitwarden.eu or https://...) and imports the vault; a line
+//       conversation on stdin/stdout (src/agent/bwsignin.resid)
 //                                              PIN on stdin (not with --dry-run): another password
 //                                              manager's export, as one new vault version
 //   symbolon device openings DIR                  PIN on stdin; each device's protected-item openings (hour, day, week) from the cosigner's records, and whether a day is unusual
@@ -110,6 +114,7 @@ import "agent/vaultitems.resid";
 import "agent/protect.resid";
 import "agent/breachcli.resid";
 import "agent/importers.resid";
+import "agent/bwsignin.resid";
 import "agent/sharecli.resid";
 import "browser/nmhost.resid";
 import "agent/sshcli.resid";
@@ -418,6 +423,9 @@ Int main() {
     if (a1 == "device" && a2 == "vault" && args.get(3) == "import" && n >= 6) {
         Str fmt = flag_arg("--format", 1, 6);
         return vault_import(args.get(4), args.get(5), if (str_len(fmt) == 0) { "auto" } else { fmt }, has_flag("--dry-run", 6), share);
+    }
+    if (a1 == "device" && a2 == "vault" && args.get(3) == "signin-bitwarden" && n >= 6) {
+        return vault_signin_bitwarden(args.get(4), args.get(5), has_flag("--dry-run", 6), share);
     }
     if (a1 == "device" && a2 == "share" && args.get(3) == "new" && n == 6) { return share_new(args.get(4), args.get(5)); }
     if (a1 == "device" && a2 == "share" && args.get(3) == "list" && n == 5) { return share_list(args.get(4)); }

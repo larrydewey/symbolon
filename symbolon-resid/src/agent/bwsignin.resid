@@ -1,0 +1,781 @@
+// Moving in from Bitwarden or Vaultwarden by signing in, not by exporting
+// a file (SPEC 18.9): `symbolon device vault signin-bitwarden DIR SERVER
+// [--dry-run] [--share ID]`.
+//
+// The agent signs in the way Bitwarden's own apps do, downloads the
+// encrypted vault (/api/sync) and decrypts it here, then hands the items to
+// the file importer's Bitwarden mapping (importers.resid): the sync
+// response's items have the export's shape. Nothing of it is written to
+// disk: not the master key, the session token, nor the decrypted vault;
+// the device keeps only a random device identifier (bitwarden-device), so
+// the server's "new device" step happens once.
+//
+// SERVER: "bitwarden.com" (or "us"), "bitwarden.eu" (or "eu"), or the
+// https:// address of a self-hosted Bitwarden or Vaultwarden.
+//
+// The conversation, one line each way (the app keeps the process open):
+//   in   the email, then the master password
+//   out  "need 2fa P1,P2,..." (0 authenticator app, 1 email, 3 YubiKey OTP,
+//        8 recovery code; others are not offered here) or "need newdevice"
+//        (bitwarden.com emailed a code); in "code P VALUE", "send-email"
+//        (asks the server to email a two-step code; then "need 2fa" again),
+//        or "cancel"
+//   out  "fail TEXT-HEX" and exit 1 on any failure
+//   then the file importer's preview ("item", "skip", "warn", "total"),
+//   "ready", and with --dry-run the end; otherwise in "import" (or
+//   "cancel"), then the PIN, and the importer's report.
+//
+// Crypto (Bitwarden's security whitepaper and bitwarden/sdk-internal):
+// master key = PBKDF2-SHA256(password, email, n) or Argon2id(password,
+// SHA-256(email), t, m MiB, p); the login hash is base64(PBKDF2(master
+// key, password, 1)); the master key is stretched with HKDF-Expand into an
+// encryption and a MAC key, which open the user key (EncString type 2:
+// AES-256-CBC with HMAC-SHA-256, encrypt-then-MAC, checked first); the
+// user key opens the RSA private key, which opens each organization's key
+// (type 4, RSA-OAEP-SHA-1; type 3, SHA-256); an item with its own key is
+// opened with that. Accounts on Bitwarden's newer key format ("user crypto
+// v2", COSE keys) are refused with a message for now.
+
+import "../types.resid";
+import "state.resid";
+import "common.resid";
+import "device.resid";
+import "vaultcli.resid";
+import "importers.resid";
+import "tlsclient.resid";
+import "chain.resid";
+import "crypto.resid";
+import "word.resid";
+import "hash.resid";
+import "sha256g.resid";
+import "aescbcg.resid";
+import "rsaoaep.resid";
+import "rsakey.resid";
+import "argon2g.resid";
+import "tlskey.resid";
+import "ecdsa.resid";
+import "synced.resid";
+import "resid-json/json.resid";
+import "serial_value.resid";
+
+// ─── The service ────────────────────────────────────────────────────
+
+type BwSvc = { Str identity; Str api; TrustStore store; Str client; Int device_type; Str device_id; };
+
+Str bw_strip(Str s) {
+    Str t = str_trim(s);
+    return if (str_len(t) > 0 && str_slice(t, str_len(t) - 1, str_len(t)) == "/") { bw_strip(str_slice(t, 0, str_len(t) - 1)) } else { t };
+}
+
+// The trust anchors for public HTTPS: SYMBOLON_CA (the app sets it on
+// Android), else the breach check's variable, else the system bundle.
+@requires(filesystem, environment)
+Result(TrustStore, Str) public_roots() {
+    Str a = environment.get("SYMBOLON_CA");
+    Str b = environment.get("SYMBOLON_BREACH_CA");
+    List(Str) tries = [a, b, "/etc/ssl/certs/ca-certificates.crt", "/etc/ssl/cert.pem", "/etc/pki/tls/certs/ca-bundle.crt"];
+    return roots_from(tries, 0);
+}
+
+@requires(filesystem)
+Result(TrustStore, Str) roots_from(List(Str) ps, Int i) {
+    if (i >= ps.len()) { return Err("no trust anchors for HTTPS (set SYMBOLON_CA to a PEM bundle)"); }
+    if (str_len(ps[i]) == 0) { return roots_from(ps, i + 1); }
+    List(Int) pem = filesystem.read_bytes(ps[i]);
+    return if (pem.len() == 0) { roots_from(ps, i + 1) } else { Ok(trust_store_add_pem(trust_store_empty(), text_of(pem))) };
+}
+
+// A random device identifier, kept in DIR so the server knows this device
+// the next time (it is not a secret: Bitwarden's apps show it).
+@requires(filesystem)
+Str bw_device_id(Str dir) {
+    Str f = dir + "/bitwarden-device";
+    Str have = str_trim(filesystem.read_all(f));
+    if (str_len(have) == 36) { return have; }
+    List(Int) r = random_bytes(16);
+    Str h = hex_encode(r.with(6, (r[6] & 15) | 64).with(8, (r[8] & 63) | 128));
+    Str id = str_slice(h, 0, 8) + "-" + str_slice(h, 8, 12) + "-" + str_slice(h, 12, 16) + "-" + str_slice(h, 16, 20) + "-" + str_slice(h, 20, 32);
+    _ = filesystem.write_all(f, id);
+    return id;
+}
+
+@requires(filesystem, environment)
+Result(BwSvc, Str) bw_service(Str dir, Str server) {
+    Str s = bw_strip(server);
+    Bool us = s == "" || s == "us" || s == "bitwarden.com" || s == "https://bitwarden.com" || s == "https://vault.bitwarden.com";
+    Bool eu = s == "eu" || s == "bitwarden.eu" || s == "https://bitwarden.eu" || s == "https://vault.bitwarden.eu";
+    if (!us && !eu && !str_starts_with(s, "https://")) { return Err("the server must be bitwarden.com, bitwarden.eu or an https:// address"); }
+    Str identity = if (us) { "https://identity.bitwarden.com" } else { if (eu) { "https://identity.bitwarden.eu" } else { s + "/identity" } };
+    Str api = if (us) { "https://api.bitwarden.com" } else { if (eu) { "https://api.bitwarden.eu" } else { s + "/api" } };
+    // Bitwarden's servers accept their own client names only; Symbolon
+    // signs in as the kind of app it is on this platform.
+    Bool android = str_len(environment.get("ANDROID_ROOT")) > 0;
+    Result(TrustStore, Str) rs = public_roots();
+    return match rs {
+        Err(m) => Err(m),
+        Ok(st) => Ok(BwSvc {.identity = identity, .api = api, .store = st, .client = if (android) { "mobile" } else { "desktop" }, .device_type = if (android) { 0 } else { 8 }, .device_id = bw_device_id(dir)})
+    };
+}
+
+type BwReply = { Int status; Value body; Str err; };
+
+Str bw_client_headers(BwSvc s) {
+    return f"Device-Type: {s.device_type}\r\nBitwarden-Client-Name: " + s.client + "\r\nBitwarden-Client-Version: 2026.11.0\r\n";
+}
+
+@requires(network, clock(readonly), declassify)
+BwReply bw_call(BwSvc s, Str method, Str url, Str headers, Str body) {
+    HttpsGet g = tls_https_request(url, "", s.store, ["http/1.1"], 60000, method, bw_client_headers(s) + "Accept: application/json\r\n" + headers, str_to_bytes(body));
+    if (str_len(g.err) > 0) { return BwReply {.status = 0, .body = VUnit, .err = g.err}; }
+    Str t = str_trim(text_of(g.bytes));
+    if (str_len(t) == 0) { return BwReply {.status = g.status, .body = VUnit, .err = ""}; }
+    Result(Value, SerialError) r = from_json(t);
+    return match r {
+        Err(_) => BwReply {.status = g.status, .body = VUnit, .err = if (g.status == 200) { "the server's answer is not JSON" } else { "" }},
+        Ok(v) => BwReply {.status = g.status, .body = v, .err = ""}
+    };
+}
+
+// ─── JSON, either case ──────────────────────────────────────────────
+// Bitwarden answers in camelCase; older Vaultwarden and the token endpoint
+// in PascalCase. Lookups try both.
+
+Str bw_upper1(Str k) { return if (str_len(k) == 0) { k } else { str_to_upper(str_slice(k, 0, 1)) + str_slice(k, 1, str_len(k)) }; }
+Str bw_lower1(Str k) { return if (str_len(k) == 0) { k } else { str_to_lower(str_slice(k, 0, 1)) + str_slice(k, 1, str_len(k)) }; }
+
+Option(Value) bw_field(Value v, Str key) {
+    Option(Value) a = value_field(v, key);
+    return match a { Some(x) => Some(x), None => value_field(v, bw_upper1(key)) };
+}
+
+Str bw_text(Value v, Str key) {
+    return match bw_field(v, key) {
+        None => "",
+        Some(x) => match x { VStr(s) => s, VInt(i) => f"{i}", VUInt(u) => f"{u}", VBool(b) => if (b) { "true" } else { "false" }, _ => "" }
+    };
+}
+
+Value bw_obj(Value v, Str key) { return match bw_field(v, key) { Some(x) => x, None => VUnit }; }
+
+List(Value) bw_list(Value v, Str key) {
+    return match bw_field(v, key) { Some(x) => match x { VSeq(xs) => xs, _ => [] }, None => [] };
+}
+
+Int bw_int(Value v, Str key, Int dflt) {
+    Str t = bw_text(v, key);
+    return if (str_len(t) == 0) { dflt } else { str_parse_int(t) };
+}
+
+Str bw_json_str(Str s) { return "\"" + str_replace(str_replace(str_replace(str_replace(s, "\\", "\\\\"), "\"", "\\\""), "\n", "\\n"), "\r", "\\r") + "\""; }
+
+// application/x-www-form-urlencoded (RFC 3986 unreserved kept).
+Str bw_form(Str s) { return bw_form_at(str_to_bytes(s), 0, StrBuf()); }
+
+Str bw_form_at(List(Int) b, Int i, StrBuf acc) {
+    if (i >= b.len()) { return acc.finish(); }
+    Int c = b[i];
+    Bool keep = (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 45 || c == 46 || c == 95 || c == 126;
+    return bw_form_at(b, i + 1, if (keep) { acc.push(str_from_code(c)) } else { acc.push("%" + str_to_upper(hex_encode([c]))) });
+}
+
+Str bw_b64url_nopad(Str s) { return str_replace(str_replace(str_replace(base64_encode(str_to_bytes(s)), "+", "-"), "/", "_"), "=", ""); }
+
+// ─── Keys ───────────────────────────────────────────────────────────
+
+// An encryption key and its MAC key (empty for a legacy key, EncString type 0).
+type BwKey = { List(Secret(UInt(8))) enc; List(Secret(UInt(8))) mac; };
+
+BwKey no_key() { List(Secret(UInt(8))) z = []; return BwKey {.enc = z, .mac = z}; }
+
+BwKey key_of64(List(Secret(UInt(8))) k) {
+    List(Secret(UInt(8))) z = [];
+    return if (k.len() == 64) { BwKey {.enc = k[0..32], .mac = k[32..64]} } else { if (k.len() == 32) { BwKey {.enc = k, .mac = z} } else { no_key() } };
+}
+
+type BwKdf = { Int kind; Int iters; Int memory; Int par; Str salt; };
+
+// The master key (32 bytes) of the password.
+@requires(declassify)
+List(Secret(UInt(8))) master_key(BwKdf k, Str password) {
+    List(Secret(UInt(8))) pw = secret_bytes(str_to_bytes(password));
+    if (k.kind == 1) {
+        List(Secret(UInt(8))) none = [];
+        return argon2id(pw, sha256_bytes(str_to_bytes(k.salt)), none, [], k.par, k.memory * 1024, k.iters, 32);
+    }
+    return pbkdf2_sha256g(pw, secret_bytes(str_to_bytes(k.salt)), k.iters, 32);
+}
+
+// The login hash the server checks: base64(PBKDF2(master key, password, 1)).
+@requires(declassify)
+Str login_hash(List(Secret(UInt(8))) mk, Str password) { return base64_encode(reveal(pbkdf2_sha256g(mk, secret_bytes(str_to_bytes(password)), 1, 32))); }
+
+// The stretched master key: HKDF-Expand(master key, "enc" / "mac", 32).
+BwKey stretched(List(Secret(UInt(8))) mk) {
+    return BwKey {.enc = hkdf256g_expand(mk, secret_bytes(str_to_bytes("enc")), 32), .mac = hkdf256g_expand(mk, secret_bytes(str_to_bytes("mac")), 32)};
+}
+
+// ─── EncStrings ─────────────────────────────────────────────────────
+
+type EncStr = { Int kind; List(Int) iv; List(Int) ct; List(Int) mac; };
+
+EncStr bad_enc() { return EncStr {.kind = 0 - 1, .iv = [], .ct = [], .mac = []}; }
+
+// "T.part|part|...": type 0 iv|ct, type 2 iv|ct|mac, types 3-6 ct[|mac].
+EncStr enc_parse(Str s) {
+    Int dot = str_index_of(s, ".", 0);
+    if (dot < 1 || dot > 2) { return bad_enc(); }
+    Str ts = str_slice(s, 0, dot);
+    if (!(ts == "0" || ts == "2" || ts == "3" || ts == "4" || ts == "5" || ts == "6" || ts == "7")) { return bad_enc(); }
+    Int t = str_parse_int(ts);
+    List(Str) ps = str_split(str_slice(s, dot + 1, str_len(s)), "|");
+    if (t == 0 && ps.len() == 2) { return EncStr {.kind = 0, .iv = base64_decode(ps[0]), .ct = base64_decode(ps[1]), .mac = []}; }
+    if (t == 2 && ps.len() == 3) { return EncStr {.kind = 2, .iv = base64_decode(ps[0]), .ct = base64_decode(ps[1]), .mac = base64_decode(ps[2])}; }
+    if (t >= 3 && t <= 6 && ps.len() >= 1) { return EncStr {.kind = t, .iv = [], .ct = base64_decode(ps[0]), .mac = []}; }
+    if (t == 7) { return EncStr {.kind = 7, .iv = [], .ct = base64_decode(ps[0]), .mac = []}; }
+    return bad_enc();
+}
+
+Bool enc_looks(Str s) {
+    if (str_len(s) < 8 || str_slice(s, 1, 2) != ".") { return false; }
+    Str t = str_slice(s, 0, 1);
+    return (t == "0" || t == "2") && str_contains(s, "|");
+}
+
+// The plaintext of a symmetric EncString (types 0 and 2), checked first.
+@requires(declassify)
+Option(List(Secret(UInt(8)))) sym_open(BwKey k, EncStr e) {
+    if (e.kind == 2) {
+        if (k.mac.len() != 32 || e.mac.len() != 32 || e.iv.len() != 16) { return None; }
+        List(Secret(UInt(8))) want = hmac256g(k.mac, secret_bytes(e.iv.concat(e.ct)));
+        if (!ct_same(want, secret_bytes(e.mac))) { return None; }
+        return aes_cbcg_decrypt(k.enc, e.iv, e.ct);
+    }
+    if (e.kind == 0 && k.mac.len() == 0 && k.enc.len() == 32) { return aes_cbcg_decrypt(k.enc, e.iv, e.ct); }
+    return None;
+}
+
+// ─── Signing in ─────────────────────────────────────────────────────
+
+type BwSession = { Str access; Str key; Str private_key; BwKdf kdf; List(Secret(UInt(8))) mk; };
+
+@requires(network, clock(readonly), declassify)
+Result(BwKdf, Str) prelogin(BwSvc s, Str email) {
+    Str body = "{\"email\": " + bw_json_str(email) + "}";
+    BwReply a = bw_call(s, "POST", s.identity + "/accounts/prelogin/password", "Content-Type: application/json\r\n", body);
+    BwReply r = if (a.status == 200) { a } else { bw_call(s, "POST", s.identity + "/accounts/prelogin", "Content-Type: application/json\r\n", body) };
+    if (r.status != 200) { return Err(if (str_len(r.err) > 0) { r.err } else { f"the server did not answer the sign-in ({r.status}): is this a Bitwarden or Vaultwarden address?" }); }
+    Value ks = bw_obj(r.body, "kdfSettings");
+    Bool nested = match ks { VUnit => false, _ => true };
+    Value src = if (nested) { ks } else { r.body };
+    Str salt0 = bw_text(r.body, "salt");
+    Str salt = if (str_len(salt0) > 0) { salt0 } else { str_to_lower(str_trim(email)) };
+    Int kind = if (nested) { bw_int(src, "kdfType", 0) } else { bw_int(src, "kdf", 0) };
+    BwKdf k = BwKdf {.kind = kind, .iters = bw_int(src, if (nested) { "iterations" } else { "kdfIterations" }, 600000),
+                     .memory = bw_int(src, if (nested) { "memory" } else { "kdfMemory" }, 64), .par = bw_int(src, if (nested) { "parallelism" } else { "kdfParallelism" }, 4), .salt = salt};
+    if (k.kind != 0 && k.kind != 1) { return Err("this account uses a key derivation Symbolon does not know"); }
+    // Floors against a server that lowers them to make the login hash it
+    // receives cheap to guess (a malicious-server downgrade): Bitwarden's
+    // own minimums allow 5000 PBKDF2 iterations; Symbolon wants 100000.
+    if (k.kind == 0 && k.iters < 100000) { return Err(f"the account's key derivation is weak ({k.iters} PBKDF2 iterations): raise it in Bitwarden (Settings, Security, Keys) to 600000, then sign in again"); }
+    if (k.kind == 0 && k.iters > 2000000) { return Err("the account's key derivation settings are out of range"); }
+    if (k.kind == 1 && (k.iters < 2 || k.memory < 16 || k.par < 1)) { return Err("the account's Argon2 settings are weaker than Bitwarden allows: raise them in Bitwarden, then sign in again"); }
+    if (k.kind == 1 && (k.iters > 10 || k.memory > 1024 || k.par > 16)) { return Err("the account's Argon2 settings are out of range"); }
+    return Ok(k);
+}
+
+// What a token request ended in.
+type Tok = TokOk(BwSession) | TokNeed2fa(List(Int)) | TokNeedDevice | TokFail(Str);
+
+@requires(network, clock(readonly), declassify)
+Tok token(BwSvc s, Str email, Str hash, BwKdf k, List(Secret(UInt(8))) mk, Str extra) {
+    Str form = "grant_type=password&username=" + bw_form(email) + "&password=" + bw_form(hash) + "&scope=api%20offline_access&client_id=" + s.client
+             + f"&deviceType={s.device_type}" + "&deviceIdentifier=" + s.device_id + "&deviceName=Symbolon" + extra;
+    BwReply r = bw_call(s, "POST", s.identity + "/connect/token", "Content-Type: application/x-www-form-urlencoded; charset=utf-8\r\nAuth-Email: " + bw_b64url_nopad(email) + "\r\n", form);
+    if (str_len(r.err) > 0) { return TokFail(r.err); }
+    if (r.status == 200) {
+        Str tok = bw_text(r.body, "access_token");
+        if (str_len(tok) == 0) { return TokFail("the server sent no session"); }
+        return TokOk(BwSession {.access = tok, .key = bw_text(r.body, "key"), .private_key = bw_text(r.body, "privateKey"), .kdf = k, .mk = mk});
+    }
+    Value p2 = bw_obj(r.body, "twoFactorProviders2");
+    List(Int) provs = match p2 { VMap(es) => provider_codes(es, 0, ListBuf()), _ => [] };
+    if (provs.len() > 0) { return TokNeed2fa(provs); }
+    Str d = str_to_lower(bw_text(r.body, "error_description") + " " + bw_text(bw_obj(r.body, "errorModel"), "message") + " " + bw_text(r.body, "message"));
+    if (str_contains(d, "new device verification")) { return TokNeedDevice; }
+    if (str_contains(d, "captcha")) { return TokFail("the server wants a captcha: sign in once in Bitwarden's web vault on this network, then try again"); }
+    if (str_contains(d, "username or password") || str_contains(d, "invalid_username_or_password")) { return TokFail("the email or master password is wrong"); }
+    if (str_contains(d, "two-step token is invalid") || str_contains(d, "invalid two")) { return TokFail("that code is wrong or expired"); }
+    return TokFail(f"the server refused the sign-in ({r.status}): " + str_trim(d));
+}
+
+List(Int) provider_codes(List(VEntry) es, Int i, ListBuf(Int) acc) {
+    if (i >= es.len()) { return acc.finish(); }
+    Value kv = es[i].key;
+    Str k = match kv { VStr(t) => t, VInt(n) => f"{n}", _ => "" };
+    return provider_codes(es, i + 1, if (str_len(k) > 0) { acc.push(str_parse_int(k)) } else { acc });
+}
+
+Str codes_text(List(Int) ps) { return str_join(map_codes(ps, 0, ListBuf()), ","); }
+
+List(Str) map_codes(List(Int) ps, Int i, ListBuf(Str) acc) {
+    if (i >= ps.len()) { return acc.finish(); }
+    return map_codes(ps, i + 1, acc.push(f"{ps[i]}"));
+}
+
+Int bw_fail(Str m) {
+    println("fail " + hex_encode(str_to_bytes(m)));
+    return 1;
+}
+
+Str read_line() {
+    Str l = resid_read_line();
+    Int n = str_len(l);
+    return if (n > 0 && str_slice(l, n - 1, n) == "\n") { str_slice(l, 0, n - 1) } else { l };
+}
+
+// The two-step loop: the server asked for a code; ask the app for one.
+@requires(network, clock(readonly), declassify)
+Tok answer(BwSvc s, Str email, Str hash, BwKdf k, List(Secret(UInt(8))) mk, Tok t, Int rounds) {
+    return match t {
+        TokOk(x) => t,
+        TokFail(m) => t,
+        TokNeedDevice => if (rounds <= 0) { TokFail("too many tries") } else { ask_device(s, email, hash, k, mk, rounds) },
+        TokNeed2fa(ps) => if (rounds <= 0) { TokFail("too many tries") } else { ask_code(s, email, hash, k, mk, ps, rounds) }
+    };
+}
+
+@requires(network, clock(readonly), declassify)
+Tok ask_device(BwSvc s, Str email, Str hash, BwKdf k, List(Secret(UInt(8))) mk, Int rounds) {
+    println("need newdevice");
+    List(Str) w = str_split(str_trim(read_line()), " ");
+    if (w.len() < 2 || w[0] != "code") { return TokFail("cancelled"); }
+    return answer(s, email, hash, k, mk, token(s, email, hash, k, mk, "&newDeviceOtp=" + bw_form(w[w.len() - 1])), rounds - 1);
+}
+
+@requires(network, clock(readonly), declassify)
+Tok ask_code(BwSvc s, Str email, Str hash, BwKdf k, List(Secret(UInt(8))) mk, List(Int) ps, Int rounds) {
+    println("need 2fa " + codes_text(ps));
+    List(Str) w = str_split(str_trim(read_line()), " ");
+    if (w.len() == 1 && w[0] == "send-email") {
+        Str body = "{\"email\": " + bw_json_str(email) + ", \"masterPasswordHash\": " + bw_json_str(hash) + ", \"deviceIdentifier\": " + bw_json_str(s.device_id) + "}";
+        BwReply r = bw_call(s, "POST", s.api + "/two-factor/send-email-login", "Content-Type: application/json\r\n", body);
+        if (r.status != 200) { return TokFail(if (str_len(r.err) > 0) { r.err } else { f"the server did not send the email ({r.status})" }); }
+        return ask_code(s, email, hash, k, mk, ps, rounds - 1);
+    }
+    if (w.len() < 3 || w[0] != "code") { return TokFail("cancelled"); }
+    Str p = w[1];
+    Str v = str_replace(w[2], " ", "");
+    return answer(s, email, hash, k, mk, token(s, email, hash, k, mk, "&twoFactorToken=" + bw_form(v) + "&twoFactorProvider=" + bw_form(p) + "&twoFactorRemember=0"), rounds - 1);
+}
+
+// ─── The vault ──────────────────────────────────────────────────────
+
+type BwKeys = { BwKey user; Map(Str, BwKey) orgs; Int failed; };
+
+@requires(declassify)
+Result(BwKey, Str) user_key(BwSession ss, Value profile) {
+    Str k0 = ss.key;
+    Str k1 = bw_text(profile, "key");
+    Str k2 = bw_text(bw_obj(bw_obj(profile, "userDecryption"), "masterPasswordUnlock"), "masterKeyEncryptedUserKey");
+    Str k = if (str_len(k0) > 0) { k0 } else { if (str_len(k1) > 0) { k1 } else { k2 } };
+    EncStr e = enc_parse(k);
+    if (e.kind == 7) { return Err("this account uses Bitwarden's newer key format, which Symbolon cannot read yet: export a .json file instead"); }
+    BwKey st = stretched(ss.mk);
+    Option(List(Secret(UInt(8)))) a = if (e.kind == 2) { sym_open(st, e) } else { sym_open(BwKey {.enc = ss.mk, .mac = st.mac[0..0]}, e) };
+    return match a {
+        None => Err("the account's key does not open with this master password"),
+        Some(uk) => if (uk.len() == 64 || uk.len() == 32) { Ok(key_of64(uk)) } else { Err("this account uses Bitwarden's newer key format, which Symbolon cannot read yet: export a .json file instead") }
+    };
+}
+
+@requires(declassify)
+BwKeys org_keys(BwKey uk, Str enc_private, List(Value) orgs) {
+    Map(Str, BwKey) none = {};
+    if (orgs.len() == 0) { return BwKeys {.user = uk, .orgs = none, .failed = 0}; }
+    Option(List(Secret(UInt(8)))) pk = sym_open(uk, enc_parse(enc_private));
+    Option(RsaKey) rk = match pk { None => None, Some(der) => rsa_key_parse_secret(der) };
+    return match rk {
+        None => BwKeys {.user = uk, .orgs = none, .failed = orgs.len()},
+        Some(k) => orgs_with(k, orgs, 0, BwKeys {.user = uk, .orgs = none, .failed = 0})
+    };
+}
+
+@requires(declassify)
+BwKeys orgs_with(RsaKey rk, List(Value) orgs, Int i, BwKeys acc) {
+    if (i >= orgs.len()) { return acc; }
+    EncStr e = enc_parse(bw_text(orgs[i], "key"));
+    HashAlg h = if (e.kind == 3 || e.kind == 5) { Sha256 } else { Sha1 };
+    Option(List(Secret(UInt(8)))) ok = if (e.kind >= 3 && e.kind <= 6) { rsa_oaep_decrypt(h, h, rk, e.ct, []) } else { None };
+    BwKeys next = match ok {
+        None => BwKeys {.user = acc.user, .orgs = acc.orgs, .failed = acc.failed + 1},
+        Some(k) => if (k.len() == 64) { BwKeys {.user = acc.user, .orgs = acc.orgs.insert(bw_text(orgs[i], "id"), key_of64(k)), .failed = acc.failed} } else { BwKeys {.user = acc.user, .orgs = acc.orgs, .failed = acc.failed + 1} }
+    };
+    return orgs_with(rk, orgs, i + 1, next);
+}
+
+// ─── The items, secret ──────────────────────────────────────────────
+// What a person sees in a list stays text, as everywhere in Symbolon: an
+// item's name, its folder, its site, a custom field's label, a passkey's
+// site and credential ID. Everything else (usernames, passwords, one-time
+// code seeds, notes, card and identity details, keys) is decrypted into
+// Secret bytes and stays there until the vault seals it (FieldPlain).
+
+// A field's plaintext, secret; empty when it is absent or does not open.
+@requires(declassify)
+List(Secret(UInt(8))) sec_of(BwKey k, Value v, Str key) {
+    List(Secret(UInt(8))) none = [];
+    Str s = bw_text(v, key);
+    if (!enc_looks(s)) { return none; }
+    return sym_open(k, enc_parse(s)) else { none };
+}
+
+// Listing text (a name, a site, a label): published by design.
+@requires(declassify)
+Str txt_of(BwKey k, Value v, Str key) {
+    Str s = bw_text(v, key);
+    if (!enc_looks(s)) { return ""; }
+    return match sym_open(k, enc_parse(s)) { None => "", Some(b) => str_trim(text_of(reveal(b))) };
+}
+
+// The EncStrings under `v` that do not open (a wrong key, a damaged field).
+@requires(declassify)
+Int count_bad(BwKey k, Value v) {
+    return match v {
+        VStr(s) => if (enc_looks(s) && match sym_open(k, enc_parse(s)) { None => true, Some(_) => false }) { 1 } else { 0 },
+        VSeq(xs) => count_list(k, xs, 0, 0),
+        VMap(es) => count_entries(k, es, 0, 0),
+        _ => 0
+    };
+}
+
+@requires(declassify)
+Int count_list(BwKey k, List(Value) xs, Int i, Int n) {
+    if (i >= xs.len()) { return n; }
+    return count_list(k, xs, i + 1, n + count_bad(k, xs[i]));
+}
+
+@requires(declassify)
+Int count_entries(BwKey k, List(VEntry) es, Int i, Int n) {
+    if (i >= es.len()) { return n; }
+    Value kv = es[i].key;
+    Bool own_key = match kv { VStr(t) => bw_lower1(t) == "key", _ => false };
+    return count_entries(k, es, i + 1, n + if (own_key) { 0 } else { count_bad(k, es[i].val) });
+}
+
+// Secret pieces joined with `sep`, the empty ones left out (lengths are
+// public).
+List(Secret(UInt(8))) sjoin(List(List(Secret(UInt(8)))) ps, Str sep, Int i, List(Secret(UInt(8))) acc) {
+    if (i >= ps.len()) { return acc; }
+    if (ps[i].len() == 0) { return sjoin(ps, sep, i + 1, acc); }
+    return sjoin(ps, sep, i + 1, if (acc.len() == 0) { ps[i] } else { acc.concat(sv(sep)).concat(ps[i]) });
+}
+
+// MM/YY from a card's month and year, without reading them: a one-digit
+// month gets a leading zero, the year its last two characters.
+List(Secret(UInt(8))) sexpiry(List(Secret(UInt(8))) m, List(Secret(UInt(8))) y) {
+    List(Secret(UInt(8))) none = [];
+    if (m.len() < 1 || m.len() > 2 || y.len() < 2) { return none; }
+    return (if (m.len() == 1) { sv("0").concat(m) } else { m }).concat(sv("/")).concat(y[y.len() - 2..y.len()]);
+}
+
+// Lower-case hex of secret bytes, in constant time.
+Secret(UInt(8)) hex_digit(Secret(UInt(32)) n) {
+    Secret(UInt(32)) above9 = (wrapping_usub((UInt(32)) 9, n) >> (UInt(32)) 31) & (UInt(32)) 1;
+    return wrapping_u8(wrapping_uadd(wrapping_uadd(n, (UInt(32)) 48), wrapping_usub((UInt(32)) 0, above9) & (UInt(32)) 39));
+}
+
+List(Secret(UInt(8))) shex(List(Secret(UInt(8))) b, Int i, ListBuf(Secret(UInt(8))) acc) {
+    if (i >= b.len()) { return acc.finish(); }
+    Secret(UInt(32)) x = (UInt(32)) b[i];
+    return shex(b, i + 1, acc.push(hex_digit(x >> (UInt(32)) 4)).push(hex_digit(x & (UInt(32)) 15)));
+}
+
+// The base64url alphabet ('-', '_') as the standard one ('+', '/'), per
+// byte with masks.
+List(Secret(UInt(8))) url_to_std(List(Secret(UInt(8))) t, Int i, ListBuf(Secret(UInt(8))) acc) {
+    if (i >= t.len()) { return acc.finish(); }
+    Secret(UInt(32)) c = (UInt(32)) t[i];
+    Secret(UInt(32)) dash = wrapping_usub((UInt(32)) 0, b64g_in(c, 45, 45));
+    Secret(UInt(32)) under = wrapping_usub((UInt(32)) 0, b64g_in(c, 95, 95));
+    Secret(UInt(32)) out = c ^ (dash & (UInt(32)) 6) ^ (under & (UInt(32)) 112);
+    return url_to_std(t, i + 1, acc.push(wrapping_u8(out)));
+}
+
+// Unpadded base64url text, decoded in constant time; empty when it is not
+// base64url (one published bit).
+@requires(declassify)
+List(Secret(UInt(8))) sunb64url(List(Secret(UInt(8))) t) {
+    List(Secret(UInt(8))) none = [];
+    Int r = t.len() % 4;
+    if (t.len() == 0 || r == 1) { return none; }
+    return base64g_decode(url_to_std(t, 0, ListBuf()), if (r == 2) { 2 } else { if (r == 3) { 1 } else { 0 } });
+}
+
+// A passkey's P-256 private scalar from its PKCS#8 (base64url), read with
+// the standard library's secret DER reader (only the framing is public).
+@requires(declassify, provision)
+List(Secret(UInt(8))) passkey_scalar(List(Secret(UInt(8))) b64) {
+    List(Secret(UInt(8))) none = [];
+    List(Secret(UInt(8))) der = sunb64url(b64);
+    if (der.len() == 0) { return none; }
+    return match tk_pkcs8(der) { Some(k) => match k { EcKey(x) => x, _ => none }, None => none };
+}
+
+type Named = { Str id; Str name; };
+
+Str named(List(Named) xs, Str id, Int i) {
+    if (str_len(id) == 0 || i >= xs.len()) { return ""; }
+    if (xs[i].id == id) { return xs[i].name; }
+    return named(xs, id, i + 1);
+}
+
+// Folders (under the user key) and collections (under their organization's).
+@requires(declassify)
+List(Named) names_of(BwKeys ks, List(Value) fs, Bool coll, Int i, ListBuf(Named) acc) {
+    if (i >= fs.len()) { return acc.finish(); }
+    Option(BwKey) k = if (coll) { ks.orgs.get(bw_text(fs[i], "organizationId")) } else { Some(ks.user) };
+    Str n = match k { None => "", Some(kk) => txt_of(kk, fs[i], "name") };
+    return names_of(ks, fs, coll, i + 1, acc.push(Named {.id = bw_text(fs[i], "id"), .name = n}));
+}
+
+Str folder_of(Value c, List(Named) fs) {
+    Str f = named(fs, bw_text(c, "folderId"), 0);
+    if (str_len(f) > 0) { return f; }
+    List(Value) cs = bw_list(c, "collectionIds");
+    if (cs.len() == 0) { return ""; }
+    Value c0 = cs[0];
+    return named(fs, match c0 { VStr(t) => t, _ => "" }, 0);
+}
+
+@requires(declassify)
+ListBuf(ImpCustom) sync_fields(BwKey k, List(Value) fs, Int i, ListBuf(ImpCustom) acc) {
+    if (i >= fs.len()) { return acc; }
+    Str t = bw_text(fs[i], "type");
+    Str label0 = txt_of(k, fs[i], "name");
+    Str label = if (str_len(label0) == 0) { "Field" } else { label0 };
+    return sync_fields(k, fs, i + 1, if (t == "3") { acc } else { cputs(acc, label, sec_of(k, fs[i], "value"), t == "1") });
+}
+
+@requires(declassify, provision)
+Imp sync_item(BwKey k, Value c, Str folder) {
+    Str t = bw_text(c, "type");
+    Str name = txt_of(k, c, "name");
+    List(Secret(UInt(8))) notes = sec_of(k, c, "notes");
+    ListBuf(ImpCustom) cs = sync_fields(k, bw_list(c, "fields"), 0, ListBuf());
+    if (t == "1") { return sync_login(k, bw_obj(c, "login"), name, notes, folder, cs); }
+    if (t == "3") { return sync_card(k, bw_obj(c, "card"), name, notes, folder, cs); }
+    if (t == "4") { return sync_identity(k, bw_obj(c, "identity"), name, notes, folder, cs); }
+    if (t == "5") { return sync_ssh(k, bw_obj(c, "sshKey"), name, notes, folder, cs); }
+    return sync_note(name, notes, folder, cs);
+}
+
+Imp sync_note(Str name, List(Secret(UInt(8))) notes, Str folder, ListBuf(ImpCustom) cs) {
+    Str n = name_or(name, "", "");
+    return imp(n, "note", folder, fputs(ListBuf(), "text", if (notes.len() == 0) { sv(n) } else { notes }), cs);
+}
+
+@requires(declassify)
+List(Str) sync_uris(BwKey k, List(Value) us, Int i, ListBuf(Str) acc) {
+    if (i >= us.len()) { return acc.finish(); }
+    Str u = txt_of(k, us[i], "uri");
+    return sync_uris(k, us, i + 1, if (str_len(u) == 0) { acc } else { acc.push(u) });
+}
+
+@requires(declassify)
+Imp sync_login(BwKey k, Value l, Str name, List(Secret(UInt(8))) notes, Str folder, ListBuf(ImpCustom) cs) {
+    List(Str) uris = sync_uris(k, bw_list(l, "uris"), 0, ListBuf());
+    Int w = first_web(uris, 0);
+    Str origin = if (w < 0) { "" } else { web_origin(uris[w]) };
+    ListBuf(ImpField) fs = fputs(fputs(fputs(fputs(fput(ListBuf(), "origin", origin), "username", sec_of(k, l, "username")), "current", sec_of(k, l, "password")),
+                                       "totp", sec_of(k, l, "totp")), "notes", notes);
+    return imp(name_or(name, origin, ""), "login", folder, fs, extra_sites(uris, w, origin, 0, cs));
+}
+
+@requires(declassify)
+Imp sync_card(BwKey k, Value c, Str name, List(Secret(UInt(8))) notes, Str folder, ListBuf(ImpCustom) cs) {
+    List(Secret(UInt(8))) number = sec_of(k, c, "number");
+    List(Secret(UInt(8))) holder = sec_of(k, c, "cardholderName");
+    List(Secret(UInt(8))) expiry = sexpiry(sec_of(k, c, "expMonth"), sec_of(k, c, "expYear"));
+    List(Secret(UInt(8))) cvv = sec_of(k, c, "code");
+    ListBuf(ImpCustom) cs2 = cputs(cs, "Brand", sec_of(k, c, "brand"), false);
+    if (number.len() == 0) {
+        return sync_note(name, notes, folder, cputs(cputs(cputs(cs2, "Name on card", holder, false), "Expiry", expiry, false), "Security code", cvv, true));
+    }
+    ListBuf(ImpField) fs = fputs(fputs(fputs(fputs(fputs(ListBuf(), "cardholder", holder), "number", number), "expiry", expiry), "cvv", cvv), "notes", notes);
+    return imp(name_or(name, "", "Card"), "card", folder, fs, cs2);
+}
+
+@requires(declassify)
+Imp sync_identity(BwKey k, Value d, Str name, List(Secret(UInt(8))) notes, Str folder, ListBuf(ImpCustom) cs) {
+    List(Secret(UInt(8))) none = [];
+    List(Secret(UInt(8))) full = sjoin([sec_of(k, d, "title"), sec_of(k, d, "firstName"), sec_of(k, d, "middleName"), sec_of(k, d, "lastName")], " ", 0, none);
+    List(Secret(UInt(8))) place = sjoin([sec_of(k, d, "city"), sec_of(k, d, "state"), sec_of(k, d, "postalCode")], " ", 0, none);
+    List(Secret(UInt(8))) addr = sjoin([sec_of(k, d, "address1"), sec_of(k, d, "address2"), sec_of(k, d, "address3"), place, sec_of(k, d, "country")], "\n", 0, none);
+    ListBuf(ImpField) fs = fputs(fputs(fputs(fputs(fputs(fputs(ListBuf(), "full_name", full), "email", sec_of(k, d, "email")), "phone", sec_of(k, d, "phone")),
+                                             "address", addr), "document", sec_of(k, d, "passportNumber")), "notes", notes);
+    ListBuf(ImpCustom) more = cputs(cputs(cputs(cputs(cs, "Company", sec_of(k, d, "company"), false), "Username", sec_of(k, d, "username"), false),
+                                          "Social Security number", sec_of(k, d, "ssn"), true), "Driver's license", sec_of(k, d, "licenseNumber"), true);
+    return imp(name_or(name, "", "Identity"), "identity", folder, fs, more);
+}
+
+@requires(declassify)
+Imp sync_ssh(BwKey k, Value s, Str name, List(Secret(UInt(8))) notes, Str folder, ListBuf(ImpCustom) cs) {
+    List(Secret(UInt(8))) key = sec_of(k, s, "privateKey");
+    ListBuf(ImpCustom) cs2 = cputs(cputs(cs, "Public key", sec_of(k, s, "publicKey"), false), "Fingerprint", sec_of(k, s, "keyFingerprint"), false);
+    if (key.len() == 0) { return sync_note(name, notes, folder, cs2); }
+    return imp(name_or(name, "", "SSH key"), "secret", folder, fputs(fputs(ListBuf(), "secret", key), "notes", notes), cs2);
+}
+
+// A login's passkeys, each a Synced passkey (importers.resid's bw_passkey,
+// with the key and the user's details kept secret).
+@requires(declassify, provision)
+ListBuf(Imp) sync_passkeys(BwKey k, List(Value) ks, Str login, Str folder, Int i, ListBuf(Imp) acc) {
+    if (i >= ks.len()) { return acc; }
+    return sync_passkeys(k, ks, login, folder, i + 1, acc.push(sync_passkey(k, ks[i], login, folder)));
+}
+
+@requires(declassify, provision)
+Imp sync_passkey(BwKey k, Value p, Str login, Str folder) {
+    Str rp = str_to_lower(txt_of(k, p, "rpId"));
+    Str rp_name = txt_of(k, p, "rpName");
+    Str site = if (str_len(rp_name) > 0) { rp_name } else { if (str_len(rp) > 0) { rp } else { name_or(login, "", "") } };
+    List(Int) cid = bw_credential_id(txt_of(k, p, "credentialId"));
+    List(Secret(UInt(8))) key = passkey_scalar(sec_of(k, p, "keyValue"));
+    List(Int) pub = if (key.len() == 32) { ec_public_keyg(P256, key) } else { [] };
+    Str alg = txt_of(k, p, "keyAlgorithm");
+    Str curve = txt_of(k, p, "keyCurve");
+    Str why = if ((str_len(alg) > 0 && str_to_upper(alg) != "ECDSA") || (str_len(curve) > 0 && str_to_upper(curve) != "P-256")) { "only ES256 passkeys (ECDSA on P-256) can be kept; this one is " + alg + " " + curve }
+              else { if (str_len(rp) == 0) { "this passkey has no site (rpId)" }
+              else { if (cid.len() == 0 || cid.len() > 1023) { "this passkey's credential ID does not read" }
+              else { if (pub.len() != 65) { "this passkey's private key does not read" } else { "" } } } };
+    ListBuf(ImpField) fs = fput(fput(fput(fputs(fputs(fputs(fput(fputs(fput(fput(fput(fput(ListBuf(),
+        "rp_id", rp), "credential_id", hex_encode(cid)), "public_key", hex_encode(pub)), "rp_name", rp_name),
+        "key", shex(key, 0, ListBuf())), "profile", "synced"),
+        "user_handle", shex(sunb64url(sec_of(k, p, "userHandle")), 0, ListBuf())), "username", sec_of(k, p, "userName")), "display_name", sec_of(k, p, "userDisplayName")),
+        "counter", if (str_len(bw_text(p, "counter")) > 0 && !enc_looks(bw_text(p, "counter"))) { bw_text(p, "counter") } else { txt_of(k, p, "counter") }), "migrate", "1"), "source", "bitwarden");
+    Imp x = imp(site + " passkey", "passkey", folder, fs, ListBuf());
+    return Imp {.name = x.name, .kind = x.kind, .folder = x.folder, .fields = x.fields, .custom = x.custom, .why = why};
+}
+
+// The key an item opens under: its organization's or the user's, then its
+// own key when it has one.
+@requires(declassify)
+Option(BwKey) item_key(BwKeys ks, Value c) {
+    Str org = bw_text(c, "organizationId");
+    Option(BwKey) base = if (str_len(org) == 0) { Some(ks.user) } else { ks.orgs.get(org) };
+    Str own = bw_text(c, "key");
+    return match base {
+        None => None,
+        Some(b) => if (str_len(own) == 0) { Some(b) } else { match sym_open(b, enc_parse(own)) { None => None, Some(ik) => if (ik.len() == 64) { Some(key_of64(ik)) } else { None } } }
+    };
+}
+
+type Gathered = { Int bad; Int locked; };
+
+@requires(declassify, provision)
+List(Imp) sync_items(BwKeys ks, List(Value) cs, List(Named) folders, Int i, ListBuf(Imp) acc) {
+    if (i >= cs.len()) { return acc.finish(); }
+    Value c = cs[i];
+    if (trashed(c)) { return sync_items(ks, cs, folders, i + 1, acc); }
+    Option(BwKey) k = item_key(ks, c);
+    return match k {
+        None => sync_items(ks, cs, folders, i + 1, acc),
+        Some(kk) => sync_items(ks, cs, folders, i + 1, sync_passkeys(kk, bw_list(bw_obj(c, "login"), "fido2Credentials"), txt_of(kk, c, "name"), folder_of(c, folders), 0, acc.push(sync_item(kk, c, folder_of(c, folders)))))
+    };
+}
+
+Bool trashed(Value c) {
+    return match bw_field(c, "deletedDate") { None => false, Some(x) => match x { VUnit => false, VNone => false, VStr(t) => str_len(t) > 0, _ => true } };
+}
+
+// How many items could not be opened, and how many fields did not.
+@requires(declassify)
+Gathered tally(BwKeys ks, List(Value) cs, Int i, Gathered g) {
+    if (i >= cs.len()) { return g; }
+    if (trashed(cs[i])) { return tally(ks, cs, i + 1, g); }
+    Option(BwKey) k = item_key(ks, cs[i]);
+    return tally(ks, cs, i + 1, match k { None => Gathered {.bad = g.bad, .locked = g.locked + 1}, Some(kk) => Gathered {.bad = g.bad + count_bad(kk, cs[i]), .locked = g.locked} });
+}
+
+// ─── The command ────────────────────────────────────────────────────
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+pub Int vault_signin_bitwarden(Str dir, Str server, Bool dry, Str share) {
+    Option(DeviceConfig) oc = load_config(dir);
+    if (match oc { None => true, Some(_) => false }) { return bw_fail("this device is not set up"); }
+    Result(BwSvc, Str) rs = bw_service(dir, server);
+    return match rs { Err(m) => bw_fail(m), Ok(s) => signin_with(dir, s, dry, share) };
+}
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+Int signin_with(Str dir, BwSvc s, Bool dry, Str share) {
+    Str email = str_trim(read_line());
+    Str password = read_line();
+    if (str_len(email) == 0 || str_len(password) == 0) { return bw_fail("the email and master password are needed"); }
+    Result(BwKdf, Str) rk = prelogin(s, email);
+    return match rk {
+        Err(m) => bw_fail(m),
+        Ok(k) => signed_in(dir, s, email, password, k, dry, share)
+    };
+}
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+Int signed_in(Str dir, BwSvc s, Str email, Str password, BwKdf k, Bool dry, Str share) {
+    List(Secret(UInt(8))) mk = master_key(k, password);
+    Str hash = login_hash(mk, password);
+    Tok t = answer(s, email, hash, k, mk, token(s, email, hash, k, mk, ""), 8);
+    return match t {
+        TokOk(ss) => synced_import(dir, s, ss, dry, share),
+        TokFail(m) => bw_fail(m),
+        _ => bw_fail("the sign-in did not finish")
+    };
+}
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+Int synced_import(Str dir, BwSvc s, BwSession ss, Bool dry, Str share) {
+    HttpsGet g = tls_https_request(s.api + "/sync?excludeDomains=true", "", s.store, ["http/1.1"], 120000, "GET",
+                                   bw_client_headers(s) + "Accept: application/json\r\nAuthorization: Bearer " + ss.access + "\r\n", []);
+    if (str_len(g.err) > 0) { return bw_fail(g.err); }
+    if (g.status != 200) { return bw_fail(f"the server did not send the vault ({g.status})"); }
+    Result(Value, SerialError) rv = from_json(text_of(g.bytes));
+    return match rv {
+        Err(_) => bw_fail("the vault the server sent is not JSON"),
+        Ok(sync) => from_sync(dir, ss, sync, dry, share)
+    };
+}
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+Int from_sync(Str dir, BwSession ss, Value sync, Bool dry, Str share) {
+    Value profile = bw_obj(sync, "profile");
+    Result(BwKey, Str) ru = user_key(ss, profile);
+    return match ru {
+        Err(m) => bw_fail(m),
+        Ok(uk) => with_keys(dir, org_keys(uk, if (str_len(ss.private_key) > 0) { ss.private_key } else { bw_text(profile, "privateKey") }, bw_list(profile, "organizations")), sync, dry, share)
+    };
+}
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+Int with_keys(Str dir, BwKeys ks, Value sync, Bool dry, Str share) {
+    List(Named) folders = names_of(ks, bw_list(sync, "folders"), false, 0, ListBuf()).concat(names_of(ks, bw_list(sync, "collections"), true, 0, ListBuf()));
+    List(Value) cs = bw_list(sync, "ciphers");
+    List(Imp) items = sync_items(ks, cs, folders, 0, ListBuf());
+    Gathered g = tally(ks, cs, 0, Gathered {.bad = 0, .locked = 0});
+    return preview_then(dir, with_notes(ImpRead {.items = items, .warnings = synced_warnings(items)}, ks.failed, g.bad, g.locked), dry, share);
+}
+
+ImpRead with_notes(ImpRead r, Int orgs_failed, Int bad, Int locked) {
+    List(Str) a = if (orgs_failed > 0) { [f"{orgs_failed} organization key(s) did not open: their items are left out"] } else { [] };
+    List(Str) b = if (locked > 0) { [f"{locked} item(s) could not be opened and are left out"] } else { [] };
+    List(Str) c = if (bad > 0) { [f"{bad} field(s) did not decrypt and came across empty"] } else { [] };
+    return ImpRead {.items = r.items, .warnings = r.warnings.concat(a).concat(b).concat(c)};
+}
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+Int preview_then(Str dir, ImpRead got, Bool dry, Str share) {
+    if (got.items.len() == 0) { return bw_fail("the vault has no items to bring across"); }
+    Int rc = import_items(dir, got, true, share);
+    println("ready");
+    if (dry || rc != 0) { return rc; }
+    if (str_trim(read_line()) != "import") { return bw_fail("cancelled"); }
+    return import_items(dir, got, false, share);
+}
