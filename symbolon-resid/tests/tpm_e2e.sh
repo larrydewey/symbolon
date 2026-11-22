@@ -47,7 +47,11 @@ done
 wait_port "$RP" || fail "relay did not start"
 
 COS=$(run 60 "$BIN" cosigner new "$W/cos" 127.0.0.1 "$RP") || fail "cosigner new"
-DEV=$(printf '2468\n1357\n' | run 120 "$BIN" device new "$W/dev" 127.0.0.1 "$RP" --fast-kdf) || fail "device new (TPM)"
+# One TPM holds one Symbolon device: on a machine whose TPM has a real
+# device's keys, `device new` refuses (and nothing here touches them).
+DEV=$(printf '2468\n1357\n' | run 120 "$BIN" device new "$W/dev" 127.0.0.1 "$RP" --fast-kdf 2> "$W/new.err") || {
+  grep -q "already holds another Symbolon device" "$W/new.err" && { rm -rf "$W/dev"; echo "SKIP tpm_e2e: this TPM holds a real Symbolon device's keys"; exit 0; }
+  fail "device new (TPM): $(cat "$W/new.err")"; }
 run 60 "$BIN" cosigner pair "$W/cos" "$DEV" || fail "cosigner pair"
 runc 3600 "$BIN" cosigner serve "$W/cos" "$W/cosigner.primes" > "$W/cosigner.log" 2>&1 & PIDS+=($!)
 

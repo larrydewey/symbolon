@@ -143,6 +143,12 @@ pub Int device_new(Str dir, Str host, Int port, Bool unprotected, Bool keystore,
 @requires(filesystem, device, declassify, provision, network, environment)
 pub Int device_new_pins(Str dir, Str host, Int port, Bool unprotected, Bool keystore, Bool fast, Str ca, Str pin, Str dpin) {
     if (filesystem.exists(dir + "/config.cbor")) { return dfail("already set up"); }
+    // One TPM holds one Symbolon device: its keys sit at fixed persistent
+    // handles. Another device's keys there are never replaced (they would be
+    // gone for good); that device is retired with `device forget` first.
+    if (!unprotected && !keystore && tpm_taken()) {
+        return dfail("this computer's security chip already holds another Symbolon device's keys: retire that device first (symbolon device forget ITS-DIR), or use --unprotected");
+    }
     _ = filesystem.create_dir(dir + "/log");
     if (str_len(pin) < 4) { return dfail("a PIN of at least 4 characters"); }
     if (dpin == pin) { return dfail("the duress PIN must differ from the PIN"); }
@@ -657,9 +663,36 @@ pub Int device_forget(Str dir) {
 Int forget_keys(DeviceConfig c) {
     if (c.unprotected) { println("unprotected profile: no TPM keys to remove"); return 0; }
     if (on_keystore(c)) { return ks_forget(c); }
-    Int gone = evict_all([c.tpm_dk, c.tpm_unlock_a, c.tpm_unlock_b, srk_handle()], 0, 0);
+    // Only this device's keys: the device key at its handle must be the one
+    // this configuration names. Keys another device put there stay.
+    if (!dk_is_ours(c)) { return dfail("the security chip's keys at this device's handles belong to another device (or are gone): nothing removed"); }
+    // The storage key (SRK) is left: it is the TPM's own, made again the
+    // same from the TPM's seed, and other software may use it.
+    Int gone = evict_all([c.tpm_dk, c.tpm_unlock_a, c.tpm_unlock_b], 0, 0);
     println(f"removed {gone} TPM key(s)");
     return 0;
+}
+
+// Whether the persistent handles a TPM-profile device uses (either set: a
+// PIN change moves the keys to the other) hold anything.
+@requires(device)
+Bool tpm_taken() {
+    Result(List(Int), TpmError) r = tpm_handles(dk_handle(), 512);
+    List(Int) hs = match r { Ok(x) => x, Err(_) => [] };
+    List(Int) ours = [dk_handle(), unlock_a_handle(), unlock_b_handle(), other_handle(dk_handle(), dk_handle()), other_handle(unlock_a_handle(), unlock_a_handle()), other_handle(unlock_b_handle(), unlock_b_handle())];
+    return any_in(ours, hs, 0);
+}
+
+Bool any_in(List(Int) xs, List(Int) hs, Int i) {
+    if (i >= xs.len()) { return false; }
+    return hs.contains(xs[i]) || any_in(xs, hs, i + 1);
+}
+
+// Whether the key at the device-key handle is this device's.
+@requires(device)
+Bool dk_is_ours(DeviceConfig c) {
+    Result(TpmPublic, TpmError) r = tpm_read_public(c.tpm_dk);
+    return match r { Err(_) => false, Ok(p) => bytes_eq(public_point(p.public_area), c.dk_pub) };
 }
 
 @requires(device)
