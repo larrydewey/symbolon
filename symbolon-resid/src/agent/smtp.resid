@@ -1,0 +1,96 @@
+// Sending one email over SMTP with implicit TLS (RFC 8314, port 465), for
+// duress alerts (SPEC 14.4): EHLO, AUTH PLAIN, MAIL FROM, RCPT TO, DATA,
+// QUIT, each reply checked. The server's certificate is checked against the
+// trust store like any HTTPS server's.
+
+import "tlsclient.resid";
+import "chain.resid";
+import "wire.resid";
+import "crypto.resid";
+import "httpserv.resid";
+
+pub type Mail = { Str host; Int port; Str user; Str pass; Str from; Str to; Str subject; Str body; };
+
+// The reply code of a complete SMTP reply (the last line "NNN " ends it),
+// or -1 while it is not complete.
+Int reply_code(List(Int) b) {
+    Str t = text_of_bytes(b);
+    List(Str) ls = str_split(t, "\r\n");
+    return last_code(ls, 0, 0 - 1);
+}
+
+Int last_code(List(Str) ls, Int i, Int found) {
+    if (i >= ls.len()) { return found; }
+    Str l = ls[i];
+    Bool final = str_len(l) >= 4 && str_slice(l, 3, 4) == " " && digits3(str_slice(l, 0, 3));
+    return last_code(ls, i + 1, if (final) { str_parse_int(str_slice(l, 0, 3)) } else { found });
+}
+
+Bool digits3(Str s) { return str_len(s) == 3 && s >= "000" && s <= "999"; }
+
+Str text_of_bytes(List(Int) b) { return http_text(b, 0, b.len()); }
+
+type Said = { TlsClient conn; Int code; };
+
+// Reads until a complete reply.
+@requires(network, declassify)
+Said read_reply(TlsClient c, List(Int) acc, Int rounds) {
+    Int code = reply_code(acc);
+    if (code >= 0 || rounds <= 0) { return Said {.conn = c, .code = code}; }
+    WireIn(TlsClient) in = wire_fill(c, acc, acc.len() + 1, 65536);
+    if (in.eof && reply_code(in.data) < 0) { return Said {.conn = in.conn, .code = 0 - 1}; }
+    return read_reply(in.conn, in.data, rounds - 1);
+}
+
+// Sends `line` (CRLF added) and reads the reply.
+@requires(network, declassify)
+Said say(TlsClient c, Str line) {
+    WireOut(TlsClient) o = wire_send(c, str_to_bytes(line + "\r\n"));
+    if (!o.ok) { return Said {.conn = o.conn, .code = 0 - 1}; }
+    return read_reply(o.conn, [], 200);
+}
+
+// A body with lines starting "." doubled (RFC 5321 §4.5.2), CRLF endings.
+Str dot_stuffed(Str body) {
+    List(Str) ls = str_split(str_replace(body, "\r\n", "\n"), "\n");
+    return stuff_at(ls, 0, StrBuf());
+}
+
+Str stuff_at(List(Str) ls, Int i, StrBuf acc) {
+    if (i >= ls.len()) { return acc.finish(); }
+    Str l = if (str_starts_with(ls[i], ".")) { "." + ls[i] } else { ls[i] };
+    return stuff_at(ls, i + 1, acc.push(l).push("\r\n"));
+}
+
+// "" when the mail was accepted, else what went wrong.
+@requires(network, clock(readonly), declassify)
+pub Str send_mail(Mail m, TrustStore store) {
+    TlsDial d = tls_client_connect(m.host, m.port, tls_client_cfg_within(tls_client_cfg(m.host, store, []), 60000));
+    if (str_len(d.err) > 0) { return "cannot reach the mail server: " + d.err; }
+    Said g = read_reply(d.conn, [], 200);
+    if (g.code != 220) { return close_with(g.conn, f"the mail server greeted with {g.code}"); }
+    Said e = say(g.conn, "EHLO symbolon-home");
+    if (e.code != 250) { return close_with(e.conn, f"EHLO answered {e.code}"); }
+    Str plain = base64_encode([0].concat(str_to_bytes(m.user)).concat([0]).concat(str_to_bytes(m.pass)));
+    Said a = if (str_len(m.user) > 0) { say(e.conn, "AUTH PLAIN " + plain) } else { Said {.conn = e.conn, .code = 235} };
+    if (a.code != 235) { return close_with(a.conn, f"the mail server refused the login ({a.code})"); }
+    Said f = say(a.conn, "MAIL FROM:<" + m.from + ">");
+    if (f.code != 250) { return close_with(f.conn, f"MAIL FROM answered {f.code}"); }
+    Said r = say(f.conn, "RCPT TO:<" + m.to + ">");
+    if (r.code != 250 && r.code != 251) { return close_with(r.conn, f"the mail server refused {m.to} ({r.code})"); }
+    Said dd = say(r.conn, "DATA");
+    if (dd.code != 354) { return close_with(dd.conn, f"DATA answered {dd.code}"); }
+    Str msg = "From: Symbolon Home <" + m.from + ">\r\nTo: <" + m.to + ">\r\nSubject: " + m.subject
+        + "\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: 8bit\r\n\r\n" + dot_stuffed(m.body) + ".";
+    Said sent = say(dd.conn, msg);
+    if (sent.code != 250) { return close_with(sent.conn, f"the mail server did not accept the message ({sent.code})"); }
+    Said q = say(sent.conn, "QUIT");
+    _ = wire_close(q.conn);
+    return "";
+}
+
+@requires(network, declassify)
+Str close_with(TlsClient c, Str why) {
+    _ = wire_close(c);
+    return why;
+}

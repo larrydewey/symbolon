@@ -172,7 +172,7 @@ void main() {
     await start(t);
     await t.tap(find.text('More').last);
     await t.pumpAndSettle();
-    await t.ensureVisible(find.byKey(const Key('open-breach')));
+    await t.scrollUntilVisible(find.byKey(const Key('open-breach')), 200, scrollable: find.byType(Scrollable).hitTestable().first);
     await t.pumpAndSettle();
     await t.tap(find.byKey(const Key('open-breach')));
     await route(t);
@@ -260,7 +260,7 @@ void main() {
     await start(t);
     await t.tap(find.text('More').last);
     await t.pumpAndSettle();
-    await t.ensureVisible(find.byKey(const Key('open-breach')));
+    await t.scrollUntilVisible(find.byKey(const Key('open-breach')), 200, scrollable: find.byType(Scrollable).hitTestable().first);
     await t.pumpAndSettle();
     await t.tap(find.byKey(const Key('open-breach')));
     await route(t);

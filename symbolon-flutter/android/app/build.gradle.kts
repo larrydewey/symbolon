@@ -77,6 +77,8 @@ dependencies {
     implementation("androidx.credentials.providerevents:providerevents-play-services:1.0.0-beta01")
     // Fingerprint or face unlock (the PIN kept under a key it opens).
     implementation("androidx.biometric:biometric:1.1.0")
+    // Household duress alerts, checked in the background (AlertWorker.kt).
+    implementation("androidx.work:work-runtime-ktx:2.11.2")
     // The QR decoder (Apache-2.0, no dependencies), with the platform camera: QrScanner.kt.
     implementation("com.google.zxing:core:3.5.3")
 }

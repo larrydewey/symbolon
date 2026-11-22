@@ -26,6 +26,7 @@ import "common.resid";
 import "session.resid";
 import "cggmp_store.resid";
 import "kvagent.resid";
+import "alerts.resid";
 import "ecdsa.resid";
 import "hash.resid";
 import "serials.resid";
@@ -171,7 +172,7 @@ Int supervise(Str cmd) {
 }
 
 // `symbolon cosigner serve-for DIR PRIMES SECONDS` (run by `serve`).
-@requires(network, filesystem, declassify, clock, provision)
+@requires(network, filesystem, declassify, clock, provision, process, environment)
 pub Int cosignerd_serve_for(Str dir, Str primes_file, Int secs) {
     Option(Cosigner) oc = load(dir);
     Str pf = if (primes_file == "-") { "" } else { primes_file };
@@ -227,7 +228,7 @@ Int soonest(List(Kept) ks, Int i, Int best) {
 // included), so `cosigner serve` runs these children one after another and
 // the kernel takes back each one's memory when it exits. The session state
 // in `kept` (nonce shares among it) only ever lives in memory.
-@requires(network, filesystem, declassify, clock, provision)
+@requires(network, filesystem, declassify, clock, provision, process, environment)
 Int serve_loop(Str dir, Str primes_file, List(Kept) kept0, Int n, Int until) {
     Int now = clock_now_seconds();
     List(Kept) kept = unexpired(kept0, now, 0, []);
@@ -251,7 +252,7 @@ Int idle_wait(Str dir, Int until) {
     };
 }
 
-@requires(network, filesystem, declassify, clock, provision)
+@requires(network, filesystem, declassify, clock, provision, process, environment)
 List(Kept) serve_turn(Str dir, Str primes_file, List(Kept) kept, Int n) {
     Option(Cosigner) oc = load(dir);
     return match oc {
@@ -260,7 +261,7 @@ List(Kept) serve_turn(Str dir, Str primes_file, List(Kept) kept, Int n) {
     };
 }
 
-@requires(network, filesystem, declassify, clock)
+@requires(network, filesystem, declassify, clock, process, environment)
 List(Kept) serve_once(Cosigner c0, List(List(UInt(64))) primes, List(List(UInt(64))) primes2, List(Kept) kept, Int n) {
     Cosigner c = if (n % 25 == 0) { refresh_peers(c0) } else { c0 };
     Endpoint relay = relay_of(c.cfg);
@@ -277,6 +278,11 @@ List(Kept) serve_once(Cosigner c0, List(List(UInt(64))) primes, List(List(UInt(6
     _ = save_cfg(c.dir, c2.cfg);
     Handled h = handle_all(c2, gs, 0, primes, primes2, kept);
     _ = save_cfg(c.dir, h.c.cfg);
+    // Duress alerts (SPEC 14.4): a window that ran out, the queue, and
+    // alerts other people's cosigners left for this person.
+    _ = check_window(h.c);
+    _ = send_queued(h.c.dir, relay);
+    _ = deliver_inbox(h.c.dir, relay, h.c.cfg.log_id, cos_hpke(h.c.root).sk, cos_hpke(h.c.root).pk);
     return h.kept;
 }
 
@@ -300,6 +306,10 @@ Handled handle_all(Cosigner c, List(Got) gs, Int i, List(List(UInt(64))) primes,
         WKvDeal(m) => Handled {.c = on_kv_deal(c, gs[i].from, m), .kept = kept},
         WEval(r) => Handled {.c = on_eval(c, gs[i].from, r), .kept = kept},
         WEvalLog(r) => Handled {.c = on_eval_log(c, gs[i].from, r), .kept = kept},
+        WBeacon(b) => Handled {.c = on_beacon(c, gs[i].from, b), .kept = kept},
+        WAlertConfig(a) => Handled {.c = on_alert_config(c, gs[i].from, a), .kept = kept},
+        WEndDuress(e) => Handled {.c = on_end_duress(c, gs[i].from, e), .kept = kept},
+        WAlertKey(k) => Handled {.c = on_alert_key(c, k), .kept = kept},
         _ => Handled {.c = c, .kept = kept}
     };
     return handle_all(h.c, gs, i + 1, primes, primes2, h.kept);
@@ -1071,3 +1081,166 @@ List(EvalLogEntry) eval_entries(List(SessionRecord) rs, Int since, Int i, List(E
     Bool take = rs[i].kind == (Int)request_eval() && rs[i].time > since;
     return eval_entries(rs, since, i + 1, if (take) { acc.concat([EvalLogEntry {.time = rs[i].time, .device = rs[i].requester, .count = if (rs[i].count > 0) { rs[i].count } else { 1 }}]) } else { acc });
 }
+
+// ─── Duress alerts (SPEC 14.4) ──────────────────────────────────
+
+// The person's name in alerts: as set, else the name this box knows them by.
+@requires(filesystem)
+Str person_name(Cosigner c) {
+    AlertState a = person_settings(c.dir);
+    if (str_len(a.person) > 0) { return a.person; }
+    List(Str) p = str_split(c.dir, "/");
+    Str n = if (p.len() >= 2) { p[p.len() - 2] } else { "" };
+    return if (str_len(n) == 0) { "Someone" } else { str_to_upper(str_slice(n, 0, 1)) + str_slice(n, 1, str_len(n)) };
+}
+
+@requires(filesystem, clock(readonly))
+Bool queue_open(Cosigner c, Int at, List(Int) location) {
+    BoxAlerts b = box_alerts(box_of(c.dir));
+    println("cosigner: duress window opened; alert queued");
+    return queue_alert(c.dir, "Duress alert: " + person_name(c), alert_text(b, person_name(c), at, loc_of(location)));
+}
+
+@requires(filesystem, clock(readonly))
+Bool queue_ended(Cosigner c, Int at, Str how) {
+    BoxAlerts b = box_alerts(box_of(c.dir));
+    println("cosigner: duress window ended (" + how + "); alert queued");
+    return queue_alert(c.dir, "Duress alert ended: " + person_name(c), ended_text(b, person_name(c), at, how));
+}
+
+// An unlock beacon: a duress one opens the window and queues the alert; a
+// normal one changes nothing and is forgotten, its location included.
+@requires(network, filesystem, declassify, clock)
+Cosigner on_beacon(Cosigner c, List(Int) from, Beacon b) {
+    if (c.cfg.log_id.len() == 0 || !bytes_eq(b.log_id, c.cfg.log_id) || !bytes_eq(from, b.requester) || b.location.len() != 32) { return c; }
+    Result(VerifiedHead, SymbolonError) rv = verified_log_at(relay_of(c.cfg), c.cfg.log_id, local_host(c.dir));
+    return match rv { Err(_) => c, Ok(vh) => beacon_decide(c, from, b, vh) };
+}
+
+@requires(network, filesystem, declassify, clock)
+Cosigner beacon_decide(Cosigner c, List(Int) from, Beacon b, VerifiedHead vh) {
+    Quorum q = vh.head.quorum;
+    Option(Party) op = party_at(q.parties, from, 0);
+    return match op {
+        None => c,
+        Some(p) => beacon_with(c, p, b, vh)
+    };
+}
+
+@requires(network, filesystem, declassify, clock)
+Cosigner beacon_with(Cosigner c, Party p, Beacon b, VerifiedHead vh) {
+    CosignerState st = load_state(c, vh);
+    Int now = policy_now(c, vh);
+    List(Int) tbs = request_tbs(b.session_id, beacon_message(b), vh.head.quorum.epoch, b.requester, request_beacon());
+    BeaconOutcome o = cosigner_beacon(st, p, b.session_id, tbs, b.sig, b.time, now);
+    _ = filesystem.write_bytes(c.dir + "/state.cbor", cbor_of_state(o.s));
+    Option(DuressState) was = o.was;
+    _ = if (o.ended) { match was { None => false, Some(w) => queue_ended(c, w.started_at + (Int)vh.head.policy.duress_window_sec, "the duress window ran out") } } else { false };
+    _ = if (o.opened) { queue_open(c, now, b.location) } else { false };
+    return c;
+}
+
+// A window that ran out since the last turn: the "ended" alert. Only when a
+// window is recorded (the witnesses are asked for the time then).
+@requires(network, filesystem, declassify, clock)
+Bool check_window(Cosigner c) {
+    Option(CosignerState) os = state_of_cbor(get_file(c.dir + "/state.cbor"));
+    Bool open = match os { None => false, Some(s) => duress_recorded(s) };
+    if (!open || c.cfg.log_id.len() == 0) { return false; }
+    Result(VerifiedHead, SymbolonError) rv = verified_log_at(relay_of(c.cfg), c.cfg.log_id, local_host(c.dir));
+    return match rv { Err(_) => false, Ok(vh) => window_check(c, vh) };
+}
+
+@requires(network, filesystem, declassify, clock)
+Bool window_check(Cosigner c, VerifiedHead vh) {
+    CosignerState st = load_state(c, vh);
+    Int now = policy_now(c, vh);
+    if (now == 0 || !window_ran_out(st, now)) { return false; }
+    Option(DuressState) w = st.duress;
+    _ = filesystem.write_bytes(c.dir + "/state.cbor", cbor_of_state(without_duress(st)));
+    return match w { None => false, Some(x) => queue_ended(c, x.started_at + (Int)vh.head.policy.duress_window_sec, "the duress window ran out") };
+}
+
+Bool duress_recorded(CosignerState s) {
+    Option(DuressState) d = s.duress;
+    return match d { None => false, Some(_) => true };
+}
+
+// The alert settings, read or replaced, by a device of the quorum signing
+// with its DK; a change while a duress window is open is refused, as an
+// outage looks.
+@requires(network, filesystem, declassify, clock)
+Cosigner on_alert_config(Cosigner c, List(Int) from, AlertConfig a) {
+    if (c.cfg.log_id.len() == 0 || !bytes_eq(a.log_id, c.cfg.log_id) || !bytes_eq(from, a.requester) || a.session_id.len() != 32 || a.contacts.len() > 32) { return refuse(c, from, a.session_id); }
+    Result(VerifiedHead, SymbolonError) rv = verified_log_at(relay_of(c.cfg), c.cfg.log_id, local_host(c.dir));
+    return match rv { Err(_) => refuse(c, from, a.session_id), Ok(vh) => alert_config_with(c, from, a, vh) };
+}
+
+@requires(network, filesystem, declassify, clock)
+Cosigner alert_config_with(Cosigner c, List(Int) from, AlertConfig a, VerifiedHead vh) {
+    Quorum q = vh.head.quorum;
+    Option(Party) op = party_at(q.parties, from, 0);
+    CosignerState st = load_state(c, vh);
+    List(Int) tbs = request_tbs(a.session_id, alert_config_message(a), q.epoch, from, request_alert_config());
+    Bool dk = match op { None => false, Some(p) => p.kind == party_kind_device() && a.epoch == (Int)q.epoch && which_key_tbs(st, p, tbs, a.sig) == 1 };
+    if (!dk) { return refuse(c, from, a.session_id); }
+    Int now = policy_now(c, vh);
+    Bool in_duress = cosigner_in_duress(st, now);
+    if (a.set && in_duress) { return refuse(c, from, a.session_id); }
+    _ = if (a.set) { save_settings(c.dir, a.person, a.contacts) } else { true };
+    AlertState s = person_settings(c.dir);
+    Option(DuressState) w = st.duress;
+    AlertState out = AlertState {.session_id = a.session_id, .person = s.person, .contacts = s.contacts, .topics = s.topics, .duress = in_duress,
+                                 .started_at = match w { None => 0, Some(x) => x.started_at }, .party = match w { None => [], Some(x) => x.party }};
+    Option(Remote) rr = remote_of_party(c, from);
+    _ = match rr { None => false, Some(x) => send_to(relay_of(c.cfg), me_of(c), x, WAlertState(out)) };
+    return c;
+}
+
+// An end-duress message (SPEC 14.3): signed by the other devices.
+@requires(network, filesystem, declassify, clock)
+Cosigner on_end_duress(Cosigner c, List(Int) from, EndDuressReq r) {
+    if (c.cfg.log_id.len() == 0 || !bytes_eq(r.log_id, c.cfg.log_id) || r.signers.len() != r.sigs.len() || r.sigs.len() > 16) { return c; }
+    Result(VerifiedHead, SymbolonError) rv = verified_log_at(relay_of(c.cfg), c.cfg.log_id, local_host(c.dir));
+    return match rv { Err(_) => c, Ok(vh) => end_duress_with(c, r, vh) };
+}
+
+@requires(network, filesystem, declassify, clock)
+Cosigner end_duress_with(Cosigner c, EndDuressReq r, VerifiedHead vh) {
+    CosignerState st = load_state(c, vh);
+    Int now = policy_now(c, vh);
+    Bool was = cosigner_in_duress(st, now);
+    Result(CosignerState, SymbolonError) e = cosigner_end_duress(st, EndDuress {.log_id = r.log_id, .started_at = r.started_at, .sigs = event_sigs(r.signers, r.sigs, 0, [])}, now);
+    return match e {
+        Err(x) => cos_fail(c, "end-duress refused: " + err_text(x)),
+        Ok(s) => ended_now(c, s, was, now)
+    };
+}
+
+@requires(filesystem, clock(readonly))
+Cosigner ended_now(Cosigner c, CosignerState s, Bool was, Int now) {
+    _ = filesystem.write_bytes(c.dir + "/state.cbor", cbor_of_state(s));
+    _ = if (was) { queue_ended(c, now, "ended from another of their devices") } else { false };
+    return c;
+}
+
+List(EventSig) event_sigs(List(List(Int)) who, List(List(Int)) sigs, Int i, List(EventSig) acc) {
+    if (i >= who.len()) { return acc; }
+    return event_sigs(who, sigs, i + 1, acc.concat([EventSig {.signer = who[i], .sig = sigs[i]}]));
+}
+
+// A device's alert key, for alerts other people's cosigners leave for this
+// person (at most eight kept, the newest last).
+@requires(filesystem)
+Cosigner on_alert_key(Cosigner c, List(Int) k) {
+    if (k.len() != 65 || k[0] != 4) { return c; }
+    List(List(Int)) ks = alert_keys(get_file(c.dir + "/alert-keys"), 0, []);
+    if (has_key(ks, k, 0)) { return c; }
+    List(List(Int)) all = ks.concat([k]);
+    List(List(Int)) kept = if (all.len() > 8) { all[all.len() - 8..all.len()] } else { all };
+    _ = put_secret_file(c.dir + "/alert-keys", flat_keys(kept, 0, []));
+    return c;
+}
+
+Bool has_key(List(List(Int)) ks, List(Int) k, Int i) { return if (i >= ks.len()) { false } else { bytes_eq(ks[i], k) || has_key(ks, k, i + 1) }; }
+List(Int) flat_keys(List(List(Int)) ks, Int i, List(Int) acc) { return if (i >= ks.len()) { acc } else { flat_keys(ks, i + 1, acc.concat(ks[i])) }; }

@@ -25,6 +25,10 @@ pub UInt(8) request_policy_change() { return 5; }
 // blinded elements (18.10.4); like every request but signing, refused
 // during a duress window, as an outage.
 pub UInt(8) request_eval() { return 6; }
+// An unlock beacon (SPEC 14.4) and a duress alert settings request: signed
+// like a request, never co-signed.
+pub UInt(8) request_beacon() { return 7; }
+pub UInt(8) request_alert_config() { return 8; }
 
 pub type CosignRequest = {
     List(Int) session_id;                // 32 fresh bytes
@@ -173,14 +177,57 @@ CosignOutcome refuse_as(CosignerState s, SymbolonError e) {
 // ============================================================================
 
 // 0 neither key, 1 the DK, 2 the duress sub-key.
-Int which_key(CosignerState s, Party p, CosignRequest r) {
-    List(Int) tbs = request_tbs(r.session_id, r.message, r.epoch, r.requester, r.kind);
-    if (ecdsa_verify_raw(P256, Sha256, p.auth_key, tbs, r.sig)) { return 1; }
+Int which_key(CosignerState s, Party p, CosignRequest r) { return which_key_tbs(s, p, request_tbs(r.session_id, r.message, r.epoch, r.requester, r.kind), r.sig); }
+
+pub Int which_key_tbs(CosignerState s, Party p, List(Int) tbs, List(Int) sig) {
+    if (ecdsa_verify_raw(P256, Sha256, p.auth_key, tbs, sig)) { return 1; }
     return match duress_key_of(s.duress_keys, p.id, 0) {
         None => 0,
-        Some(k) => if (ecdsa_verify_raw(P256, Sha256, k, tbs, r.sig)) { 2 } else { 0 }
+        Some(k) => if (ecdsa_verify_raw(P256, Sha256, k, tbs, sig)) { 2 } else { 0 }
     };
 }
+
+// ============================================================================
+// Unlock beacons (SPEC 14.4)
+// ============================================================================
+
+// What a beacon did: `opened` when it opened a duress window (the alert is
+// sent once, then), `ended` when a window it found had run out.
+pub type BeaconOutcome = { CosignerState s; Bool opened; Bool ended; Option(DuressState) was; };
+
+// A beacon from device `p`: the DK's changes nothing; the duress sub-key's
+// opens a window unless one is open. Refused (no change) when neither key
+// signed it, its session was seen, or its time is more than ten minutes
+// from now (a replayed duress beacon would raise a false alarm).
+pub BeaconOutcome cosigner_beacon(CosignerState s0, Party p, List(Int) session_id, List(Int) tbs, List(Int) sig, Int time, Int now) {
+    LogHead h = s0.verified.head;
+    Option(DuressState) live = window_at(s0.duress, h.policy, now);
+    Option(DuressState) had = s0.duress;
+    Bool was_open = match had { None => false, Some(_) => true };
+    Bool still = match live { None => false, Some(_) => true };
+    Bool ran_out = was_open && !still;
+    CosignerState s = with_duress(s0, live);
+    BeaconOutcome none = BeaconOutcome {.s = s, .opened = false, .ended = ran_out, .was = s0.duress};
+    if (p.kind != party_kind_device() || session_id.len() != 32 || seen(s.seen_sessions, session_id, 0)) { return none; }
+    if (time < now - 600 || time > now + 600) { return none; }
+    Int key = which_key_tbs(s, p, tbs, sig);
+    if (key != 2) { return BeaconOutcome {.s = with_seen(s, session_id), .opened = false, .ended = ran_out, .was = s0.duress}; }
+    Bool open = match live { None => false, Some(_) => true };
+    CosignerState s2 = with_seen(if (open) { s } else { with_duress(s, Some(DuressState {.party = p.id, .started_at = now})) }, session_id);
+    return BeaconOutcome {.s = s2, .opened = !open, .ended = ran_out, .was = s0.duress};
+}
+
+// Whether a recorded window has run out by `now` (the "ended" alert is due).
+pub Bool window_ran_out(CosignerState s, Int now) {
+    Option(DuressState) d = s.duress;
+    Option(DuressState) live = window_at(d, s.verified.head.policy, now);
+    Bool had = match d { None => false, Some(_) => true };
+    Bool still = match live { None => false, Some(_) => true };
+    return had && !still;
+}
+
+// The state with the duress window cleared.
+pub CosignerState without_duress(CosignerState s) { return with_duress(s, None); }
 
 pub CosignOutcome cosign_decide(CosignerState s0, CosignRequest r, Int now) { return cosign_decide_n(s0, r, now, 1); }
 
@@ -241,6 +288,11 @@ List(List(Int)) end_signers(List(Party) ps, List(EventSig) sigs, List(Int) exclu
     return end_signers(ps, sigs, excluded, tbs, i + 1, if (ok) { acc.concat([g.signer]) } else { acc });
 }
 
+Int other_devices(List(Party) ps, List(Int) not, Int i, Int n) {
+    if (i >= ps.len()) { return n; }
+    return other_devices(ps, not, i + 1, if (ps[i].kind == party_kind_device() && !bytes_eq(ps[i].id, not)) { n + 1 } else { n });
+}
+
 pub Result(CosignerState, SymbolonError) cosigner_end_duress(CosignerState s, EndDuress m, Int now) {
     LogHead h = s.verified.head;
     Option(DuressState) ow = window_at(s.duress, h.policy, now);
@@ -254,8 +306,12 @@ Result(CosignerState, SymbolonError) end_window(CosignerState s, DuressState w, 
     LogHead h = s.verified.head;
     if (!bytes_eq(m.log_id, h.log_id) || m.started_at != w.started_at) { return Err(ErrDuressContainment("end-duress names another window")); }
     List(List(Int)) who = end_signers(h.quorum.parties, m.sigs, w.party, end_duress_tbs(m.log_id, m.started_at), 0, []);
-    if (who.len() < (Int)h.policy.device_sigs_for_authority) {
-        return Err(ErrQuorumNotMet((UInt(8))who.len(), h.policy.device_sigs_for_authority));
+    // policy[1] devices other than the duress one, or all of them when
+    // there are fewer (two devices: the other one alone).
+    Int others = other_devices(h.quorum.parties, w.party, 0, 0);
+    Int need = if (others < (Int)h.policy.device_sigs_for_authority) { others } else { (Int)h.policy.device_sigs_for_authority };
+    if (need < 1 || who.len() < need) {
+        return Err(ErrQuorumNotMet((UInt(8))who.len(), (UInt(8))need));
     }
     return Ok(with_duress(s, None));
 }

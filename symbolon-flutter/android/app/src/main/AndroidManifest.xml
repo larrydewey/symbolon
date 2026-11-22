@@ -8,6 +8,13 @@
     <uses-feature android:name="android.hardware.camera" android:required="false"/>
     <!-- The fill screen hides other apps' overlays (SPEC 22.6 item 4, Android 12+). -->
     <uses-permission android:name="android.permission.HIDE_OVERLAY_WINDOWS"/>
+    <!-- Duress alerts (SPEC 14.4): the last known location the alert carries
+         (no new fix is asked for), and household members' alerts shown as
+         notifications (AlertWorker.kt). Asked for when alerts are set up. -->
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION"/>
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION"/>
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+    <uses-feature android:name="android.hardware.location" android:required="false"/>
     <!-- Apps that may use the SSH agent service (SPEC 16.1.1): Symbolon's own
          signer, or one listed in res/values/ssh_agent_callers.xml. -->
     <permission

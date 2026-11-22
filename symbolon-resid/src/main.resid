@@ -45,6 +45,10 @@
 //       signs in to Bitwarden or Vaultwarden (SERVER: bitwarden.com,
 //       bitwarden.eu or https://...) and imports the vault; a line
 //       conversation on stdin/stdout (src/agent/bwsignin.resid)
+//   symbolon device beacon DIR [--location LAT,LON,ACC,AGE]   (PIN; SPEC 14.4)
+//   symbolon device alerts DIR | alerts set|register DIR | alerts inbox DIR
+//   symbolon device duress end DIR                (PIN; src/agent/alertscli.resid)
+//   symbolon home alerts DIR [set KEY VALUE]      the box's alert channels
 //   symbolon device vault signin-lastpass DIR [--dry-run] [--share ID]
 //       the same for LastPass, experimental (src/agent/lpsignin.resid)
 //                                              PIN on stdin (not with --dry-run): another password
@@ -119,6 +123,8 @@ import "agent/breachcli.resid";
 import "agent/importers.resid";
 import "agent/bwsignin.resid";
 import "agent/lpsignin.resid";
+import "agent/alertscli.resid";
+import "agent/alerts.resid";
 import "agent/sharecli.resid";
 import "browser/nmhost.resid";
 import "agent/sshcli.resid";
@@ -428,6 +434,13 @@ Int main() {
         Str fmt = flag_arg("--format", 1, 6);
         return vault_import(args.get(4), args.get(5), if (str_len(fmt) == 0) { "auto" } else { fmt }, has_flag("--dry-run", 6), share);
     }
+    if (a1 == "device" && a2 == "beacon" && n >= 4) { return device_beacon(args.get(3), flag_arg("--location", 1, 4)); }
+    if (a1 == "device" && a2 == "alerts" && n == 4) { return device_alerts(args.get(3)); }
+    if (a1 == "device" && a2 == "alerts" && args.get(3) == "set" && n == 5) { return device_alerts_set(args.get(4)); }
+    if (a1 == "device" && a2 == "alerts" && args.get(3) == "register" && n == 5) { return device_alerts_register(args.get(4)); }
+    if (a1 == "device" && a2 == "alerts" && args.get(3) == "inbox" && n == 5) { return device_alerts_inbox(args.get(4)); }
+    if (a1 == "device" && a2 == "duress" && args.get(3) == "end" && n == 5) { return device_duress_end(args.get(4)); }
+    if (a1 == "home" && a2 == "alerts" && n >= 4) { return home_alerts(args.get(3), arg_list(4, n, ListBuf())); }
     if (a1 == "device" && a2 == "vault" && args.get(3) == "signin-lastpass" && n >= 5) {
         return vault_signin_lastpass(args.get(4), has_flag("--dry-run", 5), share);
     }

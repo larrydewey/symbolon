@@ -34,3 +34,5 @@ If someone forces you to unlock, the duress PIN opens a separate profile: a
 subset of passkeys and folders you chose, in a vault of its own. It looks
 like the real thing. Lasting changes fail as if the server were having
 trouble, and nothing in the log or at the relay shows a duress unlock.
+Your Symbolon Home box can alert people you choose: see
+[Duress alerts](/symbolon/guide/duress-alerts/).

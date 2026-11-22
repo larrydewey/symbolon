@@ -1,0 +1,467 @@
+// Duress alerts (SPEC 14.4), sent by a person's cosigner on Symbolon Home,
+// never by the phone under duress.
+//
+// Files:
+//   BOX/alerts.conf          the box's channels (`home alerts`), mode 0600:
+//                            key=value lines (ntfy_url, ntfy_token,
+//                            smtp_host, smtp_port, smtp_user, smtp_pass,
+//                            smtp_from, sms_url, sms_auth, sms_body,
+//                            sms_type form|json, threnody, tz, tz_minutes, ca)
+//   COS/alerts.cbor          this person's settings (AlertState: the name,
+//                            the contacts, one ntfy topic per contact)
+//   COS/alerts/N             queued alerts, one file each, until every
+//                            channel took them (or a day passed)
+//   COS/alert-keys           this person's devices' alert keys (household
+//                            alerts), 65-byte P-256 points
+//   COS/inbox/N              alerts other people's cosigners left for this
+//                            person, sealed by this cosigner to the alert
+//                            keys and put on the relay as alrt-LOG-N
+//
+// An alert reads: "DURESS: Larry unlocked Symbolon with the duress PIN at
+// 2026-11-22 14:32 MST. Last known location: 40.7608, -111.8910 (within
+// 30 m, 4 minutes old): https://www.openstreetmap.org/?mlat=..&mlon=..".
+// Its end: "Larry's duress alert ended at 15:10 MST (ended from another
+// device)" or "(the duress window ran out)".
+
+import "../types.resid";
+import "../net/proto.resid";
+import "../net/services.resid";
+import "state.resid";
+import "common.resid";
+import "smtp.resid";
+import "tlsclient.resid";
+import "chain.resid";
+import "crypto.resid";
+import "httpserv.resid";
+import "word.resid";
+import "hpkeg.resid";
+import "serial.resid";
+import "cose.resid";
+import "../net/envelope.resid";
+
+// ─── Small helpers (as in bwsignin.resid, which imports the device side) ─
+
+@requires(filesystem, environment)
+Result(TrustStore, Str) system_roots() {
+    List(Str) tries = [environment.get("SYMBOLON_CA"), "/etc/ssl/certs/ca-certificates.crt", "/etc/ssl/cert.pem", "/etc/pki/tls/certs/ca-bundle.crt"];
+    return roots_at(tries, 0);
+}
+
+@requires(filesystem)
+Result(TrustStore, Str) roots_at(List(Str) ps, Int i) {
+    if (i >= ps.len()) { return Err("no trust anchors for HTTPS (set ca in home alerts)"); }
+    List(Int) pem = if (str_len(ps[i]) == 0) { [] } else { filesystem.read_bytes(ps[i]) };
+    return if (pem.len() == 0) { roots_at(ps, i + 1) } else { Ok(trust_store_add_pem(trust_store_empty(), http_text(pem, 0, pem.len()))) };
+}
+
+Str form_enc(Str s) { return form_at(str_to_bytes(s), 0, StrBuf()); }
+
+Str form_at(List(Int) b, Int i, StrBuf acc) {
+    if (i >= b.len()) { return acc.finish(); }
+    Int c = b[i];
+    Bool keep = (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 45 || c == 46 || c == 95 || c == 126;
+    return form_at(b, i + 1, if (keep) { acc.push(str_from_code(c)) } else { acc.push("%" + str_to_upper(hex_encode([c]))) });
+}
+
+// ─── Box settings ───────────────────────────────────────────────────
+
+pub type BoxAlerts = { Map(Str, Str) kv; };
+
+@requires(filesystem)
+pub BoxAlerts box_alerts(Str box) { return BoxAlerts {.kv = conf_of(str_split(filesystem.read_all(box + "/alerts.conf"), "\n"), 0, {})}; }
+
+Map(Str, Str) conf_of(List(Str) ls, Int i, Map(Str, Str) acc) {
+    if (i >= ls.len()) { return acc; }
+    Int eq = str_index_of(ls[i], "=", 0);
+    Str k = if (eq > 0) { str_trim(str_slice(ls[i], 0, eq)) } else { "" };
+    return conf_of(ls, i + 1, if (str_len(k) == 0 || str_starts_with(k, "#")) { acc } else { acc.insert(k, str_trim(str_slice(ls[i], eq + 1, str_len(ls[i])))) });
+}
+
+pub Str setting(BoxAlerts b, Str k) { return b.kv.get(k) else { "" }; }
+
+pub List(Str) setting_keys() { return ["ntfy_url", "ntfy_token", "smtp_host", "smtp_port", "smtp_user", "smtp_pass", "smtp_from", "sms_url", "sms_auth", "sms_body", "sms_type", "threnody", "tz", "tz_minutes", "ca"]; }
+
+// The box's directory from a cosigner's (BOX/people/NAME/cos).
+Int show_settings(BoxAlerts b, List(Str) ks, Int i) {
+    if (i >= ks.len()) { return 0; }
+    println(ks[i] + " " + shown(ks[i], setting(b, ks[i])));
+    return show_settings(b, ks, i + 1);
+}
+
+Str shown(Str k, Str v) {
+    if (str_len(v) == 0) { return "-"; }
+    if (k == "ntfy_token" || k == "smtp_pass" || k == "sms_auth") { return "(set)"; }
+    return v;
+}
+
+pub Str box_of(Str cos) { return cos + "/../../.."; }
+
+// `symbolon home alerts DIR` prints the channels (secrets shown as set or
+// not); `... set KEY VALUE` changes one (an empty VALUE removes it).
+@requires(filesystem)
+pub Int home_alerts(Str box, List(Str) args) {
+    if (!filesystem.exists(box + "/home.txt")) { eprintln("home: not set up (home init)"); return 1; }
+    BoxAlerts b = box_alerts(box);
+    if (args.len() == 0) {
+        return show_settings(b, setting_keys(), 0);
+    }
+    if (args.len() < 2 || args[0] != "set" || !setting_keys().contains(args[1])) { eprintln("home: alerts set KEY VALUE, KEY one of " + str_join(setting_keys(), ", ")); return 1; }
+    Str v = if (args.len() > 2) { str_join(args[2..args.len()], " ") } else { "" };
+    Map(Str, Str) kv = if (str_len(v) == 0) { b.kv.remove(args[1]) } else { b.kv.insert(args[1], v) };
+    return if (filesystem.write_secret(box + "/alerts.conf", str_to_bytes(conf_text(sort(kv.keys()), kv, 0, StrBuf())))) { 0 } else { 1 };
+}
+
+Str conf_text(List(Str) ks, Map(Str, Str) kv, Int i, StrBuf acc) {
+    if (i >= ks.len()) { return acc.finish(); }
+    return conf_text(ks, kv, i + 1, acc.push(ks[i] + "=" + (kv.get(ks[i]) else { "" }) + "\n"));
+}
+
+// ─── This person's settings ─────────────────────────────────────────
+
+pub AlertState no_settings() { return AlertState {.session_id = [], .person = "", .contacts = [], .topics = [], .duress = false, .started_at = 0, .party = []}; }
+
+@requires(filesystem)
+pub AlertState person_settings(Str cos) {
+    Result(AlertState, SerialError) r = from_cbor(get_file(cos + "/alerts.cbor"));
+    return match r { Ok(x) => x, Err(_) => no_settings() };
+}
+
+// New settings: a contact keeps its ntfy topic when its name is the same,
+// a new one gets a random one.
+@requires(filesystem)
+pub Bool save_settings(Str cos, Str person, List(AlertContact) cs) {
+    AlertState old = person_settings(cos);
+    AlertState s = AlertState {.session_id = [], .person = person, .contacts = cs, .topics = topics_for(cs, old, 0, ListBuf()), .duress = false, .started_at = 0, .party = []};
+    Result(List(Int), SerialError) b = to_cbor(s);
+    return match b { Ok(x) => filesystem.write_secret(cos + "/alerts.cbor", x), Err(_) => false };
+}
+
+List(Str) topics_for(List(AlertContact) cs, AlertState old, Int i, ListBuf(Str) acc) {
+    if (i >= cs.len()) { return acc.finish(); }
+    Str kept = topic_of(old, cs[i].name, 0);
+    return topics_for(cs, old, i + 1, acc.push(if (str_len(kept) > 0) { kept } else { "duress-" + hex_encode(random_bytes(12)) }));
+}
+
+pub Str topic_of(AlertState s, Str name, Int i) {
+    if (i >= s.contacts.len() || i >= s.topics.len()) { return ""; }
+    return if (s.contacts[i].name == name) { s.topics[i] } else { topic_of(s, name, i + 1) };
+}
+
+// ─── Messages ───────────────────────────────────────────────────────
+
+pub type Loc = { Bool known; Int lat; Int lon; Int acc; Int age; };
+
+Int be_signed(List(Int) b, Int p) {
+    Int v = ((b[p] & 127) << 56) | ((b[p + 1] & 255) << 48) | ((b[p + 2] & 255) << 40) | ((b[p + 3] & 255) << 32) | ((b[p + 4] & 255) << 24) | ((b[p + 5] & 255) << 16) | ((b[p + 6] & 255) << 8) | (b[p + 7] & 255);
+    return if ((b[p] & 128) != 0) { v - 9223372036854775807 - 1 } else { v };
+}
+
+pub Loc loc_of(List(Int) b) {
+    if (b.len() != 32 || all_zero(b, 0)) { return Loc {.known = false, .lat = 0, .lon = 0, .acc = 0, .age = 0}; }
+    return Loc {.known = true, .lat = be_signed(b, 0), .lon = be_signed(b, 8), .acc = be_signed(b, 16), .age = be_signed(b, 24)};
+}
+
+Bool all_zero(List(Int) b, Int i) { return if (i >= b.len()) { true } else { b[i] == 0 && all_zero(b, i + 1) }; }
+
+// A coordinate in 1e-7 degrees as degrees with four decimals.
+Str deg(Int v) {
+    Int a = if (v < 0) { 0 - v } else { v };
+    Int whole = a / 10000000;
+    Int frac = (a % 10000000) / 1000;
+    return (if (v < 0) { "-" } else { "" }) + f"{whole}." + f"{frac:zero, width 4}";
+}
+
+Str ago(Int s) {
+    if (s < 90) { return "just now"; }
+    if (s < 5400) { return f"{s / 60} minutes old"; }
+    if (s < 172800) { return f"{s / 3600} hours old"; }
+    return f"{s / 86400} days old";
+}
+
+pub Str where_text(Loc l) {
+    if (!l.known) { return "Location unknown."; }
+    return "Last known location: " + deg(l.lat) + ", " + deg(l.lon) + f" (within {l.acc} m, " + ago(l.age) + "): https://www.openstreetmap.org/?mlat=" + deg(l.lat) + "&mlon=" + deg(l.lon) + "#map=16/" + deg(l.lat) + "/" + deg(l.lon);
+}
+
+// Unix seconds as "YYYY-MM-DD HH:MM" in the box's zone (tz_minutes from
+// UTC, tz its name), by Howard Hinnant's days-to-civil.
+pub Str when_text(BoxAlerts b, Int t0) {
+    Int off = str_parse_int(setting(b, "tz_minutes"));
+    Int t = t0 + off * 60;
+    Int days = t / 86400;
+    Int secs = t % 86400;
+    Int z = days + 719468;
+    Int era = z / 146097;
+    Int doe = z - era * 146097;
+    Int yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    Int doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    Int mp = (5 * doy + 2) / 153;
+    Int d = doy - (153 * mp + 2) / 5 + 1;
+    Int m = if (mp < 10) { mp + 3 } else { mp - 9 };
+    Int y = yoe + era * 400 + (if (m <= 2) { 1 } else { 0 });
+    Str tz = if (str_len(setting(b, "tz")) > 0) { setting(b, "tz") } else { if (off == 0) { "UTC" } else { "" } };
+    return f"{y}-{m:zero, width 2}-{d:zero, width 2} {secs / 3600:zero, width 2}:{(secs % 3600) / 60:zero, width 2}" + (if (str_len(tz) > 0) { " " + tz } else { "" });
+}
+
+pub Str alert_text(BoxAlerts b, Str person, Int time, Loc l) {
+    return "DURESS: " + person + " unlocked Symbolon with the duress PIN at " + when_text(b, time) + ". " + where_text(l)
+         + " They may not be able to talk freely. This alert comes from their Symbolon Home box.";
+}
+
+pub Str ended_text(BoxAlerts b, Str person, Int time, Str how) {
+    return person + "'s duress alert ended at " + when_text(b, time) + " (" + how + ").";
+}
+
+// ─── The queue ──────────────────────────────────────────────────────
+// One file per alert: "subject", "text" and "done" lines (text hex), the
+// channels done as "ci-kind" words, and when it was queued.
+
+pub type Queued = { Str name; Str subject; Str text; Int queued; List(Str) done; };
+
+@requires(filesystem, clock(readonly))
+pub Bool queue_alert(Str cos, Str subject, Str text) {
+    _ = filesystem.create_dir(cos + "/alerts");
+    Str name = f"{clock_now_seconds()}-" + hex_encode(random_bytes(4));
+    return write_queued(cos, Queued {.name = name, .subject = subject, .text = text, .queued = clock_now_seconds(), .done = []});
+}
+
+@requires(filesystem)
+Bool write_queued(Str cos, Queued q) {
+    Str t = "subject " + hex_encode(str_to_bytes(q.subject)) + "\ntext " + hex_encode(str_to_bytes(q.text)) + f"\nqueued {q.queued}\ndone " + str_join(q.done, " ") + "\n";
+    return filesystem.write_secret(cos + "/alerts/" + q.name, str_to_bytes(t));
+}
+
+@requires(filesystem)
+Option(Queued) read_queued(Str cos, Str name) {
+    List(Str) ls = str_split(filesystem.read_all(cos + "/alerts/" + name), "\n");
+    Str subject = field_line(ls, "subject", 0);
+    Str text = field_line(ls, "text", 0);
+    if (str_len(text) == 0) { return None; }
+    Str done = field_line(ls, "done", 0);
+    return Some(Queued {.name = name, .subject = text_of_hex(subject), .text = text_of_hex(text), .queued = str_parse_int(field_line(ls, "queued", 0)),
+                        .done = if (str_len(str_trim(done)) == 0) { [] } else { str_split(str_trim(done), " ") }});
+}
+
+Str field_line(List(Str) ls, Str k, Int i) {
+    if (i >= ls.len()) { return ""; }
+    return if (str_starts_with(ls[i], k + " ")) { str_slice(ls[i], str_len(k) + 1, str_len(ls[i])) } else { if (ls[i] == k) { "" } else { field_line(ls, k, i + 1) } };
+}
+
+Str text_of_hex(Str h) { return http_text(hex_decode_str(h), 0, hex_decode_str(h).len()); }
+
+List(Int) hex_decode_str(Str h) { return cose_hex_decode(h); }
+
+// ─── Sending ────────────────────────────────────────────────────────
+
+// Each queued alert, on every channel of every contact not done yet; an
+// alert done everywhere, or queued more than a day ago, is removed.
+@requires(filesystem, network, clock, declassify, process, environment)
+pub Int send_queued(Str cos, Endpoint relay) {
+    List(Str) names = filesystem.list_dir(cos + "/alerts");
+    if (names.len() == 0) { return 0; }
+    AlertState s = person_settings(cos);
+    BoxAlerts b = box_alerts(box_of(cos));
+    return send_each(cos, relay, s, b, sort(names), 0);
+}
+
+@requires(filesystem, network, clock, declassify, process, environment)
+Int send_each(Str cos, Endpoint relay, AlertState s, BoxAlerts b, List(Str) names, Int i) {
+    if (i >= names.len()) { return 0; }
+    Option(Queued) oq = read_queued(cos, names[i]);
+    _ = match oq {
+        None => true,
+        Some(q) => send_one(cos, relay, s, b, q)
+    };
+    return send_each(cos, relay, s, b, names, i + 1);
+}
+
+@requires(filesystem, network, clock, declassify, process, environment)
+Bool send_one(Str cos, Endpoint relay, AlertState s, BoxAlerts b, Queued q) {
+    List(Str) done = try_contacts(cos, relay, s, b, q, 0, q.done);
+    Bool all = everything_done(s, b, done, 0);
+    if (all || clock_now_seconds() > q.queued + 86400) {
+        println(f"cosigner: duress alert {q.name} " + (if (all) { "sent" } else { "given up after a day" }) + ": " + str_join(done, " "));
+        // Resid's filesystem has no delete: a finished alert is emptied,
+        // and an empty file is skipped.
+        return filesystem.write_all(cos + "/alerts/" + q.name, "");
+    }
+    return write_queued(cos, Queued {.name = q.name, .subject = q.subject, .text = q.text, .queued = q.queued, .done = done});
+}
+
+// The channels contact i has, as "ci-kind" words, given the box's settings.
+List(Str) channels_of(AlertState s, BoxAlerts b, Int i) {
+    AlertContact c = s.contacts[i];
+    Str p = f"c{i}-";
+    List(Str) a = if (c.ntfy && str_len(setting(b, "ntfy_url")) > 0) { [p + "ntfy"] } else { [] };
+    List(Str) e = if (str_len(c.email) > 0 && str_len(setting(b, "smtp_host")) > 0) { [p + "email"] } else { [] };
+    List(Str) m = if (str_len(c.phone) > 0 && str_len(setting(b, "sms_url")) > 0) { [p + "sms"] } else { [] };
+    List(Str) t = if (str_len(c.threnody) > 0 && str_len(setting(b, "threnody")) > 0) { [p + "threnody"] } else { [] };
+    List(Str) h = if (str_len(c.household) > 0) { [p + "home"] } else { [] };
+    return a.concat(e).concat(m).concat(t).concat(h);
+}
+
+Bool everything_done(AlertState s, BoxAlerts b, List(Str) done, Int i) {
+    if (i >= s.contacts.len()) { return true; }
+    return all_in(channels_of(s, b, i), done, 0) && everything_done(s, b, done, i + 1);
+}
+
+Bool all_in(List(Str) xs, List(Str) ys, Int i) { return if (i >= xs.len()) { true } else { ys.contains(xs[i]) && all_in(xs, ys, i + 1) }; }
+
+@requires(filesystem, network, clock, declassify, process, environment)
+List(Str) try_contacts(Str cos, Endpoint relay, AlertState s, BoxAlerts b, Queued q, Int i, List(Str) done) {
+    if (i >= s.contacts.len()) { return done; }
+    return try_contacts(cos, relay, s, b, q, i + 1, try_channels(cos, relay, s, b, q, i, channels_of(s, b, i), 0, done));
+}
+
+@requires(filesystem, network, clock, declassify, process, environment)
+List(Str) try_channels(Str cos, Endpoint relay, AlertState s, BoxAlerts b, Queued q, Int i, List(Str) chs, Int k, List(Str) done) {
+    if (k >= chs.len()) { return done; }
+    if (done.contains(chs[k])) { return try_channels(cos, relay, s, b, q, i, chs, k + 1, done); }
+    Str why = send_on(cos, relay, s, b, q, i, str_slice(chs[k], str_index_of(chs[k], "-", 0) + 1, str_len(chs[k])));
+    if (str_len(why) > 0) { eprintln("cosigner: duress alert to " + s.contacts[i].name + " (" + chs[k] + ") not sent yet: " + why); }
+    return try_channels(cos, relay, s, b, q, i, chs, k + 1, if (str_len(why) == 0) { done.concat([chs[k]]) } else { done });
+}
+
+// "" when the channel took the alert.
+@requires(filesystem, network, clock, declassify, process, environment)
+Str send_on(Str cos, Endpoint relay, AlertState s, BoxAlerts b, Queued q, Int i, Str kind) {
+    AlertContact c = s.contacts[i];
+    if (kind == "ntfy") { return send_ntfy(b, topic_of(s, c.name, 0), q); }
+    if (kind == "email") { return send_email(b, c.email, q); }
+    if (kind == "sms") { return send_sms(b, c.phone, q); }
+    if (kind == "threnody") { return send_threnody(b, c.threnody, q); }
+    if (kind == "home") { return leave_for(cos, c.household, q); }
+    return "unknown channel";
+}
+
+@requires(filesystem, environment)
+Result(TrustStore, Str) box_roots(BoxAlerts b) {
+    Str ca = setting(b, "ca");
+    if (str_len(ca) == 0) { return system_roots(); }
+    List(Int) pem = filesystem.read_bytes(ca);
+    return if (pem.len() == 0) { Err("no trust anchors at " + ca) } else { Ok(trust_store_add_pem(trust_store_empty(), http_text(pem, 0, pem.len()))) };
+}
+
+@requires(filesystem, network, clock(readonly), declassify, environment)
+Str send_ntfy(BoxAlerts b, Str topic, Queued q) {
+    if (str_len(topic) == 0) { return "no topic"; }
+    Result(TrustStore, Str) rs = box_roots(b);
+    Str token = setting(b, "ntfy_token");
+    Str auth = if (str_len(token) > 0) { "Authorization: Bearer " + token + "\r\n" } else { "" };
+    Str url = strip_slash(setting(b, "ntfy_url")) + "/" + topic;
+    Str hs = "Title: " + q.subject + "\r\nPriority: urgent\r\nTags: rotating_light\r\n" + auth;
+    return match rs {
+        Err(m) => m,
+        Ok(st) => https_ok(tls_https_request(url, "", st, ["http/1.1"], 30000, "POST", hs, str_to_bytes(q.text)))
+    };
+}
+
+Str strip_slash(Str s) { return if (str_ends_with(s, "/")) { str_slice(s, 0, str_len(s) - 1) } else { s }; }
+
+Str https_ok(HttpsGet g) {
+    if (str_len(g.err) > 0) { return g.err; }
+    return if (g.status >= 200 && g.status < 300) { "" } else { f"answered {g.status}" };
+}
+
+@requires(network, clock(readonly), declassify, filesystem, environment)
+Str send_email(BoxAlerts b, Str to, Queued q) {
+    Result(TrustStore, Str) rs = box_roots(b);
+    Int port = if (str_len(setting(b, "smtp_port")) > 0) { str_parse_int(setting(b, "smtp_port")) } else { 465 };
+    return match rs {
+        Err(m) => m,
+        Ok(st) => send_mail(Mail {.host = setting(b, "smtp_host"), .port = port, .user = setting(b, "smtp_user"), .pass = setting(b, "smtp_pass"),
+                                  .from = setting(b, "smtp_from"), .to = to, .subject = q.subject, .body = q.text}, st)
+    };
+}
+
+// The SMS gateway: sms_body with {to} and {text} filled in, form-encoded
+// (sms_type form, the default, as Twilio takes it) or JSON-quoted.
+@requires(network, clock(readonly), declassify, filesystem, environment)
+Str send_sms(BoxAlerts b, Str to, Queued q) {
+    Bool json = setting(b, "sms_type") == "json";
+    Str tmpl = setting(b, "sms_body");
+    Str body = str_replace(str_replace(tmpl, "{to}", if (json) { json_esc(to) } else { form_enc(to) }), "{text}", if (json) { json_esc(q.text) } else { form_enc(q.text) });
+    Result(TrustStore, Str) rs = box_roots(b);
+    Str ctype = if (json) { "application/json" } else { "application/x-www-form-urlencoded" };
+    Str sauth = setting(b, "sms_auth");
+    Str auth = if (str_len(sauth) > 0) { "Authorization: " + sauth + "\r\n" } else { "" };
+    Str h = "Content-Type: " + ctype + "\r\n" + auth;
+    return match rs { Err(m) => m, Ok(st) => https_ok(tls_https_request(setting(b, "sms_url"), "", st, ["http/1.1"], 30000, "POST", h, str_to_bytes(body))) };
+}
+
+Str json_esc(Str s) { return str_replace(str_replace(str_replace(str_replace(s, "\\", "\\\\"), "\"", "\\\""), "\n", "\\n"), "\r", "\\r"); }
+
+// Threnody: the box's node, run as a service (`threnody run --daemon`),
+// told through `threnody ctl` (its control socket from THRENODY_CONTROL);
+// the words of the message go as separate arguments, as `ctl` takes them.
+@requires(process)
+Str send_threnody(BoxAlerts b, Str fp, Queued q) {
+    Str bin = setting(b, "threnody");
+    if (str_contains(fp, " ") || str_len(fp) == 0) { return "a Threnody contact is one word"; }
+    if (process.run(bin + " ctl /to " + fp) != 0) { return "threnody ctl /to failed"; }
+    Str words = str_join(nonempty(str_split(str_replace(str_replace(q.subject + ": " + q.text, "\n", " "), "\t", " "), " "), 0, ListBuf()), " ");
+    return if (process.run(bin + " ctl " + words) == 0) { "" } else { "threnody ctl failed" };
+}
+
+List(Str) nonempty(List(Str) xs, Int i, ListBuf(Str) acc) {
+    if (i >= xs.len()) { return acc.finish(); }
+    return nonempty(xs, i + 1, if (str_len(xs[i]) == 0) { acc } else { acc.push(xs[i]) });
+}
+
+// ─── Household members (their Symbolon apps) ────────────────────────
+// The alert goes into the other person's inbox on this box; their own
+// cosigner seals it to their devices' alert keys (its HPKE key, which
+// their devices know) and puts it on the relay.
+
+@requires(filesystem, clock(readonly))
+Str leave_for(Str cos, Str person, Queued q) {
+    if (!name_is_ok(person)) { return "not a household name"; }
+    Str them = box_of(cos) + "/people/" + person + "/cos";
+    if (!filesystem.exists(them + "/cosigner.cbor")) { return person + " has no cosigner on this box"; }
+    _ = filesystem.create_dir(them + "/inbox");
+    Str name = f"{clock_now_seconds()}-" + hex_encode(random_bytes(4));
+    return if (filesystem.write_secret(them + "/inbox/" + name, str_to_bytes(q.subject + "\n" + q.text))) { "" } else { "cannot write the inbox" };
+}
+
+Bool name_is_ok(Str n) { return str_len(n) >= 1 && str_len(n) <= 32 && !str_contains(n, "/") && !str_contains(n, ".") && !str_contains(n, " "); }
+
+// This person's inbox, sealed to each alert key and put on the relay as
+// alrt-LOG-NAME (base64 of the HPKE encapsulation and ciphertext, one per
+// key, newline-separated). `sk` is this cosigner's HPKE key.
+@requires(filesystem, network, clock(readonly), declassify)
+pub Int deliver_inbox(Str cos, Endpoint relay, List(Int) log_id, List(Secret(UInt(8))) sk, List(Int) pk) {
+    List(Str) names = filesystem.list_dir(cos + "/inbox");
+    if (names.len() == 0 || log_id.len() == 0) { return 0; }
+    List(List(Int)) keys = alert_keys(get_file(cos + "/alert-keys"), 0, []);
+    if (keys.len() == 0) { return 0; }
+    return deliver_each(cos, relay, log_id, sk, pk, keys, sort(names), 0);
+}
+
+pub List(List(Int)) alert_keys(List(Int) b, Int i, List(List(Int)) acc) {
+    if (i + 65 > b.len()) { return acc; }
+    return alert_keys(b, i + 65, acc.concat([b[i..i + 65]]));
+}
+
+@requires(filesystem, network, clock(readonly), declassify)
+Int deliver_each(Str cos, Endpoint relay, List(Int) log_id, List(Secret(UInt(8))) sk, List(Int) pk, List(List(Int)) keys, List(Str) names, Int i) {
+    if (i >= names.len()) { return 0; }
+    List(Int) msg = get_file(cos + "/inbox/" + names[i]);
+    Str sealed = seal_each(keys, msg, sk, pk, 0, StrBuf());
+    if (msg.len() > 0 && blob_put(relay, "alrt-" + hex_encode(log_id) + "-" + names[i], str_to_bytes(sealed))) { _ = filesystem.write_all(cos + "/inbox/" + names[i], ""); }
+    return deliver_each(cos, relay, log_id, sk, pk, keys, names, i + 1);
+}
+
+pub List(Int) alert_info() { return utf8("symbolon v1 duress alert"); }
+
+// HPKE mode_auth (the envelopes' suite: P-256, HKDF-SHA256) to each alert key, from
+// this cosigner's HPKE key; info names the purpose.
+@requires(declassify)
+Str seal_each(List(List(Int)) keys, List(Int) msg, List(Secret(UInt(8))) sk, List(Int) pk, Int i, StrBuf acc) {
+    if (i >= keys.len()) { return acc.finish(); }
+    List(Secret(UInt(8))) none = [];
+    HpkeSenderG(Secret(UInt(8))) h = hpkeg_setup_sender_full(envelope_suite(), keys[i], alert_info(), none, [], sk, none);
+    if (!h.ctx.ok) { return seal_each(keys, msg, sk, pk, i + 1, acc); }
+    HpkeSealedG(Secret(UInt(8))) sealed = hpkeg_seal(h.ctx, [], secret_bytes(msg));
+    List(Int) ct = reveal(sealed.ct);
+    return seal_each(keys, msg, sk, pk, i + 1, acc.push(base64_encode(h.enc) + " " + base64_encode(ct) + "\n"));
+}

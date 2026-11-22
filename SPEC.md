@@ -993,7 +993,7 @@ message signed by `policy[1]` devices other than the duress device, or
 - signing for credentials outside the subset is impossible, not merely
   refused: the duress profile holds the subset's tweaks but not the chain
   code (Section 9.2);
-- guardians named in the policy are notified, through their own agents.
+- the principal's chosen contacts are alerted (Section 14.4).
 
 Refusals during duress MUST look like ordinary transient failures (the
 same errors and timing as an unreachable cosigner), so the coercer cannot
@@ -1006,7 +1006,85 @@ they refuse to co-sign authority events with the duress device's sub-key
 (which they learn at setup), and the duress profile still cannot sign
 outside the subset.
 
-### 14.4 Limits
+An end-duress message names the window (its start time) and carries
+signatures over `["symbolon v1 end-duress", log_id, started_at]` from
+`min(policy[1], other devices)` devices other than the duress device, at
+least one: an identity with two devices ends a window from the second
+alone. The agent sends it as `device duress end DIR` (the app's "I'm
+safe" button), from any device but the one that opened the window.
+
+### 14.4 Duress alerts
+
+A duress unlock alerts people the principal chose, through their Symbolon
+Home box (the cosigner), never from the phone under duress.
+
+**The unlock beacon.** After every unlock, under either PIN, the app sends
+the cosigner one beacon: `{session_id, log_id, epoch, time, location,
+requester, sig}` in the usual envelope, as cosign request kind 7 (the
+signature is over the request bytes of Section 13 with
+`m = SHA-256("symbolon v1 beacon" || log_id || be64(time) || location)`).
+The real profile signs it with the DK, the duress profile with the duress
+sub-key: the same size, the same timing, and no answer is awaited. The
+location is 32 bytes (latitude, longitude in 1e-7 degrees, accuracy in
+meters, age in seconds, each a big-endian signed 64-bit integer; zeros
+when there is none), the phone's last known location: no new fix is
+asked for, so no location indicator shows.
+
+The cosigner drops a DK-signed beacon at once, location included. A beacon
+signed by a duress sub-key opens the duress window (as a duress signing
+request does) and queues an alert; a second one within the window queues
+nothing. A beacon more than ten minutes from the cosigner's time, or with
+a session identifier already seen, is ignored. When the window runs out,
+or an end-duress message ends it, an "ended" alert is queued.
+
+**The contacts.** Kept by the cosigner (`cos/alerts.cbor`), read and
+replaced with an alert-settings message (request kind 8) signed by a DK
+of the quorum. A duress sub-key's signature is refused, so the duress
+profile sees no contacts and cannot change them; a change while a window
+is open is refused too, so a coercer cannot switch alerts off. Each
+contact has a name and any of: an ntfy notification (the box makes a
+random topic per contact), an email address, a phone number for text
+messages, a household member's name on the same box, and a Threnody
+fingerprint.
+
+**Sending.** Queued alerts are files in `cos/alerts/`, tried on every
+channel each turn of the cosigner until each channel takes it, given up
+after a day. The box's settings (`home alerts BOX set KEY VALUE`, in
+`BOX/alerts.conf`) say how:
+
+| Channel | Settings | How |
+|---|---|---|
+| ntfy | `ntfy_url`, `ntfy_token` | HTTPS POST to the topic, priority urgent |
+| Email | `smtp_host`, `smtp_port` (465), `smtp_user`, `smtp_pass`, `smtp_from` | SMTP over TLS: EHLO, AUTH PLAIN, MAIL, RCPT, DATA |
+| Text message | `sms_url`, `sms_auth`, `sms_body` (`{to}`, `{text}`), `sms_type` (`form` or `json`) | HTTPS POST to a gateway |
+| Threnody | `threnody` (the binary) | `threnody ctl /to FP`, then the text |
+| Household | none | sealed to the member's devices' alert keys (below) |
+
+`ca` names a PEM file of trust anchors for the HTTPS and SMTP servers
+(the system's by default); `tz` and `tz_minutes` the time zone the alert
+is written in.
+
+**Household members.** A device registers an alert key with its own
+cosigner (`device alerts register DIR`): 32 random bytes kept in
+`DIR/alert-key` without the PIN, so a background job can read alerts;
+the cosigner keeps the HPKE public keys of at most eight devices. An
+alert for a household member is left in their cosigner's inbox on the
+box; their cosigner seals it with HPKE (the envelope suite, mode auth
+from the cosigner's key, info "symbolon v1 duress alert"), one line per
+alert key, to the relay blob `alrt-<log id>-<n>`. Their devices read it
+with `device alerts inbox DIR` (no PIN): the Android app every 15 minutes
+and at every start, as a notification; elsewhere when the app opens.
+
+**The message.** "DURESS: NAME unlocked Symbolon with the duress PIN at
+TIME. Last known location: LAT, LON (within ACC m, AGE old): an
+OpenStreetMap link", or "Location unknown"; then "NAME's duress alert
+ended at TIME (the duress window ran out / ended from another of their
+devices)".
+
+The alert can be seen by a coercer near a contact, and a contact's
+response may be seen by the coercer; the principal chooses who is told.
+
+### 14.5 Limits
 
 A coercer who knows Symbolon's design may demand the real PIN. The design
 offers no deniability about whether a duress PIN exists beyond Section
@@ -2409,7 +2487,7 @@ it are verified; this table is not a claim of security.
   attestation of a non-exportable key; those use Bound.
 - Losing all devices, the kit and the cosigner (or guardian threshold)
   loses everything; the interface says so at setup.
-- Duress protection is bounded (Section 14.4).
+- Duress protection is bounded (Section 14.5).
 - Witness collusion with the sync service defeats fork detection for
   parties that never meet, and a witness majority colluding with a kit
   thief can shorten a recovery delay.
@@ -2836,7 +2914,7 @@ compromise rules under which the lemma must hold.
 5. OS credential-provider availability per platform (not yet verified).
 6. The verification programme of Section 27 (L-01 to L-20, C-01 to C-04)
    before any claim of security.
-7. Legal review of duress (Section 14.4).
+7. Legal review of duress (Section 14.5).
 8. Defining capability sets in provenance records precisely enough for
    Section 17.4 to be a sound policy, not a label.
 9. Recipe repository governance: who signs recipes, review, and how

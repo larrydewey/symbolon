@@ -67,6 +67,19 @@ ref_tbs = tbs(ref_sid, ref_m, EPOCH, a_id, RESHARE)
 first, _, first_m = req(a_dk, a_id)
 
 
+BEACON = 7
+REPLAY = rb(32)
+
+
+def beacon_case(key, who, now, pname, oname, state='fresh()', sid=None, time_shift=0, kind_kit=False):
+    sid = sid or rb(32)
+    m = rb(32)
+    sg = sign(key, tbs(sid, m, EPOCH, who, BEACON))
+    party = f'pt({L(who)}, party_kind_kit(), [])' if kind_kit else f'party_by_id_t({L(who)})'
+    return (f'Party {pname} = {party};\n'
+            f'    BeaconOutcome {oname} = cosigner_beacon({state}, {pname}, {L(sid)}, {L(tbs(sid, m, EPOCH, who, BEACON))}, {L(sg)}, {now + time_shift}, {now});')
+
+
 def end_tbs(started): return arr([tstr('symbolon v1 end-duress'), bstr(log_id), uint(started)])
 
 
@@ -107,6 +120,14 @@ VerifiedHead vh(UInt(64) seq, List(Int) dig) {{ return VerifiedHead {{ .head = h
 
 CosignerState fresh() {{
     return cosigner_new(vh(9, {L(digest)}), [DuressKey {{ .party = {L(a_id)}, .subkey = {L(a_dur_pub)} }}]);
+}}
+
+Party party_by_id_t(List(Int) id) {{ return party_find(head_at(9, []).quorum.parties, id, 0); }}
+
+Party party_find(List(Party) ps, List(Int) id, Int i) {{
+    if (i >= ps.len()) {{ return pt(id, party_kind_device(), []); }}
+    if (hex_encode(ps[i].id) == hex_encode(id)) {{ return ps[i]; }}
+    return party_find(ps, id, i + 1);
 }}
 
 Str err_str(SymbolonError e) {{
@@ -212,6 +233,41 @@ test "end-duress needs policy[1] devices other than the duress device" {{
     expect(ended(s, EndDuress {{ .log_id = {L(log_id)}, .started_at = {DSTART}, .sigs = [{esig(b_dk, b_id, DSTART)}, {esig(b_dk, b_id, DSTART)}] }}, {DSTART + 5})).toEqual("quorum 1/2");
     expect(ended(s, EndDuress {{ .log_id = {L(log_id)}, .started_at = {DSTART}, .sigs = [{esig(b_dk, b_id, DSTART + 1)}, {esig(c_dk, c_id, DSTART + 1)}] }}, {DSTART + 5})).toEqual("quorum 0/2");
     expect(ended(s, EndDuress {{ .log_id = {L(log_id)}, .started_at = {DSTART + 1}, .sigs = [{esig(b_dk, b_id, DSTART + 1)}, {esig(c_dk, c_id, DSTART + 1)}] }}, {DSTART + 5})).toEqual("duress: end-duress names another window");
+}}
+
+// Unlock beacons (SPEC 14.4): kind 7, signed like requests.
+Str bea(BeaconOutcome o) {{
+    return (if (o.opened) {{ "opened" }} else {{ "-" }}) + (if (o.ended) {{ " ended" }} else {{ "" }});
+}}
+
+test "a DK-signed beacon changes nothing; a duress one opens the window once" {{
+    {beacon_case(a_dk, a_id, DSTART, 'p0', 'b0')}
+    expect(bea(b0)).toEqual("-");
+    expect(cosigner_in_duress(b0.s, {DSTART + 1})).toBeFalse();
+    {beacon_case(a_dur, a_id, DSTART, 'p1', 'b1')}
+    expect(bea(b1)).toEqual("opened");
+    expect(cosigner_in_duress(b1.s, {DSTART + 1})).toBeTrue();
+    {beacon_case(a_dur, a_id, DSTART + 30, 'p2', 'b2', state='b1.s')}
+    expect(bea(b2)).toEqual("-");
+    expect(cosigner_in_duress(b2.s, {DSTART + 31})).toBeTrue();
+}}
+
+test "a beacon is refused when replayed, stale, or not from a device" {{
+    {beacon_case(a_dur, a_id, DSTART, 'p3', 'b3', sid=REPLAY)}
+    {beacon_case(a_dur, a_id, DSTART + 5, 'p4', 'b4', state='without_duress(b3.s)', sid=REPLAY)}
+    expect(bea(b4)).toEqual("-");
+    {beacon_case(a_dur, a_id, DSTART, 'p5', 'b5', time_shift=601)}
+    expect(bea(b5)).toEqual("-");
+    {beacon_case(a_dk, kit_id, DSTART, 'p6', 'b6', kind_kit=True)}
+    expect(bea(b6)).toEqual("-");
+}}
+
+test "after policy[6] seconds a beacon reports the window ran out" {{
+    {beacon_case(a_dur, a_id, DSTART, 'p7', 'b7')}
+    {beacon_case(b_dk, b_id, DSTART + 600, 'p8', 'b8', state='b7.s')}
+    expect(bea(b8)).toEqual("- ended");
+    expect(window_ran_out(b7.s, {DSTART + 600})).toBeTrue();
+    expect(window_ran_out(b7.s, {DSTART + 599})).toBeFalse();
 }}
 
 Str moved(CosignerState s, VerifiedHead v) {{

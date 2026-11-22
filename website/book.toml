@@ -32,6 +32,7 @@ nav = [
     "page|guide/ssh",
     "page|guide/security-keys",
     "page|guide/recovery",
+    "page|guide/duress-alerts",
     "page|guide/migration",
 
     "topic|Organizations|org",

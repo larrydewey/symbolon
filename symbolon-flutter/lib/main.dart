@@ -8,6 +8,7 @@ import 'package:flutter/services.dart';
 import 'app.dart';
 import 'autofill_main.dart';
 import 'brand.dart';
+import 'cli.dart';
 import 'fill_consent.dart';
 import 'ssh_consent.dart';
 import 'pages/home_page.dart';
@@ -111,6 +112,7 @@ class _ShellState extends State<Shell> with WidgetsBindingObserver {
     _nav.setMethodCallHandler((c) async {
       if (c.method == 'open') _openPage(c.arguments as String?);
     });
+    WidgetsBinding.instance.addPostFrameCallback((_) => _householdAlerts());
     WidgetsBinding.instance.addPostFrameCallback((_) async {
       try {
         _openPage(await _nav.invokeMethod<String>('take'));
@@ -150,6 +152,39 @@ class _ShellState extends State<Shell> with WidgetsBindingObserver {
   @override
   void didChangeAppLifecycleState(AppLifecycleState s) {
     if (s == AppLifecycleState.paused || s == AppLifecycleState.hidden) widget.app.session.lock();
+    if (s == AppLifecycleState.resumed) _householdAlerts();
+  }
+
+  // Household members' duress alerts (SPEC 14.4), when this device receives
+  // them: on Android as notifications (AlertWorker.kt, also every 15
+  // minutes in the background); elsewhere shown here.
+  bool _checking = false;
+  Future<void> _householdAlerts() async {
+    final app = widget.app;
+    if (_checking || !File('${app.dir}/alert-key').existsSync()) return;
+    _checking = true;
+    try {
+      if (Platform.isAndroid) {
+        await const MethodChannel('symbolon/platform').invokeMethod<bool>('checkAlerts', app.dir);
+        return;
+      }
+      final found = HouseholdAlert.parse(await app.cli.alertsInbox(app.dir));
+      for (final a in found) {
+        if (!mounted) return;
+        await showDialog<void>(
+            context: context,
+            builder: (c) => AlertDialog(
+                  icon: const Icon(Icons.campaign, size: 40),
+                  title: Text(a.subject),
+                  content: SelectableText(a.text),
+                  actions: [FilledButton(onPressed: () => Navigator.of(c).pop(), child: const Text('OK'))],
+                ));
+      }
+    } on Object {
+      // Offline: the next start or resume tries again.
+    } finally {
+      _checking = false;
+    }
   }
 
   void go(int i) => setState(() {

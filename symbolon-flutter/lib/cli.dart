@@ -442,6 +442,105 @@ class SymbolonCli {
 
   Future<CliResult> recoverFinish(String dir, String kitSeed, String pin, {String primes = ''}) =>
       run(['device', 'recover-finish', dir, kitSeed, if (primes.isNotEmpty) primes], input: [pin]);
+
+  // Duress alerts (SPEC 14.4).
+
+  /// The unlock beacon, sent after every unlock under either PIN; [location]
+  /// is "LAT,LON,ACC,AGE" (1e-7 degrees, meters, seconds) or empty.
+  Future<CliResult> beacon(String dir, String pin, {String location = ''}) =>
+      run(['device', 'beacon', dir, if (location.isNotEmpty) ...['--location', location]], input: [pin], timeout: const Duration(minutes: 2));
+
+  /// The alert settings and whether a duress window is open.
+  Future<CliResult> alerts(String dir, String pin) => run(['device', 'alerts', dir], input: [pin], timeout: const Duration(minutes: 2));
+
+  /// Replaces the contacts (and the name alerts use).
+  Future<CliResult> alertsSet(String dir, String person, List<AlertContact> contacts, String pin) => run(['device', 'alerts', 'set', dir],
+      input: [pin, 'person ${_hexOr(person)}', for (final c in contacts) c.line, ''], timeout: const Duration(minutes: 2));
+
+  /// Ends a duress window another device of this identity opened.
+  Future<CliResult> duressEnd(String dir, String pin) => run(['device', 'duress', 'end', dir], input: [pin], timeout: const Duration(minutes: 2));
+
+  /// Lets this device receive household members' alerts.
+  Future<CliResult> alertsRegister(String dir, String pin) => run(['device', 'alerts', 'register', dir], input: [pin], timeout: const Duration(minutes: 2));
+
+  /// New household alerts (no PIN): "alert SUBJECT-HEX TEXT-HEX" lines.
+  Future<CliResult> alertsInbox(String dir) => run(['device', 'alerts', 'inbox', dir], timeout: const Duration(minutes: 2));
+}
+
+String _hexOr(String s) => s.isEmpty ? '-' : _hex(s);
+
+String _unhex(String h) {
+  if (h == '-') return '';
+  try {
+    return utf8.decode([for (var i = 0; i + 1 < h.length; i += 2) int.parse(h.substring(i, i + 2), radix: 16)], allowMalformed: true);
+  } on FormatException {
+    return '';
+  }
+}
+
+/// Someone told when this identity's duress PIN is used, and how.
+class AlertContact {
+  final String name;
+  final bool ntfy;
+  final String email, phone, household, threnody;
+  final String topic; // the ntfy topic the box made for them ("" if none)
+  const AlertContact({required this.name, this.ntfy = false, this.email = '', this.phone = '', this.household = '', this.threnody = '', this.topic = ''});
+
+  String get line => 'contact ${_hexOr(name)} ${ntfy ? 1 : 0} ${_hexOr(email)} ${_hexOr(phone)} ${_hexOr(household)} ${_hexOr(threnody)}';
+
+  /// The channels, for a list.
+  String get summary => [
+        if (ntfy) 'ntfy',
+        if (email.isNotEmpty) email,
+        if (phone.isNotEmpty) phone,
+        if (household.isNotEmpty) 'Symbolon ($household)',
+        if (threnody.isNotEmpty) 'Threnody',
+      ].join(' · ');
+}
+
+/// What `device alerts` reports.
+class AlertSettings {
+  final String person;
+  final List<AlertContact> contacts;
+  final bool duress;
+  final int startedAt;
+  final String party; // the device that opened the window
+  const AlertSettings({this.person = '', this.contacts = const [], this.duress = false, this.startedAt = 0, this.party = ''});
+
+  static AlertSettings? parse(CliResult r) {
+    if (!r.ok) return null;
+    var person = '';
+    final cs = <AlertContact>[];
+    bool? duress;
+    var started = 0;
+    var party = '';
+    for (final l in r.lines) {
+      final p = l.trim().split(' ');
+      if (p.length == 2 && p[0] == 'person') person = _unhex(p[1]);
+      if (p.length == 8 && p[0] == 'contact') {
+        cs.add(AlertContact(name: _unhex(p[1]), ntfy: p[2] == '1', email: _unhex(p[3]), phone: _unhex(p[4]), household: _unhex(p[5]), threnody: _unhex(p[6]), topic: p[7] == '-' ? '' : p[7]));
+      }
+      if (p.length == 2 && p[0] == 'duress' && p[1] == 'none') duress = false;
+      if (p.length == 4 && p[0] == 'duress' && p[1] == 'open') {
+        duress = true;
+        started = int.tryParse(p[2]) ?? 0;
+        party = p[3];
+      }
+    }
+    if (duress == null) return null;
+    return AlertSettings(person: person, contacts: cs, duress: duress, startedAt: started, party: party);
+  }
+}
+
+/// A household member's alert, from `device alerts inbox`.
+class HouseholdAlert {
+  final String subject, text;
+  const HouseholdAlert(this.subject, this.text);
+
+  static List<HouseholdAlert> parse(CliResult r) => [
+        for (final l in r.lines)
+          if (l.startsWith('alert ') && l.trim().split(' ').length == 3) HouseholdAlert(_unhex(l.trim().split(' ')[1]), _unhex(l.trim().split(' ')[2])),
+      ];
 }
 
 /// What `device status` reports.

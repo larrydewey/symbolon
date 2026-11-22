@@ -4,6 +4,7 @@ import 'package:material_ui/material_ui.dart';
 
 import '../app.dart';
 import '../widgets.dart';
+import 'alerts_page.dart';
 import 'breach_page.dart';
 import 'devices_page.dart';
 import 'hardware_page.dart';
@@ -37,6 +38,14 @@ class MorePage extends StatelessWidget {
           subtitle: const Text('Add a device to your identity'),
           trailing: const Icon(Icons.chevron_right),
           onTap: () => open(DevicesPage(app: app)),
+        ),
+        ListTile(
+          key: const Key('open-alerts'),
+          leading: const Icon(Icons.campaign_outlined),
+          title: const Text('Duress alerts'),
+          subtitle: const Text('Who is told when you use your duress PIN'),
+          trailing: const Icon(Icons.chevron_right),
+          onTap: () => open(AlertsPage(app: app)),
         ),
         ListTile(
           leading: const Icon(Icons.healing),

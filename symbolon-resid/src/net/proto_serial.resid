@@ -628,9 +628,280 @@ Result(Parsed(EvalLogAnswer, F), SerialError) derive_eval_log_answer_done(F s, O
 }
 Decode(EvalLogAnswer, F) = derive_eval_log_answer_decode;
 
-// ── Packet (line 92)
+// ── Beacon (line 99)
+/// The serialized field names of `Beacon`, in declaration order.
+pub List(Str) derive_beacon_names() { return ["session_id", "log_id", "epoch", "time", "location", "requester", "sig"]; }
+/// Encodes a `Beacon` through the encoder `s`.
+@needs(Encoder(F))
+pub Result(F, SerialError) derive_beacon_encode(Beacon v, F s) {
+    Int n = 7;
+    F s0 = write_struct_begin(s, "Beacon", n)?;
+    F s1 = write_named(s0, "session_id", v.session_id)?;
+    F s2 = write_named(s1, "log_id", v.log_id)?;
+    F s3 = write_named(s2, "epoch", v.epoch)?;
+    F s4 = write_named(s3, "time", v.time)?;
+    F s5 = write_named(s4, "location", v.location)?;
+    F s6 = write_named(s5, "requester", v.requester)?;
+    F s7 = write_named(s6, "sig", v.sig)?;
+    return write_struct_end(s7);
+}
+Encode(Beacon, F) = derive_beacon_encode;
+/// Decodes a `Beacon` from the decoder `s`, with the input left over.
+@needs(Decoder(F))
+pub Result(Parsed(Beacon, F), SerialError) derive_beacon_decode(F s) {
+    F s0 = read_struct_begin(s, "Beacon", derive_beacon_names())?;
+    return derive_beacon_fields(s0, None, None, None, None, None, None, None);
+}
+@needs(Decoder(F))
+Result(Parsed(Beacon, F), SerialError) derive_beacon_fields(F s, Option(List(Int)) f_session_id, Option(List(Int)) f_log_id, Option(Int) f_epoch, Option(Int) f_time, Option(List(Int)) f_location, Option(List(Int)) f_requester, Option(List(Int)) f_sig) {
+    Parsed(FieldKey, F) k = read_field(s, derive_beacon_names())?;
+    FieldKey key = k.value;
+    return match key {
+        KnownField(i) => derive_beacon_field(k.rest, i, f_session_id, f_log_id, f_epoch, f_time, f_location, f_requester, f_sig),
+        UnknownField(name) => derive_beacon_fields(skip_unknown(k.rest, name, derive_beacon_names(), false)?, f_session_id, f_log_id, f_epoch, f_time, f_location, f_requester, f_sig),
+        EndOfFields => derive_beacon_done(k.rest, f_session_id, f_log_id, f_epoch, f_time, f_location, f_requester, f_sig)
+    };
+}
+@needs(Decoder(F))
+Result(Parsed(Beacon, F), SerialError) derive_beacon_field(F s, Int i, Option(List(Int)) f_session_id, Option(List(Int)) f_log_id, Option(Int) f_epoch, Option(Int) f_time, Option(List(Int)) f_location, Option(List(Int)) f_requester, Option(List(Int)) f_sig) {
+    if (i == 0) { Parsed(Option(List(Int)), F) p = read_slot(s, f_session_id, "session_id")?; return derive_beacon_fields(p.rest, p.value, f_log_id, f_epoch, f_time, f_location, f_requester, f_sig); }
+    if (i == 1) { Parsed(Option(List(Int)), F) p = read_slot(s, f_log_id, "log_id")?; return derive_beacon_fields(p.rest, f_session_id, p.value, f_epoch, f_time, f_location, f_requester, f_sig); }
+    if (i == 2) { Parsed(Option(Int), F) p = read_slot(s, f_epoch, "epoch")?; return derive_beacon_fields(p.rest, f_session_id, f_log_id, p.value, f_time, f_location, f_requester, f_sig); }
+    if (i == 3) { Parsed(Option(Int), F) p = read_slot(s, f_time, "time")?; return derive_beacon_fields(p.rest, f_session_id, f_log_id, f_epoch, p.value, f_location, f_requester, f_sig); }
+    if (i == 4) { Parsed(Option(List(Int)), F) p = read_slot(s, f_location, "location")?; return derive_beacon_fields(p.rest, f_session_id, f_log_id, f_epoch, f_time, p.value, f_requester, f_sig); }
+    if (i == 5) { Parsed(Option(List(Int)), F) p = read_slot(s, f_requester, "requester")?; return derive_beacon_fields(p.rest, f_session_id, f_log_id, f_epoch, f_time, f_location, p.value, f_sig); }
+    Parsed(Option(List(Int)), F) p = read_slot(s, f_sig, "sig")?; return derive_beacon_fields(p.rest, f_session_id, f_log_id, f_epoch, f_time, f_location, f_requester, p.value);
+}
+Result(Parsed(Beacon, F), SerialError) derive_beacon_done(F s, Option(List(Int)) f_session_id, Option(List(Int)) f_log_id, Option(Int) f_epoch, Option(Int) f_time, Option(List(Int)) f_location, Option(List(Int)) f_requester, Option(List(Int)) f_sig) {
+    List(Int) d_session_id = require(f_session_id, "session_id")?;
+    List(Int) d_log_id = require(f_log_id, "log_id")?;
+    Int d_epoch = require(f_epoch, "epoch")?;
+    Int d_time = require(f_time, "time")?;
+    List(Int) d_location = require(f_location, "location")?;
+    List(Int) d_requester = require(f_requester, "requester")?;
+    List(Int) d_sig = require(f_sig, "sig")?;
+    return parsed(Beacon {.session_id = d_session_id, .log_id = d_log_id, .epoch = d_epoch, .time = d_time, .location = d_location, .requester = d_requester, .sig = d_sig}, s);
+}
+Decode(Beacon, F) = derive_beacon_decode;
+
+// ── AlertContact (line 103)
+/// The serialized field names of `AlertContact`, in declaration order.
+pub List(Str) derive_alert_contact_names() { return ["name", "ntfy", "email", "phone", "household", "threnody"]; }
+/// Encodes a `AlertContact` through the encoder `s`.
+@needs(Encoder(F))
+pub Result(F, SerialError) derive_alert_contact_encode(AlertContact v, F s) {
+    Int n = 6;
+    F s0 = write_struct_begin(s, "AlertContact", n)?;
+    F s1 = write_named(s0, "name", v.name)?;
+    F s2 = write_named(s1, "ntfy", v.ntfy)?;
+    F s3 = write_named(s2, "email", v.email)?;
+    F s4 = write_named(s3, "phone", v.phone)?;
+    F s5 = write_named(s4, "household", v.household)?;
+    F s6 = write_named(s5, "threnody", v.threnody)?;
+    return write_struct_end(s6);
+}
+Encode(AlertContact, F) = derive_alert_contact_encode;
+/// Decodes a `AlertContact` from the decoder `s`, with the input left over.
+@needs(Decoder(F))
+pub Result(Parsed(AlertContact, F), SerialError) derive_alert_contact_decode(F s) {
+    F s0 = read_struct_begin(s, "AlertContact", derive_alert_contact_names())?;
+    return derive_alert_contact_fields(s0, None, None, None, None, None, None);
+}
+@needs(Decoder(F))
+Result(Parsed(AlertContact, F), SerialError) derive_alert_contact_fields(F s, Option(Str) f_name, Option(Bool) f_ntfy, Option(Str) f_email, Option(Str) f_phone, Option(Str) f_household, Option(Str) f_threnody) {
+    Parsed(FieldKey, F) k = read_field(s, derive_alert_contact_names())?;
+    FieldKey key = k.value;
+    return match key {
+        KnownField(i) => derive_alert_contact_field(k.rest, i, f_name, f_ntfy, f_email, f_phone, f_household, f_threnody),
+        UnknownField(name) => derive_alert_contact_fields(skip_unknown(k.rest, name, derive_alert_contact_names(), false)?, f_name, f_ntfy, f_email, f_phone, f_household, f_threnody),
+        EndOfFields => derive_alert_contact_done(k.rest, f_name, f_ntfy, f_email, f_phone, f_household, f_threnody)
+    };
+}
+@needs(Decoder(F))
+Result(Parsed(AlertContact, F), SerialError) derive_alert_contact_field(F s, Int i, Option(Str) f_name, Option(Bool) f_ntfy, Option(Str) f_email, Option(Str) f_phone, Option(Str) f_household, Option(Str) f_threnody) {
+    if (i == 0) { Parsed(Option(Str), F) p = read_slot(s, f_name, "name")?; return derive_alert_contact_fields(p.rest, p.value, f_ntfy, f_email, f_phone, f_household, f_threnody); }
+    if (i == 1) { Parsed(Option(Bool), F) p = read_slot(s, f_ntfy, "ntfy")?; return derive_alert_contact_fields(p.rest, f_name, p.value, f_email, f_phone, f_household, f_threnody); }
+    if (i == 2) { Parsed(Option(Str), F) p = read_slot(s, f_email, "email")?; return derive_alert_contact_fields(p.rest, f_name, f_ntfy, p.value, f_phone, f_household, f_threnody); }
+    if (i == 3) { Parsed(Option(Str), F) p = read_slot(s, f_phone, "phone")?; return derive_alert_contact_fields(p.rest, f_name, f_ntfy, f_email, p.value, f_household, f_threnody); }
+    if (i == 4) { Parsed(Option(Str), F) p = read_slot(s, f_household, "household")?; return derive_alert_contact_fields(p.rest, f_name, f_ntfy, f_email, f_phone, p.value, f_threnody); }
+    Parsed(Option(Str), F) p = read_slot(s, f_threnody, "threnody")?; return derive_alert_contact_fields(p.rest, f_name, f_ntfy, f_email, f_phone, f_household, p.value);
+}
+Result(Parsed(AlertContact, F), SerialError) derive_alert_contact_done(F s, Option(Str) f_name, Option(Bool) f_ntfy, Option(Str) f_email, Option(Str) f_phone, Option(Str) f_household, Option(Str) f_threnody) {
+    Str d_name = require(f_name, "name")?;
+    Bool d_ntfy = require(f_ntfy, "ntfy")?;
+    Str d_email = require(f_email, "email")?;
+    Str d_phone = require(f_phone, "phone")?;
+    Str d_household = require(f_household, "household")?;
+    Str d_threnody = require(f_threnody, "threnody")?;
+    return parsed(AlertContact {.name = d_name, .ntfy = d_ntfy, .email = d_email, .phone = d_phone, .household = d_household, .threnody = d_threnody}, s);
+}
+Decode(AlertContact, F) = derive_alert_contact_decode;
+
+// ── AlertConfig (line 108)
+/// The serialized field names of `AlertConfig`, in declaration order.
+pub List(Str) derive_alert_config_names() { return ["session_id", "log_id", "epoch", "set", "person", "contacts", "requester", "sig"]; }
+/// Encodes a `AlertConfig` through the encoder `s`.
+@needs(Encoder(F))
+pub Result(F, SerialError) derive_alert_config_encode(AlertConfig v, F s) {
+    Int n = 8;
+    F s0 = write_struct_begin(s, "AlertConfig", n)?;
+    F s1 = write_named(s0, "session_id", v.session_id)?;
+    F s2 = write_named(s1, "log_id", v.log_id)?;
+    F s3 = write_named(s2, "epoch", v.epoch)?;
+    F s4 = write_named(s3, "set", v.set)?;
+    F s5 = write_named(s4, "person", v.person)?;
+    F s6 = write_named(s5, "contacts", v.contacts)?;
+    F s7 = write_named(s6, "requester", v.requester)?;
+    F s8 = write_named(s7, "sig", v.sig)?;
+    return write_struct_end(s8);
+}
+Encode(AlertConfig, F) = derive_alert_config_encode;
+/// Decodes a `AlertConfig` from the decoder `s`, with the input left over.
+@needs(Decoder(F))
+pub Result(Parsed(AlertConfig, F), SerialError) derive_alert_config_decode(F s) {
+    F s0 = read_struct_begin(s, "AlertConfig", derive_alert_config_names())?;
+    return derive_alert_config_fields(s0, None, None, None, None, None, None, None, None);
+}
+@needs(Decoder(F))
+Result(Parsed(AlertConfig, F), SerialError) derive_alert_config_fields(F s, Option(List(Int)) f_session_id, Option(List(Int)) f_log_id, Option(Int) f_epoch, Option(Bool) f_set, Option(Str) f_person, Option(List(AlertContact)) f_contacts, Option(List(Int)) f_requester, Option(List(Int)) f_sig) {
+    Parsed(FieldKey, F) k = read_field(s, derive_alert_config_names())?;
+    FieldKey key = k.value;
+    return match key {
+        KnownField(i) => derive_alert_config_field(k.rest, i, f_session_id, f_log_id, f_epoch, f_set, f_person, f_contacts, f_requester, f_sig),
+        UnknownField(name) => derive_alert_config_fields(skip_unknown(k.rest, name, derive_alert_config_names(), false)?, f_session_id, f_log_id, f_epoch, f_set, f_person, f_contacts, f_requester, f_sig),
+        EndOfFields => derive_alert_config_done(k.rest, f_session_id, f_log_id, f_epoch, f_set, f_person, f_contacts, f_requester, f_sig)
+    };
+}
+@needs(Decoder(F))
+Result(Parsed(AlertConfig, F), SerialError) derive_alert_config_field(F s, Int i, Option(List(Int)) f_session_id, Option(List(Int)) f_log_id, Option(Int) f_epoch, Option(Bool) f_set, Option(Str) f_person, Option(List(AlertContact)) f_contacts, Option(List(Int)) f_requester, Option(List(Int)) f_sig) {
+    if (i == 0) { Parsed(Option(List(Int)), F) p = read_slot(s, f_session_id, "session_id")?; return derive_alert_config_fields(p.rest, p.value, f_log_id, f_epoch, f_set, f_person, f_contacts, f_requester, f_sig); }
+    if (i == 1) { Parsed(Option(List(Int)), F) p = read_slot(s, f_log_id, "log_id")?; return derive_alert_config_fields(p.rest, f_session_id, p.value, f_epoch, f_set, f_person, f_contacts, f_requester, f_sig); }
+    if (i == 2) { Parsed(Option(Int), F) p = read_slot(s, f_epoch, "epoch")?; return derive_alert_config_fields(p.rest, f_session_id, f_log_id, p.value, f_set, f_person, f_contacts, f_requester, f_sig); }
+    if (i == 3) { Parsed(Option(Bool), F) p = read_slot(s, f_set, "set")?; return derive_alert_config_fields(p.rest, f_session_id, f_log_id, f_epoch, p.value, f_person, f_contacts, f_requester, f_sig); }
+    if (i == 4) { Parsed(Option(Str), F) p = read_slot(s, f_person, "person")?; return derive_alert_config_fields(p.rest, f_session_id, f_log_id, f_epoch, f_set, p.value, f_contacts, f_requester, f_sig); }
+    if (i == 5) { Parsed(Option(List(AlertContact)), F) p = read_slot(s, f_contacts, "contacts")?; return derive_alert_config_fields(p.rest, f_session_id, f_log_id, f_epoch, f_set, f_person, p.value, f_requester, f_sig); }
+    if (i == 6) { Parsed(Option(List(Int)), F) p = read_slot(s, f_requester, "requester")?; return derive_alert_config_fields(p.rest, f_session_id, f_log_id, f_epoch, f_set, f_person, f_contacts, p.value, f_sig); }
+    Parsed(Option(List(Int)), F) p = read_slot(s, f_sig, "sig")?; return derive_alert_config_fields(p.rest, f_session_id, f_log_id, f_epoch, f_set, f_person, f_contacts, f_requester, p.value);
+}
+Result(Parsed(AlertConfig, F), SerialError) derive_alert_config_done(F s, Option(List(Int)) f_session_id, Option(List(Int)) f_log_id, Option(Int) f_epoch, Option(Bool) f_set, Option(Str) f_person, Option(List(AlertContact)) f_contacts, Option(List(Int)) f_requester, Option(List(Int)) f_sig) {
+    List(Int) d_session_id = require(f_session_id, "session_id")?;
+    List(Int) d_log_id = require(f_log_id, "log_id")?;
+    Int d_epoch = require(f_epoch, "epoch")?;
+    Bool d_set = require(f_set, "set")?;
+    Str d_person = require(f_person, "person")?;
+    List(AlertContact) d_contacts = require(f_contacts, "contacts")?;
+    List(Int) d_requester = require(f_requester, "requester")?;
+    List(Int) d_sig = require(f_sig, "sig")?;
+    return parsed(AlertConfig {.session_id = d_session_id, .log_id = d_log_id, .epoch = d_epoch, .set = d_set, .person = d_person, .contacts = d_contacts, .requester = d_requester, .sig = d_sig}, s);
+}
+Decode(AlertConfig, F) = derive_alert_config_decode;
+
+// ── AlertState (line 113)
+/// The serialized field names of `AlertState`, in declaration order.
+pub List(Str) derive_alert_state_names() { return ["session_id", "person", "contacts", "topics", "duress", "started_at", "party"]; }
+/// Encodes a `AlertState` through the encoder `s`.
+@needs(Encoder(F))
+pub Result(F, SerialError) derive_alert_state_encode(AlertState v, F s) {
+    Int n = 7;
+    F s0 = write_struct_begin(s, "AlertState", n)?;
+    F s1 = write_named(s0, "session_id", v.session_id)?;
+    F s2 = write_named(s1, "person", v.person)?;
+    F s3 = write_named(s2, "contacts", v.contacts)?;
+    F s4 = write_named(s3, "topics", v.topics)?;
+    F s5 = write_named(s4, "duress", v.duress)?;
+    F s6 = write_named(s5, "started_at", v.started_at)?;
+    F s7 = write_named(s6, "party", v.party)?;
+    return write_struct_end(s7);
+}
+Encode(AlertState, F) = derive_alert_state_encode;
+/// Decodes a `AlertState` from the decoder `s`, with the input left over.
+@needs(Decoder(F))
+pub Result(Parsed(AlertState, F), SerialError) derive_alert_state_decode(F s) {
+    F s0 = read_struct_begin(s, "AlertState", derive_alert_state_names())?;
+    return derive_alert_state_fields(s0, None, None, None, None, None, None, None);
+}
+@needs(Decoder(F))
+Result(Parsed(AlertState, F), SerialError) derive_alert_state_fields(F s, Option(List(Int)) f_session_id, Option(Str) f_person, Option(List(AlertContact)) f_contacts, Option(List(Str)) f_topics, Option(Bool) f_duress, Option(Int) f_started_at, Option(List(Int)) f_party) {
+    Parsed(FieldKey, F) k = read_field(s, derive_alert_state_names())?;
+    FieldKey key = k.value;
+    return match key {
+        KnownField(i) => derive_alert_state_field(k.rest, i, f_session_id, f_person, f_contacts, f_topics, f_duress, f_started_at, f_party),
+        UnknownField(name) => derive_alert_state_fields(skip_unknown(k.rest, name, derive_alert_state_names(), false)?, f_session_id, f_person, f_contacts, f_topics, f_duress, f_started_at, f_party),
+        EndOfFields => derive_alert_state_done(k.rest, f_session_id, f_person, f_contacts, f_topics, f_duress, f_started_at, f_party)
+    };
+}
+@needs(Decoder(F))
+Result(Parsed(AlertState, F), SerialError) derive_alert_state_field(F s, Int i, Option(List(Int)) f_session_id, Option(Str) f_person, Option(List(AlertContact)) f_contacts, Option(List(Str)) f_topics, Option(Bool) f_duress, Option(Int) f_started_at, Option(List(Int)) f_party) {
+    if (i == 0) { Parsed(Option(List(Int)), F) p = read_slot(s, f_session_id, "session_id")?; return derive_alert_state_fields(p.rest, p.value, f_person, f_contacts, f_topics, f_duress, f_started_at, f_party); }
+    if (i == 1) { Parsed(Option(Str), F) p = read_slot(s, f_person, "person")?; return derive_alert_state_fields(p.rest, f_session_id, p.value, f_contacts, f_topics, f_duress, f_started_at, f_party); }
+    if (i == 2) { Parsed(Option(List(AlertContact)), F) p = read_slot(s, f_contacts, "contacts")?; return derive_alert_state_fields(p.rest, f_session_id, f_person, p.value, f_topics, f_duress, f_started_at, f_party); }
+    if (i == 3) { Parsed(Option(List(Str)), F) p = read_slot(s, f_topics, "topics")?; return derive_alert_state_fields(p.rest, f_session_id, f_person, f_contacts, p.value, f_duress, f_started_at, f_party); }
+    if (i == 4) { Parsed(Option(Bool), F) p = read_slot(s, f_duress, "duress")?; return derive_alert_state_fields(p.rest, f_session_id, f_person, f_contacts, f_topics, p.value, f_started_at, f_party); }
+    if (i == 5) { Parsed(Option(Int), F) p = read_slot(s, f_started_at, "started_at")?; return derive_alert_state_fields(p.rest, f_session_id, f_person, f_contacts, f_topics, f_duress, p.value, f_party); }
+    Parsed(Option(List(Int)), F) p = read_slot(s, f_party, "party")?; return derive_alert_state_fields(p.rest, f_session_id, f_person, f_contacts, f_topics, f_duress, f_started_at, p.value);
+}
+Result(Parsed(AlertState, F), SerialError) derive_alert_state_done(F s, Option(List(Int)) f_session_id, Option(Str) f_person, Option(List(AlertContact)) f_contacts, Option(List(Str)) f_topics, Option(Bool) f_duress, Option(Int) f_started_at, Option(List(Int)) f_party) {
+    List(Int) d_session_id = require(f_session_id, "session_id")?;
+    Str d_person = require(f_person, "person")?;
+    List(AlertContact) d_contacts = require(f_contacts, "contacts")?;
+    List(Str) d_topics = require(f_topics, "topics")?;
+    Bool d_duress = require(f_duress, "duress")?;
+    Int d_started_at = require(f_started_at, "started_at")?;
+    List(Int) d_party = require(f_party, "party")?;
+    return parsed(AlertState {.session_id = d_session_id, .person = d_person, .contacts = d_contacts, .topics = d_topics, .duress = d_duress, .started_at = d_started_at, .party = d_party}, s);
+}
+Decode(AlertState, F) = derive_alert_state_decode;
+
+// ── EndDuressReq (line 118)
+/// The serialized field names of `EndDuressReq`, in declaration order.
+pub List(Str) derive_end_duress_req_names() { return ["log_id", "started_at", "signers", "sigs"]; }
+/// Encodes a `EndDuressReq` through the encoder `s`.
+@needs(Encoder(F))
+pub Result(F, SerialError) derive_end_duress_req_encode(EndDuressReq v, F s) {
+    Int n = 4;
+    F s0 = write_struct_begin(s, "EndDuressReq", n)?;
+    F s1 = write_named(s0, "log_id", v.log_id)?;
+    F s2 = write_named(s1, "started_at", v.started_at)?;
+    F s3 = write_named(s2, "signers", v.signers)?;
+    F s4 = write_named(s3, "sigs", v.sigs)?;
+    return write_struct_end(s4);
+}
+Encode(EndDuressReq, F) = derive_end_duress_req_encode;
+/// Decodes a `EndDuressReq` from the decoder `s`, with the input left over.
+@needs(Decoder(F))
+pub Result(Parsed(EndDuressReq, F), SerialError) derive_end_duress_req_decode(F s) {
+    F s0 = read_struct_begin(s, "EndDuressReq", derive_end_duress_req_names())?;
+    return derive_end_duress_req_fields(s0, None, None, None, None);
+}
+@needs(Decoder(F))
+Result(Parsed(EndDuressReq, F), SerialError) derive_end_duress_req_fields(F s, Option(List(Int)) f_log_id, Option(Int) f_started_at, Option(List(List(Int))) f_signers, Option(List(List(Int))) f_sigs) {
+    Parsed(FieldKey, F) k = read_field(s, derive_end_duress_req_names())?;
+    FieldKey key = k.value;
+    return match key {
+        KnownField(i) => derive_end_duress_req_field(k.rest, i, f_log_id, f_started_at, f_signers, f_sigs),
+        UnknownField(name) => derive_end_duress_req_fields(skip_unknown(k.rest, name, derive_end_duress_req_names(), false)?, f_log_id, f_started_at, f_signers, f_sigs),
+        EndOfFields => derive_end_duress_req_done(k.rest, f_log_id, f_started_at, f_signers, f_sigs)
+    };
+}
+@needs(Decoder(F))
+Result(Parsed(EndDuressReq, F), SerialError) derive_end_duress_req_field(F s, Int i, Option(List(Int)) f_log_id, Option(Int) f_started_at, Option(List(List(Int))) f_signers, Option(List(List(Int))) f_sigs) {
+    if (i == 0) { Parsed(Option(List(Int)), F) p = read_slot(s, f_log_id, "log_id")?; return derive_end_duress_req_fields(p.rest, p.value, f_started_at, f_signers, f_sigs); }
+    if (i == 1) { Parsed(Option(Int), F) p = read_slot(s, f_started_at, "started_at")?; return derive_end_duress_req_fields(p.rest, f_log_id, p.value, f_signers, f_sigs); }
+    if (i == 2) { Parsed(Option(List(List(Int))), F) p = read_slot(s, f_signers, "signers")?; return derive_end_duress_req_fields(p.rest, f_log_id, f_started_at, p.value, f_sigs); }
+    Parsed(Option(List(List(Int))), F) p = read_slot(s, f_sigs, "sigs")?; return derive_end_duress_req_fields(p.rest, f_log_id, f_started_at, f_signers, p.value);
+}
+Result(Parsed(EndDuressReq, F), SerialError) derive_end_duress_req_done(F s, Option(List(Int)) f_log_id, Option(Int) f_started_at, Option(List(List(Int))) f_signers, Option(List(List(Int))) f_sigs) {
+    List(Int) d_log_id = require(f_log_id, "log_id")?;
+    Int d_started_at = require(f_started_at, "started_at")?;
+    List(List(Int)) d_signers = require(f_signers, "signers")?;
+    List(List(Int)) d_sigs = require(f_sigs, "sigs")?;
+    return parsed(EndDuressReq {.log_id = d_log_id, .started_at = d_started_at, .signers = d_signers, .sigs = d_sigs}, s);
+}
+Decode(EndDuressReq, F) = derive_end_duress_req_decode;
+
+// ── Packet (line 121)
 /// The serialized variant names of `Packet`, in declaration order.
-pub List(Str) derive_packet_variants() { return ["WKeygen", "WSign", "WSession", "WRefused", "WKitHalf", "WSignEvent", "WEventSig", "WReshare", "WEnrollSecrets", "WKitKey", "WKitRelease", "WDuressKey", "WKvDeal", "WKvHalf", "WEval", "WEvalAnswer", "WEvalLog", "WEvalLogAnswer"]; }
+pub List(Str) derive_packet_variants() { return ["WKeygen", "WSign", "WSession", "WRefused", "WKitHalf", "WSignEvent", "WEventSig", "WReshare", "WEnrollSecrets", "WKitKey", "WKitRelease", "WDuressKey", "WKvDeal", "WKvHalf", "WEval", "WEvalAnswer", "WEvalLog", "WEvalLogAnswer", "WBeacon", "WAlertConfig", "WAlertState", "WEndDuress", "WAlertKey"]; }
 /// Encodes a `Packet` through the encoder `s`.
 @needs(Encoder(F))
 pub Result(F, SerialError) derive_packet_encode(Packet v, F s) {
@@ -652,7 +923,12 @@ pub Result(F, SerialError) derive_packet_encode(Packet v, F s) {
         WEval(x) => write_newtype_variant(s, "Packet", 14, "WEval", x),
         WEvalAnswer(x) => write_newtype_variant(s, "Packet", 15, "WEvalAnswer", x),
         WEvalLog(x) => write_newtype_variant(s, "Packet", 16, "WEvalLog", x),
-        WEvalLogAnswer(x) => write_newtype_variant(s, "Packet", 17, "WEvalLogAnswer", x)
+        WEvalLogAnswer(x) => write_newtype_variant(s, "Packet", 17, "WEvalLogAnswer", x),
+        WBeacon(x) => write_newtype_variant(s, "Packet", 18, "WBeacon", x),
+        WAlertConfig(x) => write_newtype_variant(s, "Packet", 19, "WAlertConfig", x),
+        WAlertState(x) => write_newtype_variant(s, "Packet", 20, "WAlertState", x),
+        WEndDuress(x) => write_newtype_variant(s, "Packet", 21, "WEndDuress", x),
+        WAlertKey(x) => write_newtype_variant(s, "Packet", 22, "WAlertKey", x)
     };
 }
 Encode(Packet, F) = derive_packet_encode;
@@ -679,11 +955,16 @@ pub Result(Parsed(Packet, F), SerialError) derive_packet_decode(F s) {
     if (i == 15) { Parsed(EvalAnswer, F) p15 = read_newtype_payload(t.rest, "WEvalAnswer")?; Packet u15 = WEvalAnswer(p15.value); return parsed(u15, p15.rest); }
     if (i == 16) { Parsed(EvalLogRequest, F) p16 = read_newtype_payload(t.rest, "WEvalLog")?; Packet u16 = WEvalLog(p16.value); return parsed(u16, p16.rest); }
     if (i == 17) { Parsed(EvalLogAnswer, F) p17 = read_newtype_payload(t.rest, "WEvalLogAnswer")?; Packet u17 = WEvalLogAnswer(p17.value); return parsed(u17, p17.rest); }
+    if (i == 18) { Parsed(Beacon, F) p18 = read_newtype_payload(t.rest, "WBeacon")?; Packet u18 = WBeacon(p18.value); return parsed(u18, p18.rest); }
+    if (i == 19) { Parsed(AlertConfig, F) p19 = read_newtype_payload(t.rest, "WAlertConfig")?; Packet u19 = WAlertConfig(p19.value); return parsed(u19, p19.rest); }
+    if (i == 20) { Parsed(AlertState, F) p20 = read_newtype_payload(t.rest, "WAlertState")?; Packet u20 = WAlertState(p20.value); return parsed(u20, p20.rest); }
+    if (i == 21) { Parsed(EndDuressReq, F) p21 = read_newtype_payload(t.rest, "WEndDuress")?; Packet u21 = WEndDuress(p21.value); return parsed(u21, p21.rest); }
+    if (i == 22) { Parsed(List(Int), F) p22 = read_newtype_payload(t.rest, "WAlertKey")?; Packet u22 = WAlertKey(p22.value); return parsed(u22, p22.rest); }
     return Err(custom_error(f"variant index {i} out of range"));
 }
 Decode(Packet, F) = derive_packet_decode;
 
-// ── Envelope (line 115)
+// ── Envelope (line 149)
 /// The serialized field names of `Envelope`, in declaration order.
 pub List(Str) derive_envelope_names() { return ["from", "to", "enc", "ct"]; }
 /// Encodes a `Envelope` through the encoder `s`.

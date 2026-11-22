@@ -1,0 +1,366 @@
+// Duress alerts on the device (SPEC 14.4):
+//
+//   symbolon device beacon DIR [--location LAT,LON,ACC,AGE]       PIN on stdin
+//       the unlock beacon the app sends at every unlock: signed with the DK
+//       under the real PIN, with the duress sub-key under the duress PIN,
+//       the same size either way; not answered. LAT and LON in 1e-7
+//       degrees, ACC in meters, AGE in seconds (the phone's last known
+//       location; Linux sends none).
+//   symbolon device alerts DIR                                    PIN on stdin
+//       the settings and the duress window: "person NAME-HEX", per contact
+//       "contact NAME-HEX NTFY EMAIL-HEX PHONE-HEX HOUSEHOLD-HEX
+//       THRENODY-HEX TOPIC" (- for empty), then "duress open STARTED
+//       PARTY-HEX" or "duress none"
+//   symbolon device alerts set DIR      PIN, then "person NAME-HEX" and
+//       "contact ..." lines as above (NTFY 0 or 1, without the topic), then
+//       an empty line: replaces the contacts
+//   symbolon device duress end DIR                                PIN on stdin
+//       ends the duress window another device of this identity opened
+//   symbolon device alerts register DIR                           PIN on stdin
+//       this device's alert key, for alerts other household members'
+//       cosigners send (kept without the PIN, so a background job can read
+//       them), given to the cosigner
+//   symbolon device alerts inbox DIR                              no PIN
+//       new household alerts: "alert SUBJECT-HEX TEXT-HEX"
+//
+// Under the duress PIN every command looks the same on the wire (signed
+// with the duress sub-key instead), and the cosigner refuses what the duress
+// profile may not do as an outage looks: the settings read as empty.
+
+import "../types.resid";
+import "../core/log.resid";
+import "../cosigner/cosigner.resid";
+import "../net/proto.resid";
+import "../net/services.resid";
+import "../net/envelope.resid";
+import "../duress/duress.resid";
+import "state.resid";
+import "common.resid";
+import "session.resid";
+import "device.resid";
+import "alerts.resid";
+import "crypto.resid";
+import "word.resid";
+import "hpkeg.resid";
+import "httpserv.resid";
+
+// ─── Sending as this device ─────────────────────────────────────────
+
+// The envelope key and the request signer for the unlocked profile (the
+// duress profile shares the device's identity; only the request key
+// differs, as run_sign_as does).
+@requires(declassify)
+Local local_of(DeviceConfig c, Unlocked u) {
+    return Local {.party = c.party, .cg = 0, .hpke_sk = if (u.kind == 2) { hpkeg_derive_keypair(16, u.duress.share).sk } else { device_hpke(u.real.dek).sk }};
+}
+
+@requires(device, declassify, network, environment)
+List(Int) sign_as(DeviceConfig c, Unlocked u, List(Int) tbs) {
+    if (u.kind == 2) { return sw_sign(u.duress.subkey, tbs); }
+    Result(List(Int), Str) r = dk_sign(c, u.real, u.st, tbs);
+    return match r { Ok(v) => v, Err(_) => [] };
+}
+
+@requires(filesystem, network, clock(readonly), declassify)
+Option(Party) cosigner_party(Str dir, DeviceConfig c) {
+    Result(VerifiedHead, SymbolonError) rv = verified_log_dir(dir, relay_ep(c), c.log_id);
+    return match rv { Err(_) => None, Ok(vh) => cosigner_of(vh.head.quorum.parties, 0) };
+}
+
+@requires(filesystem, network, clock(readonly), declassify)
+Int epoch_of(Str dir, DeviceConfig c) {
+    Result(VerifiedHead, SymbolonError) rv = verified_log_dir(dir, relay_ep(c), c.log_id);
+    return match rv { Err(_) => 0 - 1, Ok(vh) => (Int)vh.head.quorum.epoch };
+}
+
+// ─── The beacon ─────────────────────────────────────────────────────
+
+List(Int) be8s(Int v) { return [(v >> 56) & 255, (v >> 48) & 255, (v >> 40) & 255, (v >> 32) & 255, (v >> 24) & 255, (v >> 16) & 255, (v >> 8) & 255, v & 255]; }
+
+// "LAT,LON,ACC,AGE" as 32 bytes; zeros for "" or anything malformed.
+pub List(Int) location_bytes(Str s) {
+    List(Int) zero = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    List(Str) p = str_split(str_trim(s), ",");
+    if (p.len() != 4 || !int_ok(p[0]) || !int_ok(p[1]) || !int_ok(p[2]) || !int_ok(p[3])) { return zero; }
+    Int lat = str_parse_int(p[0]);
+    Int lon = str_parse_int(p[1]);
+    if (lat < 0 - 900000000 || lat > 900000000 || lon < 0 - 1800000000 || lon > 1800000000) { return zero; }
+    return be8s(lat).concat(be8s(lon)).concat(be8s(str_parse_int(p[2]))).concat(be8s(str_parse_int(p[3])));
+}
+
+Bool int_ok(Str s) {
+    Str t = if (str_starts_with(s, "-")) { str_slice(s, 1, str_len(s)) } else { s };
+    return str_len(t) >= 1 && str_len(t) <= 12 && digits_only_ok(t, 0);
+}
+
+Bool digits_only_ok(Str s, Int i) {
+    if (i >= str_len(s)) { return true; }
+    Str ch = str_slice(s, i, i + 1);
+    return ch >= "0" && ch <= "9" && digits_only_ok(s, i + 1);
+}
+
+@requires(filesystem, device, network, declassify, clock, environment, provision)
+pub Int device_beacon(Str dir, Str location) {
+    Option(DeviceConfig) oc = load_config(dir);
+    return match oc {
+        None => dfail("not set up"),
+        Some(c) => beacon_unlocked(dir, c, unlock_dir(dir, c, read_pin()), location)
+    };
+}
+
+@requires(filesystem, device, network, declassify, clock, environment)
+Int beacon_unlocked(Str dir, DeviceConfig c, Unlocked u, Str location) {
+    if (u.kind != 1 && u.kind != 2) { return dfail("wrong PIN"); }
+    Option(Party) cos = cosigner_party(dir, c);
+    Int epoch = epoch_of(dir, c);
+    return match cos {
+        None => dfail("no cosigner"),
+        Some(p) => beacon_send(c, u, p, epoch, location_bytes(location))
+    };
+}
+
+@requires(device, network, declassify, clock, environment)
+Int beacon_send(DeviceConfig c, Unlocked u, Party cos, Int epoch, List(Int) loc) {
+    Beacon b0 = Beacon {.session_id = random_bytes(32), .log_id = c.log_id, .epoch = epoch, .time = clock_now_seconds(), .location = loc, .requester = c.party, .sig = []};
+    List(Int) sig = sign_as(c, u, request_tbs(b0.session_id, beacon_message(b0), (UInt(32))epoch, c.party, request_beacon()));
+    Beacon b = Beacon {.session_id = b0.session_id, .log_id = b0.log_id, .epoch = b0.epoch, .time = b0.time, .location = b0.location, .requester = b0.requester, .sig = sig};
+    Bool sent = send_to(relay_ep(c), local_of(c, u), Remote {.party = cos.id, .cg = 0, .hpke_pub = cos.hpke_key}, WBeacon(b));
+    if (!sent) { return dfail("cannot reach the relay"); }
+    println("ok");
+    return 0;
+}
+
+// ─── Settings ───────────────────────────────────────────────────────
+
+pub type AlertAnswered = { Option(AlertState) answer; Int next; };
+
+@requires(network, declassify, clock)
+AlertAnswered wait_alert(Endpoint relay, Local me, Remote from, Cursor cur, List(Int) sid, Int until) {
+    Drained d = drain(relay, me, [from], cur, ListBuf());
+    Option(AlertState) a = state_in(d.got, sid, 0);
+    Bool refused = refused_in(d.got, sid, 0);
+    if (refused || clock_now_seconds() > until || match a { Some(_) => true, None => false }) { return AlertAnswered {.answer = a, .next = d.cur.next}; }
+    _ = clock_sleep_ms(150);
+    return wait_alert(relay, me, from, d.cur, sid, until);
+}
+
+Option(AlertState) state_in(List(Got) gs, List(Int) sid, Int i) {
+    if (i >= gs.len()) { return None; }
+    Packet w = gs[i].w;
+    Option(AlertState) a = match w { WAlertState(x) => if (bytes_eq(x.session_id, sid)) { Some(x) } else { None }, _ => None };
+    return match a { Some(_) => a, None => state_in(gs, sid, i + 1) };
+}
+
+Bool refused_in(List(Got) gs, List(Int) sid, Int i) {
+    if (i >= gs.len()) { return false; }
+    Packet w = gs[i].w;
+    Bool r = match w { WRefused(x) => bytes_eq(x, sid), _ => false };
+    return r || refused_in(gs, sid, i + 1);
+}
+
+// Sends a settings request (read, or `set` with these contacts) and waits.
+@requires(filesystem, device, network, declassify, clock, environment)
+Option(AlertState) alert_request(Str dir, DeviceConfig c, Unlocked u, Bool set, Str person, List(AlertContact) cs) {
+    Option(Party) ocos = cosigner_party(dir, c);
+    Int epoch = epoch_of(dir, c);
+    Party cos = ocos else { Party {.id = [], .kind = 0, .auth_key = [], .hpke_key = [], .label = "", .attestation = NoAttestation} };
+    if (cos.id.len() == 0) { return None; }
+    AlertConfig a0 = AlertConfig {.session_id = random_bytes(32), .log_id = c.log_id, .epoch = epoch, .set = set, .person = person, .contacts = cs, .requester = c.party, .sig = []};
+    List(Int) sig = sign_as(c, u, request_tbs(a0.session_id, alert_config_message(a0), (UInt(32))epoch, c.party, request_alert_config()));
+    AlertConfig a = AlertConfig {.session_id = a0.session_id, .log_id = a0.log_id, .epoch = a0.epoch, .set = set, .person = person, .contacts = cs, .requester = c.party, .sig = sig};
+    Endpoint relay = relay_ep(c);
+    Local me = local_of(c, u);
+    Remote cr = Remote {.party = cos.id, .cg = 0, .hpke_pub = cos.hpke_key};
+    Int start = mailbox_end(relay, c.party, c.mbox_next);
+    if (!send_to(relay, me, cr, WAlertConfig(a))) { return None; }
+    AlertAnswered r = wait_alert(relay, me, cr, Cursor {.party = c.party, .next = start}, a.session_id, clock_now_seconds() + 30);
+    _ = save_config(dir, with_log(c, c.witnesses, c.log_id, r.next, c.peers));
+    return r.answer;
+}
+
+Str hx(Str s) { return if (str_len(s) == 0) { "-" } else { hex_encode(str_to_bytes(s)) }; }
+
+Int print_state(AlertState s) {
+    println("person " + hx(s.person));
+    for (Int i in 0..s.contacts.len()) {
+        AlertContact k = s.contacts[i];
+        println("contact " + hx(k.name) + " " + (if (k.ntfy) { "1" } else { "0" }) + " " + hx(k.email) + " " + hx(k.phone) + " " + hx(k.household) + " " + hx(k.threnody) + " "
+                + (if (i < s.topics.len() && k.ntfy) { s.topics[i] } else { "-" }));
+    }
+    println(if (s.duress) { f"duress open {s.started_at} " + hex_encode(s.party) } else { "duress none" });
+    return 0;
+}
+
+@requires(filesystem, device, network, declassify, clock, environment, provision)
+pub Int device_alerts(Str dir) {
+    Option(DeviceConfig) oc = load_config(dir);
+    return match oc { None => dfail("not set up"), Some(c) => alerts_show(dir, c, unlock_dir(dir, c, read_pin())) };
+}
+
+@requires(filesystem, device, network, declassify, clock, environment)
+Int alerts_show(Str dir, DeviceConfig c, Unlocked u) {
+    if (u.kind != 1 && u.kind != 2) { return dfail("wrong PIN"); }
+    Option(AlertState) a = alert_request(dir, c, u, false, "", []);
+    // The duress profile is refused by the cosigner; it shows no settings,
+    // as an identity without any would.
+    if (u.kind == 2) { return print_state(no_settings()); }
+    return match a { None => dfail("the cosigner did not answer"), Some(s) => print_state(s) };
+}
+
+@requires(filesystem, device, network, declassify, clock, environment, provision)
+pub Int device_alerts_set(Str dir) {
+    Option(DeviceConfig) oc = load_config(dir);
+    return match oc { None => dfail("not set up"), Some(c) => alerts_set_unlocked(dir, c, unlock_dir(dir, c, read_pin())) };
+}
+
+type Parsed = { Str person; List(AlertContact) contacts; Bool ok; };
+
+Parsed read_contacts(Parsed p) {
+    Str l = str_trim(read_pin());
+    if (str_len(l) == 0) { return p; }
+    List(Str) w = str_split(l, " ");
+    if (w.len() == 2 && w[0] == "person") { return read_contacts(Parsed {.person = unhx(w[1]), .contacts = p.contacts, .ok = p.ok}); }
+    if (w.len() >= 7 && w[0] == "contact") {
+        AlertContact k = AlertContact {.name = unhx(w[1]), .ntfy = w[2] == "1", .email = unhx(w[3]), .phone = unhx(w[4]), .household = unhx(w[5]), .threnody = unhx(w[6])};
+        Bool good = str_len(k.name) > 0 && str_len(k.name) <= 64 && str_len(k.email) <= 254 && str_len(k.phone) <= 32 && str_len(k.household) <= 32 && str_len(k.threnody) <= 128;
+        return read_contacts(Parsed {.person = p.person, .contacts = p.contacts.concat([k]), .ok = p.ok && good});
+    }
+    return read_contacts(Parsed {.person = p.person, .contacts = p.contacts, .ok = false});
+}
+
+Str unhx(Str h) { return if (h == "-") { "" } else { http_text(cose_hex_decode(h), 0, cose_hex_decode(h).len()) }; }
+
+@requires(filesystem, device, network, declassify, clock, environment)
+Int alerts_set_unlocked(Str dir, DeviceConfig c, Unlocked u) {
+    if (u.kind != 1 && u.kind != 2) { return dfail("wrong PIN"); }
+    Parsed p = read_contacts(Parsed {.person = "", .contacts = [], .ok = true});
+    if (!p.ok || p.contacts.len() > 32) { return dfail("malformed contacts"); }
+    Option(AlertState) a = alert_request(dir, c, u, true, p.person, p.contacts);
+    if (u.kind == 2) { return dfail("the cosigner did not answer"); }
+    return match a { None => dfail("the cosigner did not answer (or a duress window is open)"), Some(s) => print_state(s) };
+}
+
+// ─── Ending duress (SPEC 14.3) ──────────────────────────────────────
+
+@requires(filesystem, device, network, declassify, clock, environment, provision)
+pub Int device_duress_end(Str dir) {
+    Option(DeviceConfig) oc = load_config(dir);
+    return match oc { None => dfail("not set up"), Some(c) => duress_end_unlocked(dir, c, unlock_dir(dir, c, read_pin())) };
+}
+
+@requires(filesystem, device, network, declassify, clock, environment)
+Int duress_end_unlocked(Str dir, DeviceConfig c, Unlocked u) {
+    if (u.kind != 1) { return dfail("wrong PIN"); }
+    Option(AlertState) a = alert_request(dir, c, u, false, "", []);
+    return match a {
+        None => dfail("the cosigner did not answer"),
+        Some(s) => if (!s.duress) { none_open() } else { if (bytes_eq(s.party, c.party)) { dfail("this is the device that opened the duress window: end it from another device") } else { end_send(dir, c, u, s) } }
+    };
+}
+
+Int none_open() { println("duress none"); return 0; }
+
+@requires(filesystem, device, network, declassify, clock, environment)
+Int end_send(Str dir, DeviceConfig c, Unlocked u, AlertState s) {
+    List(Int) sig = sign_as(c, u, end_duress_tbs(c.log_id, s.started_at));
+    Option(Party) cos = cosigner_party(dir, c);
+    Bool sent = match cos {
+        None => false,
+        Some(p) => send_to(relay_ep(c), local_of(c, u), Remote {.party = p.id, .cg = 0, .hpke_pub = p.hpke_key},
+                           WEndDuress(EndDuressReq {.log_id = c.log_id, .started_at = s.started_at, .signers = [c.party], .sigs = [sig]}))
+    };
+    if (!sent) { return dfail("cannot reach the relay"); }
+    _ = clock_sleep_ms(1500);
+    Option(AlertState) after = alert_request(dir, c, u, false, "", []);
+    return match after {
+        None => dfail("the cosigner did not answer"),
+        Some(x) => if (x.duress) { dfail("the duress window is still open (the cosigner refused the end)") } else { ended_ok() }
+    };
+}
+
+Int ended_ok() { println("ended"); return 0; }
+
+// ─── Household alerts ───────────────────────────────────────────────
+
+@requires(filesystem, device, network, declassify, clock, environment, provision)
+pub Int device_alerts_register(Str dir) {
+    Option(DeviceConfig) oc = load_config(dir);
+    return match oc { None => dfail("not set up"), Some(c) => register_unlocked(dir, c, unlock_dir(dir, c, read_pin())) };
+}
+
+// The alert key: 32 random bytes in DIR/alert-key (mode 0600, not under the
+// PIN: a background job reads alerts with it), and the cosigner's HPKE key
+// in DIR/alert-cos (the sender alerts are checked against).
+@requires(filesystem, device, network, declassify, clock, environment)
+Int register_unlocked(Str dir, DeviceConfig c, Unlocked u) {
+    if (u.kind != 1 && u.kind != 2) { return dfail("wrong PIN"); }
+    List(Int) have = get_file(dir + "/alert-key");
+    List(Int) ikm = if (have.len() == 32) { have } else { random_bytes(32) };
+    if (have.len() != 32 && !put_secret_file(dir + "/alert-key", ikm)) { return dfail("cannot store the alert key"); }
+    HpkeKeyPairG(Secret(UInt(8))) kp = hpkeg_derive_keypair(16, secret_bytes(ikm));
+    Option(Party) cos = cosigner_party(dir, c);
+    return match cos {
+        None => dfail("no cosigner"),
+        Some(p) => if (filesystem.write_bytes(dir + "/alert-cos", p.hpke_key) && send_to(relay_ep(c), local_of(c, u), Remote {.party = p.id, .cg = 0, .hpke_pub = p.hpke_key}, WAlertKey(kp.pk))) { registered() } else { dfail("cannot reach the relay") }
+    };
+}
+
+Int registered() { println("registered"); return 0; }
+
+@requires(filesystem, network, clock(readonly), declassify)
+pub Int device_alerts_inbox(Str dir) {
+    Option(DeviceConfig) oc = load_config(dir);
+    return match oc { None => dfail("not set up"), Some(c) => inbox_read(dir, c) };
+}
+
+@requires(filesystem, network, clock(readonly), declassify)
+Int inbox_read(Str dir, DeviceConfig c) {
+    List(Int) ikm = get_file(dir + "/alert-key");
+    List(Int) cos_pk = get_file(dir + "/alert-cos");
+    if (ikm.len() != 32 || cos_pk.len() != 65) { return dfail("this device is not registered for household alerts"); }
+    List(Str) seen = str_split(filesystem.read_all(dir + "/alerts-seen"), "\n");
+    List(Str) names = blob_list(relay_ep(c), "alrt-" + hex_encode(c.log_id) + "-");
+    HpkeKeyPairG(Secret(UInt(8))) kp = hpkeg_derive_keypair(16, secret_bytes(ikm));
+    List(Str) fresh = unseen(names, seen, 0, ListBuf());
+    Int shown = show_each(relay_ep(c), kp.sk, cos_pk, fresh, 0, 0);
+    _ = filesystem.write_all(dir + "/alerts-seen", str_join(seen.concat(fresh), "\n"));
+    return 0;
+}
+
+List(Str) unseen(List(Str) xs, List(Str) seen, Int i, ListBuf(Str) acc) {
+    if (i >= xs.len()) { return acc.finish(); }
+    return unseen(xs, seen, i + 1, if (seen.contains(xs[i])) { acc } else { acc.push(xs[i]) });
+}
+
+@requires(network, clock(readonly), declassify)
+Int show_each(Endpoint relay, List(Secret(UInt(8))) sk, List(Int) cos_pk, List(Str) names, Int i, Int n) {
+    if (i >= names.len()) { return n; }
+    Option(List(Int)) b = blob_get(relay, names[i]);
+    Option(List(Int)) pt = match b { None => None, Some(x) => open_any(str_split(http_text(x, 0, x.len()), "\n"), sk, cos_pk, 0) };
+    Int shown = match pt {
+        None => 0,
+        Some(m) => show_alert(http_text(m, 0, m.len()))
+    };
+    return show_each(relay, sk, cos_pk, names, i + 1, n + shown);
+}
+
+// The line meant for this key: each is "ENC CT" in base64, one per alert key.
+@requires(declassify)
+Option(List(Int)) open_any(List(Str) ls, List(Secret(UInt(8))) sk, List(Int) cos_pk, Int i) {
+    if (i >= ls.len()) { return None; }
+    List(Str) p = str_split(str_trim(ls[i]), " ");
+    if (p.len() != 2) { return open_any(ls, sk, cos_pk, i + 1); }
+    List(Secret(UInt(8))) none = [];
+    HpkeCtxG(Secret(UInt(8))) ctx = hpkeg_setup_receiver_full(envelope_suite(), base64_decode(p[0]), sk, alert_info(), none, [], cos_pk);
+    if (!ctx.ok) { return open_any(ls, sk, cos_pk, i + 1); }
+    HpkeOpenedG(Secret(UInt(8))) o = hpkeg_open(ctx, [], base64_decode(p[1]));
+    return if (o.ok) { Some(reveal(o.pt)) } else { open_any(ls, sk, cos_pk, i + 1) };
+}
+
+Int show_alert(Str m) {
+    Int nl = str_index_of(m, "\n", 0);
+    Str subject = if (nl < 0) { "Duress alert" } else { str_slice(m, 0, nl) };
+    Str text = if (nl < 0) { m } else { str_slice(m, nl + 1, str_len(m)) };
+    println("alert " + hex_encode(str_to_bytes(subject)) + " " + hex_encode(str_to_bytes(text)));
+    return 1;
+}

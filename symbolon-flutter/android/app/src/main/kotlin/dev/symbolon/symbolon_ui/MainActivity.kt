@@ -82,6 +82,23 @@ class MainActivity : FlutterFragmentActivity() {
                 // The current network's DNS servers: Android has no
                 // /etc/resolv.conf, so the agent is told (RESID_RESOLV_CONF).
                 "dnsServers" -> result.success(dnsServers(this))
+                // Duress alerts (SPEC 14.4): the last known location for the
+                // unlock beacon, the permission for it (asked when alerts are
+                // set up), and the household alert check (AlertWorker.kt).
+                "lastLocation" -> result.success(AlertWorker.lastLocation(this))
+                "askLocation" -> {
+                    if (Build.VERSION.SDK_INT >= 23) requestPermissions(arrayOf(android.Manifest.permission.ACCESS_FINE_LOCATION, android.Manifest.permission.ACCESS_COARSE_LOCATION), 7301)
+                    result.success(true)
+                }
+                "watchAlerts" -> {
+                    if (Build.VERSION.SDK_INT >= 33) requestPermissions(arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), 7302)
+                    AlertWorker.watch(this, call.arguments as String)
+                    result.success(true)
+                }
+                "checkAlerts" -> {
+                    val dir = call.arguments as String
+                    Thread { AlertWorker.check(applicationContext, dir); runOnUiThread { result.success(true) } }.start()
+                }
                 // Android autofill (SPEC 22.6): whether Symbolon is the service,
                 // the system page to choose it, and the apps a login may be linked to.
                 "autofillEnabled" -> result.success(Build.VERSION.SDK_INT >= 26 &&

@@ -166,6 +166,30 @@ case "$1 $2" in
       card) echo "$A 12345-67890-11111-22222-33333-44444" ;;
       *) echo "shared folder version 3, 2 people" ;;
     esac ;;
+  "device beacon")
+    # As the agent: the same answer under either PIN.
+    { [ "$PIN" = "2468" ] || [ "$PIN" = "1357" ]; } || { echo "device: wrong PIN" >&2; exit 1; }
+    echo "$PIN ${5:-}" >> "$D/beacons.log"; echo "ok" ;;
+  "device alerts")
+    case "$3" in
+      inbox) [ -f "$D/inbox" ] && { cat "$D/inbox"; rm -f "$D/inbox"; }; exit 0 ;;
+    esac
+    { [ "$PIN" = "2468" ] || [ "$PIN" = "1357" ]; } || { echo "device: wrong PIN" >&2; exit 1; }
+    case "$3" in
+      register) mkdir -p "$4"; printf 'k' > "$4/alert-key"; echo "registered"; exit 0 ;;
+      set)
+        [ "$PIN" = "1357" ] && { echo "device: the cosigner did not answer" >&2; exit 1; }
+        [ -f "$D/duress-open" ] && { echo "device: the cosigner did not answer (or a duress window is open)" >&2; exit 1; }
+        printf '%s\n' "$IN" | sed 1d | grep -v '^$' | awk '$1 == "contact" { t = ($3 == "1") ? "duress-" substr("0123456789abcdef0123", NR, 16) : "-"; print $0 " " t; next } { print }' > "$D/alerts.state" ;;
+    esac
+    if [ "$PIN" = "1357" ]; then echo "person -"; echo "duress none"; exit 0; fi
+    [ -f "$D/alerts.state" ] && cat "$D/alerts.state" || echo "person -"
+    [ -f "$D/duress-open" ] && echo "duress open 1800000000 $(cat "$D/duress-open")" || echo "duress none" ;;
+  "device duress")
+    [ "$PIN" = "2468" ] || { echo "device: wrong PIN" >&2; exit 1; }
+    [ -f "$D/duress-open" ] || { echo "duress none"; exit 0; }
+    [ "$(cat "$D/duress-open")" = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff" ] && { echo "device: this is the device that opened the duress window: end it from another device" >&2; exit 1; }
+    rm -f "$D/duress-open"; echo "ended" ;;
   "device org")
     A=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
     B=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb

@@ -28,8 +28,25 @@ class PinSession extends ChangeNotifier {
     if (keepMinutes > 0) _timer = Timer(Duration(minutes: keepMinutes), forget);
   }
 
+  /// Told of each unlock (a PIN that was not held, and that an action
+  /// accepted): the duress alert's beacon (SPEC 14.4). The same for either
+  /// PIN; the same PIN again within two minutes is not told twice.
+  void Function(String pin)? onUnlock;
+  int? _toldHash;
+  DateTime _toldAt = DateTime.fromMillisecondsSinceEpoch(0);
+
+  void _tell(String pin) {
+    final h = pin.hashCode;
+    final now = DateTime.now();
+    if (h == _toldHash && now.difference(_toldAt) < const Duration(minutes: 2)) return;
+    _toldHash = h;
+    _toldAt = now;
+    onUnlock?.call(pin);
+  }
+
   /// Remembers [pin] (after an action it unlocked succeeded).
   void remember(String pin) {
+    if (_pin != pin) _tell(pin);
     if (keepMinutes == 0) return;
     _pin = pin;
     _arm();

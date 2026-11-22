@@ -88,6 +88,35 @@ pub type EvalLogEntry = { Int time; List(Int) device; Int count; };
 //@ serial
 pub type EvalLogAnswer = { List(Int) session_id; Int now; Int limit; List(EvalLogEntry) entries; };
 
+// ─── Duress alerts (SPEC 14.4) ─────────────────────────────────────
+
+// Sent at every unlock, by the real profile (signed with the DK) and by the
+// duress profile (signed with the duress sub-key) alike, so the traffic is
+// the same either way. `location` is always 32 bytes (all zeros when there
+// is none): latitude and longitude in 1e-7 degrees, accuracy in meters and
+// age in seconds, each 8 bytes big-endian, two's complement.
+//@ serial
+pub type Beacon = { List(Int) session_id; List(Int) log_id; Int epoch; Int time; List(Int) location; List(Int) requester; List(Int) sig; };
+
+// Someone the cosigner tells when this identity is under duress, and how.
+//@ serial
+pub type AlertContact = { Str name; Bool ntfy; Str email; Str phone; Str household; Str threnody; };
+
+// Ask for the alert settings (`set` false) or replace them; signed by a
+// device's DK (the duress profile has none).
+//@ serial
+pub type AlertConfig = { List(Int) session_id; List(Int) log_id; Int epoch; Bool set; Str person; List(AlertContact) contacts; List(Int) requester; List(Int) sig; };
+
+// The settings as the cosigner keeps them, with each contact's ntfy topic,
+// and whether a duress window is open (and since when, by which device).
+//@ serial
+pub type AlertState = { List(Int) session_id; Str person; List(AlertContact) contacts; List(Str) topics; Bool duress; Int started_at; List(Int) party; };
+
+// An end-duress message (SPEC 14.3): the window it ends and the device
+// signatures over ["symbolon v1 end-duress", log_id, started_at].
+//@ serial
+pub type EndDuressReq = { List(Int) log_id; Int started_at; List(List(Int)) signers; List(List(Int)) sigs; };
+
 //@ serial
 pub type Packet =
     WKeygen(KeygenInvite)
@@ -107,7 +136,12 @@ pub type Packet =
   | WEval(EvalRequest)                    // a protected-item evaluation request (SPEC 18.10.3)
   | WEvalAnswer(EvalAnswer)               // its answer; a refusal is WRefused(session id)
   | WEvalLog(EvalLogRequest)              // the evaluation records, asked for
-  | WEvalLogAnswer(EvalLogAnswer);        // and given
+  | WEvalLogAnswer(EvalLogAnswer)         // and given
+  | WBeacon(Beacon)                       // an unlock (SPEC 14.4); no answer
+  | WAlertConfig(AlertConfig)             // the duress alert settings, asked for or set
+  | WAlertState(AlertState)               // and answered
+  | WEndDuress(EndDuressReq)              // end a duress window early (SPEC 14.3)
+  | WAlertKey(List(Int));                 // the sender's alert key (household alerts, SPEC 14.4)
 
 // What the relay carries: sender and recipient party ids, and the HPKE
 // mode_auth encapsulation and ciphertext of one Packet value.
@@ -134,6 +168,24 @@ List(Int) be8(Int v) { return [(v >> 56) & 255, (v >> 48) & 255, (v >> 40) & 255
 List(Int) flat_bl(List(List(Int)) xs, Int i, List(Int) acc) { return if (i >= xs.len()) { acc } else { flat_bl(xs, i + 1, acc.concat([xs[i].len() & 255]).concat(xs[i])) }; }
 
 pub List(Int) eval_log_message() { return sha256_bytes(utf8("symbolon v1 eval log")); }
+
+// What a beacon's signature covers as its message m.
+pub List(Int) beacon_message(Beacon b) { return sha256_bytes(utf8("symbolon v1 beacon").concat(b.log_id).concat(be8(b.time)).concat(b.location)); }
+
+// What an alert-settings request signs as its message m.
+pub List(Int) alert_config_message(AlertConfig a) {
+    return sha256_bytes(utf8("symbolon v1 alert config").concat(a.log_id).concat([if (a.set) { 1 } else { 0 }]).concat(utf8(a.person)).concat(contacts_bytes(a.contacts, 0, [])));
+}
+
+List(Int) contacts_bytes(List(AlertContact) cs, Int i, List(Int) acc) {
+    if (i >= cs.len()) { return acc; }
+    AlertContact c = cs[i];
+    List(Int) one = lp_str(c.name).concat([if (c.ntfy) { 1 } else { 0 }]).concat(lp_str(c.email)).concat(lp_str(c.phone)).concat(lp_str(c.household)).concat(lp_str(c.threnody));
+    return contacts_bytes(cs, i + 1, acc.concat(one));
+}
+
+// A string with its length first, so fields cannot run into each other.
+List(Int) lp_str(Str s) { List(Int) b = utf8(s); return [(b.len() >> 8) & 255, b.len() & 255].concat(b); }
 
 List(Int) ids_bytes(List(Party) ps, Int i, List(Int) acc) {
     if (i >= ps.len()) { return acc; }

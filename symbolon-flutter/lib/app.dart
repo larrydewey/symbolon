@@ -2,6 +2,7 @@
 
 import 'dart:io';
 
+import 'package:flutter/services.dart';
 import 'package:flutter/widgets.dart';
 
 import 'biometric.dart';
@@ -15,6 +16,21 @@ class App {
   final PinSession session;
   App(this.settings) : session = PinSession(keepMinutes: settings.keepUnlockedMinutes) {
     session.unlocker = () => Bio.unlock('Unlock Symbolon');
+    session.onUnlock = beacon;
+  }
+
+  /// The unlock beacon (SPEC 14.4): after every unlock, under either PIN,
+  /// the cosigner is told, with the phone's last known location. Under the
+  /// duress PIN it opens the duress window and the cosigner alerts the
+  /// chosen contacts; under the real one it is dropped. Nothing waits for
+  /// it and nothing on screen differs.
+  Future<void> beacon(String pin) async {
+    try {
+      final loc = Platform.isAndroid ? await const MethodChannel('symbolon/platform').invokeMethod<String>('lastLocation') ?? '' : '';
+      await cli.beacon(dir, pin, location: loc);
+    } on Object {
+      // Offline or not set up: nothing to tell.
+    }
   }
 
   late final Favicons _favicons = Favicons(Directory('${settings.file.parent.path}/icons'));
