@@ -255,6 +255,26 @@ class SymbolonCli {
     }
   }
 
+  /// Signs in to LastPass and imports its vault (experimental,
+  /// lpsignin.resid): the same conversation as [signinBitwarden].
+  Future<AgentConversation?> signinLastpass(String dir, {String share = '', Map<String, String> extraEnv = const {}}) async {
+    try {
+      final p = await Process.start(binary, ['device', 'vault', 'signin-lastpass', dir, ..._in(share)], environment: {...env, ...extraEnv});
+      return AgentConversation._(p);
+    } on ProcessException {
+      return null;
+    }
+  }
+
+  /// An export handed over on standard input as one [line] (1Password CLI
+  /// output, format "1password-op"), checked without the PIN.
+  Future<CliResult> vaultImportLinePreview(String dir, String line, String format) =>
+      run(['device', 'vault', 'import', dir, '-', '--format', format, '--dry-run'], input: [line], timeout: const Duration(minutes: 5));
+
+  /// The export in [line] into the vault, as one new version.
+  Future<CliResult> vaultImportLine(String dir, String line, String format, String pin, {String share = ''}) =>
+      run(['device', 'vault', 'import', dir, '-', '--format', format, ..._in(share)], input: [line, pin], timeout: const Duration(minutes: 15));
+
   /// Each login's password against Pwned Passwords (SPEC 26.1):
   /// "breached NAME-HEX COUNT" lines, "protected N not checked", then
   /// "checked N breached M". [extraEnv]: where the trust anchors and DNS

@@ -4,6 +4,8 @@ import 'package:file_picker/file_picker.dart';
 import 'package:material_ui/material_ui.dart';
 
 import '../app.dart';
+import '../cli.dart';
+import '../onepassword.dart';
 import '../settings.dart';
 import '../vault_types.dart';
 import '../widgets.dart';
@@ -80,6 +82,7 @@ class ImportPreview {
 class _ImportPageState extends State<ImportPage> {
   _Source? source;
   String? file;
+  String? opLine;                      // 1Password's items, read through its CLI, until imported
   ImportPreview? preview;
   int? imported;
 
@@ -101,13 +104,37 @@ class _ImportPageState extends State<ImportPage> {
     });
   }
 
+  // 1Password on Linux: its CLI reads the items (1Password asks to be
+  // unlocked); they go to the agent on standard input.
+  Future<void> _onePassword() async {
+    final res = await runTask(context, 'Reading 1Password', () async {
+      try {
+        final line = await readOnePassword();
+        opLine = line;
+        return await app.cli.vaultImportLinePreview(app.dir, line, '1password-op');
+      } on OpProblem catch (e) {
+        return CliResult(1, '', 'device: ${e.message}');
+      }
+    }, usually: 'under a minute');
+    if (!mounted) return;
+    if (!res.ok) {
+      opLine = null;
+      return;
+    }
+    setState(() {
+      file = null;
+      preview = ImportPreview.parse(res.lines);
+    });
+  }
+
   Future<void> go() async {
     final f = file;
+    final op = opLine;
     final p = preview;
-    if (f == null || p == null || p.items.isEmpty) return;
+    if ((f == null && op == null) || p == null || p.items.isEmpty) return;
     final passkeys = widget.share.isEmpty && p.items.any((i) => i.type == 'passkey');
     final r = await app.withPin(context, (pin) => runTask(context, 'Importing ${p.items.length} items', () async {
-          final r = await app.cli.vaultImport(app.dir, f, pin, share: widget.share);
+          final r = op != null ? await app.cli.vaultImportLine(app.dir, op, '1password-op', pin, share: widget.share) : await app.cli.vaultImport(app.dir, f!, pin, share: widget.share);
           // Imported passkeys are offered at sign-in, and listed to be
           // replaced, from the same list as Symbolon's own.
           if (r.ok && passkeys) {
@@ -117,6 +144,7 @@ class _ImportPageState extends State<ImportPage> {
           return r;
         }, usually: 'under a minute'));
     if (!mounted || r == null || !r.ok) return;
+    opLine = null;
     await _forgetCopy();
     final total = r.lines.map((l) => l.trim()).where((l) => l.startsWith('total ')).map((l) => int.tryParse(l.substring(6)) ?? 0).firstOrNull ?? p.items.length;
     setState(() => imported = total);
@@ -147,8 +175,8 @@ class _ImportPageState extends State<ImportPage> {
     );
   }
 
-  Future<void> _signIn() async {
-    final ok = await Navigator.of(context).push<bool>(MaterialPageRoute(builder: (_) => SignInImportPage(app: app, share: widget.share)));
+  Future<void> _signIn({bool lastpass = false}) async {
+    final ok = await Navigator.of(context).push<bool>(MaterialPageRoute(builder: (_) => SignInImportPage(app: app, share: widget.share, lastpass: lastpass)));
     if (ok == true && mounted) Navigator.of(context).pop(true);
   }
 
@@ -166,6 +194,27 @@ class _ImportPageState extends State<ImportPage> {
             onTap: _signIn,
           ),
         ),
+        Card(
+          child: ListTile(
+            key: const Key('source-signin-lastpass'),
+            leading: const Icon(Icons.login),
+            title: const Text('LastPass'),
+            subtitle: const Text('Sign in with your email and master password (experimental)'),
+            trailing: const Icon(Icons.chevron_right),
+            onTap: () => _signIn(lastpass: true),
+          ),
+        ),
+        if (Platform.isLinux)
+          Card(
+            child: ListTile(
+              key: const Key('source-onepassword-cli'),
+              leading: const Icon(Icons.login),
+              title: const Text('1Password'),
+              subtitle: const Text('Through the 1Password app on this computer (it asks you to unlock it)'),
+              trailing: const Icon(Icons.chevron_right),
+              onTap: _onePassword,
+            ),
+          ),
         const SizedBox(height: 8),
         const Section('Or import an export file', children: [
           Text('Symbolon reads the export file your password manager makes. Everything comes across in one go: logins, cards, '
@@ -201,7 +250,12 @@ class _ImportPageState extends State<ImportPage> {
     return [
       ...importPreviewView(context, p),
       if (p.items.isNotEmpty) WideButton('Import ${p.items.length} item${p.items.length == 1 ? '' : 's'}', key: const Key('import-go'), icon: Icons.move_to_inbox, onPressed: go),
-      TextButton(onPressed: () => setState(() => preview = null), child: const Text('Choose another file')),
+      TextButton(
+          onPressed: () => setState(() {
+                preview = null;
+                opLine = null;
+              }),
+          child: const Text('Choose another source')),
     ];
   }
 

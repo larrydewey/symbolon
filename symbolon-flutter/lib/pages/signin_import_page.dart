@@ -8,14 +8,16 @@ import '../vault_types.dart';
 import '../widgets.dart';
 import 'import_page.dart';
 
-/// Moving in from Bitwarden or Vaultwarden by signing in, with no export
-/// file (`symbolon device vault signin-bitwarden`): the agent signs in,
+/// Moving in from Bitwarden or Vaultwarden (or, experimentally, LastPass)
+/// by signing in, with no export file (`symbolon device vault
+/// signin-bitwarden`, `signin-lastpass`): the agent signs in,
 /// downloads the encrypted vault and opens it on this device; nothing of it
 /// is written down unencrypted. Pops true when items were imported.
 class SignInImportPage extends StatefulWidget {
   final App app;
   final String share;
-  const SignInImportPage({super.key, required this.app, this.share = ''});
+  final bool lastpass;
+  const SignInImportPage({super.key, required this.app, this.share = '', this.lastpass = false});
 
   @override
   State<SignInImportPage> createState() => _SignInImportPageState();
@@ -43,6 +45,7 @@ class _SignInImportPageState extends State<SignInImportPage> {
   List<String> methods = [];
   String method = '0';
   bool newDevice = false;
+  String lpKind = '';            // LastPass: the authenticator a code is from
   ImportPreview? preview;
   int imported = 0;
   AgentConversation? conv;
@@ -68,7 +71,7 @@ class _SignInImportPageState extends State<SignInImportPage> {
     if (email.text.trim().isEmpty || password.text.isEmpty) {
       return setState(() => error = 'Enter your email and master password.');
     }
-    if (server == 'self' && !url.text.trim().startsWith('https://')) {
+    if (!widget.lastpass && server == 'self' && !url.text.trim().startsWith('https://')) {
       return setState(
         () => error = 'Enter your server\'s address, starting with https://',
       );
@@ -84,7 +87,7 @@ class _SignInImportPageState extends State<SignInImportPage> {
     } on StateError catch (e) {
       return _stop(e.message);
     }
-    final c = await app.cli.signinBitwarden(
+    final c = widget.lastpass ? await app.cli.signinLastpass(app.dir, share: widget.share, extraEnv: env) : await app.cli.signinBitwarden(
       app.dir,
       _server,
       share: widget.share,
@@ -129,6 +132,23 @@ class _SignInImportPageState extends State<SignInImportPage> {
           newDevice = false;
           step = _Step.code;
         });
+      }
+      // LastPass: a code from the named authenticator, or an approval on
+      // another device that the agent waits for itself.
+      if (f.length >= 3 && f[0] == 'need' && f[1] == 'code') {
+        return setState(() {
+          lpKind = f[2];
+          newDevice = false;
+          step = _Step.code;
+        });
+      }
+      if (f.length >= 3 && f[0] == 'wait' && f[1] == 'push') {
+        final who = f[2] == '-' ? 'your authenticator app' : _unhexOr(f[2]);
+        setState(() {
+          step = _Step.busy;
+          busy = 'Approve the sign-in in $who on your phone';
+        });
+        continue;
       }
       if (f.length >= 2 && f[0] == 'need' && f[1] == 'newdevice') {
         return setState(() {
@@ -177,7 +197,7 @@ class _SignInImportPageState extends State<SignInImportPage> {
       step = _Step.busy;
       busy = 'Checking the code';
     });
-    conv?.send(newDevice ? 'code 0 $v' : 'code $method $v');
+    conv?.send(lpKind.isNotEmpty ? 'code $lpKind $v' : newDevice ? 'code 0 $v' : 'code $method $v');
     await _pump();
   }
 
@@ -249,7 +269,7 @@ class _SignInImportPageState extends State<SignInImportPage> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('Sign in to Bitwarden')),
+      appBar: AppBar(title: Text(widget.lastpass ? 'Sign in to LastPass' : 'Sign in to Bitwarden')),
       body: PageBody(
         children: switch (step) {
           _Step.form => _form(),
@@ -308,14 +328,21 @@ class _SignInImportPageState extends State<SignInImportPage> {
 
   List<Widget> _form() => [
     Section(
-      'Your Bitwarden account',
+      widget.lastpass ? 'Your LastPass account' : 'Your Bitwarden account',
       children: [
         const Text(
           'Symbolon signs in, downloads your encrypted vault and opens it on this device. Your master password is used '
           'once and not kept; nothing is saved unencrypted.',
         ),
+        if (widget.lastpass) ...[
+          const SizedBox(height: 12),
+          const ImportWarning(
+            'Experimental: LastPass offers no supported way for other apps to sign in, so Symbolon speaks the protocol of '
+            'LastPass\'s own command-line tool. If it stops working, export a CSV from LastPass instead.',
+          ),
+        ],
         const SizedBox(height: 12),
-        SegmentedButton<String>(
+        if (!widget.lastpass) SegmentedButton<String>(
           key: const Key('signin-server'),
           segments: const [
             ButtonSegment(value: 'bitwarden.com', label: Text('bitwarden.com')),
@@ -326,7 +353,7 @@ class _SignInImportPageState extends State<SignInImportPage> {
           onSelectionChanged: (s) => setState(() => server = s.first),
         ),
         const SizedBox(height: 12),
-        if (server == 'self')
+        if (!widget.lastpass && server == 'self')
           Field(
             url,
             'Server address',
@@ -359,7 +386,9 @@ class _SignInImportPageState extends State<SignInImportPage> {
       newDevice ? 'Check your email' : 'Two-step login',
       children: [
         Text(
-          newDevice
+          lpKind.isNotEmpty
+              ? 'Enter the code from ${const {'google': 'Google Authenticator', 'microsoft': 'Microsoft Authenticator', 'yubikey': 'your YubiKey', 'sesame': 'LastPass Sesame'}[lpKind] ?? 'your authenticator app'}.'
+              : newDevice
               ? 'Bitwarden emailed a code to confirm this new device. Enter it here.'
               : method == '1'
               ? 'Enter the code Bitwarden emailed you.'
@@ -368,7 +397,7 @@ class _SignInImportPageState extends State<SignInImportPage> {
               : 'Enter the code from your ${_methods[method]?.toLowerCase()}.',
         ),
         const SizedBox(height: 12),
-        if (!newDevice && methods.length > 1)
+        if (lpKind.isEmpty && !newDevice && methods.length > 1)
           Wrap(
             spacing: 8,
             children: [
@@ -394,7 +423,7 @@ class _SignInImportPageState extends State<SignInImportPage> {
           icon: Icons.arrow_forward,
           onPressed: sendCode,
         ),
-        if (!newDevice && method == '1')
+        if (lpKind.isEmpty && !newDevice && method == '1')
           TextButton(onPressed: emailMe, child: const Text('Email me a code')),
       ],
     ),

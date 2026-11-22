@@ -19,6 +19,19 @@ class FakeAgent {
 D="$(dirname "$0")"
 echo "$*" >> "$D/args.log"
 [ -n "${SYMBOLON_FILL:-}" ] && echo "$3 $SYMBOLON_FILL" >> "$D/fill.log"
+# Signing in to LastPass: an approval on the phone, then a code.
+if [ "$1 $2 $3" = "device vault signin-lastpass" ]; then
+  hx() { printf '%s' "$1" | od -An -tx1 | tr -d ' \n'; }
+  read -r EMAIL; read -r PW
+  printf '%s\n%s\n' "$EMAIL" "$PW" > "$D/signin.log"
+  echo "wait push $(hx 'LastPass Authenticator')"; sleep 0.3
+  echo "need code google"
+  read -r CODE; echo "$CODE" >> "$D/signin.log"
+  echo "item login $(hx router) -"; echo "total 1"; echo "ready"
+  read -r GO; read -r P; printf '%s\n%s\n' "$GO" "$P" >> "$D/signin.log"
+  [ "$GO" = "import" ] && [ "$P" = "2468" ] || exit 1
+  echo "vault version 2, 1 items"; echo "total 1"; exit 0
+fi
 # Signing in to Bitwarden is a conversation: lines come one at a time.
 if [ "$1 $2 $3" = "device vault signin-bitwarden" ]; then
   hx() { printf '%s' "$1" | od -An -tx1 | tr -d ' \n'; }

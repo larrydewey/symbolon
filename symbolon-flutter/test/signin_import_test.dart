@@ -29,7 +29,7 @@ void main() {
     }
   }
 
-  Future<void> openSignIn(WidgetTester t) async {
+  Future<void> openSignIn(WidgetTester t, {String source = 'source-signin-bitwarden'}) async {
     t.view.devicePixelRatio = 3;
     t.view.physicalSize = const Size(420, 1400) * 3;
     addTearDown(t.view.reset);
@@ -39,7 +39,7 @@ void main() {
     await settle(t);
     await t.tap(find.text('Import'));
     await settle(t);
-    await t.tap(find.byKey(const Key('source-signin-bitwarden')));
+    await t.tap(find.byKey(Key(source)));
     await settle(t);
   }
 
@@ -85,5 +85,35 @@ void main() {
     await settle(t);
     expect(find.text('the email or master password is wrong'), findsOneWidget);
     expect(find.byKey(const Key('signin-go')), findsOneWidget);
+  });
+
+  testWidgets('LastPass: says it is experimental, waits for the push, asks for the code', (t) async {
+    await openSignIn(t, source: 'source-signin-lastpass');
+    expect(find.text('Sign in to LastPass'), findsOneWidget);
+    expect(find.textContaining('Experimental'), findsOneWidget);
+    expect(find.byKey(const Key('signin-server')), findsNothing);
+    await t.enterText(find.byKey(const Key('signin-email')), 'bob@example.com');
+    await t.enterText(find.byKey(const Key('signin-password')), 'secret phrase');
+    await t.tap(find.byKey(const Key('signin-go')));
+    await settle(t);
+    expect(find.text('Enter the code from Google Authenticator.'), findsOneWidget);
+    await t.enterText(find.byKey(const Key('signin-code')), '654321');
+    await t.tap(find.byKey(const Key('signin-code-go')));
+    await settle(t);
+    expect(find.text('Ready to import 1 item'), findsOneWidget);
+    await t.tap(find.byKey(const Key('signin-import-go')));
+    await settle(t);
+    await t.enterText(find.byKey(const Key('secret-field')), '2468');
+    await t.tap(find.byKey(const Key('secret-ok')));
+    await settle(t);
+    await settle(t);
+    expect(find.byKey(const Key('signin-import-done')), findsOneWidget);
+    final log = (await t.runAsync(() => agent.signinLog.readAsString()))!.split('\n');
+    expect(log.take(5).toList(), ['bob@example.com', 'secret phrase', 'code google 654321', 'import', '2468']);
+    await t.tap(find.text('Done'));
+    await settle(t);
+    final l = find.byKey(const Key('lock'));
+    if (l.evaluate().isNotEmpty) await t.tap(l.first);
+    await settle(t);
   });
 }
