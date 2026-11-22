@@ -174,9 +174,11 @@ def setup(url, ca, out):
     lh = login_hash(b.mk, b.password)
     g = b.call("POST", "/api/two-factor/get-authenticator", json={"masterPasswordHash": lh})
     secret = (g.get("authenticator") or g)["key"]
-    b.call("POST", "/api/two-factor/authenticator", json={"key": secret, "token": totp(secret), "masterPasswordHash": lh,
+    t0 = time.time()
+    enable_code = totp(secret, t0)
+    b.call("POST", "/api/two-factor/authenticator", json={"key": secret, "token": enable_code, "masterPasswordHash": lh,
                                                           "userVerificationToken": g.get("userVerificationToken")})
-    want["bob"] = {"email": b.email, "password": b.password, "items": ["router"], "absent": [], "totp": secret, "router_password": "r0uter"}
+    want["bob"] = {"email": b.email, "password": b.password, "items": ["router"], "absent": [], "totp": secret, "used_codes": [totp(secret, t0 - 30), enable_code, totp(secret, t0 + 30)], "router_password": "r0uter"}
     json.dump(want, open(out, "w"), indent=1)
 
 

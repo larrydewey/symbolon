@@ -117,6 +117,10 @@ class _SignInImportPageState extends State<SignInImportPage> {
               : why.replaceFirst('device: ', ''),
         );
       }
+      if (l.trim() == 'bad code') {
+        error = 'That code did not work. Try the newest one.';
+        continue;
+      }
       final f = l.trim().split(' ');
       if (f.length >= 3 && f[0] == 'need' && f[1] == '2fa') {
         final offered = f[2].split(',').where(_methods.containsKey).toList();
@@ -194,6 +198,7 @@ class _SignInImportPageState extends State<SignInImportPage> {
     if (v.isEmpty) return;
     code.clear();
     setState(() {
+      error = null;
       step = _Step.busy;
       busy = 'Checking the code';
     });
@@ -417,6 +422,7 @@ class _SignInImportPageState extends State<SignInImportPage> {
           action: TextInputAction.done,
           onSubmitted: (_) => sendCode(),
         ),
+        if (error != null) ImportWarning(error!),
         WideButton(
           'Continue',
           key: const Key('signin-code-go'),

@@ -19,7 +19,8 @@
 //        8 recovery code; others are not offered here) or "need newdevice"
 //        (bitwarden.com emailed a code); in "code P VALUE", "send-email"
 //        (asks the server to email a two-step code; then "need 2fa" again),
-//        or "cancel"
+//        or "cancel"; a wrong, expired or reused code: "bad code", then
+//        the same question again
 //   out  "fail TEXT-HEX" and exit 1 on any failure
 //   then the file importer's preview ("item", "skip", "warn", "total"),
 //   "ready", and with --dry-run the end; otherwise in "import" (or
@@ -284,7 +285,7 @@ Result(BwKdf, Str) prelogin(BwSvc s, Str email) {
 }
 
 // What a token request ended in.
-type Tok = TokOk(BwSession) | TokNeed2fa(List(Int)) | TokNeedDevice | TokFail(Str);
+type Tok = TokOk(BwSession) | TokNeed2fa(List(Int)) | TokNeedDevice | TokBadCode | TokFail(Str);
 
 @requires(network, clock(readonly), declassify)
 Tok token(BwSvc s, Str email, Str hash, BwKdf k, List(Secret(UInt(8))) mk, Str extra) {
@@ -304,7 +305,7 @@ Tok token(BwSvc s, Str email, Str hash, BwKdf k, List(Secret(UInt(8))) mk, Str e
     if (str_contains(d, "new device verification")) { return TokNeedDevice; }
     if (str_contains(d, "captcha")) { return TokFail("the server wants a captcha: sign in once in Bitwarden's web vault on this network, then try again"); }
     if (str_contains(d, "username or password") || str_contains(d, "invalid_username_or_password")) { return TokFail("the email or master password is wrong"); }
-    if (str_contains(d, "two-step token is invalid") || str_contains(d, "invalid two")) { return TokFail("that code is wrong or expired"); }
+    if (str_contains(d, "two-step token is invalid") || str_contains(d, "invalid two") || str_contains(d, "invalid totp") || str_contains(d, "invalid code")) { return TokBadCode; }
     return TokFail(f"the server refused the sign-in ({r.status}): " + str_trim(d));
 }
 
@@ -339,6 +340,8 @@ Tok answer(BwSvc s, Str email, Str hash, BwKdf k, List(Secret(UInt(8))) mk, Tok 
     return match t {
         TokOk(x) => t,
         TokFail(m) => t,
+        // A code before any was asked for: not a step this client takes.
+        TokBadCode => TokFail("that code is wrong or expired"),
         TokNeedDevice => if (rounds <= 0) { TokFail("too many tries") } else { ask_device(s, email, hash, k, mk, rounds) },
         TokNeed2fa(ps) => if (rounds <= 0) { TokFail("too many tries") } else { ask_code(s, email, hash, k, mk, ps, rounds) }
     };
@@ -349,7 +352,17 @@ Tok ask_device(BwSvc s, Str email, Str hash, BwKdf k, List(Secret(UInt(8))) mk, 
     println("need newdevice");
     List(Str) w = str_split(str_trim(read_line()), " ");
     if (w.len() < 2 || w[0] != "code") { return TokFail("cancelled"); }
-    return answer(s, email, hash, k, mk, token(s, email, hash, k, mk, "&newDeviceOtp=" + bw_form(w[w.len() - 1])), rounds - 1);
+    Tok t = token(s, email, hash, k, mk, "&newDeviceOtp=" + bw_form(w[w.len() - 1]));
+    return match t {
+        TokBadCode => if (rounds <= 1) { TokFail("too many wrong codes") } else { bad_device_then(s, email, hash, k, mk, rounds - 1) },
+        _ => answer(s, email, hash, k, mk, t, rounds - 1)
+    };
+}
+
+@requires(network, clock(readonly), declassify)
+Tok bad_device_then(BwSvc s, Str email, Str hash, BwKdf k, List(Secret(UInt(8))) mk, Int rounds) {
+    println("bad code");
+    return ask_device(s, email, hash, k, mk, rounds);
 }
 
 @requires(network, clock(readonly), declassify)
@@ -365,7 +378,18 @@ Tok ask_code(BwSvc s, Str email, Str hash, BwKdf k, List(Secret(UInt(8))) mk, Li
     if (w.len() < 3 || w[0] != "code") { return TokFail("cancelled"); }
     Str p = w[1];
     Str v = str_replace(w[2], " ", "");
-    return answer(s, email, hash, k, mk, token(s, email, hash, k, mk, "&twoFactorToken=" + bw_form(v) + "&twoFactorProvider=" + bw_form(p) + "&twoFactorRemember=0"), rounds - 1);
+    Tok t = token(s, email, hash, k, mk, "&twoFactorToken=" + bw_form(v) + "&twoFactorProvider=" + bw_form(p) + "&twoFactorRemember=0");
+    // A wrong, expired or already used code: say so and ask again.
+    return match t {
+        TokBadCode => if (rounds <= 1) { TokFail("too many wrong codes") } else { bad_code_then(s, email, hash, k, mk, ps, rounds - 1) },
+        _ => answer(s, email, hash, k, mk, t, rounds - 1)
+    };
+}
+
+@requires(network, clock(readonly), declassify)
+Tok bad_code_then(BwSvc s, Str email, Str hash, BwKdf k, List(Secret(UInt(8))) mk, List(Int) ps, Int rounds) {
+    println("bad code");
+    return ask_code(s, email, hash, k, mk, ps, rounds);
 }
 
 // ─── The vault ──────────────────────────────────────────────────────

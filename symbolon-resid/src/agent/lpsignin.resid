@@ -126,7 +126,11 @@ LpTok lp_ask(LpSvc s, Str email, Str hash, Int iters, Str kind, Int rounds) {
     if (w.len() < 3 || w[0] != "code") { return LpFail("cancelled"); }
     Str v = str_replace(w[w.len() - 1], " ", "");
     Str p = if (kind == "sesame") { "&sesameotp=" } else { "&otp=" };
-    return lp_answer(s, email, hash, iters, lp_login(s, email, hash, iters, p + bw_form(v)), rounds - 1);
+    LpTok t = lp_login(s, email, hash, iters, p + bw_form(v));
+    // Asked for a code again: this one was wrong (or expired).
+    Bool again = match t { LpCode(k2) => true, _ => false };
+    if (again) { println("bad code"); }
+    return lp_answer(s, email, hash, iters, t, rounds - 1);
 }
 
 // An approval on another device: asked for once, then polled every two

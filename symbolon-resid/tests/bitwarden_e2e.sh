@@ -107,6 +107,9 @@ conv bob - --dry-run > "$W/bob.log" 2>&1 || fail "bob: $(cat "$W/bob.log")"
 grep -q '^need 2fa .*0' "$W/bob.log" || fail "bob was not asked for a code: $(cat "$W/bob.log")"
 grep -q '^item login router -$' "$W/bob.log" || fail "bob's item: $(cat "$W/bob.log")"
 echo "bob: Argon2id and a two-step code"
+BW_FIRST_BAD=1 conv bob - --dry-run > "$W/bob2.log" 2>&1 || fail "bob, a wrong code first: $(cat "$W/bob2.log")"
+grep -q '^bad code$' "$W/bob2.log" && grep -q '^item login router -$' "$W/bob2.log" || fail "a wrong code is not asked again: $(cat "$W/bob2.log")"
+echo "bob: a wrong code is said, and asked for again"
 
 # ── Refusals ───────────────────────────────────────────────────────────
 python3 -c "import json,sys; d=json.load(open(sys.argv[1])); d['alice']['password']='wrong password'; json.dump(d, open(sys.argv[2],'w'))" "$W/want.json" "$W/wrong.json"
