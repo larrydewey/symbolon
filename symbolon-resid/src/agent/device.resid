@@ -622,7 +622,10 @@ Int run_sign_ctx(Str dir, DeviceConfig c, Quorum q, List(UInt(64)) tau, List(Int
 
 @requires(filesystem, network, clock(readonly), declassify)
 Int finish_sign(Str dir, DeviceConfig c, Quorum q, List(UInt(64)) tau, List(Int) m, Int form, Run(ThState) r) {
-    _ = save_config(dir, with_log(c, c.witnesses, c.log_id, mailbox_end(relay_ep(c), c.party, c.mbox_next), c.peers));
+    // The mailbox is read on from where the session stopped, not again from
+    // where it started: every round's envelope would be fetched twice.
+    Int from = if (r.cursors.len() > 0 && r.cursors[0].next > c.mbox_next) { r.cursors[0].next } else { c.mbox_next };
+    _ = save_config(dir, with_log(c, c.witnesses, c.log_id, mailbox_end(relay_ep(c), c.party, from), c.peers));
     if (str_len(r.fail) > 0) { return dfail("signing: " + r.fail + if (r.culprits.len() > 0) { f" (blames {r.culprits})" } else { "" }); }
     ThState st = r.seats[0].st;
     List(Int) sig = match st { ThSigned(s) => th_sig_raw(s), _ => [] };

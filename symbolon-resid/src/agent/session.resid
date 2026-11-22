@@ -52,16 +52,17 @@ pub type Drained = { List(Got) got; Cursor cur; Int unknown; };   // unknown: en
 // senders not in `known`, or that do not open, are skipped.
 @requires(network, declassify, clock(readonly))
 @robust_exempt(reason = "declassifies only envelope plaintext that HPKE mode_auth authenticated under this party's key; nothing is disclosed outward")
-pub Drained drain(Endpoint relay, Local me, List(Remote) known, Cursor c, ListBuf(Got) acc) { return drain_n(relay, me, known, c, acc, 0); }
+pub Drained drain(Endpoint relay, Local me, List(Remote) known, Cursor c, ListBuf(Got) acc) {
+    List(Post) none = [];
+    Fetched f = relay_read(relay, none, c.party, [c.next]);
+    return drain_open(me, known, f.envs, 0, Cursor {.party = c.party, .next = f.nexts[0]}, acc, 0);
+}
 
-@requires(network, declassify, clock(readonly))
+@requires(declassify)
 @robust_exempt(reason = "declassifies only envelope plaintext that HPKE mode_auth authenticated under this party's key; nothing is disclosed outward")
-Drained drain_n(Endpoint relay, Local me, List(Remote) known, Cursor c, ListBuf(Got) acc, Int unknown) {
-    Option(List(Int)) ob = mbox_get(relay, c.party, c.next);
-    return match ob {
-        None => Drained {.got = acc.finish(), .cur = c, .unknown = unknown},
-        Some(b) => drain_n(relay, me, known, Cursor {.party = c.party, .next = c.next + 1}, push_open(acc, me, known, b), unknown + (if (from_unknown(known, b)) { 1 } else { 0 }))
-    };
+Drained drain_open(Local me, List(Remote) known, List(List(Int)) envs, Int i, Cursor c, ListBuf(Got) acc, Int unknown) {
+    if (i >= envs.len()) { return Drained {.got = acc.finish(), .cur = c, .unknown = unknown}; }
+    return drain_open(me, known, envs, i + 1, c, push_open(acc, me, known, envs[i]), unknown + (if (from_unknown(known, envs[i])) { 1 } else { 0 }));
 }
 
 Bool from_unknown(List(Remote) known, List(Int) b) {
@@ -91,7 +92,8 @@ ListBuf(Got) dropped(ListBuf(Got) acc, Str why) { eprintln("skipped " + why); re
 
 @requires(network, clock(readonly), declassify)
 pub Int mailbox_end(Endpoint relay, List(Int) party, Int n) {
-    return match mbox_get(relay, party, n) { None => n, Some(_) => mailbox_end(relay, party, n + 1) };
+    List(Post) none = [];
+    return relay_read(relay, none, party, [n]).nexts[0];
 }
 
 // ============================================================================
@@ -145,22 +147,6 @@ List(List(Int)) others_of(List(List(Int)) all, List(Int) me, Int i, List(List(In
     return others_of(all, me, i + 1, if (bytes_eq(all[i], me)) { acc } else { acc.concat([all[i]]) });
 }
 
-// Sends `out` of local seat `from` for `round` to every remote party, and
-// returns the batches meant for the other local seats.
-@requires(network, declassify, clock(readonly))
-pub List(Batch) send_round(Endpoint relay, List(Int) sid, Local from, Int round, List(ThMsg) out, List(Remote) remotes, List(Local) locals, Int i, List(Batch) acc) {
-    if (i < remotes.len()) {
-        Remote r = remotes[i];
-        _ = send_to(relay, from, r, WSession(SessionMsg {.session_id = sid, .round = round, .msgs = for_party(out, r.cg, 0, ListBuf())}));
-        return send_round(relay, sid, from, round, out, remotes, locals, i + 1, acc);
-    }
-    Int j = i - remotes.len();
-    if (j >= locals.len()) { return acc; }
-    Local l = locals[j];
-    List(Batch) next = if (bytes_eq(l.party, from.party)) { acc } else { acc.concat([Batch {.from = from.party, .to = l.party, .round = round, .msgs = for_party(out, l.cg, 0, ListBuf())}]) };
-    return send_round(relay, sid, from, round, out, remotes, locals, i + 1, next);
-}
-
 pub type Run(T) = { List(Seat(T)) seats; Str fail; List(Int) culprits; List(Cursor) cursors; };
 
 List(Local) locals_of(List(Seat(T)) ss, Int i, List(Local) acc) {
@@ -190,19 +176,55 @@ Bool all_done(List(Seat(T)) ss, Int i) {
 pub Run(T) run_session(Endpoint relay, List(Int) sid, List(Seat(T)) seats, List(Remote) remotes, List(Cursor) cursors, List(Got) early,
                        Result(Stepped(T), CgFail) closure(T, List(ThMsg)) step, Int wait_s) {
     List(Local) ls = locals_of(seats, 0, []);
-    List(Batch) local0 = send_all(relay, sid, seats, remotes, ls, 0, []);
-    return rs_loop(relay, sid, seats, remotes, ls, cursors, batches_of(early, sid, 0, []).concat(local0), step, wait_s, clock_now_seconds());
+    Outs o = outs_all(sid, seats, remotes, ls, 0, no_outs());
+    return rs_loop(relay, sid, seats, remotes, ls, cursors, batches_of(early, sid, 0, []).concat(o.local), o.posts, step, wait_s, clock_now_seconds());
 }
 
-@requires(network, declassify, clock(readonly))
-List(Batch) send_all(Endpoint relay, List(Int) sid, List(Seat(T)) seats, List(Remote) remotes, List(Local) ls, Int i, List(Batch) acc) {
+// What local seats said in a round: envelopes for the parties behind the
+// relay, and batches for the other local seats.
+type Outs = { List(Post) posts; List(Batch) local; };
+
+Outs no_outs() {
+    List(Post) none = [];
+    return Outs {.posts = none, .local = []};
+}
+
+Outs outs_join(Outs a, Outs b) { return Outs {.posts = a.posts.concat(b.posts), .local = a.local.concat(b.local)}; }
+
+// `out` of local seat `from` for `round`: sealed to every remote party, and
+// as batches for the other local seats.
+@requires(declassify)
+Outs outs_round(List(Int) sid, Local from, Int round, List(ThMsg) out, List(Remote) remotes, List(Local) locals, Int i, Outs acc) {
+    if (i < remotes.len()) {
+        Remote r = remotes[i];
+        List(Secret(UInt(8))) fresh = [];
+        Option(Envelope) oe = seal(from.party, from.hpke_sk, r.party, r.hpke_pub, WSession(SessionMsg {.session_id = sid, .round = round, .msgs = for_party(out, r.cg, 0, ListBuf())}), fresh);
+        Outs next = match oe { None => acc, Some(e) => Outs {.posts = acc.posts.concat([Post {.to = r.party, .envelope = envelope_encode(e)}]), .local = acc.local} };
+        return outs_round(sid, from, round, out, remotes, locals, i + 1, next);
+    }
+    Int j = i - remotes.len();
+    if (j >= locals.len()) { return acc; }
+    Local l = locals[j];
+    Outs next = if (bytes_eq(l.party, from.party)) { acc } else { Outs {.posts = acc.posts, .local = acc.local.concat([Batch {.from = from.party, .to = l.party, .round = round, .msgs = for_party(out, l.cg, 0, ListBuf())}])} };
+    return outs_round(sid, from, round, out, remotes, locals, i + 1, next);
+}
+
+@requires(declassify)
+Outs outs_all(List(Int) sid, List(Seat(T)) seats, List(Remote) remotes, List(Local) ls, Int i, Outs acc) {
     if (i >= seats.len()) { return acc; }
     Seat(T) s = seats[i];
-    List(Batch) b = if (s.done && s.out.len() == 0) { [] } else { send_round(relay, sid, s.me, s.round, s.out, remotes, ls, 0, []) };
-    return send_all(relay, sid, seats, remotes, ls, i + 1, acc.concat(b));
+    Outs b = if (s.done && s.out.len() == 0) { no_outs() } else { outs_round(sid, s.me, s.round, s.out, remotes, ls, 0, no_outs()) };
+    return outs_all(sid, seats, remotes, ls, i + 1, outs_join(acc, b));
 }
 
-pub type DrainedAll = { List(Got) got; List(Cursor) cs; };
+@requires(declassify)
+Outs outs_moved(List(Int) sid, List(Seat(T)) before, List(Seat(T)) after, List(Remote) remotes, List(Local) ls, Int i, Outs acc) {
+    if (i >= after.len()) { return acc; }
+    Seat(T) s = after[i];
+    Bool moved = s.round != before[i].round;
+    Outs b = if (moved && s.out.len() + (if (s.done) { 0 } else { 1 }) > 0) { outs_round(sid, s.me, s.round, s.out, remotes, ls, 0, no_outs()) } else { no_outs() };
+    return outs_moved(sid, before, after, remotes, ls, i + 1, outs_join(acc, b));
+}
 
 Bool refused_in(List(Got) gs, List(Int) sid, Int i) {
     if (i >= gs.len()) { return false; }
@@ -211,37 +233,56 @@ Bool refused_in(List(Got) gs, List(Int) sid, Int i) {
     return hit || refused_in(gs, sid, i + 1);
 }
 
-@requires(network, declassify, clock(readonly))
-DrainedAll drain_all(Endpoint relay, List(Seat(T)) seats, List(Remote) known, List(Cursor) cs, Int i, DrainedAll acc) {
-    if (i >= cs.len()) { return acc; }
-    Drained d = drain(relay, seats[i].me, known, cs[i], ListBuf());
-    return drain_all(relay, seats, known, cs, i + 1, DrainedAll {.got = acc.got.concat(d.got), .cs = acc.cs.concat([d.cur])});
-}
-
+// The seats advance on what is buffered (`buf`) as far as they can; what
+// they say is kept in `posts` until they can go no further, and then goes
+// out at the start of the wait for the next mail, on the connection that
+// waits.
 @requires(network, declassify, clock)
-Run(T) rs_loop(Endpoint relay, List(Int) sid, List(Seat(T)) seats, List(Remote) remotes, List(Local) ls, List(Cursor) cs, List(Batch) buf,
+Run(T) rs_loop(Endpoint relay, List(Int) sid, List(Seat(T)) seats, List(Remote) remotes, List(Local) ls, List(Cursor) cs, List(Batch) buf, List(Post) posts,
                Result(Stepped(T), CgFail) closure(T, List(ThMsg)) step, Int wait_s, Int since) {
-    if (all_done(seats, 0)) { return Run {.seats = seats, .fail = "", .culprits = [], .cursors = cs}; }
-    DrainedAll d = drain_all(relay, seats, remotes, cs, 0, DrainedAll {.got = [], .cs = []});
+    if (all_done(seats, 0)) { return rs_end(relay, posts, Run {.seats = seats, .fail = "", .culprits = [], .cursors = cs}); }
+    List(List(Int)) everyone = parties_of(remotes, ls, 0, []);
+    Adv(T) a = advance_seats(seats, buf, everyone, step, 0, [], false);
+    if (str_len(a.fail) > 0) { return rs_end(relay, posts, Run {.seats = a.seats, .fail = a.fail, .culprits = a.culprits, .cursors = cs}); }
+    if (a.moved) {
+        Outs o = outs_moved(sid, seats, a.seats, remotes, ls, 0, no_outs());
+        return rs_loop(relay, sid, a.seats, remotes, ls, cs, buf.concat(o.local), posts.concat(o.posts), step, wait_s, clock_now_seconds());
+    }
+    if (clock_now_seconds() - since > wait_s) { return rs_end(relay, posts, Run {.seats = seats, .fail = "timed out waiting for a round", .culprits = [], .cursors = cs}); }
+    // Nothing to do until a mailbox grows. relay_wait waits in a loop that
+    // carries only plain values, so each burst's garbage (its connection,
+    // its replies) is freed; this loop's own state is not, and polling
+    // here every 100 ms once kept a gigabyte alive over a key generation's
+    // minutes of waiting.
+    Fetched f = relay_wait(relay, posts, flat_parties(cs, 0, ListBuf()), nexts_of(cs, 0, ListBuf()), since + wait_s);
+    List(Got) gs = opened(seats, remotes, f, 0, ListBuf());
+    List(Cursor) cs2 = cursors_at(cs, f.nexts, 0, ListBuf());
     // A party that refuses the session (the cosigner's policy; during
     // duress, SPEC 14.3) ends it, with the face of an outage.
-    if (refused_in(d.got, sid, 0)) { return Run {.seats = seats, .fail = "the cosigner is unreachable", .culprits = [], .cursors = d.cs}; }
-    List(Batch) got = buf.concat(batches_of(d.got, sid, 0, []));
-    List(Cursor) cs2 = d.cs;
-    List(List(Int)) everyone = parties_of(remotes, ls, 0, []);
-    Adv(T) a = advance_seats(seats, got, everyone, step, 0, [], false);
-    if (str_len(a.fail) > 0) { return Run {.seats = a.seats, .fail = a.fail, .culprits = a.culprits, .cursors = cs2}; }
-    if (a.moved) {
-        List(Batch) local = send_moved(relay, sid, seats, a.seats, remotes, ls, 0, []);
-        return rs_loop(relay, sid, a.seats, remotes, ls, cs2, got.concat(local), step, wait_s, clock_now_seconds());
-    }
-    if (clock_now_seconds() - since > wait_s) { return Run {.seats = seats, .fail = "timed out waiting for a round", .culprits = [], .cursors = cs2}; }
-    // Nothing to do until a mailbox grows: wait in a loop that carries only
-    // plain values, so each poll's garbage (the connection, the reply) is
-    // freed; this loop's own state is not, and polling here every 100 ms
-    // kept a gigabyte alive over a key generation's minutes of waiting.
-    _ = wait_mail(relay.host, relay.port, relay.ca, flat_parties(cs2, 0, ListBuf()), nexts_of(cs2, 0, ListBuf()), since + wait_s);
-    return rs_loop(relay, sid, seats, remotes, ls, cs2, got, step, wait_s, since);
+    if (refused_in(gs, sid, 0)) { return Run {.seats = seats, .fail = "the cosigner is unreachable", .culprits = [], .cursors = cs2}; }
+    List(Post) none = [];
+    return rs_loop(relay, sid, seats, remotes, ls, cs2, buf.concat(batches_of(gs, sid, 0, [])), none, step, wait_s, since);
+}
+
+// A session's end: what the seats said last still goes out.
+@requires(network, declassify, clock(readonly))
+Run(T) rs_end(Endpoint relay, List(Post) posts, Run(T) r) {
+    if (posts.len() > 0) { _ = relay_read(relay, posts, [], []); }
+    return r;
+}
+
+// The envelopes a wait read, each opened with the key of the seat whose
+// mailbox it came from.
+@requires(declassify)
+@robust_exempt(reason = "declassifies only envelope plaintext that HPKE mode_auth authenticated under this party's key; nothing is disclosed outward")
+List(Got) opened(List(Seat(T)) seats, List(Remote) known, Fetched f, Int i, ListBuf(Got) acc) {
+    if (i >= f.envs.len()) { return acc.finish(); }
+    return opened(seats, known, f, i + 1, push_open(acc, seats[f.which[i]].me, known, f.envs[i]));
+}
+
+List(Cursor) cursors_at(List(Cursor) cs, List(Int) nexts, Int i, ListBuf(Cursor) acc) {
+    if (i >= cs.len()) { return acc.finish(); }
+    return cursors_at(cs, nexts, i + 1, acc.push(Cursor {.party = cs[i].party, .next = nexts[i]}));
 }
 
 List(Int) flat_parties(List(Cursor) cs, Int i, ListBuf(Int) acc) {
@@ -259,38 +300,14 @@ List(Int) nexts_of(List(Cursor) cs, Int i, ListBuf(Int) acc) {
     return nexts_of(cs, i + 1, acc.push(cs[i].next));
 }
 
-// Polls until one of the mailboxes (parties of 32 bytes each in `parties`,
-// read from the matching `nexts`) holds its next message, or until `until`;
-// 1 when one does.
+// Waits until one of the mailboxes (parties of 32 bytes each in `parties`,
+// read from the matching `nexts`) holds its next message, or until
+// `until`; 1 when one does.
 @requires(network, declassify, clock)
 pub Int wait_mail(Str host, Int port, Str ca, List(Int) parties, List(Int) nexts, Int until) {
-    if (any_mail(Endpoint {.host = host, .port = port, .ca = ca, .token = ""}, parties, nexts, 0)) { return 1; }
-    if (clock_now_seconds() > until) { return 0; }
-    _ = clock_sleep_ms(100);
-    return wait_mail(host, port, ca, parties, nexts, until);
-}
-
-@requires(network, declassify, clock(readonly))
-Bool any_mail(Endpoint relay, List(Int) parties, List(Int) nexts, Int k) {
-    if (k >= nexts.len()) { return false; }
-    Bool here = match mbox_get(relay, party_at(parties, k), nexts[k]) { Some(_) => true, None => false };
-    return here || any_mail(relay, parties, nexts, k + 1);
-}
-
-List(Int) party_at(List(Int) parties, Int k) { return slice_at(parties, 32 * k, 32 * k + 32, ListBuf()); }
-
-List(Int) slice_at(List(Int) b, Int i, Int e, ListBuf(Int) acc) {
-    if (i >= e || i >= b.len()) { return acc.finish(); }
-    return slice_at(b, i + 1, e, acc.push(b[i]));
-}
-
-@requires(network, declassify, clock(readonly))
-List(Batch) send_moved(Endpoint relay, List(Int) sid, List(Seat(T)) before, List(Seat(T)) after, List(Remote) remotes, List(Local) ls, Int i, List(Batch) acc) {
-    if (i >= after.len()) { return acc; }
-    Seat(T) s = after[i];
-    Bool moved = s.round != before[i].round;
-    List(Batch) b = if (moved && s.out.len() + (if (s.done) { 0 } else { 1 }) > 0) { send_round(relay, sid, s.me, s.round, s.out, remotes, ls, 0, []) } else { [] };
-    return send_moved(relay, sid, before, after, remotes, ls, i + 1, acc.concat(b));
+    List(Post) none = [];
+    Fetched f = relay_wait(Endpoint {.host = host, .port = port, .ca = ca, .token = ""}, none, parties, nexts, until);
+    return if (f.envs.len() > 0) { 1 } else { 0 };
 }
 
 pub type Adv(T) = { List(Seat(T)) seats; Bool moved; Str fail; List(Int) culprits; };

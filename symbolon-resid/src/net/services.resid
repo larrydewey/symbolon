@@ -284,6 +284,249 @@ pub Option(List(Int)) mbox_get(Endpoint e, List(Int) to, Int n) {
     return if (o.status == 200) { Some(o.body) } else { None };
 }
 
+// ============================================================================
+// Mailbox traffic over one kept connection
+// ============================================================================
+//
+// A session waiting for its next round asks the relay for an envelope
+// every 100 ms, and every request used to be a connection of its own: a
+// TCP and TLS handshake for each one, which on a phone was much of a
+// signature's wait. A burst sends its requests over one HTTPS connection
+// (HTTP/1.1 keep-alive) and then closes it.
+//
+// A burst that waits lasts at most burst_ms(), for two reasons. The relay
+// answers in child processes that take batch_conns() connections each and
+// end when the last of them closes, and the next child starts only then:
+// a connection kept long would hold up everyone queued for it. And a loop
+// that carries a connection (a record) keeps every request's garbage until
+// it returns, so the loop that waits across bursts (relay_wait) carries
+// only plain values.
+//
+// An endpoint without a CA is plain HTTP, with no handshake to save: each
+// request there is still a connection of its own.
+
+// An envelope to post to party `to`'s mailbox.
+pub type Post = { List(Int) to; List(Int) envelope; };
+
+// What a burst read: envelope envs[i] came from the mailbox of parties
+// entry which[i], and `nexts` is where each mailbox's reading resumes.
+pub type Fetched = { List(Int) which; List(List(Int)) envs; List(Int) nexts; };
+
+pub Int burst_ms() { return 1000; }
+
+// `fresh`: no request has been answered on `conn` yet. `born`: when it
+// was opened (clock_monotonic_ns).
+type Link = { Endpoint e; Bool tls; Option(TlsClient) conn; Bool fresh; Int born; };
+
+// Each request has 30 s to be answered, as one on a connection of its own
+// had (http_call_ep).
+Int link_request_ms() { return 30000; }
+
+type LinkOut = { Link l; Int status; List(Int) body; };
+
+Link link_new(Endpoint e) { return Link {.e = e, .tls = str_len(e.ca) > 0, .conn = None, .fresh = true, .born = 0}; }
+
+Link link_closed(Link l) { return Link {.e = l.e, .tls = l.tls, .conn = None, .fresh = true, .born = 0}; }
+
+@requires(network, clock(readonly), declassify)
+Link link_dial(Endpoint e) {
+    TrustStore store = trust_store_add_pem(trust_store_empty(), e.ca);
+    TlsDial d = tls_client_connect(e.host, e.port, tls_client_cfg_within(tls_client_cfg(e.host, store, ["http/1.1"]), link_request_ms()));
+    return Link {.e = e, .tls = true, .conn = if (str_len(d.err) == 0) { Some(d.conn) } else { None }, .fresh = true, .born = clock_monotonic_ns()};
+}
+
+@requires(network, declassify)
+Bool link_close(Link l) {
+    Option(TlsClient) oc = l.conn;
+    return match oc { None => true, Some(c) => wire_close(c) };
+}
+
+// One request on the link; status 0 when nothing usable came back.
+@requires(network, clock(readonly), declassify)
+LinkOut link_call(Link l, Str method, Str path, List(Int) body) {
+    if (!l.tls) {
+        HttpOut o = http_call_ep(l.e, method, path, body);
+        return LinkOut {.l = l, .status = o.status, .body = o.body};
+    }
+    Option(TlsClient) oc = l.conn;
+    Bool open = match oc { None => false, Some(_) => true };
+    // A connection is not kept past burst_ms(), however busy it is: a long
+    // read (a mailbox far behind) takes several in turn.
+    Bool old = open && clock_monotonic_ns() - l.born > burst_ms() * 1000000;
+    if (old) { _ = link_close(l); }
+    Bool kept = open && !old;
+    Link l1 = if (kept) { l } else { link_dial(l.e) };
+    LinkOut r = link_try(l1, method, path, body);
+    if (r.status != 0 || l1.fresh) { return r; }
+    // A kept connection that answered nothing: the relay closed it while it
+    // was idle, before it read this request, so the request goes again on a
+    // new connection. Were the answer lost after the relay stored a posted
+    // envelope, a second copy would follow; only round batches (WSession)
+    // are posted this way, and a session takes a round's batch from a party
+    // once.
+    return link_try(link_dial(l.e), method, path, body);
+}
+
+@requires(network, clock(readonly), declassify)
+LinkOut link_try(Link l, Str method, Str path, List(Int) body) {
+    Option(TlsClient) oc = l.conn;
+    return match oc {
+        None => LinkOut {.l = l, .status = 0, .body = []},
+        Some(c) => link_exchange(l, c, method, path, body)
+    };
+}
+
+type LinkHead = { TlsClient conn; List(Int) data; Int end; };   // end: where the head's CR LF CR LF starts, or -1
+
+type LinkBody = { TlsClient conn; List(Int) data; Bool ok; };
+
+@requires(network, clock(readonly), declassify)
+LinkOut link_exchange(Link l, TlsClient c, Str method, Str path, List(Int) body) {
+    Str auth = if (str_len(l.e.token) == 0) { "" } else { "Authorization: Bearer " + l.e.token + "\r\n" };
+    List(Int) req = http_bytes(method + " " + path + " HTTP/1.1\r\nHost: " + l.e.host + ":" + f"{l.e.port}" + "\r\n" + auth
+        + f"Content-Length: {body.len()}\r\nConnection: keep-alive\r\n\r\n").concat(body);
+    _ = wire_deadline(c, link_request_ms());
+    WireOut(TlsClient) sent = wire_send(c, req);
+    if (!sent.ok) { return link_broken(l, sent.conn); }
+    LinkHead h = link_head(sent.conn, [], 64);
+    if (h.end < 0) { return link_broken(l, h.conn); }
+    List(Str) lines = str_split(http_text(h.data, 0, h.end), "\r\n");
+    Int status = link_status(lines[0]);
+    Str cl = link_header(lines, "content-length", 1);
+    if (status <= 0 || !dec_name(cl, 0) || str_len(cl) > 9) { return link_broken(l, h.conn); }
+    Int want = str_parse_int(cl);
+    if (want > https_max_body()) { return link_broken(l, h.conn); }
+    LinkBody b = link_body(h.conn, h.data[(h.end + 4)..h.data.len()], want);
+    if (!b.ok) { return link_broken(l, b.conn); }
+    // Bytes past the body would be an answer to nothing: the connection
+    // is not used again.
+    Bool keep = str_to_lower(link_header(lines, "connection", 1)) != "close" && b.data.len() == want;
+    if (!keep) { _ = wire_close(b.conn); }
+    Link next = if (keep) { Link {.e = l.e, .tls = true, .conn = Some(b.conn), .fresh = false, .born = l.born} } else { link_closed(l) };
+    return LinkOut {.l = next, .status = status, .body = b.data[0..want]};
+}
+
+@requires(network, declassify)
+LinkOut link_broken(Link l, TlsClient c) {
+    _ = wire_close(c);
+    return LinkOut {.l = link_closed(l), .status = 0, .body = []};
+}
+
+// Reads until the response head is whole: at most 64 KiB, in at most
+// `rounds` reads.
+@requires(network, declassify)
+LinkHead link_head(TlsClient c, List(Int) acc, Int rounds) {
+    Int at = link_find_end(acc, 0);
+    if (at >= 0) { return LinkHead {.conn = c, .data = acc, .end = at}; }
+    if (rounds <= 0 || acc.len() > 65536) { return LinkHead {.conn = c, .data = acc, .end = -1}; }
+    WireIn(TlsClient) in = wire_fill(c, acc, acc.len() + 1, 65536 + 4);
+    if (in.eof && link_find_end(in.data, 0) < 0) { return LinkHead {.conn = in.conn, .data = in.data, .end = -1}; }
+    return link_head(in.conn, in.data, rounds - 1);
+}
+
+// Where CR LF CR LF starts in `b`, from `i` on, or -1.
+Int link_find_end(List(Int) b, Int i) {
+    if (i + 3 >= b.len()) { return -1; }
+    if (b[i] == 13 && b[i + 1] == 10 && b[i + 2] == 13 && b[i + 3] == 10) { return i; }
+    return link_find_end(b, i + 1);
+}
+
+@requires(network, declassify)
+LinkBody link_body(TlsClient c, List(Int) acc, Int want) {
+    if (acc.len() >= want) { return LinkBody {.conn = c, .data = acc, .ok = true}; }
+    WireIn(TlsClient) in = wire_fill(c, acc, want, want + 16384);
+    if (in.eof && in.data.len() < want) { return LinkBody {.conn = in.conn, .data = in.data, .ok = false}; }
+    return link_body(in.conn, in.data, want);
+}
+
+// The status code of "HTTP/1.1 200 OK", or -1.
+Int link_status(Str line) {
+    List(Str) ws = str_split(line, " ");
+    if (ws.len() < 2 || !str_starts_with(ws[0], "HTTP/1.") || str_len(ws[1]) != 3 || !dec_name(ws[1], 0)) { return -1; }
+    return str_parse_int(ws[1]);
+}
+
+// The value of header `name` (lower case) among the lines from `i` on, or "".
+Str link_header(List(Str) lines, Str name, Int i) {
+    if (i >= lines.len()) { return ""; }
+    Int colon = str_index_of(lines[i], ":", 0);
+    if (colon > 0 && str_to_lower(str_trim(str_slice(lines[i], 0, colon))) == name) { return str_trim(str_slice(lines[i], colon + 1, str_len(lines[i]))); }
+    return link_header(lines, name, i + 1);
+}
+
+@requires(network, clock(readonly), declassify)
+Link link_posts(Link l, List(Post) posts, Int i) {
+    if (i >= posts.len()) { return l; }
+    LinkOut r = link_call(l, "POST", "/mbox/" + hex_encode(posts[i].to), posts[i].envelope);
+    return link_posts(r.l, posts, i + 1);
+}
+
+type BurstRead = { Link l; List(Int) which; List(List(Int)) envs; List(Int) nexts; };
+
+// Reads each mailbox from its next index on until the relay has nothing
+// more there (or does not answer).
+@requires(network, clock(readonly), declassify)
+BurstRead link_read(Link l, List(Int) parties, List(Int) nexts, Int k, ListBuf(Int) which, ListBuf(List(Int)) envs, ListBuf(Int) nx) {
+    if (k >= nexts.len()) { return BurstRead {.l = l, .which = which.finish(), .envs = envs.finish(), .nexts = nx.finish()}; }
+    LinkOut r = link_call(l, "GET", "/mbox/" + hex_encode(link_party(parties, k)) + "/" + f"{nexts[k]}", []);
+    if (r.status != 200) { return link_read(r.l, parties, nexts, k + 1, which, envs, nx.push(nexts[k])); }
+    // The same mailbox again, one further on.
+    List(Int) more = nexts[0..k].concat([nexts[k] + 1]).concat(nexts[(k + 1)..nexts.len()]);
+    return link_read(r.l, parties, more, k, which.push(k), envs.push(r.body), nx);
+}
+
+List(Int) link_party(List(Int) parties, Int k) { return parties[(32 * k)..(32 * k + 32)]; }
+
+// Posts `posts`, then reads what the mailboxes of `parties` (32 bytes each,
+// one after another) hold from `nexts` on, over one connection.
+@requires(network, clock(readonly), declassify)
+pub Fetched relay_read(Endpoint e, List(Post) posts, List(Int) parties, List(Int) nexts) {
+    BurstRead r = link_read(link_posts(link_new(e), posts, 0), parties, nexts, 0, ListBuf(), ListBuf(), ListBuf());
+    _ = link_close(r.l);
+    return Fetched {.which = r.which, .envs = r.envs, .nexts = r.nexts};
+}
+
+// Posts `posts`, then reads the mailboxes of `parties` (32 bytes each, one
+// after another) from `nexts` on, over one connection. With `wait`, when
+// nothing came, asks again every 100 ms until something does, the clock
+// passes `until` (seconds), or the burst has lasted burst_ms().
+@requires(network, clock, declassify)
+pub Fetched relay_burst(Endpoint e, List(Post) posts, List(Int) parties, List(Int) nexts, Bool wait, Int until) {
+    return burst_loop(link_posts(link_new(e), posts, 0), parties, nexts, wait, until, clock_monotonic_ns());
+}
+
+@requires(network, clock, declassify)
+Fetched burst_loop(Link l, List(Int) parties, List(Int) nexts, Bool wait, Int until, Int start) {
+    BurstRead r = link_read(l, parties, nexts, 0, ListBuf(), ListBuf(), ListBuf());
+    Bool over = !wait || r.envs.len() > 0 || clock_now_seconds() > until || clock_monotonic_ns() - start > burst_ms() * 1000000;
+    if (over) {
+        _ = link_close(r.l);
+        return Fetched {.which = r.which, .envs = r.envs, .nexts = r.nexts};
+    }
+    _ = clock_sleep_ms(100);
+    return burst_loop(r.l, parties, r.nexts, wait, until, start);
+}
+
+// Posts `posts`, then waits until a mailbox of `parties` holds its next
+// envelope or the clock passes `until`, burst after burst, and returns
+// what the burst that found something read.
+@requires(network, clock, declassify)
+pub Fetched relay_wait(Endpoint e, List(Post) posts, List(Int) parties, List(Int) nexts, Int until) {
+    Fetched f = relay_burst(e, posts, parties, nexts, true, until);
+    if (f.envs.len() > 0 || clock_now_seconds() > until) { return f; }
+    return relay_wait_on(e.host, e.port, e.ca, e.token, parties, nexts, until);
+}
+
+// The waiting loop: plain values only, so each burst's garbage (its
+// connection, its replies) is freed when the next begins.
+@requires(network, clock, declassify)
+Fetched relay_wait_on(Str host, Int port, Str ca, Str token, List(Int) parties, List(Int) nexts, Int until) {
+    List(Post) none = [];
+    Fetched f = relay_burst(Endpoint {.host = host, .port = port, .ca = ca, .token = token}, none, parties, nexts, true, until);
+    if (f.envs.len() > 0 || clock_now_seconds() > until) { return f; }
+    return relay_wait_on(host, port, ca, token, parties, nexts, until);
+}
+
 @requires(network, clock(readonly), declassify)
 pub Bool log_put(Endpoint e, List(Int) l, UInt(64) seq, List(Int) event) {
     return http_call_ep(e, "POST", "/log/" + hex_encode(l) + "/" + f"{seq}", event).status == 200;
