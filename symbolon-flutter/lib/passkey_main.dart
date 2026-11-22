@@ -4,7 +4,7 @@
 // PIN (so the response truthfully says the user was verified), and has the
 // agent make or use the passkey with the cosigner.
 
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:flutter/services.dart';
 
 import 'brand.dart';

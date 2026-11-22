@@ -4,7 +4,7 @@
 // screen shows its name, package, signing certificate and where it was
 // installed from, and warns when no app store installed it.
 
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:flutter/services.dart';
 
 import '../widgets.dart';

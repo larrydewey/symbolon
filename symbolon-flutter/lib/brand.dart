@@ -3,7 +3,7 @@
 // and they fit. The geometry matches tools/icon/make_icons.py, which makes
 // the launcher icon and the splash screen from it.
 
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 
 class Brand {
   static const indigo = Color(0xFF283593);

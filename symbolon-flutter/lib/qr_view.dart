@@ -1,7 +1,7 @@
 // A QR code for a text (the qr package encodes it; this paints the modules
 // with a quiet zone, dark on white whatever the theme, so phones read it).
 
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:qr/qr.dart';
 
 class QrView extends StatelessWidget {
