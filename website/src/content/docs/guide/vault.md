@@ -68,11 +68,46 @@ On the command line it is `symbolon device vault breach DIR`.
 `SYMBOLON_BREACH_URL` and `SYMBOLON_BREACH_CA` point it at a mirror of your
 own and its certificate.
 
+## Protected items
+
+Every device of yours holds the vault's key, so a device that is unlocked
+by someone else, or that runs malware while you use it, could read the
+whole vault. Items you mark **protected** need your cosigner as well:
+
+- An item's key also needs a value only your devices and your cosigner can
+  compute together, each from its own share of a key that no one holds
+  whole. Without the cosigner, a device sees a protected item's name, kind,
+  folder and site, and nothing else.
+- The cosigner does not learn which item is being opened. It allows each
+  device at most 60 openings an hour and records every one.
+- **More, Devices, Check protected openings** shows each device's openings
+  for the past hour, day and week. A day well above a device's usual is
+  shown on the home screen of every device: if it was not you, remove that
+  device from your identity.
+
+Protect an item with the shield on its page (`symbolon device vault
+protect DIR NAME`; `unprotect` takes it back). Good candidates: bank
+accounts, cards, recovery codes and other secrets, and the logins of your
+email and of the accounts you sign in to other sites with.
+
+What it costs: a protected item does not open offline, each fill waits for
+the cosigner, and it cannot be in the duress subset. During a duress window
+the cosigner refuses to open protected items, as if it could not be
+reached. A shared folder holds no protected items: moving one into a folder
+asks first, and it is stored there unprotected.
+
+An identity made with this version has protected items from the start. An
+older one turns them on under **More, Devices** (`symbolon device
+protection enable DIR`): a re-share with your cosigner that takes a minute
+or two. Do it before you add another device. Every device needs this
+version, and so does a cosigner on a Symbolon Home box.
+
 ## Moving items
 
 An item moves between your own vault and a shared folder (**Move** on the
 item, or `symbolon device vault move`): it is written in its new place first,
-then removed from the old one.
+then removed from the old one. A protected item goes into a shared folder
+only unprotected (`--unprotect`).
 
 ## Under the duress PIN
 

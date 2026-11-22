@@ -55,6 +55,13 @@ which version is current. Devices keep a verified copy, so the vault opens
 read-only even with no network. Shared folders and organizations' group
 folders are vaults of their own, with their own keys.
 
+Items you mark **protected** need your cosigner as well: their keys take a
+value your devices and the cosigner compute together, each from its share
+of a key no one holds whole, as for signing. A stolen or infected device
+then opens them only at the cosigner's hourly limit, and every opening is
+recorded and shown on your other devices. See
+[protected items](/symbolon/guide/vault/#protected-items).
+
 ## The duress PIN
 
 A second PIN, if you set one, opens a separate profile: a subset of passkeys

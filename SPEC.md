@@ -1375,10 +1375,11 @@ platform's file picker made and tells the person to delete the original.
 
 ### 18.10 Protected items: a second tier under the quorum
 
-Status: specified 2026-11-19. The evaluation core (`src/vault/toprf.resid`)
-is implemented and tested against RFC 9497's vectors and an independent
-reference; key generation, the cosigner's evaluation endpoint, the agent
-and the app are not yet built.
+Status: built (2026-11-22), with the deviations listed in 18.10.8. The
+evaluation core (`src/vault/toprf.resid`) is tested against RFC 9497's
+vectors and an independent reference; the sharing of `k_v`
+(`src/vault/kvshare.resid`) against independent P-256 arithmetic; the whole
+tier end to end in `tests/protected_e2e.sh`.
 
 The keys of 18.1 separate items from each other cryptographically, but every
 device holds `vault_key`, and anyone with `vault_key` derives every item key.
@@ -1595,6 +1596,42 @@ the principal's other devices can still veto (13.4).
 - Against the cosigner colluding with a compromised unlocked device:
   everything, as for signing (12.4). The defense is the same: a cosigner
   of the principal's own, an attested cosigner, or a larger `t`.
+
+#### 18.10.8 As built
+
+What the implementation does where this section leaves a choice, or does
+less than it says:
+
+- **Dealers.** `k_v` is generated and re-shared by the two parties that
+  deal `x`: the requesting device and the cosigner (the kit's device at a
+  recovery). Each dealing is one message per receiver (`WKvDeal`) in the
+  receiver's HPKE mode_auth envelope (`src/net/envelope.resid`), next to the
+  CGGMP rounds; there is no separate inner HPKE layer. A part that does not
+  fit its dealer's commitments (or, re-sharing, a dealing whose `C_0` is not
+  `lambda_d K_d`) ends the session naming the dealer; there is no
+  complaint round.
+- **Inception and later.** A new identity gets `k_v` at inception when its
+  cosigner deals it; an older cosigner does not answer, and the identity is
+  made without it. `device protection enable` adds `k_v` to a quorum with
+  this device as its only device (a re-share to the same parties at the
+  next epoch); a quorum with other devices would need them to join that
+  re-share, which they cannot yet.
+- **Evaluation.** The session id is 32 bytes (as for signing requests),
+  and the request is signed with `request_tbs` (12.3) over its message
+  `SHA-256(log-id || purpose || seq || each element)`, kind 6. Purpose 1
+  (re-key) is counted like purpose 0: vault rotation (18.6) is not built,
+  so no event exempts it yet.
+- **The session log** for devices: `device openings` asks the cosigner for
+  the past week's evaluation records (DK-signed request; nothing is
+  recorded for it) and prints each device's openings for the hour, day and
+  week. A day is unusual when it exceeds 20 openings and three times the
+  device's daily average over the six days before; the app shows it on
+  every device's home screen while unlocked.
+- **Key lifetime.** The agent is one process per command, so `y` and
+  `pitem_key` live only for that command, which is shorter than the five
+  minutes of 18.10.3.
+- **Not built.** The no-cosigner mode of 18.10.5 (opening is refused
+  without a cosigner), and the purpose-1 re-key of 18.10.6.
 
 ---
 
