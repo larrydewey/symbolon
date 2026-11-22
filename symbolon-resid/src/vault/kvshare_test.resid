@@ -1,0 +1,152 @@
+// SPEC 18.10.1 with fresh randomness: generating the vault OPRF key k_v
+// between two dealers, re-sharing it to a new quorum, the kit's halves,
+// and that every t-subset of shares evaluates the same OPRF as k_v itself.
+
+import "../types.resid";
+import "kvshare.resid";
+import "toprf.resid";
+import "p256.resid";
+import "p256ops.resid";
+import "cggmp_secret_scalar.resid";
+import "word.resid";
+import "crypto.resid";
+import "random.resid";
+
+List(Int) widen(List(UInt(8)) b, Int i, ListBuf(Int) acc) {
+    if (i >= b.len()) { return acc.finish(); }
+    return widen(b, i + 1, acc.push((Int) b[i]));
+}
+
+@requires(declassify)
+List(Int) opened(List(Secret(UInt(8))) b) { return widen(declassify(secret_join(b), "test compares values"), 0, ListBuf()); }
+
+// y with k itself.
+@requires(declassify)
+List(Int) y_single(Secret(UInt(576)) k, List(Int) input) {
+    ToprfBlind bl = toprf_blind(input);
+    ToprfEval e = toprf_evaluate(k, [bl.blinded]);
+    return opened(toprf_finalize(input, bl.r, toprf_deser(e.elements[0])));
+}
+
+@requires(declassify)
+List(List(Int)) evals(List(KvScalar) ks, List(Int) b, Int i, ListBuf(List(Int)) acc) {
+    if (i >= ks.len()) { return acc.finish(); }
+    ToprfEval e = toprf_evaluate(ks[i].v, [b]);
+    return evals(ks, b, i + 1, acc.push(e.elements[0]));
+}
+
+// y with the shares `ks` of the parties `ids`, combined.
+@requires(declassify)
+List(Int) y_shared(List(Int) ids, List(KvScalar) ks, List(Int) input) {
+    ToprfBlind bl = toprf_blind(input);
+    return opened(toprf_finalize(input, bl.r, toprf_combine(ids, evals(ks, bl.blinded, 0, ListBuf()))));
+}
+
+Secret(UInt(576)) add(Secret(UInt(576)) a, Secret(UInt(576)) b) { return cggmp_secret_scalar_add(a, b); }
+KvScalar ks(Secret(UInt(576)) a) { return kv_scalar(a); }
+
+@requires(declassify)
+Bool same_scalar(Secret(UInt(576)) a, Secret(UInt(576)) b) { return opened(kv_share_bytes(a)) == opened(kv_share_bytes(b)); }
+
+@requires(declassify)
+Bool parts_ok(KvDealing d, List(Int) ids, Int i) {
+    if (i >= ids.len()) { return true; }
+    return kv_part_ok(d.commits, ids[i], d.parts[i].v) && parts_ok(d, ids, i + 1);
+}
+
+@requires(declassify)
+test "two dealers generate k_v; every pair of the three shares evaluates as k_v does" {
+    List(Int) ids = [1, 2, 3];
+    Secret(UInt(576)) sx = toprf_random_scalar();
+    Secret(UInt(576)) sc = toprf_random_scalar();
+    KvDealing dx = kv_deal(sx, 2, ids);
+    KvDealing dc = kv_deal(sc, 2, ids);
+    assert(parts_ok(dx, ids, 0));
+    assert(parts_ok(dc, ids, 0));
+    List(KvScalar) k = [ks(add(dx.parts[0].v, dc.parts[0].v)), ks(add(dx.parts[1].v, dc.parts[1].v)), ks(add(dx.parts[2].v, dc.parts[2].v))];
+    List(List(Int)) cs = kv_sum_commits([dx.commits, dc.commits]);
+    assert(cs.len() == 2);
+    Secret(UInt(576)) kv = add(sx, sc);
+    // C_0 is k_v G, and each share fits the summed commitments
+    assert(pt_eq(toprf_deser(cs[0]), p256_public(kv)));
+    assert(kv_part_ok(cs, 1, k[0].v) && kv_part_ok(cs, 2, k[1].v) && kv_part_ok(cs, 3, k[2].v));
+    List(Int) input = utf8("symbolon v1 protected").concat(random_bytes(48));
+    List(Int) want = y_single(kv, input);
+    assert(y_shared([1, 2], [k[0], k[1]], input) == want);
+    assert(y_shared([3, 1], [k[2], k[0]], input) == want);
+    assert(y_shared([2, 3], [k[1], k[2]], input) == want);
+    // one share alone is not k_v
+    assert(y_single(k[0].v, input) != want);
+}
+
+@requires(declassify)
+test "a re-share by two old parties keeps C_0 and k_v for the new quorum" {
+    List(Int) old_ids = [1, 2, 3];
+    Secret(UInt(576)) sx = toprf_random_scalar();
+    Secret(UInt(576)) sc = toprf_random_scalar();
+    KvDealing gx = kv_deal(sx, 2, old_ids);
+    KvDealing gc = kv_deal(sc, 2, old_ids);
+    List(KvScalar) k = [ks(add(gx.parts[0].v, gc.parts[0].v)), ks(add(gx.parts[1].v, gc.parts[1].v)), ks(add(gx.parts[2].v, gc.parts[2].v))];
+    List(List(Int)) old_cs = kv_sum_commits([gx.commits, gc.commits]);
+    // dealers: old parties 1 (the device) and 3 (the cosigner); four new parties
+    List(Int) dealers = [1, 3];
+    List(Int) new_ids = [1, 2, 3, 4];
+    KvDealing rx = kv_deal(kv_reshare_secret(k[0].v, dealers, 1), 2, new_ids);
+    KvDealing rc = kv_deal(kv_reshare_secret(k[2].v, dealers, 3), 2, new_ids);
+    assert(kv_reshare_ok(old_cs, dealers, 1, rx.commits));
+    assert(kv_reshare_ok(old_cs, dealers, 3, rc.commits));
+    assert(parts_ok(rx, new_ids, 0) && parts_ok(rc, new_ids, 0));
+    List(List(Int)) new_cs = kv_sum_commits([rx.commits, rc.commits]);
+    assert(new_cs[0] == old_cs[0]);
+    assert(new_cs[1] != old_cs[1]);
+    List(KvScalar) n = [ks(add(rx.parts[0].v, rc.parts[0].v)), ks(add(rx.parts[1].v, rc.parts[1].v)), ks(add(rx.parts[2].v, rc.parts[2].v)), ks(add(rx.parts[3].v, rc.parts[3].v))];
+    List(Int) input = random_bytes(40);
+    List(Int) want = y_single(add(sx, sc), input);
+    assert(y_shared([1, 4], [n[0], n[3]], input) == want);
+    assert(y_shared([2, 3], [n[1], n[2]], input) == want);
+    // a new share does not combine with an old one (the polynomial changed)
+    assert(y_shared([1, 2], [n[0], k[1]], input) != want);
+}
+
+@requires(declassify)
+test "a wrong part, or a re-share dealing of something other than the dealer's share, is caught" {
+    List(Int) ids = [1, 2, 3];
+    KvDealing d = kv_deal(toprf_random_scalar(), 2, ids);
+    assert(!kv_part_ok(d.commits, 2, d.parts[0].v));
+    assert(!kv_part_ok(d.commits, 1, add(d.parts[0].v, classify((UInt(576)) 1))));
+    assert(!kv_part_ok([], 1, d.parts[0].v));
+    List(List(Int)) cs = kv_sum_commits([d.commits]);
+    // a dealer re-sharing a random value instead of lambda_d k_d
+    KvDealing fake = kv_deal(toprf_random_scalar(), 2, ids);
+    assert(!kv_reshare_ok(cs, [1, 3], 1, fake.commits));
+    // a dealer outside the dealer set
+    assert(!kv_reshare_ok(cs, [1, 3], 2, fake.commits));
+    // mismatched thresholds do not sum
+    KvDealing t3 = kv_deal(toprf_random_scalar(), 3, ids);
+    assert(kv_sum_commits([d.commits, t3.commits]).len() == 0);
+}
+
+@requires(declassify)
+test "the kit's share is its two halves, each from one dealer (SPEC 10.6)" {
+    List(Int) ids = [1, 2, 3];
+    KvDealing dx = kv_deal(toprf_random_scalar(), 2, ids);
+    KvDealing dc = kv_deal(toprf_random_scalar(), 2, ids);
+    List(List(Int)) cs = kv_sum_commits([dx.commits, dc.commits]);
+    Secret(UInt(576)) a_v = dx.parts[1].v;
+    Secret(UInt(576)) b_v = dc.parts[1].v;
+    assert(kv_part_ok(cs, 2, add(a_v, b_v)));
+    assert(!kv_part_ok(cs, 2, a_v));
+    assert(!kv_part_ok(cs, 2, b_v));
+}
+
+@requires(declassify)
+test "encodings: commitments to SEC1 and back, a share to 32 bytes and back" {
+    KvDealing d = kv_deal(toprf_random_scalar(), 2, [1]);
+    List(List(Int)) sec1 = kv_to_sec1(d.commits);
+    assert(sec1.len() == 2 && sec1[0].len() == 65 && sec1[0][0] == 4);
+    List(List(Int)) back = kv_from_sec1(sec1);
+    assert(back[0] == d.commits[0] && back[1] == d.commits[1]);
+    assert(kv_to_sec1([[2, 1, 2]]).len() == 0);
+    assert(same_scalar(kv_share_from(kv_share_bytes(d.parts[0].v)), d.parts[0].v));
+    assert(kv_share_bytes(d.parts[0].v).len() == 32);
+}

@@ -1,0 +1,172 @@
+// The vault OPRF key k_v (SPEC 18.10.1): Shamir-shared at the quorum's
+// threshold t, committed with Feldman commitments, never held whole.
+//
+// One dealing serves every case. A dealer with a secret s draws f of
+// degree t - 1 with f(0) = s, gives receiver j the part f(j) and publishes
+// C_l = a_l G. A receiver checks f(j) G = sum_l j^l C_l; its share is the
+// sum of the parts it received, and the commitments of the result are the
+// sums of the dealers'.
+//
+// - Generation: each dealer's s is random; k_v is the sum of the dealers'
+//   secrets, which no party holds.
+// - Re-share: dealer d deals s = lambda_d k_d (Lagrange at zero over the
+//   old dealer set), so the new shares are of the same k_v. Each dealer's
+//   C_0 must equal lambda_d K_d, K_d from the old commitments; so the new
+//   C_0 (the OPRF public key) is the old one (kv_reshare_ok).
+// - The kit (10.6): its share is the sum of the dealers' parts for its
+//   index; each dealer's part is one half (a_v from the device, b_v from
+//   the cosigner), so neither half alone says anything about the share.
+//
+// Shares and parts are Secret(UInt(576)) scalars, as toprf_evaluate takes
+// them. Commitments travel compressed (33 bytes, toprf_ser); the quorum's
+// field 6 holds them SEC1 uncompressed (65 bytes, kv_to_sec1).
+
+import "../types.resid";
+import "toprf.resid";
+import "p256.resid";
+import "p256ops.resid";
+import "shamir.resid";
+import "cggmp_secret_scalar.resid";
+import "word.resid";
+import "crypto.resid";
+
+// A secret scalar in a record: lists hold records, never wide secrets
+// themselves (E0258).
+pub type KvScalar = { Secret(UInt(576)) v; };
+
+pub KvScalar kv_scalar(Secret(UInt(576)) v) { return KvScalar {.v = v}; }
+
+pub type KvDealing = { List(List(Int)) commits; List(KvScalar) parts; };
+
+// ─── Dealing ─────────────────────────────────────────────────────
+
+// f(j) = sum_l a_l j^l, by Horner from the top coefficient.
+Secret(UInt(576)) poly_at(List(KvScalar) a, UInt(576) j, Int l, Secret(UInt(576)) acc) {
+    if (l < 0) { return acc; }
+    return poly_at(a, j, l - 1, cggmp_secret_scalar_add(cggmp_secret_scalar_mul(acc, classify(j)), a[l].v));
+}
+
+@requires(declassify)
+List(List(Int)) commit_all(List(KvScalar) a, Int i, ListBuf(List(Int)) acc) {
+    if (i >= a.len()) { return acc.finish(); }
+    return commit_all(a, i + 1, acc.push(toprf_ser(p256_public(a[i].v))));
+}
+
+List(KvScalar) parts_at(List(KvScalar) a, List(Int) ids, Int i, ListBuf(KvScalar) acc) {
+    if (i >= ids.len()) { return acc.finish(); }
+    Secret(UInt(576)) zero = classify((UInt(576)) 0);
+    return parts_at(a, ids, i + 1, acc.push(kv_scalar(poly_at(a, (UInt(576)) ids[i], a.len() - 1, zero))));
+}
+
+// The dealing of the polynomial with coefficients a (a[0] the secret) to
+// the receivers `ids` (share indices, each >= 1): parts aligned with ids.
+@requires(declassify)
+pub KvDealing kv_deal_with(List(KvScalar) a, List(Int) ids) {
+    return KvDealing {.commits = commit_all(a, 0, ListBuf()), .parts = parts_at(a, ids, 0, ListBuf())};
+}
+
+@requires(declassify)
+List(KvScalar) random_coeffs(Int n, ListBuf(KvScalar) acc) {
+    if (n <= 0) { return acc.finish(); }
+    return random_coeffs(n - 1, acc.push(kv_scalar(toprf_random_scalar())));
+}
+
+// A dealing of s at threshold t (degree t - 1), its other coefficients random.
+@requires(declassify)
+pub KvDealing kv_deal(Secret(UInt(576)) s, Int t, List(Int) ids) {
+    return kv_deal_with([kv_scalar(s)].concat(random_coeffs(t - 1, ListBuf())), ids);
+}
+
+// A fresh random secret's dealing: one dealer's part of generating k_v.
+@requires(declassify)
+pub KvDealing kv_generate(Int t, List(Int) ids) { return kv_deal(toprf_random_scalar(), t, ids); }
+
+// ─── Checking ────────────────────────────────────────────────────
+
+// Whether `part` is the dealer's value at j: part G = sum_l j^l C_l.
+@requires(declassify)
+pub Bool kv_part_ok(List(List(Int)) commits, Int j, Secret(UInt(576)) part) {
+    if (commits.len() == 0 || j < 1 || !p256_scalar_ok(part)) { return false; }
+    P256Aff want = toprf_party_key(commits, j);
+    return want.ok && pt_eq(p256_public(part), want);
+}
+
+// ─── Re-sharing ──────────────────────────────────────────────────
+
+// Dealer d's secret in a re-share by the old dealer set `dealers`
+// (old share indices): lambda_d k_d.
+pub Secret(UInt(576)) kv_reshare_secret(Secret(UInt(576)) k_d, List(Int) dealers, Int d) {
+    UInt(576) lam = (UInt(576)) sh_lagrange0(dealers, d);
+    return cggmp_secret_scalar_mul(classify(lam), k_d);
+}
+
+// Whether dealer d's re-share dealing is of its share: its C_0 is
+// lambda_d K_d, K_d from the old commitments.
+pub Bool kv_reshare_ok(List(List(Int)) old_commits, List(Int) dealers, Int d, List(List(Int)) dealt) {
+    if (dealt.len() == 0 || !dealers.contains(d)) { return false; }
+    UInt(576) lam = (UInt(576)) sh_lagrange0(dealers, d);
+    P256Aff want = pt_mul(lam, toprf_party_key(old_commits, d));
+    P256Aff got = toprf_deser(dealt[0]);
+    return want.ok && got.ok && pt_eq(want, got);
+}
+
+// ─── Combining ───────────────────────────────────────────────────
+
+// A receiver's share: the sum of the parts it received.
+pub Secret(UInt(576)) kv_sum(List(KvScalar) parts, Int i, Secret(UInt(576)) acc) {
+    if (i >= parts.len()) { return acc; }
+    return kv_sum(parts, i + 1, cggmp_secret_scalar_add(acc, parts[i].v));
+}
+
+pub Secret(UInt(576)) kv_share_of(List(KvScalar) parts) { return kv_sum(parts, 0, classify((UInt(576)) 0)); }
+
+// The commitments of the result: C_l = sum over dealers of their C_l
+// (every dealing at the same threshold). Empty when any is malformed.
+pub List(List(Int)) kv_sum_commits(List(List(List(Int))) dealt) {
+    if (dealt.len() == 0) { return []; }
+    Int t = dealt[0].len();
+    if (t == 0 || !same_len(dealt, t, 0)) { return []; }
+    return sum_at(dealt, t, 0, ListBuf());
+}
+
+Bool same_len(List(List(List(Int))) d, Int t, Int i) { return i >= d.len() || (d[i].len() == t && same_len(d, t, i + 1)); }
+
+List(List(Int)) sum_at(List(List(List(Int))) dealt, Int t, Int l, ListBuf(List(Int)) acc) {
+    if (l >= t) { return acc.finish(); }
+    P256Aff s = column_sum(dealt, l, 0, p256_bad());
+    if (!s.ok) { acc.discard(); return []; }
+    return sum_at(dealt, t, l + 1, acc.push(toprf_ser(s)));
+}
+
+P256Aff column_sum(List(List(List(Int))) dealt, Int l, Int i, P256Aff acc) {
+    if (i >= dealt.len()) { return acc; }
+    P256Aff c = toprf_deser(dealt[i][l]);
+    if (!c.ok) { return p256_bad(); }
+    return column_sum(dealt, l, i + 1, pt_add(acc, c));
+}
+
+// ─── Encodings ───────────────────────────────────────────────────
+
+// Compressed commitments (33 bytes) to SEC1 uncompressed (65, quorum field
+// 6), and back. Empty when any is not a point.
+pub List(List(Int)) kv_to_sec1(List(List(Int)) cs) { return to_sec1(cs, 0, ListBuf()); }
+
+List(List(Int)) to_sec1(List(List(Int)) cs, Int i, ListBuf(List(Int)) acc) {
+    if (i >= cs.len()) { return acc.finish(); }
+    P256Aff p = toprf_deser(cs[i]);
+    if (!p.ok) { acc.discard(); return []; }
+    return to_sec1(cs, i + 1, acc.push(pt_enc(p)));
+}
+
+pub List(List(Int)) kv_from_sec1(List(List(Int)) cs) { return from_sec1(cs, 0, ListBuf()); }
+
+List(List(Int)) from_sec1(List(List(Int)) cs, Int i, ListBuf(List(Int)) acc) {
+    if (i >= cs.len()) { return acc.finish(); }
+    P256Aff p = pt_dec(cs[i]);
+    if (!p.ok) { acc.discard(); return []; }
+    return from_sec1(cs, i + 1, acc.push(toprf_ser(p)));
+}
+
+// A share as 32 secret bytes (for storage under the DEK, or HPKE), and back.
+pub List(Secret(UInt(8))) kv_share_bytes(Secret(UInt(576)) k) { return p256_store(k); }
+pub Secret(UInt(576)) kv_share_from(List(Secret(UInt(8))) b) { return p256_load(b); }

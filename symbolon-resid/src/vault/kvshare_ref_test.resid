@@ -1,0 +1,41 @@
+// The vault OPRF key's dealing, re-share scaling and commitment sums
+// (src/vault/kvshare.resid) against independent P-256 arithmetic
+// (tests/gen_kvshare_ref.py). Generated; do not edit by hand.
+
+import "../types.resid";
+import "kvshare.resid";
+import "p256.resid";
+import "word.resid";
+import "crypto.resid";
+
+Secret(UInt(576)) s(List(Int) b) { return p256_load(secret_bytes(b)); }
+KvScalar k(List(Int) b) { return kv_scalar(s(b)); }
+
+@requires(declassify)
+List(Int) out(Secret(UInt(576)) v) { return ints(declassify(secret_join(kv_share_bytes(v)), "test compares values")); }
+
+List(Int) ints(List(UInt(8)) b) { return ints_at(b, 0, ListBuf()); }
+List(Int) ints_at(List(UInt(8)) b, Int i, ListBuf(Int) acc) { if (i >= b.len()) { return acc.finish(); } return ints_at(b, i + 1, acc.push((Int) b[i])); }
+
+@requires(declassify)
+test "a dealing's parts and commitments equal the reference" {
+    KvDealing d = kv_deal_with([k([253, 49, 75, 47, 135, 8, 29, 148, 255, 132, 44, 42, 112, 207, 127, 245, 5, 49, 59, 224, 104, 61, 80, 203, 96, 22, 241, 117, 146, 181, 162, 110]), k([173, 12, 235, 185, 155, 117, 34, 179, 35, 152, 162, 181, 226, 235, 219, 98, 24, 91, 196, 83, 27, 6, 194, 162, 155, 152, 212, 126, 21, 197, 0, 45])], [1, 2, 3]);
+    expect(hex_encode(d.commits[0])).toEqual("032599de0e18e32680f68368c51e9dab22211f90b9dec29845a5f581e2bcfcde58");
+    expect(hex_encode(d.commits[1])).toEqual("0268f8cc613c7ef02af23c3251b94b97697da980ed8ffa4e1d5de48bcb6ceeea4e");
+    expect(hex_encode(out(d.parts[0].v))).toEqual("aa3e36ea227d4047231ccee053bb5b5760a60585dc2c74e907f5fb30ac177d4a");
+    expect(hex_encode(out(d.parts[1].v))).toEqual("574b22a4bdf262f946b5719636a736b9bc1acf2b501b9906afd504ebc5795826");
+    expect(hex_encode(out(d.parts[2].v))).toEqual("04580e5f596785ab6a4e144c1993121c178f98d0c40abd2457b40ea6dedb3302");
+    expect(kv_part_ok(d.commits, 3, d.parts[2].v)).toBeTrue();
+}
+
+@requires(declassify)
+test "summed commitments, a re-share's scaled secrets and its check equal the reference" {
+    List(List(Int)) cs = kv_sum_commits([[[3, 37, 153, 222, 14, 24, 227, 38, 128, 246, 131, 104, 197, 30, 157, 171, 34, 33, 31, 144, 185, 222, 194, 152, 69, 165, 245, 129, 226, 188, 252, 222, 88], [2, 104, 248, 204, 97, 60, 126, 240, 42, 242, 60, 50, 81, 185, 75, 151, 105, 125, 169, 128, 237, 143, 250, 78, 29, 93, 228, 139, 203, 108, 238, 234, 78]], [[3, 47, 221, 183, 82, 180, 171, 6, 182, 65, 84, 81, 228, 224, 234, 168, 26, 19, 145, 14, 1, 113, 88, 73, 126, 19, 95, 137, 189, 29, 252, 174, 103], [2, 95, 53, 104, 214, 170, 50, 71, 174, 136, 231, 23, 125, 203, 8, 21, 48, 92, 203, 236, 175, 239, 15, 70, 103, 242, 119, 140, 70, 165, 20, 74, 144]]]);
+    expect(hex_encode(cs[0])).toEqual("02736983169a553a6e14692265ae7b377f48172d4d257d54f9627a0d298f70cb39");
+    expect(hex_encode(cs[1])).toEqual("039f6f30b8628811833288089dc626f4e387c11bc0f551e8b17c78274d25516844");
+    expect(hex_encode(out(kv_reshare_secret(s([184, 245, 71, 213, 28, 109, 69, 208, 89, 37, 115, 10, 141, 169, 25, 139, 244, 194, 144, 127, 30, 176, 247, 84, 88, 33, 112, 102, 174, 197, 176, 163]), [1, 3], 1)))).toEqual("956febc02aa3e8b805b82c8fd47da65210b05b67da7da3bc0a55433887f6f64c");
+    expect(hex_encode(out(kv_reshare_secret(s([88, 128, 212, 3, 215, 94, 196, 99, 55, 154, 6, 67, 155, 65, 51, 87, 111, 97, 228, 72, 204, 211, 81, 201, 134, 188, 248, 129, 166, 201, 96, 112]), [1, 3], 3)))).toEqual("d3bf95fd14509dcf6432fcde325f66540536088940adf5a0305b4e8228fe7519");
+    expect(kv_reshare_ok(cs, [1, 3], 1, [[3, 65, 197, 42, 55, 13, 141, 110, 201, 198, 127, 241, 25, 59, 238, 208, 130, 57, 224, 244, 196, 246, 147, 240, 223, 94, 159, 15, 101, 192, 230, 76, 178]])).toBeTrue();
+    expect(kv_reshare_ok(cs, [1, 3], 3, [[3, 65, 197, 42, 55, 13, 141, 110, 201, 198, 127, 241, 25, 59, 238, 208, 130, 57, 224, 244, 196, 246, 147, 240, 223, 94, 159, 15, 101, 192, 230, 76, 178]])).toBeFalse();
+    expect(hex_encode(kv_to_sec1(cs)[0])).toEqual("04736983169a553a6e14692265ae7b377f48172d4d257d54f9627a0d298f70cb3960b31fdd8925da94fcc3864cb266ba9b9ceb7481f8cf5a85445636336a832440");
+}
