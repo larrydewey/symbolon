@@ -6,17 +6,36 @@
 //   symbolon device ssh list DIR              "NAME-HEX PUBLIC-LINE" per key, no PIN
 //   symbolon device ssh sign DIR NAME         PIN, then the data in hex, on stdin;
 //                                             prints "signature BLOB-HEX"
-//   symbolon device ssh delete DIR NAME       (PIN on stdin)
+//   symbolon device ssh delete DIR NAME       a key or a certificate authority (PIN on stdin)
+//
+// The certificate authority (SPEC 16.1.2):
+//
+//   symbolon device ssh ca-new DIR NAME       a threshold ecdsa-sha2-nistp256 CA (PIN on stdin)
+//   symbolon device ssh cas DIR               "NAME-HEX PUBLIC-LINE" per CA, no PIN
+//   symbolon device ssh certify DIR KEY CA --principal USER [--principal USER]... [--days N]
+//                                             a user certificate for KEY (PIN on stdin)
+//   symbolon device ssh renew DIR KEY         again, with the CA, principals and days
+//                                             the vault remembers (PIN on stdin)
+//   symbolon device ssh certs DIR             the certificates, no PIN (cert_text below)
+//   symbolon device ssh refresh DIR           the three lists rebuilt from the vault,
+//                                             for a key made on another device (PIN on stdin)
 //
 // A key is an item of type "ssh": kind "threshold" (rp, cid, public) or
-// "imported" (alg, private, public, comment). The public lines are also
-// kept in DIR/ssh-keys so the agent lists them without the PIN.
+// "imported" (alg, private, public, comment). A certified key also holds
+// its certificate and what renews it: cert_ca, cert_principals (comma
+// separated), cert_days and cert (the public line). A certificate
+// authority is a threshold key with role "ca", under the relying-party
+// label "ssh-ca:NAME", and signs nothing but certificates. The public
+// lines are also kept in DIR/ssh-keys, DIR/ssh-cas and DIR/ssh-certs, so
+// the agent lists them without the PIN; the agent offers only ssh-keys
+// (and their certificates).
 
 import "../types.resid";
 import "../core/log.resid";
 import "../vault/vault.resid";
 import "../threshold/threshold.resid";
 import "../ssh/sshwire.resid";
+import "../ssh/sshcert.resid";
 import "state.resid";
 import "common.resid";
 import "device.resid";
@@ -33,6 +52,7 @@ import "ed25519g.resid";
 import "hash.resid";
 import "bcrypt_pbkdf.resid";
 import "rsasign.resid";
+import "clock.resid";
 
 // ============================================================================
 // The public index
@@ -53,10 +73,16 @@ List(SshEntry) entries_at(List(Str) ls, Int i, List(SshEntry) acc) {
 }
 
 @requires(filesystem)
-pub List(SshEntry) read_index(Str dir) {
-    Str f = ssh_index(dir);
-    return if (filesystem.exists(f)) { entries_of(filesystem.read_all(f)) } else { [] };
-}
+pub List(SshEntry) read_index(Str dir) { return read_index_at(ssh_index(dir)); }
+
+// The certificate authorities, in the same form; the agent never offers them.
+pub Str ca_index(Str dir) { return dir + "/ssh-cas"; }
+
+@requires(filesystem)
+pub List(SshEntry) read_cas(Str dir) { return read_index_at(ca_index(dir)); }
+
+@requires(filesystem)
+List(SshEntry) read_index_at(Str f) { return if (filesystem.exists(f)) { entries_of(filesystem.read_all(f)) } else { [] }; }
 
 Str index_text(List(SshEntry) es, Int i, Str acc) {
     if (i >= es.len()) { return acc; }
@@ -76,9 +102,22 @@ Bool index_put(Str dir, Str name, Str line) {
     return write_index(dir, without_entry(read_index(dir), name, 0, []).concat([SshEntry {.name = name, .line = line}]));
 }
 
+@requires(filesystem)
+Bool write_cas(Str dir, List(SshEntry) es) { return filesystem.write_all(ca_index(dir), index_text(es, 0, "")); }
+
+pub Option(SshEntry) entry_named(List(SshEntry) es, Str name, Int i) {
+    if (i >= es.len()) { return None; }
+    if (es[i].name == name) { return Some(es[i]); }
+    return entry_named(es, name, i + 1);
+}
+
 // `device ssh list DIR`
 @requires(filesystem)
 pub Int ssh_list(Str dir) { return print_entries(read_index(dir), 0); }
+
+// `device ssh cas DIR`
+@requires(filesystem)
+pub Int ssh_cas(Str dir) { return print_entries(read_cas(dir), 0); }
 
 Int print_entries(List(SshEntry) es, Int i) {
     if (i >= es.len()) { return 0; }
@@ -99,20 +138,36 @@ FieldPlain fpl(Str n, Str v) { return FieldPlain {.name = n, .value = secret_byt
 @requires(filesystem, network, device, declassify, clock, provision, environment)
 pub Int ssh_new(Str dir, Str name) {
     if (!name_ok(name)) { return dfail("a name of 1-64 characters"); }
+    if (is_ca(dir, name)) { return dfail(name + " is a certificate authority"); }
     Result(Opened, Str) ro = open_vault(dir);
     return match ro { Err(m) => dfail(m), Ok(o) => ssh_new_in(dir, o, name) };
+}
+
+@requires(filesystem)
+Bool is_ca(Str dir, Str name) { return match entry_named(read_cas(dir), name, 0) { None => false, Some(_) => true }; }
+
+// A key the quorum holds, under the relying-party label `rp`: its
+// credential ID and public line. Outside the duress subset.
+pub type NewKey = { List(Int) cid; Str line; };
+
+@requires(filesystem, declassify)
+Option(NewKey) threshold_key(Str dir, Opened o, Str rp, Str name) {
+    List(Int) nonce = random_bytes(16);
+    List(Int) cid = credential_id(o.u.real.cc, rp, nonce);
+    List(UInt(64)) tau = tweak_scalar(o.u.real.cc, rp, nonce);
+    if (!update_duress(dir, o.u.real, cid, bn_to_be(tau, 32), false)) { return None; }
+    List(Int) q = credential_pubkey(o.vh.head.quorum.root_pubkey, tau);
+    return Some(NewKey {.cid = cid, .line = ssh_pub_line(ecdsa_blob("nistp256", q), name)});
 }
 
 @requires(filesystem, network, device, declassify, clock, environment)
 Int ssh_new_in(Str dir, Opened o, Str name) {
     Str rp = "ssh:" + name;
-    List(Int) nonce = random_bytes(16);
-    List(Int) cid = credential_id(o.u.real.cc, rp, nonce);
-    List(UInt(64)) tau = tweak_scalar(o.u.real.cc, rp, nonce);
-    if (!update_duress(dir, o.u.real, cid, bn_to_be(tau, 32), false)) { return dfail("cannot update the duress profile"); }
-    List(Int) q = credential_pubkey(o.vh.head.quorum.root_pubkey, tau);
-    Str line = ssh_pub_line(ecdsa_blob("nistp256", q), name);
-    List(FieldPlain) fs = [fpl("name", name), fpl("type", "ssh"), fpl("kind", "threshold"), fpl("rp", rp), fpl("cid", hex_encode(cid)), fpl("public", line)];
+    Option(NewKey) ok = threshold_key(dir, o, rp, name);
+    NewKey k = ok else { NewKey {.cid = [], .line = ""} };
+    if (k.cid.len() == 0) { return dfail("cannot update the duress profile"); }
+    Str line = k.line;
+    List(FieldPlain) fs = [fpl("name", name), fpl("type", "ssh"), fpl("kind", "threshold"), fpl("rp", rp), fpl("cid", hex_encode(k.cid)), fpl("public", line)];
     Int r = seal_publish(dir, o, name, fs);
     if (r != 0) { return r; }
     if (!index_put(dir, name, line)) { return dfail("cannot write " + ssh_index(dir)); }
@@ -126,6 +181,7 @@ Int ssh_new_in(Str dir, Opened o, Str name) {
 @requires(filesystem, network, device, declassify, clock, provision, environment)
 pub Int ssh_import(Str dir, Str name, Str file) {
     if (!name_ok(name)) { return dfail("a name of 1-64 characters"); }
+    if (is_ca(dir, name)) { return dfail(name + " is a certificate authority"); }
     if (!filesystem.exists(file)) { return dfail("no file " + file); }
     Option(KeyFile) of = key_file_of(filesystem.read_all(file));
     KeyFile k = of else { KeyFile {.cipher = "", .kdf = "", .kdf_opts = [], .pub_blob = [], .sealed = []} };
@@ -184,12 +240,18 @@ Int done_import(Str line) {
     return 0;
 }
 
-// `device ssh delete DIR NAME`
+// `device ssh delete DIR NAME`: a key, with its certificate, or a
+// certificate authority, with the certificates it issued (servers that
+// trust it keep accepting those until they expire: remove the CA's line
+// from them).
 @requires(filesystem, network, device, declassify, clock, provision, environment)
 pub Int ssh_delete(Str dir, Str name) {
     Int r = vault_delete(dir, name, "");
     if (r != 0) { return r; }
-    return if (write_index(dir, without_entry(read_index(dir), name, 0, []))) { 0 } else { dfail("cannot write " + ssh_index(dir)) };
+    Bool a = write_index(dir, without_entry(read_index(dir), name, 0, []));
+    Bool b = write_cas(dir, without_entry(read_cas(dir), name, 0, []));
+    Bool c = write_certs(dir, certs_without(read_certs(dir), name, 0, []));
+    return if (a && b && c) { 0 } else { dfail("cannot write the SSH lists in " + dir) };
 }
 
 // ============================================================================
@@ -231,12 +293,17 @@ Int sign_item(Str dir, Opened o, Item it, List(Int) data, Str rsa_alg) {
     return match r { Err(m) => dfail(m), Ok(fs) => sign_fields(dir, o, fs, data, rsa_alg) };
 }
 
+// A certificate authority signs only certificates: its key is never
+// handed data to sign here, so no login, git signature or forged
+// certificate body can be passed off as one of its certificates.
 @requires(filesystem, network, device, declassify, clock, provision, environment)
 Int sign_fields(Str dir, Opened o, List(FieldPlain) fs, List(Int) data, Str rsa_alg) {
     if (ftext(fs, "type") != "ssh") { return dfail("not an SSH key"); }
+    if (ftext(fs, "role") == "ca") { return dfail("a certificate authority signs only certificates (device ssh certify)"); }
     Str kind = ftext(fs, "kind");
     if (kind == "threshold") {
-        return sign_with(dir, o.c, ftext(fs, "rp"), cose_hex_decode(ftext(fs, "cid")), sha256_bytes(data), o.pin, 1);
+        Int r = sign_unlocked(dir, o.c, o.u, ftext(fs, "rp"), cose_hex_decode(ftext(fs, "cid")), sha256_bytes(data), o.pin, 1);
+        return if (r == 0) { after_sign(dir, o, ftext(fs, "name"), fs) } else { r };
     }
     List(Secret(UInt(8))) none = [];
     List(Secret(UInt(8))) k = fval(fs, "private", 0) else { none };
@@ -244,7 +311,7 @@ Int sign_fields(Str dir, Opened o, List(FieldPlain) fs, List(Int) data, Str rsa_
     List(Int) blob = if (alg == "ssh-rsa") { sign_rsa(fs, rsa_alg, data) } else { sign_imported(alg, k, data) };
     if (blob.len() == 0) { return dfail("this key cannot sign (" + alg + ")"); }
     println("signature " + hex_encode(blob));
-    return 0;
+    return after_sign(dir, o, ftext(fs, "name"), fs);
 }
 
 // rsa-sha2-256 or rsa-sha2-512 (RFC 8332) with the key's CRT parts.
@@ -266,4 +333,374 @@ pub List(Int) sign_imported(Str alg, List(Secret(UInt(8))) k, List(Int) data) {
     if (alg == "ecdsa-sha2-nistp256" && k.len() == 32) { return ecdsa_sig_blob("nistp256", ecdsag_sign_raw(P256, Sha256, k, data)); }
     if (alg == "ecdsa-sha2-nistp384" && k.len() == 48) { return ecdsa_sig_blob("nistp384", ecdsag_sign_raw(P384, Sha384, k, data)); }
     return [];
+}
+
+// ============================================================================
+// The certificate authority (SPEC 16.1.2)
+// ============================================================================
+
+// `device ssh ca-new DIR NAME`: a certificate authority the quorum holds,
+// under the relying-party label "ssh-ca:NAME". Like a threshold key, no
+// party holds its private key; unlike one, the agent never offers it and
+// it signs nothing but certificates.
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+pub Int ssh_ca_new(Str dir, Str name) {
+    if (!name_ok(name)) { return dfail("a name of 1-64 characters"); }
+    if (is_ca(dir, name) || match entry_named(read_index(dir), name, 0) { None => false, Some(_) => true }) { return dfail("there is already a key or a certificate authority named " + name); }
+    Result(Opened, Str) ro = open_vault(dir);
+    return match ro { Err(m) => dfail(m), Ok(o) => ca_new_in(dir, o, name) };
+}
+
+@requires(filesystem, network, device, declassify, clock, environment)
+Int ca_new_in(Str dir, Opened o, Str name) {
+    if (match item_by_id(o.st.items, item_id_of(o.p.vk, name), 0) { None => false, Some(_) => true }) { return dfail("the vault already has an item named " + name); }
+    Str rp = "ssh-ca:" + name;
+    Option(NewKey) ok = threshold_key(dir, o, rp, name);
+    NewKey k = ok else { NewKey {.cid = [], .line = ""} };
+    if (k.cid.len() == 0) { return dfail("cannot update the duress profile"); }
+    List(FieldPlain) fs = [fpl("name", name), fpl("type", "ssh"), fpl("kind", "threshold"), fpl("role", "ca"), fpl("rp", rp), fpl("cid", hex_encode(k.cid)), fpl("public", k.line)];
+    Int r = seal_publish(dir, o, name, fs);
+    if (r != 0) { return r; }
+    if (!write_cas(dir, without_entry(read_cas(dir), name, 0, []).concat([SshEntry {.name = name, .line = k.line}]))) { return dfail("cannot write " + ca_index(dir)); }
+    println(k.line);
+    return 0;
+}
+
+// ============================================================================
+// Certificates
+// ============================================================================
+
+// One line of DIR/ssh-certs, and of `device ssh certs`:
+//   KEY-HEX CA-HEX DAYS PRINCIPALS VALID-AFTER VALID-BEFORE CERT-LINE
+// with the principals comma separated, the times in seconds since the
+// epoch and the certificate's public line last. One certificate per key.
+pub type CertEntry = { Str key; Str ca; Int days; List(Str) principals; Int valid_after; Int valid_before; Str line; };
+
+pub Str cert_index(Str dir) { return dir + "/ssh-certs"; }
+
+pub Int max_days() { return 366; }
+
+Bool digits_ok(Str s) { return str_len(s) > 0 && str_len(s) <= 18 && digit_bytes(utf8(s), 0); }
+Bool digit_bytes(List(Int) b, Int i) {
+    if (i >= b.len()) { return true; }
+    return b[i] >= 48 && b[i] <= 57 && digit_bytes(b, i + 1);
+}
+
+pub List(CertEntry) certs_of(Str text) { return certs_at(str_split(text, "\n"), 0, []); }
+
+List(CertEntry) certs_at(List(Str) ls, Int i, List(CertEntry) acc) {
+    if (i >= ls.len()) { return acc; }
+    Str l = str_trim(ls[i]);
+    List(Str) p = str_split(l, " ");
+    Bool ok = p.len() >= 8 && str_len(p[0]) > 0 && str_len(p[1]) > 0 && hex_ok(p[0]) && hex_ok(p[1]) && digits_ok(p[2]) && digits_ok(p[4]) && digits_ok(p[5]);
+    Int skip = if (ok) { str_len(p[0]) + str_len(p[1]) + str_len(p[2]) + str_len(p[3]) + str_len(p[4]) + str_len(p[5]) + 6 } else { 0 };
+    List(CertEntry) more = if (ok) { [cert_entry(p, str_slice(l, skip, str_len(l)))] } else { [] };
+    return certs_at(ls, i + 1, acc.concat(more));
+}
+
+CertEntry cert_entry(List(Str) p, Str line) {
+    return CertEntry {.key = text_of(cose_hex_decode(p[0])), .ca = text_of(cose_hex_decode(p[1])), .days = str_parse_int(p[2]), .principals = str_split(p[3], ","),
+                      .valid_after = str_parse_int(p[4]), .valid_before = str_parse_int(p[5]), .line = line};
+}
+
+pub Str cert_text(CertEntry e) {
+    return hex_encode(utf8(e.key)) + " " + hex_encode(utf8(e.ca)) + " " + f"{e.days}" + " " + str_join(e.principals, ",") + " " + f"{e.valid_after}" + " " + f"{e.valid_before}" + " " + e.line;
+}
+
+Str certs_text(List(CertEntry) es, Int i, Str acc) {
+    if (i >= es.len()) { return acc; }
+    return certs_text(es, i + 1, acc + cert_text(es[i]) + "\n");
+}
+
+@requires(filesystem)
+pub List(CertEntry) read_certs(Str dir) {
+    Str f = cert_index(dir);
+    return if (filesystem.exists(f)) { certs_of(filesystem.read_all(f)) } else { [] };
+}
+
+@requires(filesystem)
+Bool write_certs(Str dir, List(CertEntry) es) { return filesystem.write_all(cert_index(dir), certs_text(es, 0, "")); }
+
+// Without the certificates of key `name`, and those its authority `name`
+// issued.
+List(CertEntry) certs_without(List(CertEntry) es, Str name, Int i, List(CertEntry) acc) {
+    if (i >= es.len()) { return acc; }
+    Bool drop = es[i].key == name || es[i].ca == name;
+    return certs_without(es, name, i + 1, if (drop) { acc } else { acc.concat([es[i]]) });
+}
+
+@requires(filesystem)
+Bool cert_put(Str dir, CertEntry e) {
+    List(CertEntry) others = certs_key_without(read_certs(dir), e.key, 0, []);
+    return write_certs(dir, others.concat([e]));
+}
+
+List(CertEntry) certs_key_without(List(CertEntry) es, Str key, Int i, List(CertEntry) acc) {
+    if (i >= es.len()) { return acc; }
+    return certs_key_without(es, key, i + 1, if (es[i].key == key) { acc } else { acc.concat([es[i]]) });
+}
+
+pub Option(CertEntry) cert_for_key(List(CertEntry) es, Str key, Int i) {
+    if (i >= es.len()) { return None; }
+    if (es[i].key == key) { return Some(es[i]); }
+    return cert_for_key(es, key, i + 1);
+}
+
+// `device ssh certs DIR`
+@requires(filesystem)
+pub Int ssh_certs(Str dir) { return print_certs(read_certs(dir), 0); }
+
+Int print_certs(List(CertEntry) es, Int i) {
+    if (i >= es.len()) { return 0; }
+    println(cert_text(es[i]));
+    return print_certs(es, i + 1);
+}
+
+// The options of `device ssh certify`: --principal NAME (one or more,
+// at most 32) and --days N (1 to 366, by default 30).
+pub type CertOpts = { List(Str) principals; Int days; Str err; };
+
+pub CertOpts cert_opts(List(Str) xs, Int i, CertOpts acc) {
+    if (i >= xs.len() || str_len(acc.err) > 0) { return acc; }
+    Str v = if (i + 1 < xs.len()) { xs[i + 1] } else { "" };
+    if (xs[i] == "--principal" && i + 1 < xs.len()) {
+        if (!principal_ok(v)) { return CertOpts {.principals = acc.principals, .days = acc.days, .err = "a principal is a user name of 1-64 letters, digits and . _ - @ +"}; }
+        List(Str) ps = if (acc.principals.contains(v)) { acc.principals } else { acc.principals.concat([v]) };
+        if (ps.len() > 32) { return CertOpts {.principals = acc.principals, .days = acc.days, .err = "at most 32 principals"}; }
+        return cert_opts(xs, i + 2, CertOpts {.principals = ps, .days = acc.days, .err = ""});
+    }
+    if (xs[i] == "--days" && i + 1 < xs.len()) {
+        Int n = if (digits_ok(v)) { str_parse_int(v) } else { 0 };
+        if (n < 1 || n > max_days()) { return CertOpts {.principals = acc.principals, .days = acc.days, .err = "--days takes 1 to 366"}; }
+        return cert_opts(xs, i + 2, CertOpts {.principals = acc.principals, .days = n, .err = ""});
+    }
+    return CertOpts {.principals = acc.principals, .days = acc.days, .err = "unknown option " + xs[i] + " (--principal NAME, --days N)"};
+}
+
+Bool principals_ok(List(Str) ps, Int i) {
+    if (i >= ps.len()) { return ps.len() > 0; }
+    return principal_ok(ps[i]) && principals_ok(ps, i + 1);
+}
+
+// `device ssh certify DIR KEY CA --principal NAME... [--days N]`: the PIN
+// on standard input. Prints the certificate's public line.
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+pub Int ssh_certify(Str dir, Str key, Str ca, List(Str) opts) {
+    CertOpts co = cert_opts(opts, 0, CertOpts {.principals = [], .days = 30, .err = ""});
+    if (str_len(co.err) > 0) { return dfail(co.err); }
+    if (co.principals.len() == 0) { return dfail("give the user name(s) the certificate is for on the servers: --principal NAME"); }
+    if (is_ca(dir, key)) { return dfail(key + " is a certificate authority, not a key"); }
+    Result(Opened, Str) ro = open_vault(dir);
+    return match ro { Err(m) => dfail(m), Ok(o) => certify_named(dir, o, key, ca, co.principals, co.days) };
+}
+
+// `device ssh renew DIR KEY`: a new certificate with the authority,
+// principals and lifetime the vault remembers for KEY.
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+pub Int ssh_renew(Str dir, Str key) {
+    Result(Opened, Str) ro = open_vault(dir);
+    return match ro {
+        Err(m) => dfail(m),
+        Ok(o) => match item_fields(dir, o, key) { Err(m) => dfail(key + ": " + m), Ok(kfs) => renew_fields(dir, o, key, kfs) }
+    };
+}
+
+@requires(filesystem, network, device, declassify, clock, environment)
+Result(List(FieldPlain), Str) item_fields(Str dir, Opened o, Str name) {
+    return match item_by_id(o.st.items, item_id_of(o.p.vk, name), 0) {
+        None => Err("not in the vault"),
+        Some(it) => open_full(dir, opened_ctx(o), o.p.vk, o.p.vid, it)
+    };
+}
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+Int certify_named(Str dir, Opened o, Str key, Str ca, List(Str) principals, Int days) {
+    Result(List(FieldPlain), Str) kf = item_fields(dir, o, key);
+    Result(List(FieldPlain), Str) cf = item_fields(dir, o, ca);
+    return match kf {
+        Err(m) => dfail(key + ": " + m),
+        Ok(kfs) => match cf { Err(m) => dfail(ca + ": " + m), Ok(cfs) => certify_fields(dir, o, key, kfs, ca, cfs, principals, days) }
+    };
+}
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+Int renew_fields(Str dir, Opened o, Str key, List(FieldPlain) kfs) {
+    Str ca = ftext(kfs, "cert_ca");
+    if (str_len(ca) == 0) { return dfail(key + " has no certificate to renew (device ssh certify)"); }
+    List(Str) ps = str_split(ftext(kfs, "cert_principals"), ",");
+    Str d = ftext(kfs, "cert_days");
+    Int days = if (digits_ok(d)) { str_parse_int(d) } else { 0 };
+    if (days < 1 || days > max_days() || !principals_ok(ps, 0)) { return dfail("the certificate settings of " + key + " in the vault are damaged: certify it again"); }
+    Result(List(FieldPlain), Str) cf = item_fields(dir, o, ca);
+    return match cf { Err(m) => dfail("the certificate authority " + ca + ": " + m), Ok(cfs) => certify_fields(dir, o, key, kfs, ca, cfs, ps, days) };
+}
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+Int certify_fields(Str dir, Opened o, Str key, List(FieldPlain) kfs, Str ca, List(FieldPlain) cfs, List(Str) principals, Int days) {
+    Result(CertEntry, Str) r = issue(dir, o, key, kfs, ca, cfs, principals, days);
+    return match r { Err(m) => dfail(m), Ok(e) => store_cert(dir, o, key, kfs, e) };
+}
+
+// A user certificate for `key` by the authority `ca`: a random nonce and
+// serial, key id "symbolon:KEY", valid from five minutes ago (clocks
+// differ) for `days`, signed by the quorum under the authority's label,
+// and checked before anything keeps it.
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+Result(CertEntry, Str) issue(Str dir, Opened o, Str key, List(FieldPlain) kfs, Str ca, List(FieldPlain) cfs, List(Str) principals, Int days) {
+    if (ftext(cfs, "type") != "ssh" || ftext(cfs, "role") != "ca" || ftext(cfs, "kind") != "threshold") { return Err(ca + " is not a certificate authority"); }
+    if (ftext(kfs, "type") != "ssh" || ftext(kfs, "role") == "ca") { return Err(key + " is not an SSH key"); }
+    Option(List(Int)) okb = ssh_blob_of_line(ftext(kfs, "public"));
+    Option(SshPub) okp = pub_of_blob(okb else { [] });
+    SshPub k = okp else { no_pub() };
+    Option(List(Int)) ocb = ssh_blob_of_line(ftext(cfs, "public"));
+    List(Int) ca_blob = ocb else { [] };
+    if (str_len(k.alg) == 0 || ca_blob.len() == 0 || str_len(cert_alg_of(k.alg)) == 0) { return Err("a public key in the vault does not parse"); }
+    Int now = clock_now_seconds();
+    CertSpec spec = CertSpec {.nonce = random_bytes(32), .serial = random_bytes(8), .key_id = "symbolon:" + key, .principals = principals,
+                              .valid_after = now - 300, .valid_before = now + days * 86400};
+    List(Int) tbs = cert_tbs(k, spec, ca_blob);
+    // The configuration as the last signature left it (its mailbox
+    // position), when this follows one in the same run.
+    Option(DeviceConfig) oc = load_config(dir);
+    DeviceConfig c = oc else { o.c };
+    Result(List(Int), Str) rs = sign_unlocked_raw(dir, c, o.u, ftext(cfs, "rp"), cose_hex_decode(ftext(cfs, "cid")), sha256_bytes(tbs));
+    return match rs {
+        Err(m) => Err("the certificate authority did not sign: " + m),
+        Ok(sig) => checked_cert(key, ca, principals, days, k, tbs, ca_blob, sig)
+    };
+}
+
+Result(CertEntry, Str) checked_cert(Str key, Str ca, List(Str) principals, Int days, SshPub k, List(Int) tbs, List(Int) ca_blob, List(Int) sig) {
+    List(Int) blob = tbs.concat(sstring(ecdsa_sig_blob("nistp256", sig)));
+    Option(SshCert) oc = cert_of_blob(blob);
+    return match oc { None => Err("the certificate does not parse"), Some(c) => cert_checked(key, ca, principals, days, k, blob, ca_blob, c) };
+}
+
+Result(CertEntry, Str) cert_checked(Str key, Str ca, List(Str) principals, Int days, SshPub k, List(Int) blob, List(Int) ca_blob, SshCert c) {
+    Bool same = hex_encode(c.key_blob) == hex_encode(k.blob) && hex_encode(c.ca_blob) == hex_encode(ca_blob) && c.kind == 1;
+    if (!same || !cert_signed(c)) { return Err("the certificate's signature does not verify"); }
+    return Ok(CertEntry {.key = key, .ca = ca, .days = days, .principals = principals, .valid_after = c.valid_after, .valid_before = c.valid_before, .line = ssh_pub_line(blob, key)});
+}
+
+List(FieldPlain) without_cert_fields(List(FieldPlain) fs, Int i, List(FieldPlain) acc) {
+    if (i >= fs.len()) { return acc; }
+    Bool drop = fs[i].name == "cert_ca" || fs[i].name == "cert_principals" || fs[i].name == "cert_days" || fs[i].name == "cert";
+    return without_cert_fields(fs, i + 1, if (drop) { acc } else { acc.concat([fs[i]]) });
+}
+
+// The certificate goes to this device's list first (the agent offers it
+// at once), then into the key's item, which carries it to the other
+// devices and remembers how to renew it.
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+Int store_cert(Str dir, Opened o, Str key, List(FieldPlain) kfs, CertEntry e) {
+    if (!cert_put(dir, e)) { return dfail("cannot write " + cert_index(dir)); }
+    List(FieldPlain) fs = without_cert_fields(kfs, 0, []).concat([fpl("cert_ca", e.ca), fpl("cert_principals", str_join(e.principals, ",")), fpl("cert_days", f"{e.days}"), fpl("cert", e.line)]);
+    if (seal_publish(dir, o, key, fs) != 0) { return dfail("the certificate works on this device, but the vault did not take it: other devices do not have it and it is not renewed until it is certified again"); }
+    println(e.line);
+    return 0;
+}
+
+// Due for renewal at `now`: less than a third of its life left, or expired.
+pub Bool entry_due(CertEntry e, Int now) {
+    Int life = e.valid_before - e.valid_after;
+    return life <= 0 || now >= e.valid_before - life / 3;
+}
+
+// The list entry for a key item's certificate, when it has one that parses.
+@requires(declassify)
+Option(CertEntry) entry_of_fields(Str key, List(FieldPlain) fs) {
+    Str line = ftext(fs, "cert");
+    Option(SshCert) oc = cert_of_line(line);
+    Str d = ftext(fs, "cert_days");
+    return match oc {
+        None => None,
+        Some(c) => Some(CertEntry {.key = key, .ca = ftext(fs, "cert_ca"), .days = if (digits_ok(d)) { str_parse_int(d) } else { 0 }, .principals = str_split(ftext(fs, "cert_principals"), ","),
+                                   .valid_after = c.valid_after, .valid_before = c.valid_before, .line = line})
+    };
+}
+
+// After a signature the principal approved: a certificate with less than
+// a third of its life left (or expired) is renewed with the same unlocked
+// vault, a second signature by the quorum, from the settings in the
+// vault, not in DIR/ssh-certs (which any program of the principal's could
+// edit). A failure leaves the signature as it is. A certificate not yet
+// due that another device renewed is copied to this device's list.
+// Nothing happens for a certificate whose authority was deleted.
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+Int after_sign(Str dir, Opened o, Str key, List(FieldPlain) fs) {
+    if (str_len(ftext(fs, "cert")) == 0) { return 0; }
+    // An authority deleted since: its certificates are neither renewed nor
+    // listed again.
+    if (match item_by_id(o.st.items, item_id_of(o.p.vk, ftext(fs, "cert_ca")), 0) { None => true, Some(_) => false }) { return 0; }
+    Option(CertEntry) oe = entry_of_fields(key, fs);
+    Int now = clock_now_seconds();
+    Bool due = match oe { None => true, Some(e) => entry_due(e, now) };
+    if (!due) { return keep_listed(dir, oe); }
+    eprintln("device: renewing the certificate of " + key);
+    Int r = renew_fields(dir, o, key, fs);
+    if (r != 0) { eprintln("device: the certificate was not renewed; the signature stands"); }
+    return 0;
+}
+
+@requires(filesystem)
+Int keep_listed(Str dir, Option(CertEntry) oe) {
+    CertEntry e = oe else { CertEntry {.key = "", .ca = "", .days = 0, .principals = [], .valid_after = 0, .valid_before = 0, .line = ""} };
+    Option(CertEntry) ox = cert_for_key(read_certs(dir), e.key, 0);
+    Str listed = match ox { None => "", Some(x) => x.line };
+    if (str_len(e.key) > 0 && listed != e.line) { _ = cert_put(dir, e); }
+    return 0;
+}
+
+// ============================================================================
+// The lists from the vault
+// ============================================================================
+
+// `device ssh refresh DIR`: DIR/ssh-keys, DIR/ssh-cas and DIR/ssh-certs
+// rebuilt from the vault's SSH items, so a device has the keys, the
+// authorities and the certificates another device made.
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+pub Int ssh_refresh(Str dir) {
+    Result(Opened, Str) ro = open_vault(dir);
+    return match ro { Err(m) => dfail(m), Ok(o) => refresh_in(dir, o, ssh_items(dir, o, 0, [])) };
+}
+
+pub type SshItem = { Str name; List(FieldPlain) fs; };
+
+// The SSH items: the listing (standard tier) tells the type; only those
+// are opened in full.
+@requires(filesystem, network, device, declassify, clock, environment)
+List(SshItem) ssh_items(Str dir, Opened o, Int i, List(SshItem) acc) {
+    if (i >= o.st.items.len()) { return acc; }
+    Item it = o.st.items[i];
+    Result(List(FieldPlain), SymbolonError) rl = item_open_listing(o.p.vk, o.p.vid, it);
+    Bool ssh = match rl { Err(_) => false, Ok(ls) => field_text(ls, "type") == "ssh" };
+    Result(List(FieldPlain), Str) rf = if (ssh) { open_full(dir, opened_ctx(o), o.p.vk, o.p.vid, it) } else { Err("") };
+    List(SshItem) more = match rf { Err(_) => [], Ok(fs) => [SshItem {.name = ftext(fs, "name"), .fs = fs}] };
+    return ssh_items(dir, o, i + 1, acc.concat(more));
+}
+
+@requires(filesystem, declassify)
+Int refresh_in(Str dir, Opened o, List(SshItem) xs) {
+    List(SshEntry) cas = item_entries(xs, true, 0, []);
+    List(SshEntry) keys = item_entries(xs, false, 0, []);
+    List(CertEntry) certs = item_certs(xs, cas, 0, []);
+    if (!write_index(dir, keys) || !write_cas(dir, cas) || !write_certs(dir, certs)) { return dfail("cannot write the SSH lists in " + dir); }
+    println(f"{keys.len()} keys, {cas.len()} certificate authorities, {certs.len()} certificates");
+    return 0;
+}
+
+@requires(declassify)
+List(SshEntry) item_entries(List(SshItem) xs, Bool cas, Int i, List(SshEntry) acc) {
+    if (i >= xs.len()) { return acc; }
+    Bool want = (ftext(xs[i].fs, "role") == "ca") == cas && str_len(ftext(xs[i].fs, "public")) > 0;
+    return item_entries(xs, cas, i + 1, if (want) { acc.concat([SshEntry {.name = xs[i].name, .line = ftext(xs[i].fs, "public")}]) } else { acc });
+}
+
+// Certificates whose authority is still in the vault.
+@requires(declassify)
+List(CertEntry) item_certs(List(SshItem) xs, List(SshEntry) cas, Int i, List(CertEntry) acc) {
+    if (i >= xs.len()) { return acc; }
+    Option(CertEntry) oe = if (ftext(xs[i].fs, "role") == "ca") { None } else { entry_of_fields(xs[i].name, xs[i].fs) };
+    List(CertEntry) more = match oe { None => [], Some(e) => match entry_named(cas, e.ca, 0) { None => [], Some(_) => [e] } };
+    return item_certs(xs, cas, i + 1, acc.concat(more));
 }

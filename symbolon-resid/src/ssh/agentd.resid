@@ -9,8 +9,15 @@
 // sign`, and sends back only the signature, on a per-request Unix socket
 // that must first receive the request's one-time token. The agent checks
 // the signature against the key before it answers. It holds no secret.
+//
+// A key with a certificate in DIR/ssh-certs that is valid by the clock
+// (SPEC 16.1.2) is offered twice, as OpenSSH's agent does: the
+// certificate first, then the key. A request naming the certificate is
+// signed with the certified key and shown to the principal as a
+// certificate's; an expired certificate is not offered or signed for.
 
 import "sshwire.resid";
+import "sshcert.resid";
 import "../agent/sshcli.resid";
 import "../browser/json.resid";
 import "crypto.resid";
@@ -20,28 +27,14 @@ import "ed25519.resid";
 import "rsa.resid";
 import "hash.resid";
 import "httpserv.resid";
+import "clock.resid";
 
 // ============================================================================
 // Checks
 // ============================================================================
 
 // Does `sig_blob` verify over `data` under the public key `blob`?
-pub Bool verifies(List(Int) blob, List(Int) data, List(Int) sig_blob) {
-    Option(SshPub) ok = pub_of_blob(blob);
-    SshPub k = ok else { no_pub() };
-    Int size = if (k.kind == "p384") { 48 } else { 32 };
-    Option(SigParts) os = sig_parts(sig_blob, size);
-    SigParts s = os else { SigParts {.alg = "", .sig = []} };
-    if (k.kind == "ed25519") { return s.alg == "ssh-ed25519" && verify_sig_bytes(data, s.sig, k.point); }
-    if (k.kind == "p256") { return s.alg == k.alg && ecdsa_verify_raw(P256, Sha256, k.point, data, s.sig); }
-    if (k.kind == "p384") { return s.alg == k.alg && ecdsa_verify_raw(P384, Sha384, k.point, data, s.sig); }
-    if (k.kind == "rsa") {
-        RsaPub r = rsa_pub(k.n, k.e);
-        if (s.alg == "rsa-sha2-256") { return rsa_pkcs1_verify(Sha256, r, data, s.sig); }
-        if (s.alg == "rsa-sha2-512") { return rsa_pkcs1_verify(Sha512, r, data, s.sig); }
-    }
-    return false;
-}
+pub Bool verifies(List(Int) blob, List(Int) data, List(Int) sig_blob) { return sig_verifies(blob, data, sig_blob); }
 
 // The session a client bound (session-bind@openssh.com), checked: the
 // host key's signature over the session identifier.
@@ -80,19 +73,35 @@ pub Str rsa_alg_of(List(Int) key, Int flags) {
     return "refused";
 }
 
-pub Str consent_json(SshEntry e, Signed w, AgentSession s, Int pid, List(Int) data, Str sock, Str token, Str rsa_alg) { return consent_json_peer(e, w, s, pid, "", data, sock, token, rsa_alg); }
+pub Str consent_json(SshEntry e, Signed w, AgentSession s, Int pid, List(Int) data, Str sock, Str token, Str rsa_alg) { return consent_json_peer(e, w, s, pid, "", data, sock, token, rsa_alg, ""); }
+
+// The certificate a request names, for the window: its authority, its
+// principals, when it ends and whether this signature renews it (less
+// than a third of its life left). "" when the request names the key.
+pub Str cert_json(Option(CertEntry) oc, Int now) {
+    return match oc {
+        None => "",
+        Some(c) => "{\"ca\":" + json_quote(c.ca) + ",\"principals\":[" + quoted(c.principals, 0, "") + "],\"valid_before\":" + f"{c.valid_before}"
+                   + ",\"renews\":" + (if (entry_due(c, now)) { "true" } else { "false" }) + "}"
+    };
+}
+
+Str quoted(List(Str) xs, Int i, Str acc) {
+    if (i >= xs.len()) { return acc; }
+    return quoted(xs, i + 1, acc + (if (i > 0) { "," } else { "" }) + json_quote(xs[i]));
+}
 
 // `peer`: who is asking, when the platform says so instead of a pid (on
 // Android, the calling app as the agent service verified it: its label
-// and package); "" leaves the field out.
-pub Str consent_json_peer(SshEntry e, Signed w, AgentSession s, Int pid, Str peer, List(Int) data, Str sock, Str token, Str rsa_alg) {
+// and package); "" leaves the field out. `cert`: cert_json, or "".
+pub Str consent_json_peer(SshEntry e, Signed w, AgentSession s, Int pid, Str peer, List(Int) data, Str sock, Str token, Str rsa_alg, Str cert) {
     Str what = if (w.kind == "auth") { "{\"kind\":\"auth\",\"user\":" + json_quote(w.user) + "}" }
                else { if (w.kind == "sshsig") { "{\"kind\":\"sshsig\",\"namespace\":" + json_quote(w.namespace) + "}" } else { "{\"kind\":\"unknown\"}" } };
     Str host = if (s.bound) { "{\"key\":" + json_quote(base64_encode(s.host_key)) + ",\"fingerprint\":" + json_quote(ssh_fingerprint(s.host_key)) + ",\"forwarding\":" + (if (s.forwarding) { "true" } else { "false" }) + "}" } else { "null" };
     Option(List(Int)) ob = ssh_blob_of_line(e.line);
     List(Int) blob = ob else { [] };
     return "{\"key\":" + json_quote(e.name) + ",\"fingerprint\":" + json_quote(ssh_fingerprint(blob)) + ",\"what\":" + what + ",\"host\":" + host
-        + ",\"pid\":" + f"{pid}" + (if (str_len(peer) > 0) { ",\"peer\":" + json_quote(peer) } else { "" }) + ",\"data\":" + json_quote(hex_encode(data)) + ",\"alg\":" + json_quote(rsa_alg) + ",\"socket\":" + json_quote(sock) + ",\"token\":" + json_quote(token) + "}";
+        + ",\"pid\":" + f"{pid}" + (if (str_len(peer) > 0) { ",\"peer\":" + json_quote(peer) } else { "" }) + ",\"data\":" + json_quote(hex_encode(data)) + ",\"alg\":" + json_quote(rsa_alg) + (if (str_len(cert) > 0) { ",\"certificate\":" + cert } else { "" }) + ",\"socket\":" + json_quote(sock) + ",\"token\":" + json_quote(token) + "}";
 }
 
 Bool shell_safe(Str s) { return str_len(s) > 0 && !str_contains(s, "'") && !str_contains(s, "\n"); }
@@ -146,7 +155,7 @@ TokenConn accept_token(Int l, Str token, Int tries) {
 
 // The signature the window sends ("ok HEX\n"), [] for cancel or nothing.
 @requires(filesystem, network, clock, process, environment)
-pub List(Int) ask_window(SshEntry e, Signed w, AgentSession s, Int pid, List(Int) data, Str rt, Str rsa_alg) {
+pub List(Int) ask_window(SshEntry e, Signed w, AgentSession s, Int pid, List(Int) data, Str rt, Str rsa_alg, Str cert) {
     Str ui = environment.get("SYMBOLON_CONSENT");
     if (!shell_safe(ui) || !word_safe(rt)) { return []; }
     Str base = rt + "/symbolon/sign-" + hex_encode(random_bytes(8));
@@ -156,7 +165,7 @@ pub List(Int) ask_window(SshEntry e, Signed w, AgentSession s, Int pid, List(Int
     Str token = hex_encode(random_bytes(32));
     Str req = base + ".json";
     Str sh = base + ".sh";
-    _ = filesystem.write_secret(req, json_utf8(consent_json(e, w, s, pid, data, sock, token, rsa_alg)));
+    _ = filesystem.write_secret(req, json_utf8(consent_json_peer(e, w, s, pid, "", data, sock, token, rsa_alg, cert)));
     _ = filesystem.write_secret(sh, json_utf8("exec '" + ui + "' --ssh-consent '" + req + "' </dev/null >/dev/null 2>&1\n"));
     Int started = process.run("setsid -f sh " + sh);
     TokenConn tc = if (started == 0) { accept_token(l, token, 600) } else { TokenConn {.fd = -1, .rest = []} };
@@ -179,7 +188,7 @@ pub List(Int) ask_window(SshEntry e, Signed w, AgentSession s, Int pid, List(Int
 // on standard error instead of a program run. The window has five
 // minutes.
 @requires(filesystem, network, clock, process)
-pub List(Int) ask_platform(SshEntry e, Signed w, AgentSession s, Str peer, List(Int) data, Str rt, Str rsa_alg) {
+pub List(Int) ask_platform(SshEntry e, Signed w, AgentSession s, Str peer, List(Int) data, Str rt, Str rsa_alg, Str cert) {
     if (!word_safe(rt)) { return []; }
     Str base = rt + "/symbolon/sign-" + hex_encode(random_bytes(8));
     Str sock = base + ".sock";
@@ -187,7 +196,7 @@ pub List(Int) ask_platform(SshEntry e, Signed w, AgentSession s, Str peer, List(
     if (l < 0) { return []; }
     Str token = hex_encode(random_bytes(32));
     Str req = base + ".json";
-    _ = filesystem.write_secret(req, json_utf8(consent_json_peer(e, w, s, 0, peer, data, sock, token, rsa_alg)));
+    _ = filesystem.write_secret(req, json_utf8(consent_json_peer(e, w, s, 0, peer, data, sock, token, rsa_alg, cert)));
     eprintln("consent " + req);
     TokenConn tc = accept_token(l, token, 3000);
     _ = resid_unix_close(l);
@@ -206,18 +215,67 @@ pub List(Int) ask_platform(SshEntry e, Signed w, AgentSession s, Str peer, List(
 // Messages
 // ============================================================================
 
-Option(SshEntry) entry_for(List(SshEntry) es, List(Int) blob, Int i) {
+// A certificate of DIR/ssh-certs the agent offers: valid at `now`, and
+// for the key it is listed with. Its principals and times are read from
+// the certificate itself (what the window shows is what is signed for);
+// only the authority's name comes from the list.
+pub type Offered = { List(Int) blob; CertEntry e; };
+
+pub Option(Offered) offered_cert(List(CertEntry) cs, SshEntry k, Int now) {
+    return match cert_for_key(cs, k.name, 0) { None => None, Some(e) => offered_if(e, k, now) };
+}
+
+Option(Offered) offered_if(CertEntry e, SshEntry k, Int now) {
+    Option(List(Int)) ob = cert_blob_of_line(e.line);
+    List(Int) blob = ob else { [] };
+    Option(SshCert) oc = cert_of_blob(blob);
+    Option(List(Int)) kb = ssh_blob_of_line(k.line);
+    List(Int) key = kb else { [] };
+    return match oc {
+        None => None,
+        Some(c) => if (cert_current(c, now) && key.len() > 0 && hex_encode(c.key_blob) == hex_encode(key)) {
+            Some(Offered {.blob = blob, .e = CertEntry {.key = e.key, .ca = e.ca, .days = e.days, .principals = c.principals, .valid_after = c.valid_after, .valid_before = c.valid_before, .line = e.line}})
+        } else { None }
+    };
+}
+
+// What a sign request names: the key's entry, its own blob, the
+// certificate when the request named one, and the blob the signed data
+// must name (the request's, or the certificate: for_signed).
+pub type Target = { SshEntry e; List(Int) key; Option(CertEntry) cert; List(Int) named; };
+
+pub Option(Target) target_for(List(SshEntry) es, List(CertEntry) cs, Int now, List(Int) blob, Int i) {
     if (i >= es.len()) { return None; }
     Option(List(Int)) b = ssh_blob_of_line(es[i].line);
     List(Int) eb = b else { [] };
-    if (hex_encode(eb) == hex_encode(blob)) { return Some(es[i]); }
-    return entry_for(es, blob, i + 1);
+    if (eb.len() > 0 && hex_encode(eb) == hex_encode(blob)) { return Some(Target {.e = es[i], .key = eb, .cert = None, .named = blob}); }
+    Option(Offered) oc = offered_cert(cs, es[i], now);
+    Option(CertEntry) named = match oc { None => None, Some(x) => if (hex_encode(x.blob) == hex_encode(blob)) { Some(x.e) } else { None } };
+    return match named { None => target_for(es, cs, now, blob, i + 1), Some(x) => Some(Target {.e = es[i], .key = eb, .cert = Some(x), .named = blob}) };
 }
 
-List(Ident) idents_of(List(SshEntry) es, Int i, List(Ident) acc) {
+// A client that loaded the certificate from a file asks for the
+// signature with the key itself, while the user authentication it signs
+// names the certificate (OpenSSH does this). That is taken as a request
+// for the certificate when it is this key's current one (`oc`); any other
+// certificate stays "another key" and is refused.
+pub Target for_signed(Target t, Option(Offered) oc, Signed w) {
+    Option(CertEntry) tc = t.cert;
+    Bool plain = match tc { None => true, Some(_) => false };
+    return match oc {
+        None => t,
+        Some(x) => if (plain && w.kind == "auth" && hex_encode(w.key) == hex_encode(x.blob)) { Target {.e = t.e, .key = t.key, .cert = Some(x.e), .named = x.blob} } else { t }
+    };
+}
+
+// Each key, after its certificate when it has one valid at `now`.
+pub List(Ident) idents_of(List(SshEntry) es, List(CertEntry) cs, Int now, Int i, List(Ident) acc) {
     if (i >= es.len()) { return acc; }
     Option(List(Int)) b = ssh_blob_of_line(es[i].line);
-    return idents_of(es, i + 1, match b { None => acc, Some(x) => acc.concat([Ident {.blob = x, .comment = es[i].name}]) });
+    Option(Offered) oc = offered_cert(cs, es[i], now);
+    List(Ident) cert = match oc { None => [], Some(x) => [Ident {.blob = x.blob, .comment = es[i].name + " (certificate)"}] };
+    List(Ident) more = match b { None => [], Some(x) => cert.concat([Ident {.blob = x, .comment = es[i].name}]) };
+    return idents_of(es, cs, now, i + 1, acc.concat(more));
 }
 
 pub List(Int) failure() { return agent_msg(msg_failure(), []); }
@@ -231,7 +289,7 @@ pub Reply answer(Str dir, Str rt, Int pid, AgentSession s, Int t, List(Int) body
 // platform opens (ask_platform); else the desktop agent's (ask_window).
 @requires(filesystem, network, clock, process, environment)
 pub Reply answer_via(Str dir, Str rt, Int pid, Str peer, AgentSession s, Int t, List(Int) body) {
-    if (t == msg_request_identities()) { return Reply {.out = identities_answer(idents_of(read_index(dir), 0, [])), .s = s}; }
+    if (t == msg_request_identities()) { return Reply {.out = identities_answer(idents_of(read_index(dir), read_certs(dir), clock_now_seconds(), 0, [])), .s = s}; }
     if (t == msg_extension()) {
         Option(AgentSession) b = checked_bind(body);
         return match b { None => Reply {.out = failure(), .s = s}, Some(x) => Reply {.out = agent_msg(msg_success(), []), .s = x} };
@@ -244,15 +302,22 @@ pub Reply answer_via(Str dir, Str rt, Int pid, Str peer, AgentSession s, Int t, 
 List(Int) sign_reply(Str dir, Str rt, Int pid, Str peer, AgentSession s, List(Int) body) {
     Option(SignReq) or = sign_req_of(body);
     SignReq r = or else { SignReq {.key = [], .data = [], .flags = 0} };
-    Option(SshEntry) oe = entry_for(read_index(dir), r.key, 0);
-    SshEntry e = oe else { SshEntry {.name = "", .line = ""} };
+    Int now = clock_now_seconds();
+    List(CertEntry) cs = read_certs(dir);
+    Option(Target) ot = target_for(read_index(dir), cs, now, r.key, 0);
+    Target t0 = ot else { Target {.e = SshEntry {.name = "", .line = ""}, .key = [], .cert = None, .named = []} };
+    SshEntry e = t0.e;
     if (str_len(e.name) == 0) { return failure(); }
+    // The request's key (the certificate, when it names one) must be the
+    // one the signed data names; the signature is the certified key's.
     Signed w = signed_of(r.data);
-    if (str_len(refused(s, r.key, w)) > 0) { return failure(); }
-    Str alg = rsa_alg_of(r.key, r.flags);
+    Target tg = for_signed(t0, offered_cert(cs, e, now), w);
+    if (str_len(refused(s, tg.named, w)) > 0) { return failure(); }
+    Str alg = rsa_alg_of(tg.key, r.flags);
     if (alg == "refused") { return failure(); }
-    List(Int) sig = if (str_len(peer) > 0) { ask_platform(e, w, s, peer, r.data, rt, alg) } else { ask_window(e, w, s, pid, r.data, rt, alg) };
-    if (sig.len() == 0 || !verifies(r.key, r.data, sig)) { return failure(); }
+    Str cert = cert_json(tg.cert, now);
+    List(Int) sig = if (str_len(peer) > 0) { ask_platform(e, w, s, peer, r.data, rt, alg, cert) } else { ask_window(e, w, s, pid, r.data, rt, alg, cert) };
+    if (sig.len() == 0 || !verifies(tg.key, r.data, sig)) { return failure(); }
     return agent_msg(msg_sign_response(), sstring(sig));
 }
 

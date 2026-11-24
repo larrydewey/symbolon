@@ -521,18 +521,37 @@ pub Int sign_with(Str dir, DeviceConfig c, Str rp, List(Int) cid, List(Int) m, S
 // unlocks first to tell a threshold credential from a Synced one).
 @requires(filesystem, network, device, declassify, clock, provision, environment)
 pub Int sign_unlocked(Str dir, DeviceConfig c, Unlocked u, Str rp, List(Int) cid, List(Int) m, Str pin, Int form) {
-    if (u.kind == 2) { return duress_sign(dir, c, u, cid, m, form); }
-    if (u.kind != 1) { return dfail("wrong PIN"); }
+    Result(List(Int), Str) r = sign_unlocked_raw(dir, c, u, rp, cid, m);
+    return match r { Err(e) => dfail(e), Ok(sig) => print_sig(sig, form) };
+}
+
+Int print_sig(List(Int) sig, Int form) {
+    if (form == 1) {
+        println("signature " + hex_encode(ecdsa_sig_blob("nistp256", sig)));
+        return 0;
+    }
+    println("signature-der " + hex_encode(ecdsa_der_of(ecdsa_sig_raw(P256, sig))));
+    println(hex_encode(sig));
+    return 0;
+}
+
+// The signature itself, r || s (64 bytes, checked against the
+// credential's public key), for a caller that builds on it: an SSH
+// certificate (SPEC 16.1.2) is signed this way.
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+pub Result(List(Int), Str) sign_unlocked_raw(Str dir, DeviceConfig c, Unlocked u, Str rp, List(Int) cid, List(Int) m) {
+    if (u.kind == 2) { return duress_sign(dir, c, u, cid, m); }
+    if (u.kind != 1) { return Err("wrong PIN"); }
     Option(List(Int)) nonce = credential_nonce(u.real.cc, rp, cid);
     Option(CgConfig) cg = load_share(dir, u.real.dek);
     Result(VerifiedHead, SymbolonError) v = verified_log_dir(dir, relay_ep(c), c.log_id);
     return match nonce {
-        None => dfail("that credential ID is not for this relying party (A-12)"),
+        None => Err("that credential ID is not for this relying party (A-12)"),
         Some(n) => match cg {
-            None => dfail("no share"),
+            None => Err("no share"),
             Some(x) => match v {
-                Err(e) => dfail(err_text(e)),
-                Ok(vh) => run_sign(dir, c, u, x, vh, tweak_scalar(u.real.cc, rp, n), m, pin, form)
+                Err(e) => Err(err_text(e)),
+                Ok(vh) => run_sign(dir, c, u, x, vh, tweak_scalar(u.real.cc, rp, n), m)
             }
         }
     };
@@ -545,18 +564,18 @@ pub Int sign_unlocked(Str dir, DeviceConfig c, Unlocked u, Str rp, List(Int) cid
 // normal signature's, and a credential outside the subset fails as a
 // credential presented to another relying party does.
 @requires(filesystem, network, device, declassify, clock, provision)
-Int duress_sign(Str dir, DeviceConfig c, Unlocked u, List(Int) cid, List(Int) m, Int form) {
+Result(List(Int), Str) duress_sign(Str dir, DeviceConfig c, Unlocked u, List(Int) cid, List(Int) m) {
     Option(List(Secret(UInt(8)))) tau = subset_tweak(DuressFull {.share = u.duress.share, .subkey = u.duress.subkey, .vault_key = u.duress.vault_key,
                                                                 .hpke_priv = u.duress.hpke_priv, .tweaks = duress_tweaks(dir, u.duress)}, cid, 0);
     Option(CgConfig) cg = load_dshare(dir, u.duress.hpke_priv);
     Result(VerifiedHead, SymbolonError) v = verified_log_dir(dir, relay_ep(c), c.log_id);
     return match tau {
-        None => dfail("that credential ID is not for this relying party (A-12)"),
+        None => Err("that credential ID is not for this relying party (A-12)"),
         Some(t) => match cg {
-            None => dfail("no share"),
+            None => Err("no share"),
             Some(x) => match v {
-                Err(e) => dfail(err_text(e)),
-                Ok(vh) => run_sign_as(dir, c, u.duress.share, u.duress.subkey, x, vh, bn_from_be(reveal(t)), m, form)
+                Err(e) => Err(err_text(e)),
+                Ok(vh) => run_sign_as(dir, c, u.duress.share, u.duress.subkey, x, vh, bn_from_be(reveal(t)), m)
             }
         }
     };
@@ -566,10 +585,10 @@ Int duress_sign(Str dir, DeviceConfig c, Unlocked u, List(Int) cid, List(Int) m,
 // and whose envelopes use the HPKE key derived for this device (the duress
 // profile shares the device's identity; only the request key differs).
 @requires(filesystem, network, declassify, clock)
-Int run_sign_as(Str dir, DeviceConfig c, List(Secret(UInt(8))) hpke_ikm, List(Secret(UInt(8))) rkey, CgConfig x, VerifiedHead vh, List(UInt(64)) tau, List(Int) m, Int form) {
+Result(List(Int), Str) run_sign_as(Str dir, DeviceConfig c, List(Secret(UInt(8))) hpke_ikm, List(Secret(UInt(8))) rkey, CgConfig x, VerifiedHead vh, List(UInt(64)) tau, List(Int) m) {
     List(Int) sid = random_bytes(32);
     List(Int) rsig = sw_sign(rkey, request_tbs(sid, m, vh.head.quorum.epoch, c.party, request_sign()));
-    return run_sign_core(dir, c, hpkeg_derive_keypair(16, hpke_ikm).sk, x, vh, tau, m, sid, rsig, form);
+    return run_sign_core(dir, c, hpkeg_derive_keypair(16, hpke_ikm).sk, x, vh, tau, m, sid, rsig);
 }
 
 pub Option(Party) cosigner_of(List(Party) ps, Int i) {
@@ -579,64 +598,58 @@ pub Option(Party) cosigner_of(List(Party) ps, Int i) {
 }
 
 @requires(filesystem, network, device, declassify, clock, environment)
-Int run_sign(Str dir, DeviceConfig c, Unlocked u, CgConfig x, VerifiedHead vh, List(UInt(64)) tau, List(Int) m, Str pin, Int form) {
+Result(List(Int), Str) run_sign(Str dir, DeviceConfig c, Unlocked u, CgConfig x, VerifiedHead vh, List(UInt(64)) tau, List(Int) m) {
     Quorum q = vh.head.quorum;
     Option(Party) ocos = cosigner_of(q.parties, 0);
     Party cos = ocos else { Party {.id = [], .kind = 0, .auth_key = [], .hpke_key = [], .label = "", .attestation = NoAttestation} };
-    if (cos.id.len() == 0) { return dfail("no cosigner in the quorum"); }
+    if (cos.id.len() == 0) { return Err("no cosigner in the quorum"); }
     List(Int) sid = random_bytes(32);
     List(List(Int)) signers = [c.party, cos.id];
     Result(List(Int), Str) rs = dk_sign(c, u.real, u.st, request_tbs(sid, m, q.epoch, c.party, request_sign()));
     List(Int) rsig = match rs { Ok(s) => s, Err(_) => [] };
-    return run_sign_core(dir, c, device_hpke(u.real.dek).sk, x, vh, tau, m, sid, rsig, form);
+    return run_sign_core(dir, c, device_hpke(u.real.dek).sk, x, vh, tau, m, sid, rsig);
 }
 
 // The session itself, given the HPKE key the device's envelopes use and
 // the request's signature (by the DK, or under duress by the sub-key).
 @requires(filesystem, network, declassify, clock)
-Int run_sign_core(Str dir, DeviceConfig c, List(Secret(UInt(8))) hpke_sk, CgConfig x, VerifiedHead vh, List(UInt(64)) tau, List(Int) m, List(Int) sid, List(Int) rsig, Int form) {
+Result(List(Int), Str) run_sign_core(Str dir, DeviceConfig c, List(Secret(UInt(8))) hpke_sk, CgConfig x, VerifiedHead vh, List(UInt(64)) tau, List(Int) m, List(Int) sid, List(Int) rsig) {
     Quorum q = vh.head.quorum;
     Party cos = cosigner_of(q.parties, 0) else { Party {.id = [], .kind = 0, .auth_key = [], .hpke_key = [], .label = "", .attestation = NoAttestation} };
-    if (cos.id.len() == 0) { return dfail("no cosigner in the quorum"); }
+    if (cos.id.len() == 0) { return Err("no cosigner in the quorum"); }
     List(List(Int)) signers = [c.party, cos.id];
-    if (rsig.len() != 64) { return dfail("the device key did not sign the request"); }
+    if (rsig.len() != 64) { return Err("the device key did not sign the request"); }
     Endpoint relay = relay_ep(c);
     Local dev = Local {.party = c.party, .cg = cg_id_of(q, c.party, 0), .hpke_sk = hpke_sk};
     Remote cr = Remote {.party = cos.id, .cg = cg_id_of(q, cos.id, 0), .hpke_pub = cos.hpke_key};
     Int start = mailbox_end(relay, c.party, c.mbox_next);
     SignInvite inv = SignInvite {.session_id = sid, .message = m, .epoch = (Int)q.epoch, .requester = c.party, .kind = (Int)request_sign(), .sig = rsig, .signers = signers};
-    if (!send_to(relay, dev, cr, WSign(inv))) { return dfail("cannot reach the relay"); }
+    if (!send_to(relay, dev, cr, WSign(inv))) { return Err("cannot reach the relay"); }
     Option(CgCtx) octx = th_ctx(x, q, signers, c.party, tau, sid, m, random_bytes(32));
     return match octx {
-        None => dfail("no session context"),
-        Some(ctx) => run_sign_ctx(dir, c, q, tau, m, relay, sid, dev, cr, start, ctx, form)
+        None => Err("no session context"),
+        Some(ctx) => run_sign_ctx(dir, c, q, tau, m, relay, sid, dev, cr, start, ctx)
     };
 }
 
 @requires(filesystem, network, declassify, clock)
-Int run_sign_ctx(Str dir, DeviceConfig c, Quorum q, List(UInt(64)) tau, List(Int) m, Endpoint relay, List(Int) sid, Local dev, Remote cr, Int start, CgCtx ctx, Int form) {
+Result(List(Int), Str) run_sign_ctx(Str dir, DeviceConfig c, Quorum q, List(UInt(64)) tau, List(Int) m, Endpoint relay, List(Int) sid, Local dev, Remote cr, Int start, CgCtx ctx) {
     ThStep st = th_start(ctx, th_role(ctx, q, c.party, tau));
-    return finish_sign(dir, c, q, tau, m, form, run_session(relay, sid, [Seat {.me = dev, .st = st.state, .round = 1, .out = st.out, .done = false}],
+    return finish_sign(dir, c, q, tau, m, run_session(relay, sid, [Seat {.me = dev, .st = st.state, .round = 1, .out = st.out, .done = false}],
         [cr], [Cursor {.party = c.party, .next = start}], [], lambda(t, msgs) { sign_adapt(t, msgs) }, 120));
 }
 
 @requires(filesystem, network, clock(readonly), declassify)
-Int finish_sign(Str dir, DeviceConfig c, Quorum q, List(UInt(64)) tau, List(Int) m, Int form, Run(ThState) r) {
+Result(List(Int), Str) finish_sign(Str dir, DeviceConfig c, Quorum q, List(UInt(64)) tau, List(Int) m, Run(ThState) r) {
     // The mailbox is read on from where the session stopped, not again from
     // where it started: every round's envelope would be fetched twice.
     Int from = if (r.cursors.len() > 0 && r.cursors[0].next > c.mbox_next) { r.cursors[0].next } else { c.mbox_next };
     _ = save_config(dir, with_log(c, c.witnesses, c.log_id, mailbox_end(relay_ep(c), c.party, from), c.peers));
-    if (str_len(r.fail) > 0) { return dfail("signing: " + r.fail + if (r.culprits.len() > 0) { f" (blames {r.culprits})" } else { "" }); }
+    if (str_len(r.fail) > 0) { return Err("signing: " + r.fail + if (r.culprits.len() > 0) { f" (blames {r.culprits})" } else { "" }); }
     ThState st = r.seats[0].st;
     List(Int) sig = match st { ThSigned(s) => th_sig_raw(s), _ => [] };
-    if (sig.len() != 64 || !ecdsa_verify_digest(P256, credential_pubkey(q.root_pubkey, tau), m, ecdsa_sig_raw(P256, sig))) { return dfail("no valid signature"); }
-    if (form == 1) {
-        println("signature " + hex_encode(ecdsa_sig_blob("nistp256", sig)));
-        return 0;
-    }
-    println("signature-der " + hex_encode(ecdsa_der_of(ecdsa_sig_raw(P256, sig))));
-    println(hex_encode(sig));
-    return 0;
+    if (sig.len() != 64 || !ecdsa_verify_digest(P256, credential_pubkey(q.root_pubkey, tau), m, ecdsa_sig_raw(P256, sig))) { return Err("no valid signature"); }
+    return Ok(sig);
 }
 
 // ─── `device status` ────────────────────────────────────────────

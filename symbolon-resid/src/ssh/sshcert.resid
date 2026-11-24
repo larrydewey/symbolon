@@ -1,0 +1,178 @@
+// OpenSSH user certificates (PROTOCOL.certkeys) for Symbolon's SSH
+// certificate authority (SPEC 16.1.2): the bytes a certificate authority
+// signs, the certificate's parts read back, and the check of a signature
+// under any key the agent knows. Every parser is total: a truncated or
+// malformed input gives None.
+
+import "sshwire.resid";
+import "crypto.resid";
+import "word.resid";
+import "ecdsa.resid";
+import "ed25519.resid";
+import "rsa.resid";
+import "hash.resid";
+
+// ============================================================================
+// Signatures
+// ============================================================================
+
+// Does `sig_blob` verify over `data` under the public key `blob`?
+pub Bool sig_verifies(List(Int) blob, List(Int) data, List(Int) sig_blob) {
+    Option(SshPub) ok = pub_of_blob(blob);
+    SshPub k = ok else { no_pub() };
+    Int size = if (k.kind == "p384") { 48 } else { 32 };
+    Option(SigParts) os = sig_parts(sig_blob, size);
+    SigParts s = os else { SigParts {.alg = "", .sig = []} };
+    if (k.kind == "ed25519") { return s.alg == "ssh-ed25519" && verify_sig_bytes(data, s.sig, k.point); }
+    if (k.kind == "p256") { return s.alg == k.alg && ecdsa_verify_raw(P256, Sha256, k.point, data, s.sig); }
+    if (k.kind == "p384") { return s.alg == k.alg && ecdsa_verify_raw(P384, Sha384, k.point, data, s.sig); }
+    if (k.kind == "rsa") {
+        RsaPub r = rsa_pub(k.n, k.e);
+        if (s.alg == "rsa-sha2-256") { return rsa_pkcs1_verify(Sha256, r, data, s.sig); }
+        if (s.alg == "rsa-sha2-512") { return rsa_pkcs1_verify(Sha512, r, data, s.sig); }
+    }
+    return false;
+}
+
+// ============================================================================
+// Certificates
+// ============================================================================
+
+// The certificate algorithm for a key algorithm, and back; "" for others.
+pub Str cert_alg_of(Str key_alg) {
+    if (key_alg == "ssh-ed25519") { return "ssh-ed25519-cert-v01@openssh.com"; }
+    if (key_alg == "ecdsa-sha2-nistp256") { return "ecdsa-sha2-nistp256-cert-v01@openssh.com"; }
+    if (key_alg == "ecdsa-sha2-nistp384") { return "ecdsa-sha2-nistp384-cert-v01@openssh.com"; }
+    if (key_alg == "ssh-rsa") { return "ssh-rsa-cert-v01@openssh.com"; }
+    return "";
+}
+
+pub Str key_alg_of_cert(Str cert_alg) {
+    if (cert_alg == "ssh-ed25519-cert-v01@openssh.com") { return "ssh-ed25519"; }
+    if (cert_alg == "ecdsa-sha2-nistp256-cert-v01@openssh.com") { return "ecdsa-sha2-nistp256"; }
+    if (cert_alg == "ecdsa-sha2-nistp384-cert-v01@openssh.com") { return "ecdsa-sha2-nistp384"; }
+    if (cert_alg == "ssh-rsa-cert-v01@openssh.com") { return "ssh-rsa"; }
+    return "";
+}
+
+pub List(Int) u64_be(Int n) { return u32_be((n >> 32) & 4294967295).concat(u32_be(n & 4294967295)); }
+
+// A uint64 as an Int; one past Int's range (OpenSSH's "forever",
+// 0xffffffffffffffff) reads as the largest Int.
+pub Int u64_val(List(Int) b) {
+    if (b.len() != 8) { return -1; }
+    if (b[0] >= 128) { return 9223372036854775807; }
+    return (ssh_be(b[0..4]) << 32) | ssh_be(b[4..8]);
+}
+
+// What a certificate says besides the keys: Symbolon issues user
+// certificates only (type 1).
+pub type CertSpec = { List(Int) nonce; List(Int) serial; Str key_id; List(Str) principals; Int valid_after; Int valid_before; };
+
+List(Int) strings(List(Str) xs, Int i, List(Int) acc) {
+    if (i >= xs.len()) { return acc; }
+    return strings(xs, i + 1, acc.concat(sstr(xs[i])));
+}
+
+// The extensions, sorted by name, each with empty data: a port forward
+// and a terminal. No agent or X11 forwarding, no ~/.ssh/rc.
+pub List(Int) cert_extensions() {
+    List(Int) none = [];
+    return sstr("permit-port-forwarding").concat(sstring(none)).concat(sstr("permit-pty")).concat(sstring(none));
+}
+
+// Everything the certificate authority's signature covers: the
+// certificate up to and including the signature key. `k` is the
+// certified key; its public fields follow the nonce as they follow the
+// algorithm name in its own blob.
+pub List(Int) cert_tbs(SshPub k, CertSpec c, List(Int) ca_blob) {
+    List(Int) none = [];
+    List(Int) fields = k.blob[4 + str_len(k.alg)..k.blob.len()];
+    List(Int) head = sstr(cert_alg_of(k.alg)).concat(sstring(c.nonce)).concat(fields).concat(c.serial).concat(u32_be(1));
+    List(Int) who = sstr(c.key_id).concat(sstring(strings(c.principals, 0, []))).concat(u64_be(c.valid_after)).concat(u64_be(c.valid_before));
+    return head.concat(who).concat(sstring(none)).concat(sstring(cert_extensions())).concat(sstring(none)).concat(sstring(ca_blob));
+}
+
+// A certificate read back: `key_blob` is the certified key's own blob,
+// `tbs` what the signature covers, `sig` the signature blob.
+pub type SshCert = { Str alg; List(Int) key_blob; List(Int) nonce; List(Int) serial; Int kind; Str key_id; List(Str) principals; Int valid_after; Int valid_before;
+                     List(Int) critical; List(Int) extensions; List(Int) ca_blob; List(Int) tbs; List(Int) sig; };
+
+Option(List(Str)) strings_of(SshRd r, List(Str) acc) {
+    if (!ssh_ok(r)) { return None; }
+    if (ssh_done(r)) { return Some(acc); }
+    SshGot s = ssh_str(r);
+    if (!ssh_ok(s.r)) { return None; }
+    return strings_of(s.r, acc.concat([ssh_text(s.v)]));
+}
+
+pub Option(SshCert) cert_of_blob(List(Int) b) {
+    SshGot a = ssh_str(ssh_rd(b));
+    Str kalg = key_alg_of_cert(ssh_text(a.v));
+    if (str_len(kalg) == 0) { return None; }
+    SshGot nonce = ssh_str(a.r);
+    // Ed25519 has one public field; ECDSA (curve, point) and RSA (e, n) two.
+    SshGot f1 = ssh_str(nonce.r);
+    SshGot f2 = if (kalg == "ssh-ed25519") { f1 } else { ssh_str(f1.r) };
+    if (!ssh_ok(f2.r)) { return None; }
+    List(Int) key_blob = sstr(kalg).concat(b[nonce.r.at..f2.r.at]);
+    Bool key_ok = match pub_of_blob(key_blob) { None => false, Some(_) => true };
+    SshGot serial = ssh_take(f2.r, 8);
+    SshGot ty = ssh_u32(serial.r);
+    SshGot kid = ssh_str(ty.r);
+    SshGot pr = ssh_str(kid.r);
+    SshGot va = ssh_take(pr.r, 8);
+    SshGot vb = ssh_take(va.r, 8);
+    SshGot co = ssh_str(vb.r);
+    SshGot ex = ssh_str(co.r);
+    SshGot rs = ssh_str(ex.r);
+    SshGot ca = ssh_str(rs.r);
+    SshGot sg = ssh_str(ca.r);
+    if (!key_ok || !ssh_ok(sg.r) || !ssh_done(sg.r) || nonce.v.len() < 16) { return None; }
+    Option(List(Str)) ps = strings_of(ssh_rd(pr.v), []);
+    return match ps {
+        None => None,
+        Some(p) => Some(SshCert {.alg = ssh_text(a.v), .key_blob = key_blob, .nonce = nonce.v, .serial = serial.v, .kind = ssh_be(ty.v), .key_id = ssh_text(kid.v), .principals = p,
+                                 .valid_after = u64_val(va.v), .valid_before = u64_val(vb.v), .critical = co.v, .extensions = ex.v, .ca_blob = ca.v,
+                                 .tbs = b[0..ca.r.at], .sig = sg.v})
+    };
+}
+
+// The blob of a certificate's public line ("ALG BASE64 [comment]").
+pub Option(List(Int)) cert_blob_of_line(Str line) {
+    List(Str) p = str_split(str_trim(line), " ");
+    if (p.len() < 2) { return None; }
+    List(Int) b = base64_decode(p[1]);
+    Option(SshCert) c = cert_of_blob(b);
+    return match c { None => None, Some(x) => if (x.alg == p[0]) { Some(b) } else { None } };
+}
+
+pub Option(SshCert) cert_of_line(Str line) {
+    Option(List(Int)) b = cert_blob_of_line(line);
+    return match b { None => None, Some(x) => cert_of_blob(x) };
+}
+
+// Is the certificate's signature its authority's?
+pub Bool cert_signed(SshCert c) { return sig_verifies(c.ca_blob, c.tbs, c.sig); }
+
+// Within its validity at `now` (seconds since the epoch).
+pub Bool cert_current(SshCert c, Int now) { return c.valid_after <= now && now < c.valid_before; }
+
+// Due for renewal at `now`: less than a third of its lifetime left, or
+// expired.
+pub Bool cert_due(SshCert c, Int now) {
+    Int life = c.valid_before - c.valid_after;
+    return life <= 0 || now >= c.valid_before - life / 3;
+}
+
+// A principal (a user name on the servers): 1 to 64 letters, digits and
+// . _ - @ +, so it is safe inside authorized_keys options and in a shell
+// command line.
+pub Bool principal_ok(Str p) { return str_len(p) > 0 && str_len(p) <= 64 && principal_bytes_ok(utf8(p), 0); }
+
+Bool principal_bytes_ok(List(Int) b, Int i) {
+    if (i >= b.len()) { return true; }
+    Int c = b[i];
+    Bool ok = (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || (c >= 48 && c <= 57) || c == 46 || c == 95 || c == 45 || c == 64 || c == 43;
+    return ok && principal_bytes_ok(b, i + 1);
+}

@@ -13,8 +13,12 @@ signature is made with the test key itself (the real window runs
 Checks: identities without consent; session-bind checked (a forged one
 refused); a signature through the platform consent, verified by the
 agent; cancel refused; a signature over other data refused; request
-files removed.
+files removed. With a certificate for the key (SPEC 16.1.2, made here by
+ssh-keygen -s): offered before the key, signed for by the key whether
+the request names the certificate or the key, the window told which
+certificate.
 """
+import base64
 import json
 import os
 import socket
@@ -23,6 +27,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ed25519
@@ -47,6 +52,17 @@ def main():
     blob = sstr(b"ssh-ed25519") + sstr(user.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw))
     with open(f"{dev}/ssh-keys", "w") as f:
         f.write(b"ed".hex() + " " + pub + " ed@test\n")
+    # A certificate for the key, by a CA made by ssh-keygen, in the list
+    # `device ssh certify` writes.
+    with open(f"{w}/user.pub", "w") as f:
+        f.write(pub + " ed@test\n")
+    subprocess.run(["ssh-keygen", "-q", "-t", "ecdsa", "-b", "256", "-N", "", "-f", f"{w}/ca"], check=True)
+    subprocess.run(["ssh-keygen", "-q", "-s", f"{w}/ca", "-I", "symbolon:ed", "-n", "pylon,deploy", "-V", "-5m:+30d", f"{w}/user.pub"], check=True, capture_output=True)
+    cert_line = open(f"{w}/user-cert.pub").read().strip()
+    cblob = base64.b64decode(cert_line.split()[1])
+    now = int(time.time())
+    with open(f"{dev}/ssh-certs", "w") as f:
+        f.write(f"{b'ed'.hex()} {b'myca'.hex()} 30 pylon,deploy {now - 300} {now + 30 * 86400} {cert_line}\n")
     p = subprocess.Popen([bin_, "ssh-agent-stdio", dev, run, "Pylon (dev.pylon.pylon)"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     mode = {"m": "sign"}
     seen = []
@@ -80,8 +96,9 @@ def main():
         return r[0], r[1:]
 
     t, body = call(11)
-    assert t == 12 and struct.unpack(">I", body[:4])[0] == 1, (t, body[:8])
-    assert blob in body
+    assert t == 12 and struct.unpack(">I", body[:4])[0] == 2, (t, body[:8])
+    assert blob in body and cblob in body and body.index(cblob) < body.index(blob), "the certificate is not offered before the key"
+    assert b"ed (certificate)" in body
     host = ed25519.Ed25519PrivateKey.generate()
     hblob = sstr(b"ssh-ed25519") + sstr(host.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw))
     sid = os.urandom(32)
@@ -96,6 +113,30 @@ def main():
     assert sig[4 + 11 + 4:] == user.sign(data)
     req = seen[-1]
     assert req["peer"] == "Pylon (dev.pylon.pylon)" and req["key"] == "ed" and req["host"]["fingerprint"].startswith("SHA256:"), req
+    # The certificate: named by the request, or the key named while the
+    # authentication names the certificate (OpenSSH, for a certificate from
+    # a file).
+    def auth(key_alg, key_blob):
+        return sstr(sid) + b"\x32" + sstr(b"pylon") + sstr(b"ssh-connection") + sstr(b"publickey-hostbound-v00@openssh.com") + b"\x01" + sstr(key_alg) + sstr(key_blob) + sstr(hblob)
+    cdata = auth(b"ssh-ed25519-cert-v01@openssh.com", cblob)
+    for named in (cblob, blob):
+        t, body = call(13, sstr(named) + sstr(cdata) + struct.pack(">I", 0))
+        assert t == 14, f"no signature for the certificate ({t})"
+        assert body[4 + 4 + 11 + 4:] == user.sign(cdata)
+        c = seen[-1].get("certificate")
+        assert c and c["ca"] == "myca" and c["principals"] == ["pylon", "deploy"] and c["renews"] is False, seen[-1]
+    # An authentication for the plain key does not become a certificate's.
+    t, body = call(13, sstr(blob) + sstr(auth(b"ssh-ed25519", blob)) + struct.pack(">I", 0))
+    assert t == 14 and "certificate" not in seen[-1], seen[-1]
+    # Not the key's certificate (another CA's, unlisted): another key.
+    subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", f"{w}/ca2"], check=True)
+    os.rename(f"{w}/user-cert.pub", f"{w}/user-cert1.pub")
+    subprocess.run(["ssh-keygen", "-q", "-s", f"{w}/ca2", "-I", "x", "-n", "pylon", f"{w}/user.pub"], check=True, capture_output=True)
+    other = base64.b64decode(open(f"{w}/user-cert.pub").read().split()[1])
+    n = len(seen)
+    assert call(13, sstr(blob) + sstr(auth(b"ssh-ed25519-cert-v01@openssh.com", other)) + struct.pack(">I", 0))[0] == 5, "signed for a certificate that is not listed"
+    assert call(13, sstr(other) + sstr(auth(b"ssh-ed25519-cert-v01@openssh.com", other)) + struct.pack(">I", 0))[0] == 5, "signed for an unlisted certificate"
+    assert len(seen) == n, "the window opened for a refused request"
     mode["m"] = "cancel"
     assert call(13, sstr(blob) + sstr(data) + struct.pack(">I", 0))[0] == 5, "signed after cancel"
     mode["m"] = "other"
