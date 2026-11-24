@@ -55,7 +55,13 @@ Each takes a last `--share ID` to work in a shared folder.
 | `device ssh import DIR NAME FILE` | an OpenSSH private key (PIN, then any passphrase, on stdin) |
 | `device ssh list DIR` | the keys' public lines (no PIN) |
 | `device ssh sign DIR NAME [rsa-sha2-256\|rsa-sha2-512]` | signs (PIN, then the data in hex, on stdin) |
-| `device ssh delete DIR NAME` | removes a key |
+| `device ssh delete DIR NAME` | removes a key, or a certificate authority and the certificates it issued |
+| `device ssh ca-new DIR NAME` | an SSH certificate authority held by your quorum; prints its public line |
+| `device ssh cas DIR` | the certificate authorities' public lines (no PIN) |
+| `device ssh certify DIR KEY CA --principal USER... [--days N]` | a user certificate for KEY (30 days unless N, at most 366); prints its line |
+| `device ssh renew DIR KEY` | a new certificate with the authority, user names and days the vault remembers |
+| `device ssh certs DIR` | the certificates: key, authority, days, user names, validity and line, hex names first (no PIN) |
+| `device ssh refresh DIR` | the key, authority and certificate lists rebuilt from the vault |
 
 ## Security keys
 

@@ -1167,7 +1167,15 @@ connections by `SO_PEERCRED`, and opens it close-on-exec (Resid
   is released).
 
 The public keys, with their names, are also written to `DIR/ssh-keys`, so
-`REQUEST_IDENTITIES` is answered without the PIN.
+`REQUEST_IDENTITIES` is answered without the PIN. `device ssh refresh`
+(PIN) rebuilds that list, and those of 16.1.2, from the vault's `ssh`
+items, for a key made on another device.
+
+A server lets a key in once the key's line is in the user's
+`~/.ssh/authorized_keys` there, once per server and key. Symbolon's
+certificate authority (16.1.2) needs one setup per server for every key.
+Either way the keys and the authority are the quorum's, so one setup
+covers every device of the identity.
 
 **Signing.** A `SIGN_REQUEST` opens the consent window (the app run with
 `--ssh-consent REQUEST`) for each signature. The window shows:
@@ -1234,6 +1242,83 @@ differs from the one the service verified. With no `known_hosts` on the
 phone, it shows the server's host key fingerprint and leaves the
 server's identity to the calling app's own host trust. Connections idle
 for 30 seconds outside a pending consent end.
+
+#### 16.1.2 The certificate authority
+
+`device ssh ca-new DIR NAME` makes an SSH certificate authority: an
+`ecdsa-sha2-nistp256` key made by the quorum like a threshold key, under
+the relying-party label `ssh-ca:NAME`, kept as an `ssh` item with role
+`ca`. Its public line goes to `DIR/ssh-cas` (`device ssh cas`), not to
+`DIR/ssh-keys`: the agent never offers it, and `device ssh sign` refuses
+it, so it signs nothing but the certificates below. A key and an
+authority cannot share a name.
+
+**Certificates.** `device ssh certify DIR KEY CA --principal USER ...
+[--days N]` issues an OpenSSH user certificate (PROTOCOL.certkeys) for
+the vault key KEY: `ecdsa-sha2-nistp256-cert-v01@openssh.com`,
+`ecdsa-sha2-nistp384-cert-v01@openssh.com`,
+`ssh-ed25519-cert-v01@openssh.com` or `ssh-rsa-cert-v01@openssh.com` by
+the key's type. It has a random 32-byte nonce and a random serial, type
+1 (user), key id `symbolon:KEY`, the principals (user names on the
+servers, 1 to 32 of them, each letters, digits and `. _ - @ +`), valid
+from five minutes before it is made (clocks differ) for N days (30 by
+default, at most 366), no critical options, and exactly the extensions
+`permit-port-forwarding` and `permit-pty` (no agent or X11 forwarding,
+no `~/.ssh/rc`). The quorum signs SHA-256 of everything up to the
+signature with the authority's key, a threshold signature like any
+other; the certificate is parsed back and its signature checked before it
+is kept. It goes to `DIR/ssh-certs` (`device ssh certs`: key, authority,
+days, principals, validity and the certificate's line), and into the
+key's item with what renews it (`cert_ca`, `cert_principals`,
+`cert_days`, `cert`), which carries it to the other devices. A key has one
+certificate; certifying again replaces it.
+
+**The agent.** For each key with a certificate valid by the clock, the
+identities answer offers the certificate first (comment
+`NAME (certificate)`) and then the key, as OpenSSH's agent does; an
+expired or not yet valid certificate is not offered. A sign request
+naming the certificate is signed by the certified key, with every rule
+of 16.1: the signed user authentication must name the certificate, the
+session binding applies, the consent window opens and takes the PIN. A
+client that loaded the certificate from a file asks for the signature
+with the key itself while the authentication names the certificate
+(OpenSSH does); that is accepted only for the key's current certificate,
+and any other certificate is "another key" and refused. The window shows
+that a certificate is used: its authority, its principals and its end.
+
+**Renewal.** After a signature the principal approved, `device ssh sign`
+checks the key's certificate as the vault holds it. With less than a
+third of its lifetime left, or expired, it is renewed in the same run,
+with the same unlocked profiles: a second threshold signature, by the
+authority, with the authority, principals and days the vault remembers.
+The settings come from the sealed item, not from `DIR/ssh-certs`, which
+any program of the principal's can write, so a renewal never names
+anything the principal did not certify. The signature is printed first:
+the window sends it at once and stays open until the renewal ends. A
+failed renewal is reported and changes nothing else. A certificate not
+yet due that another device renewed is copied from the vault to
+`DIR/ssh-certs`. `device ssh renew DIR KEY` renews by hand.
+
+Deleting an authority (`device ssh delete`) drops the certificates it
+issued from this device's list; neither a signature nor `device ssh
+refresh` lists or renews them again. Servers that trust it accept those
+until they expire; its line is to be removed from them.
+
+**Server setup**, once per server:
+
+- *One user, no root*: in the user's `~/.ssh/authorized_keys`, the line
+  `cert-authority,principals="USER" CA-LINE`. Pylon writes it from a
+  device that can already log in: `pylon authorize --ca USER@HOST
+  'CA-LINE'` (and `pylon authorize USER@HOST 'KEY-LINE'` for one key);
+  it appends to the file without changing what is there and fixes its
+  permissions.
+- *The whole server, as root*: the authority's line in
+  `/etc/ssh/symbolon_user_ca.pub`, `TrustedUserCAKeys
+  /etc/ssh/symbolon_user_ca.pub` in `/etc/ssh/sshd_config` (above any
+  `Match` block), then `sshd -t` and a reload of sshd. Each user logs in
+  with a certificate that names their user name.
+
+The app's SSH page shows both, with each line and command ready to copy.
 
 ---
 
