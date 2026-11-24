@@ -119,10 +119,14 @@ case "$1 $2" in
   "device ssh")
     case "$3" in
       list) printf '676974687562 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOxx github@laptop\n71756f72756d ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBNy quorum\n' ;;
+      cas) cat "$D/ssh-cas" 2>/dev/null; true ;;
+      certs) cat "$D/ssh-certs" 2>/dev/null; true ;;
       *) [ "$PIN" = "2468" ] || { echo "device: wrong PIN" >&2; exit 1; }
          case "$3" in
            sign) echo "signature 0000000b7373682d6564323535313900000040aa" ;;
            new) echo "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBNz $5" ;;
+           ca-new) printf '%s ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBCa %s\n' "$(printf %s "$5" | od -v -An -tx1 | tr -d ' \n')" "$5" >> "$D/ssh-cas"
+                   echo "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBCa $5" ;;
            *) echo "ok" ;;
          esac ;;
     esac ;;

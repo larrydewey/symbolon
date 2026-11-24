@@ -31,20 +31,35 @@ class SshRequest {
   /// On Android, the calling app as the agent service verified it
   /// ("Label (package)"); "" on desktop, where [pid] names the caller.
   final String peer;
+  /// The certificate the client named (SPEC 16.1.2), when it named one:
+  /// its authority, principals, end (seconds since the epoch), and whether
+  /// it is renewed after this signature.
+  final String certCa;
+  final List<String> certPrincipals;
+  final int certValidBefore;
+  final bool certRenews;
   const SshRequest({required this.key, required this.fingerprint, required this.data, required this.socket, required this.token, required this.what, this.alg = '',
-      this.user = '', this.namespace = '', this.hostKey = '', this.hostFingerprint = '', this.forwarding = false, this.pid = 0, this.peer = ''});
+      this.user = '', this.namespace = '', this.hostKey = '', this.hostFingerprint = '', this.forwarding = false, this.pid = 0, this.peer = '',
+      this.certCa = '', this.certPrincipals = const [], this.certValidBefore = 0, this.certRenews = false});
+
+  bool get certificate => certCa.isNotEmpty;
 
   static SshRequest? parse(String text) {
     try {
       final j = jsonDecode(text) as Map<String, dynamic>;
       final w = j['what'] as Map<String, dynamic>;
       final h = j['host'] as Map<String, dynamic>?;
+      final c = j['certificate'] as Map<String, dynamic>?;
       return SshRequest(
         key: j['key'] as String, fingerprint: j['fingerprint'] as String, data: j['data'] as String, socket: j['socket'] as String, token: j['token'] as String,
         what: w['kind'] as String, alg: (j['alg'] as String?) ?? '', user: (w['user'] as String?) ?? '', namespace: (w['namespace'] as String?) ?? '',
         hostKey: (h?['key'] as String?) ?? '', hostFingerprint: (h?['fingerprint'] as String?) ?? '', forwarding: h?['forwarding'] == true,
         pid: (j['pid'] as int?) ?? 0,
         peer: (j['peer'] as String?) ?? '',
+        certCa: (c?['ca'] as String?) ?? '',
+        certPrincipals: [for (final p in (c?['principals'] as List<dynamic>?) ?? const []) p as String],
+        certValidBefore: (c?['valid_before'] as int?) ?? 0,
+        certRenews: c?['renews'] == true,
       );
     } catch (_) {
       return null;
@@ -61,6 +76,13 @@ class SshRequest {
           },
         _ => 'Sign data Symbolon does not recognize',
       };
+}
+
+/// A time in seconds since the epoch as a local date and time, "2026-12-01 14:05".
+String sshDate(int seconds) {
+  final d = DateTime.fromMillisecondsSinceEpoch(seconds * 1000).toLocal();
+  String two(int n) => n.toString().padLeft(2, '0');
+  return '${d.year}-${two(d.month)}-${two(d.day)} ${two(d.hour)}:${two(d.minute)}';
 }
 
 /// The program that connected: its executable and command line, from /proc.
@@ -218,6 +240,8 @@ class _SshConsentPageState extends State<SshConsentPage> {
   bool busy = false;
   bool connected = false;
   bool expired = false;
+  /// The signature went back; the run may go on to renew the certificate.
+  bool sent = false;
 
   SshConsentApp get a => widget.app;
   SshRequest? get rq => a.request;
@@ -229,7 +253,8 @@ class _SshConsentPageState extends State<SshConsentPage> {
     final r = rq;
     if (r == null) return;
     a.link.lost = () {
-      if (mounted) setState(() => expired = true);
+      // After the signature the agent closes its end: not an expiry.
+      if (mounted && !sent) setState(() => expired = true);
     };
     a.link.open(r.socket, r.token).then((ok) {
       if (mounted) setState(() => ok ? connected = true : expired = true);
@@ -249,8 +274,17 @@ class _SshConsentPageState extends State<SshConsentPage> {
       busy = true;
       error = null;
     });
-    final res = await cli.sshSign(a.settings.deviceDir, r.key, r.data, pin.text, alg: r.alg);
+    // The signature goes back as soon as it is made; a certificate that is
+    // due is renewed after it in the same run, and the window stays until
+    // that is done (closing it would end the run).
+    final res = await cli.sshSign(a.settings.deviceDir, r.key, r.data, pin.text, alg: r.alg, onSignature: (sig) {
+      if (sent) return;
+      sent = true;
+      _send('ok $sig\n');
+      if (mounted) setState(() {});
+    });
     pin.clear();
+    if (sent) return a.done();
     if (!mounted) return;
     final sig = res.lines.where((l) => l.startsWith('signature ')).map((l) => l.substring(10).trim()).firstOrNull;
     if (!res.ok || sig == null) {
@@ -265,12 +299,16 @@ class _SshConsentPageState extends State<SshConsentPage> {
 
   Future<void> cancel() => _answer('cancel\n');
 
-  Future<void> _answer(String line) async {
+  Future<void> _send(String line) async {
     if (rq != null && !expired) {
       try {
         await a.link.send(line);
       } catch (_) {}
     }
+  }
+
+  Future<void> _answer(String line) async {
+    await _send(line);
     a.done();
   }
 
@@ -323,6 +361,14 @@ class _SshConsentPageState extends State<SshConsentPage> {
                       ? 'First connection to this server, or its key changed. Check the key before you sign: ${r.hostFingerprint}'
                       : 'Server key ${r.hostFingerprint}'),
                 ),
+              if (r.certificate)
+                ListTile(
+                  key: const Key('sc-cert'),
+                  leading: const Icon(Icons.verified_user_outlined),
+                  title: Text('Certificate from ${r.certCa}'),
+                  subtitle: Text('For ${r.certPrincipals.join(', ')}, valid until ${sshDate(r.certValidBefore)}.'
+                      '${r.certRenews ? ' Less than a third of its time is left: Symbolon renews it after this signature, with a second signature by your quorum.' : ''}'),
+                ),
               if (r.what == 'auth' && r.hostFingerprint.isEmpty)
                 const ListTile(key: Key('sc-unbound'), leading: Icon(Icons.help_outline), title: Text('Server not identified'), subtitle: Text('This SSH client did not tell the agent which server it is talking to.')),
             ]),
@@ -342,7 +388,13 @@ class _SshConsentPageState extends State<SshConsentPage> {
             Padding(padding: const EdgeInsets.only(top: 8), child: Text('A web browser is asking for an SSH signature.', style: TextStyle(color: scheme.error))),
           const SizedBox(height: 16),
           if (error != null) Padding(padding: const EdgeInsets.only(bottom: 12), child: Text(error!, style: TextStyle(color: scheme.error))),
-          if (expired) ...[
+          if (sent) ...[
+            Row(key: const Key('sc-signed'), mainAxisAlignment: MainAxisAlignment.center, children: [
+              const SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2)),
+              const SizedBox(width: 12),
+              Flexible(child: Text(r.certRenews ? 'Signed. Renewing the certificate…' : 'Signed.')),
+            ]),
+          ] else if (expired) ...[
             Text('This request has expired.', key: const Key('sc-expired'), style: TextStyle(color: scheme.error)),
             const SizedBox(height: 16),
             WideButton('Close', onPressed: a.done),

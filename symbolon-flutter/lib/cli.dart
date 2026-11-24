@@ -407,8 +407,34 @@ class SymbolonCli {
 
   /// Prints "signature BLOB-HEX" for [dataHex].
   /// [alg]: rsa-sha2-256 or rsa-sha2-512 for an RSA key.
-  Future<CliResult> sshSign(String dir, String name, String dataHex, String pin, {String alg = ''}) =>
-      run(['device', 'ssh', 'sign', dir, name, if (alg.isNotEmpty) alg], input: [pin, dataHex], timeout: const Duration(minutes: 5));
+  /// [onSignature] gets the signature as soon as it is printed: a key whose
+  /// certificate is due is then renewed in the same run (SPEC 16.1.2), and
+  /// the client need not wait for that.
+  Future<CliResult> sshSign(String dir, String name, String dataHex, String pin, {String alg = '', void Function(String sig)? onSignature}) =>
+      runLive(['device', 'ssh', 'sign', dir, name, if (alg.isNotEmpty) alg], (l) {
+        if (l.startsWith('signature ')) onSignature?.call(l.substring(10).trim());
+      }, input: [pin, dataHex], timeout: const Duration(minutes: 8));
+
+  // ─── The SSH certificate authority (SPEC 16.1.2) ────────────────────
+
+  /// "NAME-HEX PUBLIC-LINE" per certificate authority (no PIN).
+  Future<CliResult> sshCas(String dir) => run(['device', 'ssh', 'cas', dir], timeout: const Duration(minutes: 1));
+
+  /// A certificate authority held by the quorum; prints its public line.
+  Future<CliResult> sshCaNew(String dir, String name, String pin) => run(['device', 'ssh', 'ca-new', dir, name], input: [pin], timeout: const Duration(minutes: 5));
+
+  /// "KEY-HEX CA-HEX DAYS PRINCIPALS VALID-AFTER VALID-BEFORE CERT-LINE" per certificate (no PIN).
+  Future<CliResult> sshCerts(String dir) => run(['device', 'ssh', 'certs', dir], timeout: const Duration(minutes: 1));
+
+  /// A user certificate for [key] by [ca] naming [principals]; prints its line.
+  Future<CliResult> sshCertify(String dir, String key, String ca, List<String> principals, int days, String pin) =>
+      run(['device', 'ssh', 'certify', dir, key, ca, for (final p in principals) ...['--principal', p], '--days', '$days'], input: [pin], timeout: const Duration(minutes: 8));
+
+  /// A new certificate for [key] with the settings the vault remembers.
+  Future<CliResult> sshRenew(String dir, String key, String pin) => run(['device', 'ssh', 'renew', dir, key], input: [pin], timeout: const Duration(minutes: 8));
+
+  /// The key, CA and certificate lists rebuilt from the vault (keys made on another device).
+  Future<CliResult> sshRefresh(String dir, String pin) => run(['device', 'ssh', 'refresh', dir], input: [pin], timeout: const Duration(minutes: 8));
 
   // ─── Security keys (SPEC 9.4) ───────────────────────────────────────
 
