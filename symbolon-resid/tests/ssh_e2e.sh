@@ -239,6 +239,20 @@ OUT=$(run 600 ssh -F none -p "$SSHD3_PORT" -i "$W/k_ed.pub" -o CertificateFile="
 [ "$OUT" = "trusted-ca" ] || fail "ssh with TrustedUserCAKeys: $(tail -3 "$W/ssh_tca.log") $(tail -5 "$W/sshd3.log")"
 echo "sshd (TrustedUserCAKeys): the certificate logs in"
 
+# Pylon (PYLON=path/to/pylon): it takes the certificate from the agent's
+# identity list, where ssh above read it from a file, so the request
+# names the certificate's blob itself. sshd3 accepts certificates only.
+if [ -n "${PYLON:-}" ] && [ -x "$PYLON" ]; then
+    PYH="$W/pylon-home"
+    PYLON_HOME="$PYH" run 60 "$PYLON" pin -p "$SSHD3_PORT" 127.0.0.1 "$HOSTFP" > "$W/pylon_pin.log" 2>&1 || fail "pylon pin: $(cat "$W/pylon_pin.log")"
+    OUT=$(PYLON_HOME="$PYH" run 600 "$PYLON" -p "$SSHD3_PORT" "$ME@127.0.0.1" echo pylon-cert 2> "$W/pylon_cert.log")
+    [ "$OUT" = "pylon-cert" ] || fail "pylon with the agent's certificate: $(tail -5 "$W/pylon_cert.log") $(tail -5 "$W/sshd3.log")"
+    grep -q "Accepted publickey.*-CERT" "$W/sshd3.log" || fail "sshd3 did not log a certificate login for pylon"
+    echo "pylon: logged in with the certificate the agent lists (TrustedUserCAKeys)"
+else
+    echo "skip pylon (set PYLON to a pylon binary)"
+fi
+
 # An expired certificate is not offered.
 ssh-keygen -q -t ed25519 -N '' -f "$W/old_ca"
 cp "$W/k_p256.pub" "$W/k_p256_old.pub"
