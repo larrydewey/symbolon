@@ -64,7 +64,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           repository: larrydewey/Resid
-          ref: v0.13.0
+          ref: v0.14.0
           path: resid
       # The Resid packages, each at a fixed commit (they have no releases),
       # so a build is the same from run to run; raise a pin when Symbolon
