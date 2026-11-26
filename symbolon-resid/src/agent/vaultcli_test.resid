@@ -146,9 +146,48 @@ test "under the duress PIN the vault reads as the empty subset, never as a wrong
     expect(count_of(view_for(dir, config(), as_real(), off, None))).toEqual(1);
     // A PIN that opened neither profile.
     expect(err_of(view_for(fresh_dir(), config(), as_neither(), Ok(vhead()), b))).toEqual("wrong PIN");
-    // A change under the duress PIN fails as an unreachable relay does.
-    expect(duress_change(Ok(vhead()))).toEqual(unreachable_text());
+    // A change under the duress PIN fails as the real profile's does: as
+    // an unreachable relay when the log cannot be had, else as a relay
+    // that refused the write.
     expect(duress_change(off)).toEqual(unreachable_text());
+}
+
+// R2A-3 (a): right after a duress read found the relay, a refused change
+// must not say there is no log at the relay; it says what the real
+// profile says when the relay fails after the log.
+test "a duress refusal after the log verified is not 'no log at the relay'" {
+    Result(VerifiedHead, SymbolonError) off = Err(ErrInvalidLog("no log at the relay"));
+    expect(duress_change(Ok(vhead()))).toEqual("the relay refused the vault");
+    expect(duress_change(Ok(vhead())) == unreachable_text()).toBeFalse();
+    expect(duress_refusal_for(Ok(vhead()))).toEqual("cannot reach the relay");
+    expect(duress_refusal_for(off)).toEqual(unreachable_text());
+}
+
+// R2A-3 (b): an online read under the duress PIN writes vault.cache and
+// vault.tag as a real one does, without spoiling the real copy.
+@requires(filesystem, declassify)
+test "a duress online read writes the copy's files, and never spoils the real copy" {
+    Option(List(Int)) b3 = Some(served_bytes(state_at(items(), 3)));
+    Option(List(Int)) b4 = Some(served_bytes(state_at(items(), 4)));
+    // No copy yet: the duress read leaves one, as a real read would.
+    Str d0 = fresh_dir();
+    expect(err_of(view_for(d0, config(), as_duress(), Ok(vhead()), b3))).toEqual("ok");
+    expect(get_file(d0 + "/vault.cache").len() > 0).toBeTrue();
+    expect(get_file(d0 + "/vault.tag").len()).toEqual(32);
+    // Its tag is not the real one: the real profile does not trust it, and
+    // its next online read replaces it.
+    expect(match kept_place_copy(d0 + "/vault", vk()) { None => true, Some(_) => false }).toBeTrue();
+    expect(count_of(view_for(d0, config(), as_real(), Ok(vhead()), b3))).toEqual(1);
+    expect(match kept_place_copy(d0 + "/vault", vk()) { None => false, Some(_) => true }).toBeTrue();
+    // A real copy: written back byte for byte, still the real profile's.
+    Str d1 = fresh_dir();
+    expect(err_of(view_for(d1, config(), as_real(), Ok(vhead()), b3))).toEqual("ok");
+    List(Int) c3 = get_file(d1 + "/vault.cache");
+    List(Int) t3 = get_file(d1 + "/vault.tag");
+    expect(err_of(view_for(d1, config(), as_duress(), Ok(vhead()), b4))).toEqual("ok");
+    expect(hex_encode(get_file(d1 + "/vault.cache"))).toEqual(hex_encode(c3));
+    expect(hex_encode(get_file(d1 + "/vault.tag"))).toEqual(hex_encode(t3));
+    expect(match kept_place_copy(d1 + "/vault", vk()) { None => false, Some(_) => true }).toBeTrue();
 }
 
 // ─── Forks (R2A-2, SPEC 18.4) ───────────────────────────────────

@@ -481,16 +481,29 @@ pub Str err_text(SymbolonError e) {
 // cannot be fetched (common.resid verified_log_dir).
 pub Str unreachable_text() { return err_text(ErrInvalidLog("no log at the relay")); }
 
+// What the real profile says when the log came from the relay but a later
+// request to it failed (a mailbox send, enroll/recover/protect): the
+// relay was reachable a moment ago, so "no log at the relay" would
+// contradict the read that just worked.
+pub Str relay_lost_text() { return "cannot reach the relay"; }
+
 // An operation the duress profile cannot or must not do (SPEC 14.2 item 3,
 // 14.3): it never says "wrong PIN" (the coercer would learn that this PIN
 // opened something else than the PIN). It fetches and verifies the log as
 // the real profile does first, so the network pattern starts the same, and
-// fails with the log's own error, or else as the real profile fails when
-// the relay does not answer.
+// fails with the log's own error when that fails, as the real profile
+// would; when the log verified, as the real profile fails when the relay
+// stops answering after the log (relay_lost_text), never "no log at the
+// relay" right after reads under the same PIN found it.
 @requires(filesystem, network, clock(readonly), declassify)
 pub Str duress_refusal(Str dir, DeviceConfig c) {
     Result(VerifiedHead, SymbolonError) v = verified_log_dir(dir, relay_ep(c), c.log_id);
-    return match v { Err(e) => err_text(e), Ok(_) => unreachable_text() };
+    Str m = duress_refusal_for(v);
+    return m;
+}
+
+pub Str duress_refusal_for(Result(VerifiedHead, SymbolonError) v) {
+    return match v { Err(e) => err_text(e), Ok(_) => relay_lost_text() };
 }
 
 // Publishes the log, wraps the kit's halves (SPEC 10.6), stores the share,

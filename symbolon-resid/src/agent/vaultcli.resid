@@ -157,11 +157,14 @@ pub Result(Opened, Str) open_vault(Str dir) {
 // A change to the vault under the duress PIN (SPEC 14.2 item 3, 14.3): the
 // duress profile cannot sign a vault head, and must not say "wrong PIN"
 // (the PIN opened something, which a coercer would learn). It fails as a
-// change fails for the real profile when the relay cannot be had: the
-// log's own error when it did not verify, else that of a relay that did
-// not answer.
+// change fails for the real profile: the log's own error when it did not
+// verify; when it did (a duress read just found the relay), as the real
+// profile's write fails at a relay that answers reads but not the write
+// (store_vault), never "no log at the relay".
+pub Str vault_refused_text() { return "the relay refused the vault"; }
+
 pub Str duress_change(Result(VerifiedHead, SymbolonError) rv) {
-    return match rv { Err(e) => err_text(e), Ok(_) => unreachable_text() };
+    return match rv { Err(e) => err_text(e), Ok(_) => vault_refused_text() };
 }
 
 // What a region that verified the log or fetched the vault gave back; a
@@ -229,7 +232,7 @@ Int store_vault(Str dir, Opened o, VaultState st) {
     // Writes need a signed-in device (SPEC 29.4); a context that has no
     // session yet signs in here.
     Endpoint ep = if (str_len(o.ep.token) > 0) { o.ep } else { relay_session(dir, o.c, o.u) };
-    if (!blob_put(ep, place_blob(o.c, o.p.share), cbor_of_vault(st))) { return dfail("the relay refused the vault"); }
+    if (!blob_put(ep, place_blob(o.c, o.p.share), cbor_of_vault(st))) { return dfail(vault_refused_text()); }
     _ = filesystem.write_all(place_local(dir, o.p.share) + ".version", seen_record(st));
     _ = keep_place_copy(place_local(dir, o.p.share), o.p.vk, st);
     println(f"vault version {st.head.version}, {st.items.len()} items");
@@ -318,12 +321,36 @@ Result(View, Str) duress_view(Str dir, DeviceConfig c, Unlocked u, Result(Verifi
     List(Int) vid = vault_id_of(c.log_id);
     Result(VaultState, Str) rs = match rv { Err(e) => Err(err_text(e)), Ok(vh) => vault_from(dir, c, vh, b) };
     return match rs {
-        Ok(st) => Ok(View {.vk = u.duress.vault_key, .vid = vid, .st = no_items(st), .offline = false, .dir = dir, .ctx = None}),
+        Ok(st) => duress_online(dir, View {.vk = u.duress.vault_key, .vid = vid, .st = no_items(st), .offline = false, .dir = dir, .ctx = None}, st),
         Err(m) => match state_of(get_file(place_local(dir, "") + ".cache")) {
             None => Err(m),
             Some(st) => offline_view(m, View {.vk = u.duress.vault_key, .vid = vid, .st = no_items(st), .offline = true, .dir = dir, .ctx = None})
         }
     };
+}
+
+// An online read under the duress PIN writes the files a real online read
+// writes (online_view: vault.cache, then vault.tag), so their times do not
+// tell the two apart (SPEC 14.2 item 3). It cannot make the real copy's
+// tag (no vault key), and never puts anything there the real profile
+// would lose: an existing copy is written back as it is; only where there
+// is none yet does it keep the verified state, with a random tag (the
+// real profile finds the tag wrong, as for no copy, and its next online
+// read replaces both). Residual: after the relay moved past the kept
+// copy, the copy stays at its older version, where a real read would
+// have advanced it.
+@requires(filesystem, declassify)
+Result(View, Str) duress_online(Str dir, View v, VaultState st) {
+    _ = touch_copy(place_local(dir, ""), st);
+    return Ok(v);
+}
+
+@requires(filesystem)
+pub Bool touch_copy(Str local, VaultState st) {
+    List(Int) have = get_file(local + ".cache");
+    if (have.len() == 0) { return filesystem.write_bytes(local + ".cache", cbor_of_vault(st)) && filesystem.write_bytes(local + ".tag", random_bytes(32)); }
+    List(Int) tag = get_file(local + ".tag");
+    return filesystem.write_bytes(local + ".cache", have) && filesystem.write_bytes(local + ".tag", tag);
 }
 
 VaultState no_items(VaultState st) { return VaultState {.head = st.head, .items = []}; }

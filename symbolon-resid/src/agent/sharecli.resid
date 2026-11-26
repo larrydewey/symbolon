@@ -160,7 +160,12 @@ Result(Ctx, Str) online(Str dir, Dev d) {
 // relay takes writes only from a signed-in device, a household's too.
 
 // Signs in when its session is old (a household's relay as an
-// organization's: every write needs a signed-in device).
+// organization's: every write needs a signed-in device). Not under the
+// duress PIN (SPEC 29.4): the relay takes a signature by the DK only,
+// which the duress profile must not hold (it would sign vault heads and
+// log events); a sign-in with the duress sub-key would leave a refused
+// sign-in at the relay, a trace a normal unlock does not leave (14.2).
+// Residual: relay.token is not renewed under duress.
 @requires(filesystem, network, device, declassify, clock, environment)
 Bool keep_signed_in(Str dir, Dev d) {
     if (d.u.kind != 1 || session_fresh(dir)) { return true; }
