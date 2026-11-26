@@ -92,7 +92,7 @@ Bool for_me(ThMsg m, Int me) {
     return match m {
         ThCg(c) => c.from != me && (c.to == 0 || c.to == me),
         ThTw(t) => t.to == me,
-        ThAbortReq(f) => f != me,
+        ThVerdict(v) => v.to == me,
         ThRs(r) => r.from != me && (r.to == 0 || r.to == me)
     };
 }
@@ -173,7 +173,7 @@ Str session(List(List(Int)) signers, List(Int) initiator) {
     List(Int) sid = [51, 55, 17, 188, 174, 75, 0, 133, 179, 81, 20, 211, 246, 165, 75, 136, 131, 169, 209, 57, 105, 90, 118, 144, 125, 235, 174, 79, 184, 57, 74, 90];
     List(Party3) ps = start_all(signers, initiator, tau, sid, 0, ListBuf());
     if (ps.len() != signers.len()) { return "no context"; }
-    Round r = run(ps, starts_out(ps, 0, []), 6);
+    Round r = run(ps, starts_out(ps, 0, []), 8);
     if (str_len(r.fail) > 0) { return "fail: " + r.fail; }
     if (signed_count(r.ps, 0, 0) != 1) { return f"signed by {signed_count(r.ps, 0, 0)} parties"; }
     return signed_by(r.ps, 0);
@@ -188,8 +188,8 @@ List(Party3) start_all(List(List(Int)) signers, List(Int) initiator, List(UInt(6
 }
 
 test "the wire refuses truncated, oversized and non-CBOR bytes" {
-    List(Int) b = msg_encode(ThAbortReq(3));
-    Bool ok = match msg_decode(b) { Some(m) => match m { ThAbortReq(f) => f == 3, _ => false }, None => false };
+    List(Int) b = msg_encode(ThVerdict(BlVerdict { .from = 1, .to = 3, .ok = false }));
+    Bool ok = match msg_decode(b) { Some(m) => match m { ThVerdict(v) => v.from == 1 && v.to == 3 && !v.ok, _ => false }, None => false };
     expect(ok).toBeTrue();
     expect(match msg_decode(b[0..b.len() - 1]) { Some(_) => false, None => true }).toBeTrue();
     expect(match msg_decode([255]) { Some(_) => false, None => true }).toBeTrue();
@@ -219,25 +219,123 @@ test "an initiator outside the signers gives no context" {
 
 // A peer's signature share sigma_j = k_j m + r chi_j and its abort-2
 // openings (k_j and the Chi MtA plaintexts) together give its key share
-// to the designated party. Once a peer has sent sigma_j, an abort request
-// must get nothing from it.
-Int peer_opened(List(Party3) ps, Int d, Int i) {
-    if (i >= ps.len()) { return -1; }
-    if (ps[i].ctx.self == d) { return peer_opened(ps, d, i + 1); }
-    return match th_step(ps[i].st, [ThAbortReq(d)]) { Ok(s) => s.out.len(), Err(_) => 0 };
+// to the designated party. So a peer answers the designated party's
+// verdict exactly once: "ok" gets sigma and never openings, "abort" gets
+// openings and never sigma, and a second verdict gets nothing.
+
+type Answer = { Int sigma; Int opens; Str fail; ThState st; };
+
+Int count_body(List(ThMsg) ms, Bool sigma, Int i, Int acc) {
+    if (i >= ms.len()) { return acc; }
+    ThMsg m = ms[i];
+    Bool hit = match m { ThCg(c) => is_body(c.body, sigma), _ => false };
+    return count_body(ms, sigma, i + 1, acc + (if (hit) { 1 } else { 0 }));
+}
+
+Bool is_body(CgBody b, Bool sigma) {
+    return match b { SgB(_) => sigma, PsA2(_) => !sigma, _ => false };
+}
+
+Answer answer(ThState st, List(ThMsg) in) {
+    return match th_step(st, in) {
+        Ok(s) => Answer { .sigma = count_body(s.out, true, 0, 0), .opens = count_body(s.out, false, 0, 0), .fail = "", .st = s.state },
+        Err(e) => Answer { .sigma = 0, .opens = 0, .fail = e.why, .st = st }
+    };
+}
+
+Party3 peer_of(List(Party3) ps, Int d, Int i) {
+    if (i + 1 >= ps.len() || ps[i].ctx.self != d) { return ps[i]; }
+    return peer_of(ps, d, i + 1);
 }
 
 @requires(declassify)
-test "a peer that has sent its signature share opens nothing on an abort request" {
+List(Party3) waiting(Int seed) {
     List(List(Int)) signers = [[12, 201, 97, 213, 187, 45, 176, 173, 225, 34, 33, 242, 136, 32, 83, 104, 116, 216, 241, 101, 151, 3, 58, 6, 128, 109, 190, 241, 109, 170, 205, 19], [50, 193, 193, 90, 151, 15, 15, 97, 64, 114, 44, 3, 216, 218, 213, 216, 65, 78, 192, 235, 134, 75, 38, 20, 123, 65, 36, 8, 70, 62, 65, 149]];
     List(UInt(64)) tau = tweak_scalar(chain_code(), "login.example.com", [50, 185, 196, 129, 49, 116, 171, 111, 241, 56, 213, 180, 146, 122, 133, 182]);
-    List(Int) sid = [52, 55, 17, 188, 174, 75, 0, 133, 179, 81, 20, 211, 246, 165, 75, 136, 131, 169, 209, 57, 105, 90, 118, 144, 125, 235, 174, 79, 184, 57, 74, 90];
+    List(Int) sid = [seed, 55, 17, 188, 174, 75, 0, 133, 179, 81, 20, 211, 246, 165, 75, 136, 131, 169, 209, 57, 105, 90, 118, 144, 125, 235, 174, 79, 184, 57, 74, 90];
     List(Party3) ps = start_all(signers, signers[0], tau, sid, 0, ListBuf());
+    // Six rounds: the peer has sent its S point and waits for the verdict.
+    Round r = run(ps, starts_out(ps, 0, []), 6);
+    return if (str_len(r.fail) > 0) { [] } else { r.ps };
+}
+
+@requires(declassify)
+test "a peer answers the verdict once: ok gives sigma, never openings; abort gives openings, never sigma" {
+    List(Party3) ps = waiting(52);
     expect(ps.len()).toEqual(2);
-    // Five rounds: the peer has sent its S point and sigma (ThPeerSent).
-    Round r = run(ps, starts_out(ps, 0, []), 5);
+    Int d = cg_id_of(quorum(), [12, 201, 97, 213, 187, 45, 176, 173, 225, 34, 33, 242, 136, 32, 83, 104, 116, 216, 241, 101, 151, 3, 58, 6, 128, 109, 190, 241, 109, 170, 205, 19], 0);
+    Party3 p = peer_of(ps, d, 0);
+    Int me = p.ctx.self;
+    expect(me == d).toBeFalse();
+    // No answer before a verdict: the peer's round-6 output was its S point only.
+    Answer ok = answer(p.st, [ThVerdict(BlVerdict { .from = d, .to = me, .ok = true })]);
+    expect(ok.fail).toEqual("");
+    expect(ok.sigma).toEqual(1);
+    expect(ok.opens).toEqual(0);
+    // An abort after the ok opens nothing.
+    Answer late = answer(ok.st, [ThVerdict(BlVerdict { .from = d, .to = me, .ok = false })]);
+    expect(late.sigma + late.opens).toEqual(0);
+    Answer ab = answer(p.st, [ThVerdict(BlVerdict { .from = d, .to = me, .ok = false })]);
+    expect(ab.fail).toEqual("");
+    expect(ab.sigma).toEqual(0);
+    expect(ab.opens).toEqual(1);
+    expect(th_peer_aborted(ab.st)).toBeTrue();
+    // An ok after the abort gets no signature share.
+    Answer late2 = answer(ab.st, [ThVerdict(BlVerdict { .from = d, .to = me, .ok = true })]);
+    expect(late2.sigma + late2.opens).toEqual(0);
+    // A verdict from anyone but the designated party is refused.
+    Answer forged = answer(p.st, [ThVerdict(BlVerdict { .from = me, .to = me, .ok = false })]);
+    expect(forged.opens).toEqual(0);
+    expect(str_len(forged.fail) > 0).toBeTrue();
+}
+
+// A peer whose Chi share is wrong (its round-3 state changed as the
+// Resid blind oracle's "chi" fault does): the S points do not add up, the
+// designated party sends "abort", the peer opens, and the openings name it.
+Ps3 bump_chi(Ps3 s, CgCtx c) {
+    List(UInt(64)) chi = sc_nat_add(s.chi_share, [1]);
+    CvPt chi_m = cv_add(cv_mul_base(chi), cv_mul(s.chi_nonce, cg_pub_of(c, c.self).elgamal));
+    return Ps3 {.prev = s.prev, .peers = s.peers, .delta_share = s.delta_share, .chi_share = chi,
+                .delta_alpha = s.delta_alpha, .chi_alpha = s.chi_alpha, .chi_nonce = s.chi_nonce, .chi_l = s.chi_l, .chi_m = chi_m,
+                .out = [cg_bc(c.self, PsB4(PsB4R {.delta_share = s.delta_share, .chi_l = s.chi_l, .chi_m = chi_m}))]};
+}
+
+List(ThMsg) not_from(List(ThMsg) ms, Int who, Int i, ListBuf(ThMsg) acc) {
+    if (i >= ms.len()) { return acc.finish(); }
+    ThMsg m = ms[i];
+    Bool theirs = match m { ThCg(c) => c.from == who, _ => false };
+    return not_from(ms, who, i + 1, if (theirs) { acc } else { acc.push(m) });
+}
+
+type Faulted = { List(Party3) ps; List(ThMsg) out; };
+
+Faulted fault_chi(List(Party3) ps, List(ThMsg) out, Int who, Int i, ListBuf(Party3) acc, List(ThMsg) extra) {
+    if (i >= ps.len()) { return Faulted { .ps = acc.finish(), .out = not_from(out, who, 0, ListBuf()).concat(extra) }; }
+    Party3 p = ps[i];
+    ThState st = p.st;
+    return match st {
+        ThR3(s, b) => if (p.ctx.self == who) { fault_one(ps, out, who, i, acc, bump_chi(s, p.ctx), b) } else { fault_chi(ps, out, who, i + 1, acc.push(p), extra) },
+        _ => fault_chi(ps, out, who, i + 1, acc.push(p), extra)
+    };
+}
+
+Faulted fault_one(List(Party3) ps, List(ThMsg) out, Int who, Int i, ListBuf(Party3) acc, Ps3 s, BlR2 b) {
+    return fault_chi(ps, out, who, i + 1, acc.push(Party3 { .ctx = ps[i].ctx, .st = ThR3(s, b) }), wrap_start(s.out, 0, ListBuf()));
+}
+
+@requires(declassify)
+test "a wrong Chi share is named by the abort-2 openings the verdict asks for" {
+    List(List(Int)) signers = [[12, 201, 97, 213, 187, 45, 176, 173, 225, 34, 33, 242, 136, 32, 83, 104, 116, 216, 241, 101, 151, 3, 58, 6, 128, 109, 190, 241, 109, 170, 205, 19], [50, 193, 193, 90, 151, 15, 15, 97, 64, 114, 44, 3, 216, 218, 213, 216, 65, 78, 192, 235, 134, 75, 38, 20, 123, 65, 36, 8, 70, 62, 65, 149]];
+    List(UInt(64)) tau = tweak_scalar(chain_code(), "login.example.com", [50, 185, 196, 129, 49, 116, 171, 111, 241, 56, 213, 180, 146, 122, 133, 182]);
+    List(Int) sid = [54, 55, 17, 188, 174, 75, 0, 133, 179, 81, 20, 211, 246, 165, 75, 136, 131, 169, 209, 57, 105, 90, 118, 144, 125, 235, 174, 79, 184, 57, 74, 90];
+    List(Party3) ps = start_all(signers, signers[0], tau, sid, 0, ListBuf());
+    Int cos = cg_id_of(quorum(), signers[1], 0);
+    Round r = run(ps, starts_out(ps, 0, []), 2);
     expect(r.fail).toEqual("");
-    expect(peer_opened(r.ps, cg_id_of(quorum(), signers[0], 0), 0)).toEqual(0);
+    Faulted f = fault_chi(r.ps, r.out, cos, 0, ListBuf(), []);
+    Round last = run(f.ps, f.out, 6);
+    expect(last.fail).toEqual("the S shares do not add up to the public key");
+    expect(last.culprits).toEqual([cos]);
 }
 
 // The peer's signature share, changed on its way to the designated party.
@@ -261,7 +359,7 @@ test "a bad signature share at the designated party is an unidentified abort" {
     List(UInt(64)) tau = tweak_scalar(chain_code(), "login.example.com", [50, 185, 196, 129, 49, 116, 171, 111, 241, 56, 213, 180, 146, 122, 133, 182]);
     List(Int) sid = [53, 55, 17, 188, 174, 75, 0, 133, 179, 81, 20, 211, 246, 165, 75, 136, 131, 169, 209, 57, 105, 90, 118, 144, 125, 235, 174, 79, 184, 57, 74, 90];
     List(Party3) ps = start_all(signers, signers[0], tau, sid, 0, ListBuf());
-    Round r = run(ps, starts_out(ps, 0, []), 5);
+    Round r = run(ps, starts_out(ps, 0, []), 7);
     expect(r.fail).toEqual("");
     Round last = run(r.ps, bump_sigma(r.out, 0, ListBuf()), 1);
     expect(last.fail).toEqual("signature failed to verify");

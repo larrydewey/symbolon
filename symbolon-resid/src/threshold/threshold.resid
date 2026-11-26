@@ -152,17 +152,43 @@ pub Result(Int, SymbolonError) epoch_ok(UInt(32) share_epoch, LogHead h) {
 // ============================================================================
 
 //@ serial
-pub type ThMsg = ThCg(CgMsg) | ThTw(BlTwMsg) | ThAbortReq(Int) | ThRs(RsMsg);
+pub type ThMsg = ThCg(CgMsg) | ThTw(BlTwMsg) | ThVerdict(BlVerdict) | ThRs(RsMsg);
 
+// Round 7 is split (lib/cggmp_blind.resid): a peer sends its S point only;
+// the designated party checks the S points and sends each peer a verdict;
+// on "ok" the peer sends its signature share, on "abort" its abort-2
+// openings, never both. A peer's sigma_j next to its openings (k_j and its
+// Chi MtA plaintexts) would give the designated party chi_j and from it the
+// peer's key share; CGGMP21 opens only a presignature that never signed.
+//
+// Every party sends one batch per round to every other (agent/session.resid),
+// so the split costs two rounds in which a party hears nothing it needs:
+// the peer's round 6 (the designated party's empty batch) and the
+// designated party's round 7 (the peers' empty batches). They run alongside
+// the rounds that matter; the critical path gains one relay round trip
+// (verdict out, answer back).
+//
+// Storage rule (BlPeer7): the state that bl_r7_answer returns is what this
+// party holds when its answer goes out, and no older copy is ever answered
+// from. Here the session state lives only in memory, in the process that
+// runs the session (the cosigner's serve-for child, the device's `sign`),
+// and is never written anywhere: a process that ends or restarts loses the
+// presignature, which is then simply abandoned (safe: nothing derived from
+// it is sent again), and a new session starts from fresh nonces.
 pub type ThState =
     ThR1(Ps1, BlRole)
   | ThR2(BlR2)
   | ThR3(Ps3, BlR2)
   | ThR4(Ps4, BlR2)
   | ThR5(Ps5, BlR2)
-  | ThR6(Ps6, BlR2)
-  | ThPeerSent(Ps6, BlR2)                // a peer that has sent its share; it answers an abort request
-  | ThAwaitAbort(PsAb2, BlR2)            // the designated party, waiting for abort-2 openings
+  | ThR6(Ps6, BlR2)                     // the designated party, waiting for the S points
+  | ThPeerS(BlPeer7, BlR2)              // a peer that has sent its S point; its round-6 inbox holds nothing for it
+  | ThPeerWait(BlPeer7, BlR2)           // a peer waiting for the designated party's verdict
+  | ThAnswered(BlPeer7)                 // a peer that has answered (sigma or openings, per `answered`); done
+  | ThVerdictOk(Ps6, CgPresig, BlR2)    // the designated party, "ok" sent; its round-7 inbox holds nothing for it
+  | ThAwaitSigma(Ps6, CgPresig, BlR2)   // the designated party, waiting for the signature shares
+  | ThVerdictAbort(PsAb2, BlR2)         // the designated party, "abort" sent; its round-7 inbox holds nothing for it
+  | ThAwaitAbort(PsAb2, BlR2)           // the designated party, waiting for abort-2 openings
   | ThSigned(CgSig)
   | ThClosed;
 
@@ -192,6 +218,11 @@ List(ThMsg) wrap_tw(List(BlTwMsg) ms, Int i, ListBuf(ThMsg) acc) {
     return wrap_tw(ms, i + 1, acc.push(ThTw(ms[i])));
 }
 
+List(ThMsg) wrap_verdicts(List(BlVerdict) vs, Int i, ListBuf(ThMsg) acc) {
+    if (i >= vs.len()) { return acc.finish(); }
+    return wrap_verdicts(vs, i + 1, acc.push(ThVerdict(vs[i])));
+}
+
 List(CgMsg) cg_of(List(ThMsg) ms, Int i, ListBuf(CgMsg) acc) {
     if (i >= ms.len()) { return acc.finish(); }
     ThMsg m = ms[i];
@@ -204,11 +235,14 @@ List(BlTwMsg) tw_of(List(ThMsg) ms, Int i, ListBuf(BlTwMsg) acc) {
     return tw_of(ms, i + 1, match m { ThTw(x) => acc.push(x), _ => acc });
 }
 
-Bool abort_asked(List(ThMsg) ms, Int from, Int i) {
-    if (i >= ms.len()) { return false; }
+// The first verdict in `ms` addressed to `me`.
+Option(BlVerdict) verdict_for(List(ThMsg) ms, Int me, Int i) {
+    if (i >= ms.len()) { return None; }
     ThMsg m = ms[i];
-    Bool hit = match m { ThAbortReq(f) => f == from, _ => false };
-    return hit || abort_asked(ms, from, i + 1);
+    return match m {
+        ThVerdict(v) => if (v.to == me) { Some(v) } else { verdict_for(ms, me, i + 1) },
+        _ => verdict_for(ms, me, i + 1)
+    };
 }
 
 pub ThStep th_start(CgCtx c, BlRole role) {
@@ -217,6 +251,8 @@ pub ThStep th_start(CgCtx c, BlRole role) {
 }
 
 CgCtx ctx_of6(Ps6 s) { return s.prev.prev.prev.prev.prev.ctx; }
+
+ThStep quiet(ThState st) { return ThStep {.state = st, .out = []}; }
 
 // Advances the session by one round on `in`, everything addressed to this
 // party in the last round. A failure names the parties to blame, if any.
@@ -229,9 +265,14 @@ pub Result(ThStep, CgFail) th_step(ThState st, List(ThMsg) in) {
         ThR4(s, b) => th_r5(s, b, cin),
         ThR5(s, b) => th_r6(s, b, cin),
         ThR6(s, b) => th_r7(s, b, cin),
-        ThPeerSent(s, b) => th_peer_after(s, b, in),
+        ThPeerS(p, b) => Ok(quiet(ThPeerWait(p, b))),
+        ThPeerWait(p, b) => th_answer(p, b, in),
+        ThAnswered(p) => Ok(quiet(ThAnswered(p))),
+        ThVerdictOk(s, pre, b) => Ok(quiet(ThAwaitSigma(s, pre, b))),
+        ThAwaitSigma(s, pre, b) => th_finish(s, pre, b, cin),
+        ThVerdictAbort(a, b) => Ok(quiet(ThAwaitAbort(a, b))),
         ThAwaitAbort(a, b) => Err(bl_abort2_blame(a, cin, b)),
-        ThSigned(sig) => Ok(ThStep {.state = ThSigned(sig), .out = []}),
+        ThSigned(sig) => Ok(quiet(ThSigned(sig))),
         ThClosed => Err(cg_fail("session closed", []))
     };
 }
@@ -257,47 +298,66 @@ Result(ThStep, CgFail) th_r5(Ps4 s4, BlR2 b, List(CgMsg) in) {
     return Ok(ThStep {.state = ThR5(s, b), .out = wrap_cg(s.out, 0, ListBuf())});
 }
 
+// A peer sends its S point, to the designated party only, and nothing else
+// until the verdict.
 Result(ThStep, CgFail) th_r6(Ps5 s5, BlR2 b, List(CgMsg) in) {
     Ps6 s = bl_r6(ps_r6(s5, in)?, b.role);
     CgCtx c = ctx_of6(s);
     if (c.self == b.role.designated) { return Ok(ThStep {.state = ThR6(s, b), .out = []}); }
-    // A peer sends its S point and its signature share in one go, both to
-    // the designated party only.
-    PsDone done = bl_r7_peer(s, b.role);
-    return Ok(ThStep {.state = ThPeerSent(s, b), .out = wrap_cg(s.out.concat(done.out), 0, ListBuf())});
+    return Ok(ThStep {.state = ThPeerS(bl_r7_peer(s, b.role), b), .out = wrap_cg(s.out, 0, ListBuf())});
 }
 
-// The designated party: the S points must add up to P; then the signature
-// shares make the signature, checked under P.
+// The designated party: the S points must add up to P. Then every peer
+// gets "ok" and is asked for its signature share; when they do not, every
+// peer gets "abort" and is asked for its openings, which name the party
+// whose Chi share was wrong. Any other failure (a missing or malformed S
+// point names its sender) ends the session at once.
 Result(ThStep, CgFail) th_r7(Ps6 s, BlR2 b, List(CgMsg) in) {
     CgCtx c = ctx_of6(s);
     return match bl_r7_designated(s, in) {
-        Err(e) => th_start_abort(s, b, e),
-        // A share that fails the designated party's check names no one:
-        // in blind mode only the designated party checks the shares, against
-        // values its own tweak entered, and no other party can confirm the
-        // blame, so it is an unidentified abort (SPEC 6.2) and bans no one.
-        Ok(done) => match bl_finish(c, done.presig, in, b.role) {
-            Err(e) => Err(cg_fail(e.why, [])),
-            Ok(sig) => Ok(ThStep {.state = ThSigned(sig), .out = []})
-        }
+        Ok(done) => Ok(ThStep {.state = ThVerdictOk(s, done.presig, b), .out = wrap_verdicts(bl_verdicts(c, true), 0, ListBuf())}),
+        Err(e) => th_start_abort(s, b, in, e)
     };
 }
 
-// A failed S check ends the session unidentified. Abort 2 is not asked
-// for: the peers have already sent their signature shares, and a peer's
-// sigma_j with its abort-2 openings (k_j and its Chi MtA plaintexts) would
-// give the designated party chi_j and from it the peer's key share. CGGMP21
-// opens abort 2 only for a presignature that never signed. The failure
-// counts as unidentified (SPEC 6.2).
-Result(ThStep, CgFail) th_start_abort(Ps6 s, BlR2 b, CgFail e) {
-    return Err(e);
+Result(ThStep, CgFail) th_start_abort(Ps6 s, BlR2 b, List(CgMsg) in, CgFail e) {
+    if (e.culprits.len() > 0 || e.why != "the S shares do not add up to the public key") { return Err(e); }
+    PsAb2 a = bl_abort2(s, in, b.role)?;
+    return Ok(ThStep {.state = ThVerdictAbort(a, b), .out = wrap_verdicts(bl_verdicts(ctx_of6(s), false), 0, ListBuf())});
 }
 
-// A peer that has sent its share is done. It answers no abort request,
-// for the reason above, whoever asks.
-Result(ThStep, CgFail) th_peer_after(Ps6 s, BlR2 b, List(ThMsg) in) {
-    return Ok(ThStep {.state = ThClosed, .out = []});
+// A peer answers the designated party's verdict once: sigma on "ok", its
+// openings on "abort" (bl_r7_answer refuses a second verdict and records
+// which answer went). No verdict (the designated party gave up) closes
+// the session; the presignature is abandoned.
+Result(ThStep, CgFail) th_answer(BlPeer7 p, BlR2 b, List(ThMsg) in) {
+    CgCtx c = p.prev.prev.prev.prev.prev.prev.ctx;
+    return match verdict_for(in, c.self, 0) {
+        None => Ok(quiet(ThClosed)),
+        Some(v) => th_answered(bl_r7_answer(p, v)?)
+    };
+}
+
+Result(ThStep, CgFail) th_answered(BlPeer7 p) {
+    return Ok(ThStep {.state = ThAnswered(p), .out = wrap_cg(p.out, 0, ListBuf())});
+}
+
+// The signature shares make the signature, checked under P. A share that
+// fails the designated party's check names no one: in blind mode only the
+// designated party checks the shares, against values its own tweak entered,
+// and no other party can confirm the blame, so it is an unidentified abort
+// (SPEC 6.2) and bans no one.
+Result(ThStep, CgFail) th_finish(Ps6 s, CgPresig pre, BlR2 b, List(CgMsg) in) {
+    return match bl_finish(ctx_of6(s), pre, in, b.role) {
+        Err(e) => Err(cg_fail(e.why, [])),
+        Ok(sig) => Ok(quiet(ThSigned(sig)))
+    };
+}
+
+// Whether a peer's session ended in its answer to an "abort" verdict: the
+// designated party found that the S points do not add up.
+pub Bool th_peer_aborted(ThState st) {
+    return match st { ThAnswered(p) => p.answered == 2, _ => false };
 }
 
 // The ECDSA signature r || s (64 bytes) of a finished session.

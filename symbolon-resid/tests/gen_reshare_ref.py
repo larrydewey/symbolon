@@ -106,7 +106,7 @@ Party party_of(Int n, UInt(8) kind) {{
 type SgP = {{ CgCtx ctx; ThState st; }};
 
 Bool sfor(ThMsg m, Int me) {{
-    return match m {{ ThCg(c) => c.from != me && (c.to == 0 || c.to == me), ThTw(t) => t.to == me, ThAbortReq(f) => f != me, ThRs(r) => r.from != me && (r.to == 0 || r.to == me) }};
+    return match m {{ ThCg(c) => c.from != me && (c.to == 0 || c.to == me), ThTw(t) => t.to == me, ThVerdict(v) => v.to == me, ThRs(r) => r.from != me && (r.to == 0 || r.to == me) }};
 }}
 
 List(ThMsg) sinbox(List(ThMsg) all, Int me, Int i, ListBuf(ThMsg) acc) {{
@@ -222,7 +222,7 @@ test "re-share to a new device: same key, kit share by the dealers, transcripts 
     CgCtx c3 = th_ctx(n3, q, signers, [4, 4, 4, 4], [], [6], digest, [23]) else {{ c4 }};
     ThStep s4 = th_start(c4, th_role(c4, q, [4, 4, 4, 4], tau));
     ThStep s3 = th_start(c3, th_role(c3, q, [4, 4, 4, 4], []));
-    SR sr = srun([SgP {{ .ctx = c4, .st = s4.state }}, SgP {{ .ctx = c3, .st = s3.state }}], s4.out.concat(s3.out), 6);
+    SR sr = srun([SgP {{ .ctx = c4, .st = s4.state }}, SgP {{ .ctx = c3, .st = s3.state }}], s4.out.concat(s3.out), 8);
     expect(sr.fail).toEqual("");
     List(Int) sig = cose_hex_decode(signed(sr.ss, 0));
     expect(ecdsa_verify_digest(P256, credential_pubkey(x, tau), digest, ecdsa_sig_raw(P256, sig))).toBeTrue();

@@ -193,7 +193,7 @@ Bool for_me(ThMsg m, Int me) {{
     return match m {{
         ThCg(c) => c.from != me && (c.to == 0 || c.to == me),
         ThTw(t) => t.to == me,
-        ThAbortReq(f) => f != me,
+        ThVerdict(v) => v.to == me,
         ThRs(r) => r.from != me && (r.to == 0 || r.to == me)
     }};
 }}
@@ -274,7 +274,7 @@ Str session(List(List(Int)) signers, List(Int) initiator) {{
     List(Int) sid = {L(rb(32))};
     List(Party3) ps = start_all(signers, initiator, tau, sid, 0, ListBuf());
     if (ps.len() != signers.len()) {{ return "no context"; }}
-    Round r = run(ps, starts_out(ps, 0, []), 6);
+    Round r = run(ps, starts_out(ps, 0, []), 8);
     if (str_len(r.fail) > 0) {{ return "fail: " + r.fail; }}
     if (signed_count(r.ps, 0, 0) != 1) {{ return f"signed by {{signed_count(r.ps, 0, 0)}} parties"; }}
     return signed_by(r.ps, 0);
@@ -289,8 +289,8 @@ List(Party3) start_all(List(List(Int)) signers, List(Int) initiator, List(UInt(6
 }}
 
 test "the wire refuses truncated, oversized and non-CBOR bytes" {{
-    List(Int) b = msg_encode(ThAbortReq(3));
-    Bool ok = match msg_decode(b) {{ Some(m) => match m {{ ThAbortReq(f) => f == 3, _ => false }}, None => false }};
+    List(Int) b = msg_encode(ThVerdict(BlVerdict {{ .from = 1, .to = 3, .ok = false }}));
+    Bool ok = match msg_decode(b) {{ Some(m) => match m {{ ThVerdict(v) => v.from == 1 && v.to == 3 && !v.ok, _ => false }}, None => false }};
     expect(ok).toBeTrue();
     expect(match msg_decode(b[0..b.len() - 1]) {{ Some(_) => false, None => true }}).toBeTrue();
     expect(match msg_decode([255]) {{ Some(_) => false, None => true }}).toBeTrue();

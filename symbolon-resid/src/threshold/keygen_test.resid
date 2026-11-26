@@ -90,7 +90,7 @@ Party party_of(Int n, UInt(8) kind) {
 type SgP = { CgCtx ctx; ThState st; };
 
 Bool sfor(ThMsg m, Int me) {
-    return match m { ThCg(c) => c.from != me && (c.to == 0 || c.to == me), ThTw(t) => t.to == me, ThAbortReq(f) => f != me, ThRs(r) => r.from != me && (r.to == 0 || r.to == me) };
+    return match m { ThCg(c) => c.from != me && (c.to == 0 || c.to == me), ThTw(t) => t.to == me, ThVerdict(v) => v.to == me, ThRs(r) => r.from != me && (r.to == 0 || r.to == me) };
 }
 
 List(ThMsg) sinbox(List(ThMsg) all, Int me, Int i, ListBuf(ThMsg) acc) {
@@ -145,7 +145,7 @@ test "2-of-3 key generation over the wire: one key, every pair of shares reconst
     CgCtx c3 = th_ctx(cs[2], q, signers, [1, 1, 1, 1], [], [5], digest, [13]) else { c1 };
     ThStep a = th_start(c1, th_role(c1, q, [1, 1, 1, 1], tau));
     ThStep b = th_start(c3, th_role(c3, q, [1, 1, 1, 1], []));
-    SR r = srun([SgP { .ctx = c1, .st = a.state }, SgP { .ctx = c3, .st = b.state }], a.out.concat(b.out), 6);
+    SR r = srun([SgP { .ctx = c1, .st = a.state }, SgP { .ctx = c3, .st = b.state }], a.out.concat(b.out), 8);
     expect(r.fail).toEqual("");
     List(Int) sig = cose_hex_decode(signed(r.ss, 0));
     List(Int) p = credential_pubkey(x, tau);

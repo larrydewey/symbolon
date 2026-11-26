@@ -226,7 +226,7 @@ pub Int cosignerd_serve_for(Str dir, Str primes_file, Int secs) {
     Str pf = if (primes_file == "-") { "" } else { primes_file };
     return match oc {
         None => 2,
-        Some(_) => serve_loop(dir, pf, [], 0, clock_now_seconds() + secs)
+        Some(_) => serve_loop(dir, pf, 0, clock_now_seconds() + secs)
     };
 }
 
@@ -245,50 +245,26 @@ pub List(List(UInt(64))) primes_line(Str f, Int k) {
     return [bn_from_be(cose_hex_decode(parts[0])), bn_from_be(cose_hex_decode(parts[1]))];
 }
 
-// A finished signing session a peer keeps, in case the designated party
-// asks for abort-2 openings, until `until` (seconds).
-type Kept = { List(Int) sid; ThState st; List(Remote) peers; Int until; };
-
-// How long a co-signed session is kept. The designated party asks for the
-// openings as soon as the signature shares fail to add up, within the
-// session's 120 seconds of waiting for a round; after that nothing asks.
-// A session kept for good kept its serve-for child from ever exiting (it
-// exits only with nothing kept), and the child, which frees nothing, grew
-// by about 20 MB a second until the kernel's OOM killer ended it, half an
-// hour after each signature.
-pub Int kept_sec() { return 300; }
-
-List(Kept) unexpired(List(Kept) ks, Int now, Int i, List(Kept) acc) {
-    if (i >= ks.len()) { return acc; }
-    return unexpired(ks, now, i + 1, if (ks[i].until > now) { acc.concat([ks[i]]) } else { acc });
-}
-
-// When the first kept session expires.
-Int soonest(List(Kept) ks, Int i, Int best) {
-    if (i >= ks.len()) { return best; }
-    return soonest(ks, i + 1, if (ks[i].until < best) { ks[i].until } else { best });
-}
-
 // One child process's share of the work (`cosigner serve-for`): turns until
 // `until` (seconds) has passed and no signing session is waiting for late
 // messages, then exit. There is no collector, and a loop that ran forever
 // kept every turn's allocations (gigabytes within minutes, regions
 // included), so `cosigner serve` runs these children one after another and
-// the kernel takes back each one's memory when it exits. The session state
-// in `kept` (nonce shares among it) only ever lives in memory.
+// the kernel takes back each one's memory when it exits. A signing
+// session's state (nonce shares among it) lives only in memory, inside the
+// turn that runs the session to its end: the cosigner answers the
+// designated party's verdict there and keeps nothing after (see ThState in
+// threshold/threshold.resid). A child that dies mid-session takes the
+// presignature with it; it is never answered for again.
 @requires(network, filesystem, declassify, clock, provision, process, environment)
-Int serve_loop(Str dir, Str primes_file, List(Kept) kept0, Int n, Int until) {
-    Int now = clock_now_seconds();
-    List(Kept) kept = unexpired(kept0, now, 0, []);
-    if (now >= until && kept.len() == 0) { return 0; }
-    List(Kept) next = serve_turn(dir, primes_file, kept, n);
-    // Wait for mail in a loop that frees each poll's garbage: until this
-    // child's time is up, or while a session is kept, until it expires (a
-    // late abort request is mail too, and wakes it). A turn every 200 ms
-    // here, as there once was for kept sessions, kept every turn's
+Int serve_loop(Str dir, Str primes_file, Int n, Int until) {
+    if (clock_now_seconds() >= until) { return 0; }
+    _ = serve_turn(dir, primes_file, n);
+    // Wait for mail in a loop that frees each poll's garbage, until this
+    // child's time is up. A turn every 200 ms here kept every turn's
     // allocations: TLS to the relay, the configuration read and written.
-    _ = idle_wait(dir, if (next.len() == 0) { until } else { soonest(next, 0, next[0].until) });
-    return serve_loop(dir, primes_file, next, n + 1, until);
+    _ = idle_wait(dir, until);
+    return serve_loop(dir, primes_file, n + 1, until);
 }
 
 @requires(network, filesystem, declassify, clock, provision)
@@ -301,16 +277,16 @@ Int idle_wait(Str dir, Int until) {
 }
 
 @requires(network, filesystem, declassify, clock, provision, process, environment)
-List(Kept) serve_turn(Str dir, Str primes_file, List(Kept) kept, Int n) {
+Int serve_turn(Str dir, Str primes_file, Int n) {
     Option(Cosigner) oc = load(dir);
     return match oc {
-        None => kept,
-        Some(c) => serve_once(c, primes_line(primes_file, 0), primes_line(primes_file, 1), kept, n)
+        None => 0,
+        Some(c) => serve_once(c, primes_line(primes_file, 0), primes_line(primes_file, 1), n)
     };
 }
 
 @requires(network, filesystem, declassify, clock, process, environment)
-List(Kept) serve_once(Cosigner c0, List(List(UInt(64))) primes, List(List(UInt(64))) primes2, List(Kept) kept, Int n) {
+Int serve_once(Cosigner c0, List(List(UInt(64))) primes, List(List(UInt(64))) primes2, Int n) {
     Cosigner cp = if (n % 25 == 0) { refresh_peers(c0) } else { c0 };
     Cosigner c = cos_mail_ready(cp);
     Endpoint relay = mail_of(c);
@@ -328,21 +304,19 @@ List(Kept) serve_once(Cosigner c0, List(List(UInt(64))) primes, List(List(UInt(6
     Int next = d.cur.next;
     Cosigner c2 = Cosigner {.dir = c1.dir, .cfg = with_log(c1.cfg, c1.cfg.log_id, next), .root = c1.root, .mail = c1.mail};
     _ = save_cfg(c.dir, c2.cfg);
-    Handled h = handle_all(c2, gs, 0, primes, primes2, kept);
-    _ = save_cfg(c.dir, h.c.cfg);
+    Cosigner hc = handle_all(c2, gs, 0, primes, primes2);
+    _ = save_cfg(c.dir, hc.cfg);
     // Duress alerts (SPEC 14.4): a window that ran out, the queue, and
     // alerts other people's cosigners left for this person.
-    _ = check_window(h.c);
-    _ = send_queued(h.c.dir, relay);
-    _ = deliver_inbox(h.c.dir, relay, h.c.cfg.log_id, cos_hpke(h.c.root).sk, cos_hpke(h.c.root).pk, cos_dk(h.c.root));
-    return h.kept;
+    _ = check_window(hc);
+    _ = send_queued(hc.dir, relay);
+    _ = deliver_inbox(hc.dir, relay, hc.cfg.log_id, cos_hpke(hc.root).sk, cos_hpke(hc.root).pk, cos_dk(hc.root));
+    return 0;
 }
 
-type Handled = { Cosigner c; List(Kept) kept; };
-
 @requires(network, filesystem, declassify, clock)
-Handled handle_all(Cosigner c, List(Got) gs, Int i, List(List(UInt(64))) primes, List(List(UInt(64))) primes2, List(Kept) kept) {
-    if (i >= gs.len()) { return Handled {.c = c, .kept = kept}; }
+Cosigner handle_all(Cosigner c, List(Got) gs, Int i, List(List(UInt(64))) primes, List(List(UInt(64))) primes2) {
+    if (i >= gs.len()) { return c; }
     Packet w = gs[i].w;
     List(Got) rest = gs[i + 1..gs.len()];
     // Under a device's duress transport key (SPEC 14.2) only what the
@@ -350,27 +324,28 @@ Handled handle_all(Cosigner c, List(Got) gs, Int i, List(List(UInt(64))) primes,
     // the alert requests the cosigner refuses. Never a duress-key
     // registration, a kit release, an event signature or a re-share.
     Bool dt = !peer_key(c, gs[i].from, gs[i].key);
-    if (dt && !duress_packet(w)) { eprintln("cosigner: refused a request under a duress transport key"); return handle_all(c, gs, i + 1, primes, primes2, kept); }
-    Handled h = match w {
-        WKeygen(inv) => Handled {.c = on_keygen(c, gs[i].from, inv, rest, primes), .kept = kept},
-        WSignEvent(b) => Handled {.c = on_sign_event(c, gs[i].from, b), .kept = kept},
-        WKitHalf(blob) => Handled {.c = on_kit_half(c, gs[i].from, blob), .kept = kept},
-        WSign(inv) => on_sign(c, gs[i].from, gs[i].key, inv, rest, kept),
-        WSession(m) => Handled {.c = c, .kept = on_late(c, gs[i].from, m, kept)},
-        WReshare(inv) => Handled {.c = on_reshare(c, gs[i].from, inv, rest, primes2), .kept = kept},
-        WKitKey(kb) => Handled {.c = on_kit_key(c, gs[i].from, kb), .kept = kept},
-        WKitRelease(l) => Handled {.c = on_release(c, gs[i].from, l), .kept = kept},
-        WDuressKey(k) => Handled {.c = on_duress_key(c, gs[i].from, k), .kept = kept},
-        WKvDeal(m) => Handled {.c = on_kv_deal(c, gs[i].from, m), .kept = kept},
-        WEval(r) => Handled {.c = on_eval(c, gs[i].from, r), .kept = kept},
-        WEvalLog(r) => Handled {.c = on_eval_log(c, gs[i].from, r), .kept = kept},
-        WBeacon(b) => Handled {.c = on_beacon(c, gs[i].from, b), .kept = kept},
-        WAlertConfig(a) => Handled {.c = on_alert_config(c, gs[i].from, gs[i].key, a), .kept = kept},
-        WEndDuress(e) => Handled {.c = on_end_duress(c, gs[i].from, e), .kept = kept},
-        WAlertKey(k) => Handled {.c = on_alert_key(c, gs[i].from, k), .kept = kept},
-        _ => Handled {.c = c, .kept = kept}
+    if (dt && !duress_packet(w)) { eprintln("cosigner: refused a request under a duress transport key"); return handle_all(c, gs, i + 1, primes, primes2); }
+    Cosigner h = match w {
+        WKeygen(inv) => on_keygen(c, gs[i].from, inv, rest, primes),
+        WSignEvent(b) => on_sign_event(c, gs[i].from, b),
+        WKitHalf(blob) => on_kit_half(c, gs[i].from, blob),
+        WSign(inv) => on_sign(c, gs[i].from, gs[i].key, inv, rest),
+        // A session's messages after its end (a verdict that came too late,
+        // a duplicate) find nothing kept to answer from, and are dropped.
+        WReshare(inv) => on_reshare(c, gs[i].from, inv, rest, primes2),
+        WKitKey(kb) => on_kit_key(c, gs[i].from, kb),
+        WKitRelease(l) => on_release(c, gs[i].from, l),
+        WDuressKey(k) => on_duress_key(c, gs[i].from, k),
+        WKvDeal(m) => on_kv_deal(c, gs[i].from, m),
+        WEval(r) => on_eval(c, gs[i].from, r),
+        WEvalLog(r) => on_eval_log(c, gs[i].from, r),
+        WBeacon(b) => on_beacon(c, gs[i].from, b),
+        WAlertConfig(a) => on_alert_config(c, gs[i].from, gs[i].key, a),
+        WEndDuress(e) => on_end_duress(c, gs[i].from, e),
+        WAlertKey(k) => on_alert_key(c, gs[i].from, k),
+        _ => c
     };
-    return handle_all(h.c, gs, i + 1, primes, primes2, h.kept);
+    return handle_all(h, gs, i + 1, primes, primes2);
 }
 
 // ─── Inception ──────────────────────────────────────────────────
@@ -667,15 +642,15 @@ Int policy_now(Cosigner c, VerifiedHead vh) { return witness_now(witnesses_at(vh
 Str local_host(Str dir) { return str_trim(filesystem.read_all(dir + "/local_host")); }
 
 @requires(network, filesystem, declassify, clock)
-Handled on_sign(Cosigner c, List(Int) from, List(Int) via, SignInvite inv, List(Got) early, List(Kept) kept) {
-    if (c.cfg.log_id.len() == 0) { return Handled {.c = cos_fail(c, "no log yet"), .kept = kept}; }
+Cosigner on_sign(Cosigner c, List(Int) from, List(Int) via, SignInvite inv, List(Got) early) {
+    if (c.cfg.log_id.len() == 0) { return cos_fail(c, "no log yet"); }
     Result(VerifiedHead, SymbolonError) rv = cos_log(c);
     // Every answer goes to the key the request came under: the device's
     // transport key, or its duress profile's (SPEC 14.2).
     Remote back = Remote {.party = from, .cg = 0, .hpke_pub = via};
     return match rv {
-        Err(_) => Handled {.c = refuse_to(c, back, inv.session_id), .kept = kept},
-        Ok(vh) => decide(c, back, inv, vh, early, kept)
+        Err(_) => refuse_to(c, back, inv.session_id),
+        Ok(vh) => decide(c, back, inv, vh, early)
     };
 }
 
@@ -693,26 +668,26 @@ Cosigner refuse(Cosigner c, List(Int) to, List(Int) sid) {
 }
 
 @requires(network, filesystem, declassify, clock)
-Handled decide(Cosigner c, Remote back, SignInvite inv, VerifiedHead vh, List(Got) early, List(Kept) kept) {
+Cosigner decide(Cosigner c, Remote back, SignInvite inv, VerifiedHead vh, List(Got) early) {
     List(Int) from = back.party;
     CosignerState st = load_state(c, vh);
     // A signing session is a sign request: any other kind would be billed
     // to another budget (an evaluation's) or pass as an authority request.
-    if (!bytes_eq(from, inv.requester) || inv.epoch < 0 || inv.kind != (Int)request_sign()) { return Handled {.c = refuse_to(c, back, inv.session_id), .kept = kept}; }
+    if (!bytes_eq(from, inv.requester) || inv.epoch < 0 || inv.kind != (Int)request_sign()) { return refuse_to(c, back, inv.session_id); }
     _ = prune_old_epochs(c.dir, (Int)vh.head.quorum.epoch);
     // No session with a party an abort identified, nor after repeated
     // aborts that identified no one, until a re-share (SPEC 6.2).
     Result(Int, SymbolonError) mr = may_run(load_aborts(c.dir, vh.head.quorum), inv.signers);
     if (match mr { Err(_) => true, Ok(_) => false }) {
         eprintln("cosigner: ALERT: refusing a signing session after an abort (" + match mr { Err(e) => err_text(e), Ok(_) => "" } + ")");
-        return Handled {.c = refuse_to(c, back, inv.session_id), .kept = kept};
+        return refuse_to(c, back, inv.session_id);
     }
     CosignRequest req = CosignRequest {.session_id = inv.session_id, .message = inv.message, .epoch = (UInt(32))inv.epoch,
                                        .requester = inv.requester, .kind = (UInt(8))inv.kind, .sig = inv.sig};
     CosignOutcome o = cosign_decide(st, req, policy_now(c, vh));
     return match o {
-        Refuse(s, e) => Handled {.c = refused_saved_to(c, back, inv.session_id, s), .kept = kept},
-        Proceed(s) => cosign(c, inv, vh, s, early, kept, back.hpke_pub)
+        Refuse(s, e) => refused_saved_to(c, back, inv.session_id, s),
+        Proceed(s) => cosign(c, inv, vh, s, early, back.hpke_pub)
     };
 }
 
@@ -742,7 +717,7 @@ Bool in_list(List(List(Int)) xs, List(Int) x, Int i) {
 }
 
 @requires(network, filesystem, declassify, clock)
-Handled cosign(Cosigner c, SignInvite inv, VerifiedHead vh, CosignerState s, List(Got) early, List(Kept) kept, List(Int) via) {
+Cosigner cosign(Cosigner c, SignInvite inv, VerifiedHead vh, CosignerState s, List(Got) early, List(Int) via) {
     _ = filesystem.write_bytes(c.dir + "/state.cbor", cbor_of_state(s));
     Quorum q = vh.head.quorum;
     Option(CgConfig) cg = cg_at(c, (Int)q.epoch);
@@ -750,13 +725,13 @@ Handled cosign(Cosigner c, SignInvite inv, VerifiedHead vh, CosignerState s, Lis
     CgConfig x = cg else { none };
     Option(CgCtx) octx = th_ctx(x, q, inv.signers, inv.requester, [], inv.session_id, inv.message, random_bytes(32));
     return match octx {
-        None => Handled {.c = cos_fail(c, "no session context"), .kept = kept},
-        Some(ctx) => run_cosign(c, inv, q, ctx, early, kept, via)
+        None => cos_fail(c, "no session context"),
+        Some(ctx) => run_cosign(c, inv, q, ctx, early, via)
     };
 }
 
 @requires(network, filesystem, declassify, clock)
-Handled run_cosign(Cosigner c, SignInvite inv, Quorum q, CgCtx ctx, List(Got) early, List(Kept) kept, List(Int) via) {
+Cosigner run_cosign(Cosigner c, SignInvite inv, Quorum q, CgCtx ctx, List(Got) early, List(Int) via) {
     ThStep st = th_start(ctx, th_role(ctx, q, inv.requester, []));
     // The requester by the key its request came under (its duress
     // profile's transport key under duress, SPEC 14.2).
@@ -765,35 +740,24 @@ Handled run_cosign(Cosigner c, SignInvite inv, Quorum q, CgCtx ctx, List(Got) ea
     Seat(ThState) seat = Seat {.me = me, .st = st.state, .round = 1, .out = st.out, .done = false};
     Run(ThState) r = run_session(mail_of(c), inv.session_id, [seat], rs, [Cursor {.party = c.cfg.party, .next = c.cfg.mbox_next}], early,
         lambda(t, msgs) { sign_adapt(t, msgs) }, 120);
-    _ = save_aborts(c.dir, record_run(load_aborts(c.dir, q), q, r.fail, r.culprits), q);
-    if (str_len(r.fail) > 0) { return Handled {.c = cos_fail(c, "session: " + r.fail), .kept = kept}; }
+    // An "abort" verdict answered with openings is an abort here too, one
+    // that names no one: the cosigner cannot check the S points itself.
+    Str fail = if (str_len(r.fail) == 0 && r.seats.len() > 0 && th_peer_aborted(r.seats[0].st)) { peer_abort_fail() } else { r.fail };
+    _ = save_aborts(c.dir, record_run(load_aborts(c.dir, q), q, fail, r.culprits), q);
+    if (str_len(fail) > 0) { return cos_fail(c, "session: " + fail); }
     println("cosigner: co-signed session " + hex_encode(inv.session_id));
-    return Handled {.c = c, .kept = [Kept {.sid = inv.session_id, .st = r.seats[0].st, .peers = rs, .until = clock_now_seconds() + kept_sec()}]};
+    return c;
 }
 
+pub Str peer_abort_fail() { return "the designated party found the S points do not add up"; }
+
+// Done once its answer to the verdict has gone (or the session closed):
+// nothing of the session outlives run_session.
 pub Result(Stepped(ThState), CgFail) sign_adapt(ThState st, List(ThMsg) msgs) {
     ThStep n = th_step(st, msgs)?;
     ThState s = n.state;
-    Bool done = match s { ThSigned(_) => true, ThPeerSent(_, _) => true, ThClosed => true, _ => false };
+    Bool done = match s { ThSigned(_) => true, ThAnswered(_) => true, ThClosed => true, _ => false };
     return Ok(Stepped {.st = s, .out = n.out, .done = done});
-}
-
-// An abort request for a session already finished here: answer with the
-// openings (to the designated party only, cggmp_blind).
-@requires(network, declassify, clock(readonly))
-List(Kept) on_late(Cosigner c, List(Int) from, SessionMsg m, List(Kept) kept) {
-    if (kept.len() == 0 || !bytes_eq(kept[0].sid, m.session_id) || m.round != 7) { return kept; }
-    return match th_step(kept[0].st, m.msgs) {
-        Err(_) => [],
-        Ok(n) => answer(c, from, m.session_id, n.out, kept[0].peers)
-    };
-}
-
-@requires(network, declassify, clock(readonly))
-List(Kept) answer(Cosigner c, List(Int) to, List(Int) sid, List(ThMsg) out, List(Remote) peers) {
-    Option(Remote) r = remote_by_party(peers, to, 0);
-    _ = match r { None => false, Some(rr) => send_to(mail_of(c), me_of(c), rr, WSession(SessionMsg {.session_id = sid, .round = 7, .msgs = out})) };
-    return [];
 }
 
 // ─── Re-share (SPEC 11.3) ───────────────────────────────────────

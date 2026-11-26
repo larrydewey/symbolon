@@ -134,7 +134,7 @@ pub Int mailbox_end(Endpoint relay, List(Int) party, Int n) {
 pub List(ThMsg) for_party(List(ThMsg) out, Int to, Int i, ListBuf(ThMsg) acc) {
     if (i >= out.len()) { return acc.finish(); }
     ThMsg m = out[i];
-    Bool keep = match m { ThCg(c) => c.to == 0 || c.to == to, ThTw(t) => t.to == to, ThAbortReq(_) => true, ThRs(r) => r.to == 0 || r.to == to };
+    Bool keep = match m { ThCg(c) => c.to == 0 || c.to == to, ThTw(t) => t.to == to, ThVerdict(v) => v.to == to, ThRs(r) => r.to == 0 || r.to == to };
     return for_party(out, to, i + 1, if (keep) { acc.push(m) } else { acc });
 }
 
@@ -346,7 +346,7 @@ pub type Adv(T) = { List(Seat(T)) seats; Bool moved; Str fail; List(Int) culprit
 Str describe(List(ThMsg) ms, Int i, Str acc) {
     if (i >= ms.len()) { return acc; }
     ThMsg m = ms[i];
-    Str d = match m { ThCg(c) => f"{c.from}>{c.to}", ThTw(t) => f"tw{t.from}>{t.to}", ThAbortReq(f) => f"abort{f}", ThRs(r) => f"rs{r.from}>{r.to}" };
+    Str d = match m { ThCg(c) => f"{c.from}>{c.to}", ThTw(t) => f"tw{t.from}>{t.to}", ThVerdict(v) => f"verdict{v.from}>{v.to}", ThRs(r) => f"rs{r.from}>{r.to}" };
     return describe(ms, i + 1, acc + (if (i > 0) { " " } else { "" }) + d);
 }
 

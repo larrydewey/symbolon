@@ -27,9 +27,10 @@ pub type SignInvite = {
 };
 
 // One round's protocol messages from one sender: a receiver runs round
-// `round` once it holds that round's batch from every other party. A
-// designated signer ends a session with a round-7 batch, [ThAbortReq] or
-// empty, so peers waiting for an abort request can close.
+// `round` once it holds that round's batch from every other party. In a
+// signing session the designated signer's round-7 batch carries its
+// verdict on the S points (ThVerdict), and each peer's round-8 batch its
+// answer: its signature share, or its abort-2 openings.
 //@ serial
 pub type SessionMsg = { List(Int) session_id; Int round; List(ThMsg) msgs; };
 
