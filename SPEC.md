@@ -934,7 +934,13 @@ Guardian shares (Section 13.3) are offline material of the same kind.
    device X.
 2. X and N authenticate their channel with a short authentication string
    of at least 40 bits compared by the principal, or a QR code carrying
-   `H(DK_N)` scanned by X.
+   `H(DK_N)` scanned by X. Whatever authenticates the channel, before X
+   sends N anything secret the principal confirms on X that N is the
+   device in front of them: X shows a fingerprint of N's keys (`H(DK_N)`
+   and N's other party keys) that N shows too, and goes on only on an
+   explicit yes (Section 11.5). A code authenticates the two ends to each
+   other, not to the principal: one someone else made would otherwise
+   enroll their device.
 3. X verifies N's evidence against the policy and appends
    `propose-party(N)` with the signatures the policy requires.
 4. The quorum re-shares to include N (Section 11.3). N receives `cc`, the
@@ -975,27 +981,45 @@ Nothing is typed or copied, and N needs no setting beforehand:
 
 1. N listens on every interface on a free port, draws a 32-byte secret
    `s`, and shows `symbolon://link?a=ADDRESSES&p=PORT&s=BASE64URL(s)`, its
-   network addresses as its platform reports them.
-2. X, with the PIN given (a wrong one stops here, before N acts), connects
-   to one of the addresses and sends an *offer*: its relay's host and port,
-   the relay's CA certificate and X's party keys, with
+   addresses on the local network. A code MUST name only addresses a
+   shared network reaches: IPv4 loopback, RFC 1918, 100.64.0.0/10
+   (Tailscale, carrier NAT) and 169.254.0.0/16; IPv6 `::1`, `fe80::/10`
+   and `fc00::/7`; `localhost` and `.local` names. N refuses to show, and
+   X to use, a code naming any other host.
+2. X takes the code (scanned, or pasted: on standard input to the agent,
+   never on its command line, since it carries `s`) and, with the PIN
+   given (a wrong one stops here, before N acts), connects to one of the
+   addresses and sends an *offer*: its relay's host and port, the relay's
+   CA certificate and X's party keys, with
    `HMAC-SHA256(s, "symbolon v1 link offer\n" || offer)`.
 3. N accepts the first connection whose offer's mac checks; any other is
-   closed and N keeps waiting (at most ten minutes and twenty refusals).
+   closed and N keeps waiting, at most ten minutes. A peer address (an
+   IPv6 /64) whose offers failed three times is closed unread from then
+   on, so a stranger on the network can neither end the wait nor hold N.
    N makes its keys against the relay the offer names (as `device new`,
-   with the PIN chosen on N), and answers with its party keys and
+   with the PIN chosen on N), shows the fingerprint of its keys (below),
+   and answers with its party keys and
    `HMAC-SHA256(s, "symbolon v1 link accept\n" || offer mac || accept)`.
-4. X checks the answer's mac and enrolls N (Section 11.1, steps 3-4) as
-   `device enroll` would; N joins as `device join` would.
+4. X checks the answer's mac and shows the same fingerprint: the first 16
+   bytes of `SHA-256("symbolon v1 device fingerprint" || keys)`, `keys`
+   N's party id, `DK_N` and transport key as sent, written as 8 groups of
+   4 hex digits. The principal compares it with N's; only on an explicit
+   yes (the CLI reads `y` on standard input, the app asks) does X enroll
+   N (Section 11.1, steps 3-4) as `device enroll` would; N joins as
+   `device join` would. Until then X has sent nothing secret.
 
-The secret travels only in the QR code, seen by the principal; it
-authenticates the exchange, which carries nothing secret (a relay address,
-a certificate, public keys). This is step 2 of Section 11.1 with a code
-that carries a key for the whole exchange rather than `H(DK_N)` alone. N
-and X must reach each other on a local network; otherwise
-`device enroll` and `device join` with the keys exchanged by hand remain.
-A device N made by an earlier attempt that never joined is used again,
-with its PIN.
+The secret travels only in the QR code; it authenticates the exchange,
+which carries nothing secret until the principal confirms (a relay
+address, a certificate, public keys). It does not tell the principal who
+made the code: a code sent from elsewhere, pasted or scanned, would enroll
+its maker's device. The local addresses keep such a maker on the
+principal's network, and the fingerprint, which N shows on its screen and
+the principal compares, is what binds the enrolment to the device in
+their hand (Section 11.1, step 2). N and X must reach each other on a
+local network; otherwise `device enroll` and `device join` with the keys
+exchanged by hand remain. A device N made by an earlier attempt that
+never joined is used again, with its PIN; a confirmation refused leaves
+it so.
 
 ---
 
@@ -1275,7 +1299,21 @@ same, and what they change lasts, for the duress profile only.
   profile's W). A key removed leaves the duress list (its last one puts W
   back: the duress PIN alone opens it again), and is not asked for under
   the duress PIN; the real profile still asks for its own keys. `key list
-  --pin` under each PIN shows that profile's list.
+  --pin` under each PIN shows that profile's list. Both lists have one
+  limit, whatever else a list carries (at most 8 keys, and their entries
+  within the list's size less a fixed reserve for its other lines), so
+  whether a key fits says nothing about the PIN; a real add whose copy
+  does not fit the duress list (filled under the duress PIN) is still
+  made, and the duress list kept as it was.
+- The fill policy (`key fills`, Section 22.7 item 2) each profile shows
+  is kept in its own list, and `key list --pin` reports it ("fills
+  keys|any"); the app shows that, never the device's `fill-policy` file.
+  Under the real PIN a change goes into the file (which every fill on
+  the real profile obeys when the list has none), the real list and the
+  duress list. Under the duress PIN it goes into the duress list alone,
+  so it shows and acts there as made, and the file is written back byte
+  for byte when it exists and never made when it does not. Either way both
+  profile files are written as for a key change.
 - The real PIN is never told apart. Under the real PIN a new PIN that
   opens the duress profile is refused with "this PIN cannot be used;
   choose another", which does not name it. Under the duress PIN, a new PIN
@@ -1298,6 +1336,16 @@ same, and what they change lasts, for the duress profile only.
   duress PIN therefore looks like one made under the real PIN, and the
   real profile still opens exactly as it did (the duress profile can
   write only the real file's slot, which the real profile does not read).
+  Nothing else is written: no trace of the writes is kept.
+- The work has one pattern: at every unlock each profile opens its own
+  update slot and reads it as a list (the real one then keeps its own),
+  and every change opens the other file's list and slot (under the
+  duress PIN, which has no key for them, with random keys), so an unlock
+  or a change takes as long under either PIN.
+- A vault read under the duress PIN that writes the real copy back
+  (Section 14.2 item 3, `vault.cache`, `vault.tag`) writes it as a real
+  read does: a new file, renamed over the old one, so a read cut short
+  never leaves the real copy half written.
 
 Residual risk: which file was written whole says which profile made a
 change; within one before-and-after pair that is the coercer's own (or,
