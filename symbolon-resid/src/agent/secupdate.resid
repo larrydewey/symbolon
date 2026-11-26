@@ -309,9 +309,9 @@ pub Result(Int, Str) to_format2(Str dir, DeviceConfig c, Unlocked u, Str dpin, B
     List(Secret(UInt(8))) sd = random_secret(32);
     List(Secret(UInt(8))) none = [];
     KeyList rl = KeyList {.w = if (keyed) { none } else { wr }, .salt = salt, .via = [], .mine = if (real_on_a) { "a" } else { "b" }, .peer_l = ld, .peer_w = wd, .keys = ks.keys,
-                          .sk = sr, .peer_pk = slot_pub(sd)};
+                          .sk = sr, .peer_pk = slot_pub(sd), .fill = ""};
     KeyList dl = KeyList {.w = if (keyed) { none } else { wd }, .salt = salt, .via = if (keyed) { seal_via(wd, u.wrap) } else { [] }, .mine = if (real_on_a) { "b" } else { "a" },
-                          .peer_l = none, .peer_w = none, .keys = ks.keys, .sk = sd, .peer_pk = slot_pub(sr)};
+                          .peer_l = none, .peer_w = none, .keys = ks.keys, .sk = sd, .peer_pk = slot_pub(sr), .fill = ""};
     List(Int) rf = own_file(u.ukey, lr, rl, wr, rw, rb);
     if (rf.len() == 0) { return Err("too many security keys for one list; remove one first"); }
     List(Int) df = if (has) { own_file(kd, ld, dl, wd, dw, db) } else { decoy_file(rl.peer_pk) };

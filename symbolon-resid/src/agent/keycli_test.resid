@@ -291,3 +291,100 @@ test "under the duress PIN the fill policy change is acted: success shown, the d
     expect(filesystem.read_all(dir + "/fill-policy")).toEqual("any\n");
     expect(key_fills_pin(dir, "keys", "9999")).toEqual(1);
 }
+
+@requires(filesystem, device, declassify, provision, network, environment)
+Str fill_under(Str dir, DeviceConfig c, Str pin) { return shown_fill_under(dir, c, stretch(c, pin_bytes(pin))); }
+
+@requires(filesystem, device, declassify, provision, network, environment, clock)
+test "a fill policy change under the duress PIN shows in later lists and acts there; the file is not touched and never made" {
+    Str dir = fresh_dir();
+    DeviceConfig c = made_with(dir, "2222");
+    // No file yet: a duress change makes none (a real change never leaves
+    // it missing once made, nor empty).
+    expect(key_fills_pin(dir, "keys", "2222")).toEqual(0);
+    expect(filesystem.exists(dir + "/fill-policy")).toBeFalse();
+    // The switch does not snap back: the duress profile shows what was set,
+    // the real one what it had.
+    expect(fill_under(dir, c, "2222")).toEqual("keys");
+    expect(fill_under(dir, c, "1111")).toEqual("any");
+    // A real change: the file and both profiles (as a real key change
+    // reaches the duress profile).
+    expect(key_fills_pin(dir, "any", "1111")).toEqual(0);
+    expect(filesystem.read_all(dir + "/fill-policy")).toEqual("any\n");
+    expect(fill_under(dir, c, "1111")).toEqual("any");
+    expect(fill_under(dir, c, "2222")).toEqual("any");
+    // Under duress again: shown there, the file byte for byte as it was.
+    List(Int) before = get_file(dir + "/fill-policy");
+    expect(key_fills_pin(dir, "keys", "2222")).toEqual(0);
+    expect(hex_encode(get_file(dir + "/fill-policy"))).toEqual(hex_encode(before));
+    expect(fill_under(dir, c, "2222")).toEqual("keys");
+    expect(fill_under(dir, c, "1111")).toEqual("any");
+    // `key list --pin` reports it last (and unlock_v2 obeys the same value).
+    expect(key_fills_pin(dir, "keys", "1111")).toEqual(0);
+    expect(fill_under(dir, c, "2222")).toEqual("keys");
+    expect(filesystem.read_all(dir + "/fill-policy")).toEqual("keys\n");
+}
+
+// A key with a long credential id (255 bytes), as some authenticators make.
+List(Int) long_cred(Int n) { return rep(n, 255); }
+
+@requires(filesystem, device, declassify, provision, network, environment)
+Unlocked touched_long(Str dir, DeviceConfig c, Str pin, Int n) {
+    List(Secret(UInt(8))) st = stretch(c, pin_bytes(pin));
+    Found f = find_own(dir, c, st, true);
+    OwnList o = f.o;
+    if (o.which == "") { return unlocked_none(); }
+    KeyList l = o.list;
+    List(Secret(UInt(8))) none = [];
+    List(Secret(UInt(8))) w = if (l.keys.len() == 0) { l.w } else { if (n == 0) { none } else { list_w_for(l, long_cred(n), out_of(n)) } };
+    return with_ukey(with_wrap(with_stretched(unlock(f.k, read_blob(dir, o.which, w), []), st), w), f.k);
+}
+
+@requires(filesystem, device, declassify, provision, network, environment)
+Int add_long(Str dir, DeviceConfig c, Str pin, Int t, Str name, Int n) {
+    Int r = key_add_commit(dir, c, touched_long(dir, c, pin, t), name, long_cred(n), [4].concat(rep(2, 64)), out_of(n));
+    return r;
+}
+
+// Keys added under the duress PIN, as many as it takes (12 tries), each
+// touched with the first.
+@requires(filesystem, device, declassify, provision, network, environment)
+Int fill_duress(Str dir, DeviceConfig c, Int i, Int ok) {
+    if (i >= 12) { return ok; }
+    Int r = add_long(dir, c, "2222", if (i == 0) { 0 } else { 20 }, f"k{i}", 20 + i);
+    return fill_duress(dir, c, i + 1, if (r == 0) { ok + 1 } else { ok });
+}
+
+@requires(filesystem, device, declassify, provision, network, environment, clock)
+test "keys added under the duress PIN cannot block a real key add; both lists have one limit" {
+    Str dir = fresh_dir();
+    DeviceConfig c = made(dir);
+    expect(fill_duress(dir, c, 0, 0)).toEqual(max_keys());
+    // The real add is made; the duress list, full, is kept as it was.
+    expect(add_long(dir, c, "1111", 0, "main", 5)).toEqual(0);
+    expect(names_under(dir, c, "1111")).toEqual("main");
+    expect(str_split(names_under(dir, c, "2222"), ",").len()).toEqual(max_keys());
+    expect(str_contains(names_under(dir, c, "2222"), "main")).toBeFalse();
+    expect(touched_long(dir, c, "1111", 5).kind).toEqual(1);
+    expect(touched_long(dir, c, "2222", 20).kind).toEqual(2);
+    // The limit is the same for the real list, which carries more lines.
+    Str d2 = fresh_dir();
+    DeviceConfig c2 = made(d2);
+    expect(fill_real(d2, c2, 0, 0)).toEqual(max_keys());
+    expect(str_split(names_under(d2, c2, "1111"), ",").len()).toEqual(max_keys());
+    List(SecKey) eight = long_keys(0, []);
+    expect(keys_fit(eight)).toBeTrue();
+    expect(keys_fit(eight.concat([SecKey {.name = "x", .cred_id = [1], .cred_point = [], .sealed = []}]))).toBeFalse();
+}
+
+@requires(filesystem, device, declassify, provision, network, environment)
+Int fill_real(Str dir, DeviceConfig c, Int i, Int ok) {
+    if (i >= 12) { return ok; }
+    Int r = add_long(dir, c, "1111", if (i == 0) { 0 } else { 30 }, f"r{i}", 30 + i);
+    return fill_real(dir, c, i + 1, if (r == 0) { ok + 1 } else { ok });
+}
+
+List(SecKey) long_keys(Int i, List(SecKey) acc) {
+    if (i >= 8) { return acc; }
+    return long_keys(i + 1, acc.concat([SecKey {.name = f"k{i}", .cred_id = long_cred(i), .cred_point = rep(4, 65), .sealed = rep(1, 60)}]));
+}

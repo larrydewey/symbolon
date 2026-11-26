@@ -243,6 +243,17 @@ pub Bool fills_need_key(Str dir) {
     return filesystem.exists(f) && str_starts_with(filesystem.read_all(f), "keys");
 }
 
+// The fill policy a profile shows and its fills obey (format 2): the one
+// it set last (its list's "fill"), else the device's fill-policy file.
+// Under the duress PIN a change is kept in the duress profile's list alone
+// (keycli key_fills_pin), so it shows, and acts, as made there, while the
+// file, the real profile's policy, is unchanged.
+@requires(filesystem)
+pub Str shown_fill(Str dir, KeyList l) {
+    if (l.fill == "keys" || l.fill == "any") { return l.fill; }
+    return if (fills_need_key(dir)) { "keys" } else { "any" };
+}
+
 pub Str fills_key_refusal() { return "this device fills only with a security key: enrol one under Security keys"; }
 
 // Why an opening for a fill is refused before the PIN is even asked, or "".
@@ -362,28 +373,46 @@ pub Bool keys_v2(Str dir) { return filesystem.exists(profile_file(dir, "a")); }
 // entries give that one). mine: "a" or "b", which of the two unlock keys
 // (TPM handle field, Keystore alias) is this profile's. peer_l, peer_w: the
 // real profile's only, the other profile's L and W (random without one).
+// fill: the fill policy this profile shows (`key fills`, SPEC 22.7 item 2,
+// 14.2), "keys" or "any", or "" when it never set one (then the device's
+// fill-policy file is what it shows).
 pub type KeyList = { List(Secret(UInt(8))) w; List(Int) salt; List(Int) via; Str mine;
                      List(Secret(UInt(8))) peer_l; List(Secret(UInt(8))) peer_w; List(SecKey) keys;
-                     List(Secret(UInt(8))) sk; List(Int) peer_pk; };
+                     List(Secret(UInt(8))) sk; List(Int) peer_pk; Str fill; };
 
-pub KeyList no_list() { return KeyList {.w = [], .salt = [], .via = [], .mine = "", .peer_l = [], .peer_w = [], .keys = [], .sk = [], .peer_pk = []}; }
+pub KeyList no_list() { return KeyList {.w = [], .salt = [], .via = [], .mine = "", .peer_l = [], .peer_w = [], .keys = [], .sk = [], .peer_pk = [], .fill = ""}; }
 
 // The list with keys `ks`: W kept in it (`w`) when there are none.
 pub KeyList list_with_keys(KeyList l, List(SecKey) ks, List(Secret(UInt(8))) w) {
     List(Secret(UInt(8))) none = [];
     return KeyList {.w = if (ks.len() == 0) { w } else { none }, .salt = l.salt, .via = if (ks.len() == 0) { [] } else { l.via }, .mine = l.mine,
-                    .peer_l = l.peer_l, .peer_w = l.peer_w, .keys = ks, .sk = l.sk, .peer_pk = l.peer_pk};
+                    .peer_l = l.peer_l, .peer_w = l.peer_w, .keys = ks, .sk = l.sk, .peer_pk = l.peer_pk, .fill = l.fill};
 }
 
 pub KeyList list_with_peer(KeyList l, List(Secret(UInt(8))) pl, List(Secret(UInt(8))) pw) {
-    return KeyList {.w = l.w, .salt = l.salt, .via = l.via, .mine = l.mine, .peer_l = pl, .peer_w = pw, .keys = l.keys, .sk = l.sk, .peer_pk = l.peer_pk};
+    return KeyList {.w = l.w, .salt = l.salt, .via = l.via, .mine = l.mine, .peer_l = pl, .peer_w = pw, .keys = l.keys, .sk = l.sk, .peer_pk = l.peer_pk, .fill = l.fill};
 }
 
 pub KeyList list_with_mine(KeyList l, Str mine) {
-    return KeyList {.w = l.w, .salt = l.salt, .via = l.via, .mine = mine, .peer_l = l.peer_l, .peer_w = l.peer_w, .keys = l.keys, .sk = l.sk, .peer_pk = l.peer_pk};
+    return KeyList {.w = l.w, .salt = l.salt, .via = l.via, .mine = mine, .peer_l = l.peer_l, .peer_w = l.peer_w, .keys = l.keys, .sk = l.sk, .peer_pk = l.peer_pk, .fill = l.fill};
+}
+
+pub KeyList list_with_fill(KeyList l, Str fill) {
+    return KeyList {.w = l.w, .salt = l.salt, .via = l.via, .mine = l.mine, .peer_l = l.peer_l, .peer_w = l.peer_w, .keys = l.keys, .sk = l.sk, .peer_pk = l.peer_pk, .fill = fill};
 }
 
 pub List(Str) list_names(KeyList l) { return key_names(l.keys, 0, ListBuf()); }
+
+// How many keys a list holds, and how many of its bytes they may take: the
+// same for either profile, whatever else its list carries (the real one's
+// "peer" line, a "w" or "via" line, "fill"), so that whether an add fits
+// says nothing about which profile made it (SPEC 14.2). The reserve covers
+// every other line at its longest: w 67, salt 70, via 125, mine 7, peer
+// 135, slot 70, peerpk 138, fill 10 (622 bytes).
+pub Int max_keys() { return 8; }
+pub Int list_reserve() { return 1024; }
+
+pub Bool keys_fit(List(SecKey) ks) { return ks.len() <= max_keys() && str_len(key_entries(ks, 0, "")) <= list_plain_len() - list_reserve(); }
 
 List(Str) key_names(List(SecKey) ks, Int i, ListBuf(Str) acc) {
     if (i >= ks.len()) { return acc.finish(); }
@@ -391,7 +420,7 @@ List(Str) key_names(List(SecKey) ks, Int i, ListBuf(Str) acc) {
 }
 
 // The list's text: "w HEX", "salt HEX", "via HEX", "mine X", "peer L W",
-// "slot SEED", "peerpk POINT", then "key NAME CRED POINT SEALED" per key; zero bytes to
+// "slot SEED", "peerpk POINT", "fill keys|any", then "key NAME CRED POINT SEALED" per key; zero bytes to
 // list_plain_len(). [] when it does not fit.
 @requires(declassify)
 pub List(Int) list_plain(KeyList l) {
@@ -402,6 +431,7 @@ pub List(Int) list_plain(KeyList l) {
           + (if (l.peer_l.len() == 32 && l.peer_w.len() == 32) { "peer " + hex_encode(reveal(l.peer_l)) + " " + hex_encode(reveal(l.peer_w)) + "\n" } else { "" })
           + (if (l.sk.len() == 32) { "slot " + hex_encode(reveal(l.sk)) + "\n" } else { "" })
           + (if (l.peer_pk.len() == 65) { "peerpk " + hex_encode(l.peer_pk) + "\n" } else { "" })
+          + (if (l.fill == "keys" || l.fill == "any") { "fill " + l.fill + "\n" } else { "" })
           + key_entries(l.keys, 0, "");
     List(Int) b = utf8(t);
     if (b.len() > list_plain_len()) { return []; }
@@ -434,16 +464,17 @@ KeyList list_lines(List(Str) ls, Int i, KeyList l) {
 }
 
 KeyList list_line(List(Str) f, Str tag, KeyList l) {
-    if (tag == "w") { return KeyList {.w = secret_bytes(hex_field(f, 1)), .salt = l.salt, .via = l.via, .mine = l.mine, .peer_l = l.peer_l, .peer_w = l.peer_w, .keys = l.keys, .sk = l.sk, .peer_pk = l.peer_pk}; }
-    if (tag == "salt") { return KeyList {.w = l.w, .salt = hex_field(f, 1), .via = l.via, .mine = l.mine, .peer_l = l.peer_l, .peer_w = l.peer_w, .keys = l.keys, .sk = l.sk, .peer_pk = l.peer_pk}; }
-    if (tag == "via") { return KeyList {.w = l.w, .salt = l.salt, .via = hex_field(f, 1), .mine = l.mine, .peer_l = l.peer_l, .peer_w = l.peer_w, .keys = l.keys, .sk = l.sk, .peer_pk = l.peer_pk}; }
+    if (tag == "w") { return KeyList {.w = secret_bytes(hex_field(f, 1)), .salt = l.salt, .via = l.via, .mine = l.mine, .peer_l = l.peer_l, .peer_w = l.peer_w, .keys = l.keys, .sk = l.sk, .peer_pk = l.peer_pk, .fill = l.fill}; }
+    if (tag == "salt") { return KeyList {.w = l.w, .salt = hex_field(f, 1), .via = l.via, .mine = l.mine, .peer_l = l.peer_l, .peer_w = l.peer_w, .keys = l.keys, .sk = l.sk, .peer_pk = l.peer_pk, .fill = l.fill}; }
+    if (tag == "via") { return KeyList {.w = l.w, .salt = l.salt, .via = hex_field(f, 1), .mine = l.mine, .peer_l = l.peer_l, .peer_w = l.peer_w, .keys = l.keys, .sk = l.sk, .peer_pk = l.peer_pk, .fill = l.fill}; }
     if (tag == "mine" && f.len() == 2) { return list_with_mine(l, f[1]); }
+    if (tag == "fill" && f.len() == 2 && (f[1] == "keys" || f[1] == "any")) { return list_with_fill(l, f[1]); }
     if (tag == "peer") { return list_with_peer(l, secret_bytes(hex_field(f, 1)), secret_bytes(hex_field(f, 2))); }
-    if (tag == "slot") { return KeyList {.w = l.w, .salt = l.salt, .via = l.via, .mine = l.mine, .peer_l = l.peer_l, .peer_w = l.peer_w, .keys = l.keys, .sk = secret_bytes(hex_field(f, 1)), .peer_pk = l.peer_pk}; }
-    if (tag == "peerpk") { return KeyList {.w = l.w, .salt = l.salt, .via = l.via, .mine = l.mine, .peer_l = l.peer_l, .peer_w = l.peer_w, .keys = l.keys, .sk = l.sk, .peer_pk = hex_field(f, 1)}; }
+    if (tag == "slot") { return KeyList {.w = l.w, .salt = l.salt, .via = l.via, .mine = l.mine, .peer_l = l.peer_l, .peer_w = l.peer_w, .keys = l.keys, .sk = secret_bytes(hex_field(f, 1)), .peer_pk = l.peer_pk, .fill = l.fill}; }
+    if (tag == "peerpk") { return KeyList {.w = l.w, .salt = l.salt, .via = l.via, .mine = l.mine, .peer_l = l.peer_l, .peer_w = l.peer_w, .keys = l.keys, .sk = l.sk, .peer_pk = hex_field(f, 1), .fill = l.fill}; }
     if (tag == "key" && f.len() == 5 && hexy(f[1]) && hexy(f[2]) && hexy(f[3]) && hexy(f[4])) {
         SecKey k = SecKey {.name = http_text(cose_hex_decode(f[1]), 0, str_len(f[1]) / 2), .cred_id = cose_hex_decode(f[2]), .cred_point = cose_hex_decode(f[3]), .sealed = cose_hex_decode(f[4])};
-        return KeyList {.w = l.w, .salt = l.salt, .via = l.via, .mine = l.mine, .peer_l = l.peer_l, .peer_w = l.peer_w, .keys = l.keys.concat([k]), .sk = l.sk, .peer_pk = l.peer_pk};
+        return KeyList {.w = l.w, .salt = l.salt, .via = l.via, .mine = l.mine, .peer_l = l.peer_l, .peer_w = l.peer_w, .keys = l.keys.concat([k]), .sk = l.sk, .peer_pk = l.peer_pk, .fill = l.fill};
     }
     return l;
 }
@@ -509,8 +540,9 @@ pub List(Int) wblob_part(List(Int) file) { return if (file.len() == profile_file
 pub List(Int) pslot_part(List(Int) file) { return if (file.len() == profile_file_len()) { file[sealed_len()..file.len()] } else { [] }; }
 
 // A profile file written whole: a new file, synced, renamed over the old
-// one, the directory synced (where the file system can). When DIR/profile-writes exists (tests only),
-// the file's name is appended to it, so that a test can count the writes.
+// one, the directory synced (where the file system can). Nothing else is
+// written: no trace of which file was written when (a test sees the order
+// by making the second write fail).
 @requires(filesystem)
 pub Bool put_whole(Str dir, Str which, List(Int) bytes) {
     if (bytes.len() != profile_file_len()) { return false; }
@@ -520,8 +552,6 @@ pub Bool put_whole(Str dir, Str which, List(Int) bytes) {
     if (!ok) { _ = filesystem.remove(tmp); return false; }
     // The rename made durable where the file system allows it.
     _ = filesystem.sync(dir);
-    Str trace = dir + "/profile-writes";
-    if (filesystem.exists(trace)) { _ = filesystem.append_bytes(trace, utf8("profile_" + which + "\n")); }
     return true;
 }
 
@@ -586,14 +616,20 @@ pub List(Int) list_update(List(Secret(UInt(8))) l, KeyList kl) {
 // slot: the real profile's (it holds the other's L) as it is, whatever its
 // slot holds; the other's, the list its slot carries when the slot opens
 // and starts with its L.
+// Both profiles do the same work here, so that how long an unlock takes
+// does not say which PIN was entered (SPEC 14.2): the slot is opened and
+// what it holds read as a list, also for the real profile, which then
+// keeps its own list.
 @requires(declassify)
 pub KeyList with_pending(List(Secret(UInt(8))) l, KeyList x, List(Int) file) {
-    if (x.peer_l.len() == 32 || x.sk.len() != 32) { return x; }
-    Option(List(Int)) p = open_pslot(x.sk, file);
+    List(Secret(UInt(8))) none_s = [];
+    Option(List(Int)) p = open_pslot(if (x.sk.len() == 32) { x.sk } else { none_s }, file);
     List(Int) none = [];
     List(Int) b = p else { none };
-    if (b.len() != pslot_plain_len() || hex_encode(b[0..32]) != hex_encode(reveal(l))) { return x; }
-    KeyList n = list_of_plain(b[32..b.len()]);
+    Bool full = b.len() == pslot_plain_len();
+    KeyList n = list_of_plain(if (full) { b[32..b.len()] } else { empty_update() });
+    Bool carries = full && hex_encode(b[0..32]) == hex_encode(reveal(l));
+    if (x.peer_l.len() == 32 || x.sk.len() != 32 || !carries) { return x; }
     return n;
 }
 
@@ -653,14 +689,22 @@ pub Bool write_change(Str dir, OwnList o, KeyList nl, List(Secret(UInt(8))) k, L
 
 // The duress profile's list as the real profile (list `o`) reads it: its
 // slot's when that holds one. None under the duress PIN, and without a
-// duress PIN (the other file is random).
+// duress PIN (the other file is random). The same work is done whichever
+// it is (SPEC 14.2: a change takes as long under either PIN): the other
+// file's list opened, under a random key when there is no L for it, and
+// its slot opened, under a random seed when the list did not open.
 @requires(filesystem, declassify)
 pub Option(KeyList) duress_list(Str dir, OwnList o) {
     KeyList ol = o.list;
-    if (ol.peer_l.len() != 32 || o.which == "") { return None; }
+    if (o.which == "") { return None; }
+    Bool real = ol.peer_l.len() == 32;
+    List(Secret(UInt(8))) lk = if (real) { ol.peer_l } else { random_secret(32) };
     List(Int) f = get_file(profile_file(dir, if (o.which == "a") { "b" } else { "a" }));
-    Option(KeyList) l = open_list(ol.peer_l, f);
-    Option(KeyList) out = match l { None => None, Some(x) => Some(with_pending(ol.peer_l, x, f)) };
+    Option(KeyList) l = open_list(lk, f);
+    KeyList dummy = KeyList {.w = [], .salt = [], .via = [], .mine = "", .peer_l = [], .peer_w = [], .keys = [], .sk = random_secret(32), .peer_pk = [], .fill = ""};
+    KeyList x = l else { dummy };
+    KeyList y = with_pending(lk, x, f);
+    Option(KeyList) out = match l { None => None, Some(_) => if (real) { Some(y) } else { None } };
     return out;
 }
 

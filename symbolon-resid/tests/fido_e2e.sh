@@ -73,8 +73,8 @@ get() { printf '2468\n' | run 300 "$BIN" device vault get "$W/dev" "$1" 2> "$W/g
 
 put before secret-0 || fail "vault put before any key: $(cat "$W/put.log")"
 printf '2468\n' | run 300 "$BIN" device key add "$W/dev" main > "$W/add.log" 2>&1 || fail "key add: $(cat "$W/add.log") $(tail -3 "$W/fido/log")"
-[ "$(printf '2468\n' | run 30 "$BIN" device key list "$W/dev" --pin)" = "$(printf main | od -v -An -tx1 | tr -d ' \n')" ] || fail "key list"
-[ "$(printf '1357\n' | run 30 "$BIN" device key list "$W/dev" --pin)" = "$(printf main | od -v -An -tx1 | tr -d ' \n')" ] || fail "key list under the duress PIN"
+[ "$(printf '2468\n' | run 30 "$BIN" device key list "$W/dev" --pin | grep -v "^fills ")" = "$(printf main | od -v -An -tx1 | tr -d ' \n')" ] || fail "key list"
+[ "$(printf '1357\n' | run 30 "$BIN" device key list "$W/dev" --pin | grep -v "^fills ")" = "$(printf main | od -v -An -tx1 | tr -d ' \n')" ] || fail "key list under the duress PIN"
 run 30 "$BIN" device key list "$W/dev" > /dev/null 2>&1 && fail "the key list was shown without the PIN"
 [ "$(stat -c %s "$W/dev/profile_a")" = 20737 ] && [ "$(stat -c %s "$W/dev/profile_b")" = 20737 ] && [ ! -e "$W/dev/security-keys" ] || fail "the profile files are not of format 2"
 grep -q main "$W/dev/profile_a" "$W/dev/profile_b" && fail "a key's name is readable in the profile files"
@@ -136,7 +136,7 @@ echo "a backup key added and the first removed: only the backup opens it"
 
 present backup
 printf '2468\n' | run 300 "$BIN" device key remove "$W/dev" backup > "$W/rm2.log" 2>&1 || fail "remove the last key: $(cat "$W/rm2.log")"
-[ -z "$(printf '2468\n' | run 30 "$BIN" device key list "$W/dev" --pin)" ] || fail "the list is not empty after the last key"
+[ -z "$(printf '2468\n' | run 30 "$BIN" device key list "$W/dev" --pin | grep -v "^fills ")" ] || fail "the list is not empty after the last key"
 present
 [ "$(get after)" = secret-1 ] || fail "PIN alone after removing every key: $(cat "$W/get.err")"
 echo "the last key removed: the PIN alone opens the device again"
@@ -150,5 +150,12 @@ grep -q "fills only with a security key" "$W/pfill.log" || fail "policy refusal:
 printf '1111\n' | run 300 "$BIN" device key fills "$W/dev" any > /dev/null 2>&1 && fail "the policy changed with a wrong PIN"
 printf '2468\n' | run 300 "$BIN" device key fills "$W/dev" any > /dev/null 2>&1 || fail "key fills any"
 printf '2468\n' | SYMBOLON_FILL="$REQ" run 300 "$BIN" device vault list "$W/dev" > /dev/null 2>&1 || fail "a fill under any"
-echo "fills need a key when set so (refused with none enrolled); a wrong PIN changes nothing"
+# Under the duress PIN the change is acted: its list shows it, the file
+# (the real profile's policy) stays byte for byte.
+POL=$(od -An -tx1 "$W/dev/fill-policy")
+printf '1357\n' | run 300 "$BIN" device key fills "$W/dev" keys > /dev/null 2>&1 || fail "key fills keys under the duress PIN"
+[ "$(od -An -tx1 "$W/dev/fill-policy")" = "$POL" ] || fail "the duress PIN changed the device's fill policy"
+[ "$(printf '1357\n' | run 30 "$BIN" device key list "$W/dev" --pin | grep '^fills ')" = "fills keys" ] || fail "the duress change does not show"
+[ "$(printf '2468\n' | run 30 "$BIN" device key list "$W/dev" --pin | grep '^fills ')" = "fills any" ] || fail "the real profile's policy changed"
+echo "fills need a key when set so (refused with none enrolled); a wrong PIN changes nothing; a duress change shows there only"
 echo "PASS fido_e2e"

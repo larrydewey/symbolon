@@ -271,7 +271,9 @@ Unlocked unlock_v2(Str dir, DeviceConfig c, List(Secret(UInt(8))) st, Bool a_fir
     OwnList o = f.o;
     if (o.which == "") { return with_stretched(unlocked_none(), st); }
     KeyList l = o.list;
-    if (str_len(environment.get("SYMBOLON_FILL")) > 0 && fills_need_key(dir) && l.keys.len() == 0) {
+    // The policy this profile shows (fidokey shown_fill): a change acted
+    // under the duress PIN acts there too (SPEC 14.2).
+    if (str_len(environment.get("SYMBOLON_FILL")) > 0 && shown_fill(dir, l) == "keys" && l.keys.len() == 0) {
         eprintln("device: " + fills_key_refusal());
         return with_stretched(unlocked_none(), st);
     }
@@ -440,8 +442,8 @@ Bool write_profiles(Str dir, Str rw, List(Secret(UInt(8))) ka, List(Secret(UInt(
     List(Secret(UInt(8))) sr = random_secret(32);
     List(Secret(UInt(8))) sd = random_secret(32);
     List(Secret(UInt(8))) none = [];
-    KeyList rl = KeyList {.w = wr, .salt = salt, .via = [], .mine = if (real_on_a) { "a" } else { "b" }, .peer_l = ld, .peer_w = wd, .keys = [], .sk = sr, .peer_pk = slot_pub(sd)};
-    KeyList dl = KeyList {.w = wd, .salt = salt, .via = [], .mine = if (real_on_a) { "b" } else { "a" }, .peer_l = none, .peer_w = none, .keys = [], .sk = sd, .peer_pk = slot_pub(sr)};
+    KeyList rl = KeyList {.w = wr, .salt = salt, .via = [], .mine = if (real_on_a) { "a" } else { "b" }, .peer_l = ld, .peer_w = wd, .keys = [], .sk = sr, .peer_pk = slot_pub(sd), .fill = ""};
+    KeyList dl = KeyList {.w = wd, .salt = salt, .via = [], .mine = if (real_on_a) { "b" } else { "a" }, .peer_l = none, .peer_w = none, .keys = [], .sk = sd, .peer_pk = slot_pub(sr), .fill = ""};
     List(Int) rf = own_file(ka, lr, rl, wr, rw, blob_real);
     List(Int) df = if (has_duress) { own_file(kb, ld, dl, wd, dw, blob_dur) } else { decoy_file(rl.peer_pk) };
     Bool ok = put_new_pair(dir, rw, rf, df);

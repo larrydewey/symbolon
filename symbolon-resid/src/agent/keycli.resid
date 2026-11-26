@@ -42,10 +42,14 @@ pub Str update_first(Str dir) { return "finish the security update first: symbol
 // line. In format 2 the list is sealed: --pin (the PIN on standard input)
 // is needed, and shows the list of the profile that PIN opens; no touch
 // is asked for. Before format 2, the security-keys file's list.
+// After the names, a last line "fills keys|any": the fill policy the
+// profile shows (shown_fill), which is what the app displays.
 @requires(filesystem)
 pub Int key_list(Str dir) {
     if (keys_v2(dir)) { return dfail("the list opens with the PIN: device key list " + dir + " --pin (the PIN on standard input)"); }
-    return print_names(names_of(read_keys(dir).keys, 0, []), 0);
+    Int r = print_names(names_of(read_keys(dir).keys, 0, []), 0);
+    println("fills " + shown_fill(dir, no_list()));
+    return r;
 }
 
 @requires(filesystem, device, declassify, provision, network, environment)
@@ -53,9 +57,12 @@ pub Int key_list_pin(Str dir) {
     if (!keys_v2(dir)) { return key_list(dir); }
     Option(DeviceConfig) oc = load_config(dir);
     DeviceConfig c = oc else { return_cfg_none() };
-    List(Str) ns = shown_names(dir, c, stretch(c, pin_bytes(read_pin())));
-    if (ns.len() == 1 && ns[0] == "\n") { return dfail("wrong PIN"); }
-    return print_names(ns, 0);
+    Found f = find_own(dir, c, stretch(c, pin_bytes(read_pin())), (random_bytes(1)[0] & 1) == 0);
+    OwnList o = f.o;
+    if (o.which == "") { return dfail("wrong PIN"); }
+    Int r = print_names(list_names(o.list), 0);
+    println("fills " + shown_fill(dir, o.list));
+    return r;
 }
 
 // The names in the list the PIN stretched to `st` opens; ["\n"] (no name
@@ -66,6 +73,13 @@ pub List(Str) shown_names(Str dir, DeviceConfig c, List(Secret(UInt(8))) st) {
     OwnList o = f.o;
     if (o.which == "") { return ["\n"]; }
     return list_names(o.list);
+}
+
+@requires(filesystem, device, declassify, provision, network, environment)
+pub Str shown_fill_under(Str dir, DeviceConfig c, List(Secret(UInt(8))) st) {
+    Found f = find_own(dir, c, st, (random_bytes(1)[0] & 1) == 0);
+    OwnList o = f.o;
+    return shown_fill(dir, o.list);
 }
 
 Int print_names(List(Str) ns, Int i) {
@@ -106,6 +120,13 @@ KeyList duress_with_key(KeyList dl, Str name, List(Int) cred_id, List(Int) cred_
     return n;
 }
 
+// The duress list with the key when that fits; else as it is.
+@requires(declassify)
+KeyList duress_add(KeyList dl, Str name, List(Int) cred_id, List(Int) cred_point, List(Secret(UInt(8))) out, List(Secret(UInt(8))) dw) {
+    KeyList n = duress_with_key(dl, name, cred_id, cred_point, out, dw);
+    return if (keys_fit(n.keys)) { n } else { dl };
+}
+
 KeyList duress_without_key(KeyList dl, List(Int) cred_id, List(Secret(UInt(8))) dw) {
     KeyList n = list_with_keys(dl, keys_without_cred(dl.keys, cred_id, 0, ListBuf()), dw);
     return n;
@@ -127,6 +148,7 @@ pub Int key_add_pin(Str dir, Str name, Str pin) {
     if (u.kind != 1 && u.kind != 2) { return dfail("wrong PIN, or no enrolled key present"); }
     OwnList o = own_list(dir, u);
     if (names_of(o.list.keys, 0, []).contains(name)) { return dfail("a key named " + name + " is already enrolled"); }
+    if (o.list.keys.len() >= max_keys()) { return dfail(f"no more keys fit: at most {max_keys()} (fewer with long credential ids); remove one first"); }
     Resp ir = resp_of(fido_exchange(req_get_info()));
     if (ir.status != 0) { return dfail(if (ir.status == -1) { "no security key answers" } else { ctap_status_text(ir.status) }); }
     Info info = info_of(ir.body);
@@ -151,12 +173,18 @@ pub Int key_add_commit(Str dir, DeviceConfig c, Unlocked u, Str name, List(Int) 
     OwnList o = own_list(dir, u);
     if (o.which == "" || u.wrap.len() != 32) { return dfail("wrong PIN, or no enrolled key present"); }
     List(SecKey) ks = keys_without_name(o.list.keys, name, 0, ListBuf()).concat([key_entry(name, cred_id, cred_point, out, u.wrap)]);
+    // One limit for either profile's list (keys_fit), so whether a key fits
+    // says nothing about which PIN was entered.
+    if (!keys_fit(ks)) { return dfail(f"no more keys fit: at most {max_keys()} (fewer with long credential ids); remove one first"); }
     KeyList ol = o.list;
     // Under the real PIN, the duress profile's list with the key too (None
-    // under the duress PIN, and without a duress PIN).
+    // under the duress PIN, and without a duress PIN). When keys added
+    // under the duress PIN fill that list, the real add is still made and
+    // the duress list kept as it is: the duress profile cannot block the
+    // real one's keys.
     Option(KeyList) pl = duress_list(dir, o);
-    Option(KeyList) next = match pl { None => None, Some(dl) => Some(duress_with_key(dl, name, cred_id, cred_point, out, ol.peer_w)) };
-    if (!write_list(dir, u, o, list_with_keys(ol, ks, u.wrap), next)) { return dfail("cannot write " + profile_file(dir, o.which) + " (at most a few keys fit)"); }
+    Option(KeyList) next = match pl { None => None, Some(dl) => Some(duress_add(dl, name, cred_id, cred_point, out, ol.peer_w)) };
+    if (!write_list(dir, u, o, list_with_keys(ol, ks, u.wrap), next)) { return dfail("cannot write " + profile_file(dir, o.which)); }
     println("security key " + name + " added; this device now opens only with it (or another enrolled key) present");
     return 0;
 }
@@ -167,10 +195,15 @@ pub Int key_add_commit(Str dir, DeviceConfig c, Unlocked u, Str name, List(Int) 
 @requires(filesystem, network, device, declassify, clock, provision, environment)
 pub Int key_fills(Str dir, Str mode) { Int r = key_fills_pin(dir, mode, read_pin()); return r; }
 
-// Under the duress PIN the change is acted (SPEC 14.2): the same unlock,
-// list and file write, the same answer for the duress profile's own keys,
-// but the device's fill policy is written back as it was, since it is the
-// real profile's.
+// Each profile keeps the policy it shows in its own sealed list (format
+// 2), written as a key change is (both profile files, SPEC 14.2); under
+// the real PIN into the duress profile's list too, as keys are. The
+// device's fill-policy file, which every fill obeys, is the real
+// profile's: under the real PIN it is written; under the duress PIN the
+// change is acted (SPEC 14.2: the same unlock, the same profile writes, the
+// same answer, and `key list` shows it from then on) and the file is
+// written back byte for byte when it exists, and never made when it does
+// not (a real change never leaves it missing or empty).
 @requires(filesystem, network, device, declassify, clock, provision, environment)
 pub Int key_fills_pin(Str dir, Str mode, Str pin) {
     if (mode != "keys" && mode != "any") { return dfail("say keys (fill only with a security key) or any"); }
@@ -182,9 +215,17 @@ pub Int key_fills_pin(Str dir, Str mode, Str pin) {
     OwnList o = if (keys_v2(dir)) { own_list(dir, u) } else { no_own() };
     KeyList ol = o.list;
     Bool keyed = if (keys_v2(dir)) { ol.keys.len() > 0 } else { keys_enrolled(dir) };
-    Str was = filesystem.read_all(fill_policy_file(dir));
-    Str written = if (u.kind == 1) { mode + "\n" } else { was };
-    if (!filesystem.write_all(fill_policy_file(dir), written)) { return dfail("cannot write " + fill_policy_file(dir)); }
+    if (keys_v2(dir)) {
+        if (o.which == "") { return dfail("wrong PIN, or no enrolled key present"); }
+        Option(KeyList) pl = duress_list(dir, o);
+        Option(KeyList) next = match pl { None => None, Some(dl) => Some(list_with_fill(dl, mode)) };
+        if (!write_list(dir, u, o, list_with_fill(ol, mode), next)) { return dfail("cannot write " + profile_file(dir, o.which)); }
+    }
+    Str pf = fill_policy_file(dir);
+    Bool had = filesystem.exists(pf);
+    List(Int) was = if (had) { get_file(pf) } else { [] };
+    Bool wrote = if (u.kind == 1) { filesystem.write_all(pf, mode + "\n") } else { if (had) { filesystem.write_bytes(pf, was) } else { true } };
+    if (!wrote) { return dfail("cannot write " + pf); }
     println(if (mode == "keys") { "fills need a security key" + if (keyed) { "" } else { "; none is enrolled, so this device fills nothing until one is" } } else { "fills need the PIN" + if (keyed) { " and the enrolled key" } else { "" } });
     return 0;
 }
