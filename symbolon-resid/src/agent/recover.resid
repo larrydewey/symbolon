@@ -99,6 +99,7 @@ pub Int device_veto(Str dir) {
 @requires(filesystem, network, device, declassify, clock, provision, environment)
 Int veto_with(Str dir, DeviceConfig c, Str pin) {
     Unlocked u = unlock_dir(dir, c, pin);
+    if (u.kind == 2) { return dfail(duress_refusal(dir, c)); }
     if (u.kind != 1) { return dfail("wrong PIN"); }
     Result(VerifiedHead, SymbolonError) rv = verified_log(relay_ep(c), c.log_id);
     return match rv {
@@ -143,6 +144,7 @@ pub Int device_recover_release(Str dir) {
 @requires(filesystem, network, device, declassify, clock, provision, environment)
 Int release_with(Str dir, DeviceConfig c, Str pin) {
     Unlocked u = unlock_dir(dir, c, pin);
+    if (u.kind == 2) { return dfail(duress_refusal(dir, c)); }
     if (u.kind != 1) { return dfail("wrong PIN"); }
     Endpoint relay = relay_ep(c);
     List(SignedEvent) es = fetch_log(relay, c.log_id, 0, []);
@@ -227,6 +229,7 @@ Int last_recover_for(List(SignedEvent) es, List(Int) me, Int i, Int acc) {
 @requires(filesystem, network, device, declassify, clock, provision, environment)
 Int finish_with(Str dir, DeviceConfig c, KitKeys kit, Str pin, Str primes_file) {
     Unlocked u = unlock_dir(dir, c, pin);
+    if (u.kind == 2) { return dfail(duress_refusal(dir, c)); }
     if (u.kind != 1) { return dfail("wrong PIN"); }
     Endpoint relay = relay_ep(c);
     Result(VerifiedHead, SymbolonError) rv = verified_log(relay, c.log_id);

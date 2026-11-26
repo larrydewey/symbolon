@@ -183,7 +183,7 @@ case "$1 $2" in
       register) mkdir -p "$4"; printf 'k' > "$4/alert-key"; echo "registered"; exit 0 ;;
       set)
         [ "$PIN" = "1357" ] && { echo "device: the cosigner did not answer" >&2; exit 1; }
-        [ -f "$D/duress-open" ] && { echo "device: the cosigner did not answer (or a duress window is open)" >&2; exit 1; }
+        [ -f "$D/duress-open" ] && { echo "device: the cosigner did not answer" >&2; exit 1; }
         printf '%s\n' "$IN" | sed 1d | grep -v '^$' | awk '$1 == "contact" { t = ($3 == "1") ? "duress-" substr("0123456789abcdef0123", NR, 16) : "-"; print $0 " " t; next } { print }' > "$D/alerts.state" ;;
     esac
     if [ "$PIN" = "1357" ]; then echo "person -"; echo "duress none"; exit 0; fi

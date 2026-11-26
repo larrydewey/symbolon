@@ -214,6 +214,7 @@ pub Int device_openings(Str dir) {
 
 @requires(filesystem, network, device, declassify, clock, environment)
 Int openings_unlocked(Str dir, DeviceConfig c, Unlocked u) {
+    if (u.kind == 2) { return dfail(duress_refusal(dir, c)); }
     if (u.kind != 1) { return dfail("wrong PIN"); }
     Result(VerifiedHead, SymbolonError) rv = verified_log_dir(dir, relay_ep(c), c.log_id);
     return match rv { Err(e) => dfail(err_text(e)), Ok(vh) => openings_ask(dir, c, u, vh) };

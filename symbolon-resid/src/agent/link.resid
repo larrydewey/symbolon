@@ -282,6 +282,7 @@ pub Int link_add(Str dir, Str text, Str primes_file) {
     Str pin = read_pin();
     // The PIN first: a wrong one stops here, before the other device acts.
     Unlocked u = unlock_dir(dir, c, pin);
+    if (u.kind == 2) { return dfail(duress_refusal(dir, c)); }
     if (u.kind != 1) { return dfail("wrong PIN"); }
     Int fd = connect_any(l.hosts, l.port, 0);
     if (fd < 0) { return dfail("cannot reach the new device: is it on the same network, with its code still showing?"); }

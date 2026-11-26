@@ -117,12 +117,22 @@ pub Result(Opened, Str) open_vault(Str dir) {
     Result(Option(List(Int)), RegionError) pb = spawn (network, clock(readonly), declassify) { return blob_get(relay_ep(c), vault_blob(c.log_id)); };
     Str pin = read_pin();
     Unlocked u = unlock_dir(dir, c, pin);
-    if (u.kind != 1) { return Err("wrong PIN"); }
+    if (u.kind != 1) { return Err(if (u.kind == 2) { duress_change(region_log(pl)) } else { "wrong PIN" }); }
     Result(VerifiedHead, SymbolonError) rv = region_log(pl);
     return match rv {
         Err(e) => Err(err_text(e)),
         Ok(vh) => match vault_from(dir, c, vh, region_blob(pb)) { Err(m) => Err(m), Ok(st) => Ok(Opened {.c = c, .u = u, .vh = vh, .st = st, .pin = pin, .p = own_place(c, u), .ep = relay_ep(c)}) }
     };
+}
+
+// A change to the vault under the duress PIN (SPEC 14.2 item 3, 14.3): the
+// duress profile cannot sign a vault head, and must not say "wrong PIN"
+// (the PIN opened something, which a coercer would learn). It fails as a
+// change fails for the real profile when the relay cannot be had: the
+// log's own error when it did not verify, else that of a relay that did
+// not answer.
+pub Str duress_change(Result(VerifiedHead, SymbolonError) rv) {
+    return match rv { Err(e) => err_text(e), Ok(_) => unreachable_text() };
 }
 
 // What a region that verified the log or fetched the vault gave back; a
@@ -249,9 +259,42 @@ pub Result(View, Str) open_view(Str dir) {
     Result(Result(VerifiedHead, SymbolonError), RegionError) pl = spawn (filesystem, network, clock(readonly), declassify) { return verified_log_dir(dir, relay_ep(c), c.log_id); };
     Result(Option(List(Int)), RegionError) pb = spawn (network, clock(readonly), declassify) { return blob_get(relay_ep(c), vault_blob(c.log_id)); };
     Unlocked u = unlock_dir(dir, c, read_pin());
-    if (u.kind != 1) { return Err("wrong PIN"); }
-    return view_of(dir, c, u, region_log(pl), region_blob(pb));
+    return view_for(dir, c, u, region_log(pl), region_blob(pb));
 }
+
+// The vault for reading under whichever profile the PIN opened: the real
+// vault under the PIN; under the duress PIN its duress subset (SPEC 14.2,
+// 18.5), found the same way, never "wrong PIN"; "wrong PIN" only when the
+// PIN opened neither.
+@requires(filesystem, declassify)
+pub Result(View, Str) view_for(Str dir, DeviceConfig c, Unlocked u, Result(VerifiedHead, SymbolonError) rv, Option(List(Int)) b) {
+    if (u.kind == 2) { return duress_view(dir, c, u, rv, b); }
+    if (u.kind != 1) { return Err("wrong PIN"); }
+    return view_of(dir, c, u, rv, b);
+}
+
+// Under the duress PIN: the relay's vault, fetched and checked as for the
+// PIN (a head that does not verify or goes back fails the same way), but
+// holding only the duress subset, which for the own vault is empty: no
+// item can be marked for it yet (item field 5 is never set), and the
+// duress profile holds no key to the others (18.5). When the relay or the
+// log cannot be had it falls back, as the real vault does, to this
+// device's copy, as of that copy's version, again without its items (the
+// duress profile has no key to check the copy's tag).
+@requires(filesystem, declassify)
+Result(View, Str) duress_view(Str dir, DeviceConfig c, Unlocked u, Result(VerifiedHead, SymbolonError) rv, Option(List(Int)) b) {
+    List(Int) vid = vault_id_of(c.log_id);
+    Result(VaultState, Str) rs = match rv { Err(e) => Err(err_text(e)), Ok(vh) => vault_from(dir, c, vh, b) };
+    return match rs {
+        Ok(st) => Ok(View {.vk = u.duress.vault_key, .vid = vid, .st = no_items(st), .offline = false, .dir = dir, .ctx = None}),
+        Err(m) => match state_of(get_file(place_local(dir, "") + ".cache")) {
+            None => Err(m),
+            Some(st) => offline_view(m, View {.vk = u.duress.vault_key, .vid = vid, .st = no_items(st), .offline = true, .dir = dir, .ctx = None})
+        }
+    };
+}
+
+VaultState no_items(VaultState st) { return VaultState {.head = st.head, .items = []}; }
 
 // The vault for reading, the profiles already unlocked (the real one).
 @requires(filesystem, network, declassify, clock)

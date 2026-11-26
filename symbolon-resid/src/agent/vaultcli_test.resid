@@ -1,5 +1,6 @@
 // The own vault on the device (src/agent/vaultcli.resid): what a device
-// accepts from the relay over time.
+// accepts from the relay over time, and what the duress PIN shows. The
+// other modules the duress PIN changes are imported so they are checked.
 // Files go to target/test-vaultcli/ (a fresh directory per test).
 
 import "../types.resid";
@@ -9,6 +10,14 @@ import "state.resid";
 import "common.resid";
 import "device.resid";
 import "vaultcli.resid";
+import "alertscli.resid";
+import "home.resid";
+import "sharecli.resid";
+import "webauthn.resid";
+import "link.resid";
+import "recover.resid";
+import "enroll.resid";
+import "protect.resid";
 import "crypto.resid";
 import "ecdsa.resid";
 import "hash.resid";
@@ -69,6 +78,25 @@ List(Int) served_bytes(VaultState st) {
 
 Bool is_ok(Result(VaultState, Str) r) { return match r { Ok(_) => true, Err(_) => false }; }
 
+RealProfile real_none() { return RealProfile {.share = [], .cc = [], .vault_key = [], .dek = [], .duress_hpke_pub = []}; }
+DuressFull duress_none() { return DuressFull {.share = [], .subkey = [], .vault_key = [], .hpke_priv = [], .tweaks = []}; }
+
+Unlocked as_real() {
+    return Unlocked {.kind = 1, .duress = duress_none(), .st = [], .wrap = [],
+        .real = RealProfile {.share = secret_bytes(rep(1, 32)), .cc = secret_bytes(rep(2, 32)), .vault_key = vk(), .dek = secret_bytes(rep(3, 32)), .duress_hpke_pub = []}};
+}
+
+Unlocked as_duress() {
+    return Unlocked {.kind = 2, .real = real_none(), .st = [], .wrap = [],
+        .duress = DuressFull {.share = secret_bytes(rep(6, 32)), .subkey = secret_bytes(rep(7, 32)), .vault_key = secret_bytes(rep(8, 32)), .hpke_priv = secret_bytes(rep(4, 32)), .tweaks = []}};
+}
+
+Unlocked as_neither() { return Unlocked {.kind = 0, .real = real_none(), .duress = duress_none(), .st = [], .wrap = []}; }
+
+Str err_of(Result(View, Str) r) { return match r { Ok(_) => "ok", Err(m) => m }; }
+Int count_of(Result(View, Str) r) { return match r { Ok(v) => v.st.items.len(), Err(_) => 0 - 1 }; }
+Int version_of(Result(View, Str) r) { return match r { Ok(v) => (Int)v.st.head.version, Err(_) => 0 - 1 }; }
+
 // ─── Rollback (A-14) ────────────────────────────────────────────
 
 @requires(filesystem, declassify)
@@ -92,4 +120,32 @@ test "a kept copy counts as seen: the relay cannot answer no vault" {
     expect(is_ok(vault_from(dir, config(), vhead(), Some(served_bytes(state_at(items(), 2)))))).toBeFalse();
     // A device that never saw a vault still starts from none.
     expect(is_ok(vault_from(fresh_dir(), config(), vhead(), None))).toBeTrue();
+}
+
+// ─── The duress PIN (SPEC 14.2, 14.3) ───────────────────────────
+
+@requires(filesystem, declassify)
+test "under the duress PIN the vault reads as the empty subset, never as a wrong PIN" {
+    Str dir = fresh_dir();
+    Option(List(Int)) b = Some(served_bytes(state_at(items(), 3)));
+    Result(View, Str) real = view_for(dir, config(), as_real(), Ok(vhead()), b);
+    Result(View, Str) dur = view_for(fresh_dir(), config(), as_duress(), Ok(vhead()), b);
+    expect(err_of(real)).toEqual("ok");
+    expect(err_of(dur)).toEqual("ok");
+    expect(count_of(real)).toEqual(1);
+    expect(count_of(dur)).toEqual(0);
+    expect(version_of(dur)).toEqual(3);
+    // The relay cannot be had and there is no copy: the same error for both.
+    Result(VerifiedHead, SymbolonError) off = Err(ErrInvalidLog("no log at the relay"));
+    expect(err_of(view_for(fresh_dir(), config(), as_duress(), off, None))).toEqual(err_of(view_for(fresh_dir(), config(), as_real(), off, None)));
+    expect(err_of(view_for(fresh_dir(), config(), as_duress(), off, None))).toEqual(unreachable_text());
+    // With a copy: both read it (the duress PIN without its items).
+    expect(count_of(view_for(dir, config(), as_duress(), off, None))).toEqual(0);
+    expect(version_of(view_for(dir, config(), as_duress(), off, None))).toEqual(3);
+    expect(count_of(view_for(dir, config(), as_real(), off, None))).toEqual(1);
+    // A PIN that opened neither profile.
+    expect(err_of(view_for(fresh_dir(), config(), as_neither(), Ok(vhead()), b))).toEqual("wrong PIN");
+    // A change under the duress PIN fails as an unreachable relay does.
+    expect(duress_change(Ok(vhead()))).toEqual(unreachable_text());
+    expect(duress_change(off)).toEqual(unreachable_text());
 }

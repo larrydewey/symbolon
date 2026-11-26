@@ -237,7 +237,7 @@ Int alerts_set_unlocked(Str dir, DeviceConfig c, Unlocked u) {
     if (!p.ok || p.contacts.len() > 32) { return dfail("malformed contacts"); }
     Option(AlertState) a = alert_request(dir, c, u, true, p.person, p.contacts);
     if (u.kind == 2) { return dfail("the cosigner did not answer"); }
-    return match a { None => dfail("the cosigner did not answer (or a duress window is open)"), Some(s) => print_state(s) };
+    return match a { None => dfail("the cosigner did not answer"), Some(s) => print_state(s) };
 }
 
 // ─── Ending duress (SPEC 14.3) ──────────────────────────────────────
@@ -250,6 +250,10 @@ pub Int device_duress_end(Str dir) {
 
 @requires(filesystem, device, network, declassify, clock, environment)
 Int duress_end_unlocked(Str dir, DeviceConfig c, Unlocked u) {
+    // Under the duress PIN the request goes out as under the PIN, signed by
+    // the duress sub-key; the cosigner refuses it, and the device says what
+    // it says when the cosigner does not answer, never "wrong PIN" (SPEC 14.3).
+    if (u.kind == 2) { _ = alert_request(dir, c, u, false, "", []); return dfail("the cosigner did not answer"); }
     if (u.kind != 1) { return dfail("wrong PIN"); }
     Option(AlertState) a = alert_request(dir, c, u, false, "", []);
     return match a {
@@ -294,6 +298,11 @@ pub Int device_alerts_register(Str dir) {
 @requires(filesystem, device, network, declassify, clock, environment)
 Int register_unlocked(Str dir, DeviceConfig c, Unlocked u) {
     if (u.kind != 1 && u.kind != 2) { return dfail("wrong PIN"); }
+    // The cosigner keeps the newest eight alert keys: a key registered under
+    // the duress PIN would push a household member's device out, and its
+    // alerts would go to the coercer. Refused, as a send the relay does not
+    // take fails (SPEC 14.3), with nothing written.
+    if (u.kind == 2) { return match cosigner_party(dir, c) { None => dfail("no cosigner"), Some(_) => dfail("cannot reach the relay") }; }
     List(Int) have = get_file(dir + "/alert-key");
     List(Int) ikm = if (have.len() == 32) { have } else { random_bytes(32) };
     if (have.len() != 32 && !put_secret_file(dir + "/alert-key", ikm)) { return dfail("cannot store the alert key"); }

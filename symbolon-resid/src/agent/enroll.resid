@@ -92,6 +92,7 @@ pub Int device_protection_enable(Str dir, Str primes_file) {
 @requires(filesystem, network, device, declassify, clock, provision, environment)
 Int protection_unlocked(Str dir, DeviceConfig c, Str pin, Str primes_file) {
     Unlocked u = unlock_dir(dir, c, pin);
+    if (u.kind == 2) { return dfail(duress_refusal(dir, c)); }
     if (u.kind != 1) { return dfail("wrong PIN"); }
     Result(VerifiedHead, SymbolonError) rv = verified_log(relay_ep(c), c.log_id);
     Option(CgConfig) cg = load_share(dir, u.real.dek);
@@ -133,6 +134,7 @@ pub Int device_enroll(Str dir, Str keys_hex, Str primes_file) {
 @requires(filesystem, network, device, declassify, clock, provision, environment)
 pub Int enroll_unlocked(Str dir, DeviceConfig c, PartyKeys nk, Str pin, Str primes_file) {
     Unlocked u = unlock_dir(dir, c, pin);
+    if (u.kind == 2) { return dfail(duress_refusal(dir, c)); }
     if (u.kind != 1) { return dfail("wrong PIN"); }
     Result(VerifiedHead, SymbolonError) rv = verified_log(relay_ep(c), c.log_id);
     Option(CgConfig) cg = load_share(dir, u.real.dek);
@@ -368,6 +370,7 @@ pub Int device_join(Str dir, Str keys_hex, Str primes_file) {
 @requires(filesystem, network, device, declassify, clock, provision, environment)
 pub Int join_unlocked(Str dir, DeviceConfig c, PartyKeys xk, Str pin, Str primes_file) {
     Unlocked u = unlock_dir(dir, c, pin);
+    if (u.kind == 2) { return dfail(duress_refusal(dir, c)); }
     if (u.kind != 1) { return dfail("wrong PIN"); }
     Local me = Local {.party = c.party, .cg = 0, .hpke_sk = device_hpke(u.real.dek).sk};
     Remote x = Remote {.party = xk.party, .cg = 0, .hpke_pub = xk.hpke_key};

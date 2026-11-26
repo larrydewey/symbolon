@@ -191,12 +191,12 @@ Bool keep_signed_in(Str dir, Dev d) {
     return match relay_sign_in(dir, d.c, d.u) { Ok(_) => true, Err(_) => false };
 }
 
-// For a change. Under the duress PIN a change fails as one the relay does
-// not take would (SPEC 14.3: refusals look like faults).
+// For a change. Under the duress PIN a change fails as one does when the
+// relay does not answer (SPEC 14.3: refusals look like faults).
 @requires(filesystem, network, device, declassify, clock, provision, environment)
 pub Result(Ctx, Str) unlocked(Str dir) {
     Dev d = unlocked_dev(dir)?;
-    if (d.u.kind != 1) { return Err("the relay refused the change; try again later"); }
+    if (d.u.kind != 1) { return Err(duress_refusal(dir, d.c)); }
     if (str_len(d.pin) < org_min_pin(dir)) { return Err(f"the organization asks for a PIN of at least {org_min_pin(dir)} characters: change it (device pin)"); }
     _ = keep_signed_in(dir, d);
     return online(dir, d);

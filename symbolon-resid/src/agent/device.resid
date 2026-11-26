@@ -435,6 +435,22 @@ pub Str err_text(SymbolonError e) {
     };
 }
 
+// What the real profile says when the relay does not answer: the log
+// cannot be fetched (common.resid verified_log_dir).
+pub Str unreachable_text() { return err_text(ErrInvalidLog("no log at the relay")); }
+
+// An operation the duress profile cannot or must not do (SPEC 14.2 item 3,
+// 14.3): it never says "wrong PIN" (the coercer would learn that this PIN
+// opened something else than the PIN). It fetches and verifies the log as
+// the real profile does first, so the network pattern starts the same, and
+// fails with the log's own error, or else as the real profile fails when
+// the relay does not answer.
+@requires(filesystem, network, clock(readonly), declassify)
+pub Str duress_refusal(Str dir, DeviceConfig c) {
+    Result(VerifiedHead, SymbolonError) v = verified_log_dir(dir, relay_ep(c), c.log_id);
+    return match v { Err(e) => err_text(e), Ok(_) => unreachable_text() };
+}
+
 // Publishes the log, wraps the kit's halves (SPEC 10.6), stores the share,
 // and prints the kit's seed.
 @requires(filesystem, network, device, declassify, clock)
@@ -480,6 +496,8 @@ pub Int device_register(Str dir, Str rp, Bool in_subset) {
 
 @requires(filesystem, network, device, declassify, clock)
 Int register_with(Str dir, DeviceConfig c, Str rp, Unlocked u, Bool in_subset) {
+    // The duress profile has no chain code to make a credential with.
+    if (u.kind == 2) { return dfail(duress_refusal(dir, c)); }
     if (u.kind != 1) { return dfail("wrong PIN"); }
     Result(VerifiedHead, SymbolonError) v = verified_log_dir(dir, relay_ep(c), c.log_id);
     return match v {

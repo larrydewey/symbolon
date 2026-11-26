@@ -70,6 +70,7 @@ pub Int device_wa_register(Str dir, Str rp, Bool uv, Bool in_subset, Str replace
 @requires(filesystem, network, device, declassify, clock, provision, environment)
 Int wa_register_with(Str dir, DeviceConfig c, Str rp, Str pin, Bool uv, Bool in_subset, List(Int) replaces) {
     Unlocked u = unlock_dir(dir, c, pin);
+    if (u.kind == 2) { return dfail(duress_refusal(dir, c)); }
     if (u.kind != 1) { return dfail("wrong PIN"); }
     Result(VerifiedHead, SymbolonError) v = verified_log_dir(dir, relay_ep(c), c.log_id);
     return match v {
