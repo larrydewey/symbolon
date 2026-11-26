@@ -342,3 +342,55 @@ test "a kit recovery keeps the vault OPRF key" {
     expect(epoch_of(late)).toEqual(2);
     expect(kv_of(late).len()).toEqual(2);
 }
+
+// ─── What a witness co-signs (SPEC 20.3, il_check_next) ─────────
+
+Bool next_ok(Result(UInt(64), SymbolonError) r) { return match r { Ok(_) => true, Err(_) => false }; }
+
+SignedEvent bare(SignedEvent e) { return SignedEvent {.payload = e.payload, .encoded = e.encoded, .sigs = e.sigs, .cosigs = []}; }
+
+test "a second recover while one is pending is refused (one recover at a time)" {
+    List(Int) l = log_id();
+    SignedEvent r1 = recover_ev(1, 1, enc(0), 20, 2000);
+    SignedEvent r2 = recover_ev(2, 2, enc(1), 20, 2500);
+    expect(ok(il_verify(l, [e0_kit([2, 3]), r1, r2], 3000, lambda(x) { false }))).toBeFalse();
+    // Once the first is vetoed, the kit may file again.
+    SignedEvent veto = with_digests(next(2, 2, enc(1), VetoBody(1), [2], 2500), [sha256_bytes(pubk(20))]);
+    SignedEvent r3 = recover_ev(3, 3, enc(2), 20, 2600);
+    expect(pending_n(il_verify(l, [e0_kit([2, 3]), r1, veto, r3], 3000, lambda(x) { false }))).toEqual(1);
+}
+
+test "a witness co-signs a device's veto of a pending kit recovery, and no claim on that sequence by the kit" {
+    List(Int) l = log_id();
+    List(SignedEvent) before = [e0_kit([2, 3]), recover_ev(1, 1, enc(0), 20, 2000)];
+    SignedEvent veto = with_digests(next(2, 2, enc(1), VetoBody(1), [2], 0), [sha256_bytes(pubk(20))]);
+    expect(next_ok(il_check_next(l, before, bare(veto), 3000, lambda(x) { false }))).toBeTrue();
+    // The kit's second recover, a veto by a key outside the quorum, an
+    // unsigned event, the wrong sequence or predecessor, a veto once the
+    // delay has run by the witness's clock: refused.
+    expect(next_ok(il_check_next(l, before, bare(recover_ev(2, 2, enc(1), 20, 0)), 3000, lambda(x) { false }))).toBeFalse();
+    expect(next_ok(il_check_next(l, before, bare(with_digests(next(2, 2, enc(1), VetoBody(1), [5], 0), [sha256_bytes(pubk(20))])), 3000, lambda(x) { false }))).toBeFalse();
+    expect(next_ok(il_check_next(l, before, bare(with_digests(next(2, 2, enc(1), VetoBody(1), [], 0), [sha256_bytes(pubk(20))])), 3000, lambda(x) { false }))).toBeFalse();
+    expect(next_ok(il_check_next(l, before, bare(with_digests(next(2, 3, enc(1), VetoBody(1), [2], 0), [sha256_bytes(pubk(20))])), 3000, lambda(x) { false }))).toBeFalse();
+    expect(next_ok(il_check_next(l, before, bare(with_digests(next(2, 2, enc(0), VetoBody(1), [2], 0), [sha256_bytes(pubk(20))])), 3000, lambda(x) { false }))).toBeFalse();
+    expect(next_ok(il_check_next(l, before, bare(veto), 2000 + 86400, lambda(x) { false }))).toBeFalse();
+    // The kit's recover itself was co-signable at sequence 1.
+    expect(next_ok(il_check_next(l, [e0_kit([2, 3])], bare(recover_ev(1, 1, enc(0), 20, 0)), 2000, lambda(x) { false }))).toBeTrue();
+}
+
+test "a witness co-signs an inception only as E0 of its own log, signed by every party" {
+    List(Int) l = log_id();
+    expect(next_ok(il_check_next(l, [], bare(e0([2, 3])), 1000, lambda(x) { false }))).toBeTrue();
+    expect(next_ok(il_check_next(id32(1), [], bare(e0([2, 3])), 1000, lambda(x) { false }))).toBeFalse();
+    expect(next_ok(il_check_next(l, [], bare(e0([2])), 1000, lambda(x) { false }))).toBeFalse();
+    // Not an inception at sequence 0.
+    expect(next_ok(il_check_next(l, [], bare(next(1, 1, enc(0), SetPolicyBody(policy(172800)), [2, 3], 0)), 1000, lambda(x) { false }))).toBeFalse();
+}
+
+test "a log before the event that does not verify gets nothing co-signed" {
+    List(Int) l = log_id();
+    SignedEvent ev = next(1, 1, enc(0), SetPolicyBody(policy(172800)), [2], 2000);
+    SignedEvent veto = next(2, 2, enc(1), VetoBody(1), [3], 0);
+    expect(next_ok(il_check_next(l, [e0([2, 3]), ev], bare(veto), 3000, lambda(x) { false }))).toBeTrue();
+    expect(next_ok(il_check_next(l, [e0([2, 3]), bare(ev)], bare(veto), 3000, lambda(x) { false }))).toBeFalse();
+}

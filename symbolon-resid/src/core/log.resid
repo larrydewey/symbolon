@@ -369,6 +369,11 @@ Bool is_recover_body(EventBody b) {
     return match b { RecoverBody(_) => true, _ => false };
 }
 
+Bool recover_pending(List(Pending) ps, Int i) {
+    if (i >= ps.len()) { return false; }
+    return is_recover_body(ps[i].body) || recover_pending(ps, i + 1);
+}
+
 // ============================================================================
 // Reshare checks (SPEC 8.2, 11.3)
 // ============================================================================
@@ -485,6 +490,10 @@ Result(LogState, SymbolonError) do_recover(LogState s, SignedEvent e, List(Int) 
     if (!ids_distinct(r.new_parties, 0) || !parties_ok(r.new_parties, 0)) { return refuse("recover parties"); }
     if (device_count(r.new_parties, 0, 0) < 1) { return refuse("recover without a device"); }
     if (ep.next_recovery_key_digests.len() < 1) { return refuse("recover without new digests"); }
+    // One recover at a time (SPEC 13.4): otherwise whoever holds the kit
+    // could file a recover at every next sequence, as fast as each one is
+    // witnessed, and no veto would ever get a sequence of its own.
+    if (recover_pending(s.pending, 0)) { return refuse("a recover is already pending"); }
     Bool authorized = if (r.path == recover_path_kit()) {
         kit_authorized(s, e, ep.next_recovery_key_digests, r.revealed_recovery_key)
     } else {
@@ -549,9 +558,15 @@ Bool digests_eq(List(List(Int)) a, List(List(Int)) b, Int i) {
 }
 
 Result(LogState, SymbolonError) step(LogState s, SignedEvent e, List(Int) l, Bool closure(EventPayload) approvals_ok) {
+    Int t = witness_time(e.cosigs, s.policy, l, e.payload.sequence, sha256_bytes(e.encoded))?;
+    return step_at(s, e, l, t, approvals_ok);
+}
+
+// One event at witness time `t`: every check of `step` but the event's own
+// co-signatures.
+Result(LogState, SymbolonError) step_at(LogState s, SignedEvent e, List(Int) l, Int t, Bool closure(EventPayload) approvals_ok) {
     EventPayload ep = e.payload;
     List(Int) dig = sha256_bytes(e.encoded);
-    Int t = witness_time(e.cosigs, s.policy, l, ep.sequence, dig)?;
     if (t < s.last_time) { return refuse("witness time went backwards"); }
     LogState settled = settle(s, t);
     if (ep.sequence != settled.next_seq) { return refuse("sequence"); }
@@ -568,7 +583,11 @@ Result(LogState, SymbolonError) step(LogState s, SignedEvent e, List(Int) l, Boo
 // Whole log
 // ============================================================================
 
-Result(LogState, SymbolonError) start(SignedEvent e0, List(Int) l) {
+Result(LogState, SymbolonError) start(SignedEvent e0, List(Int) l) { return start_at(e0, l, false, 0); }
+
+// E0 with its co-signatures (`pre` false), or before it has any (`pre`
+// true: a witness deciding whether to co-sign it at its time `now`).
+Result(LogState, SymbolonError) start_at(SignedEvent e0, List(Int) l, Bool pre, Int now) {
     EventPayload ep = e0.payload;
     List(Int) dig = sha256_bytes(e0.encoded);
     if (!bytes_eq(dig, l)) { return refuse("H(E0) is not the log id"); }
@@ -577,15 +596,16 @@ Result(LogState, SymbolonError) start(SignedEvent e0, List(Int) l) {
     if (ep.next_recovery_key_digests.len() < 1) { return refuse("E0 without recovery digests"); }
     EventBody e0_body = ep.body;
     return match e0_body {
-        InceptionBody(q, pol) => start_inception(e0, l, dig, q, pol),
+        InceptionBody(q, pol) => start_inception(e0, l, dig, q, pol, pre, now),
         _ => refuse("E0 is not an inception")
     };
 }
 
-Result(LogState, SymbolonError) start_inception(SignedEvent e0, List(Int) l, List(Int) dig, Quorum q, Policy pol) {
+Result(LogState, SymbolonError) start_inception(SignedEvent e0, List(Int) l, List(Int) dig, Quorum q, Policy pol, Bool pre, Int now) {
     EventPayload ep = e0.payload;
     if (!quorum_ok(q) || !policy_ok(pol, q)) { return refuse("E0 quorum or policy"); }
-    Int t = witness_time(e0.cosigs, pol, l, 0, dig)?;
+    Result(Int, SymbolonError) wt = if (pre) { Ok(now) } else { witness_time(e0.cosigs, pol, l, 0, dig) };
+    Int t = wt?;
     // E0 is signed by every party of its own quorum.
     List(List(Int)) signers = valid_signers(e0.sigs, q.parties, false, e0.encoded, 0, []);
     if (signers.len() < q.parties.len()) { return refuse("E0 not signed by every party"); }
@@ -617,6 +637,28 @@ pub Result(VerifiedHead, SymbolonError) il_verify(List(Int) l, List(SignedEvent)
             .quorum = fin.quorum, .policy = fin.policy },
         .witness_cosigs = fin.last_cosigs,
         .pending = pending_seqs(fin.pending, 0, ListBuf()) });
+}
+
+// SPEC 20.3: what a witness checks before it co-signs `e` as the next event
+// of log `l`, at its own time `now`. `before` is the whole log before `e`,
+// from E0, with its co-signatures, and must verify (il_verify's checks);
+// `e`, which has no co-signatures yet, must then pass every other check of
+// the next step at witness time `now` (no earlier than the last event's):
+// sequence, predecessor, log id, suite, field 6 and the signing rule in
+// force, after settling what is pending by `now` (so a veto once the delay
+// has run is refused). With `before` empty, `e` must be an inception whose
+// digest is `l`, signed by every party of its quorum. Ok(the sequence of
+// `e`) or the refusal.
+pub Result(UInt(64), SymbolonError) il_check_next(List(Int) l, List(SignedEvent) before, SignedEvent e, Int now, Bool closure(EventPayload) approvals_ok) {
+    if (before.len() == 0) {
+        LogState s = start_at(e, l, true, now)?;
+        return Ok(e.payload.sequence);
+    }
+    LogState s0 = start(before[0], l)?;
+    LogState s1 = run(s0, before, l, approvals_ok, 1)?;
+    Int t = if (now > s1.last_time) { now } else { s1.last_time };
+    LogState s2 = step_at(s1, e, l, t, approvals_ok)?;
+    return Ok(e.payload.sequence);
 }
 
 // The parties proposed and not yet re-shared in, as il_verify's state holds
