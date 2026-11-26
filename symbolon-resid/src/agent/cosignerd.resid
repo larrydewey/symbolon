@@ -7,7 +7,9 @@
 // Files in its directory: cosigner.cbor (public configuration), root (32
 // secret bytes its DK and HPKE key derive from, mode 0600), cg-<epoch>.cfg
 // (its CGGMP21 configuration for each epoch it took part in, mode 0600;
-// layer 8 open: held as public types),
+// layer 8 open: held as public types; with kit-b-<epoch> and
+// kit-half-<epoch>.raw, overwritten and removed once the verified log is at
+// a later epoch it holds a configuration of, epochfiles.resid),
 // state.cbor (the policy state: verified head, sessions, records),
 // kit-half.cbor (its half of the kit's material).
 
@@ -27,6 +29,7 @@ import "session.resid";
 import "cggmp_store.resid";
 import "kvagent.resid";
 import "alerts.resid";
+import "epochfiles.resid";
 import "ecdsa.resid";
 import "hash.resid";
 import "serials.resid";
@@ -372,7 +375,7 @@ Option(CgConfig) my_cg(Cosigner c) { return cg_at(c, 1); }
 // the one of the verified log's epoch; or, when the log is at an epoch that
 // a recovery made (no inception or reshare event carries it, so no party
 // holds shares of it), the one of the epoch before, with that epoch's
-// quorum. Never an older one.
+// quorum. Never an older one: the cosigner deletes those (SPEC 11.3).
 pub type Dealing = { CgConfig cfg; Quorum old_q; };
 
 @requires(filesystem)
@@ -413,12 +416,15 @@ Option(CgConfig) cg_at(Cosigner c, Int e) { return cg_cfg_decode(get_file(c.dir 
 @requires(network, filesystem, declassify, clock)
 Cosigner on_sign_event(Cosigner c, List(Int) from, List(Int) encoded) {
     Option(EventPayload) op = payload_decode(encoded);
-    Option(CgConfig) cg = my_cg(c);
+    // The epoch-1 configuration is needed only for the inception: once a
+    // later epoch is in force it is deleted (SPEC 11.3).
     return match op {
         None => cos_fail(c, "event does not decode"),
-        Some(p) => match cg {
-            None => cos_fail(c, "no key yet"),
-            Some(x) => if (p.sequence == 0) { sign_inception(c, from, p, encoded, x) } else { sign_reshare_event(c, from, p, encoded) }
+        Some(p) => if (p.sequence != 0) { sign_reshare_event(c, from, p, encoded) } else {
+            match my_cg(c) {
+                None => cos_fail(c, "no key yet"),
+                Some(x) => sign_inception(c, from, p, encoded, x)
+            }
         }
     };
 }
@@ -535,6 +541,7 @@ Handled decide(Cosigner c, List(Int) from, SignInvite inv, VerifiedHead vh, List
     // A signing session is a sign request: any other kind would be billed
     // to another budget (an evaluation's) or pass as an authority request.
     if (!bytes_eq(from, inv.requester) || inv.epoch < 0 || inv.kind != (Int)request_sign()) { return Handled {.c = refuse(c, from, inv.session_id), .kept = kept}; }
+    _ = prune_old_epochs(c.dir, (Int)vh.head.quorum.epoch);
     CosignRequest req = CosignRequest {.session_id = inv.session_id, .message = inv.message, .epoch = (UInt(32))inv.epoch,
                                        .requester = inv.requester, .kind = (UInt(8))inv.kind, .sig = inv.sig};
     CosignOutcome o = cosign_decide(st, req, policy_now(c, vh));
@@ -686,6 +693,7 @@ Cosigner reshare_decide(Cosigner c, List(Int) from, ReshareInvite inv, VerifiedH
     CosignerState st = load_state(c, vh);
     Quorum q = vh.head.quorum;
     if (!bytes_eq(from, inv.requester) || inv.epoch != (Int)q.epoch + 1) { return refuse(c, from, inv.session_id); }
+    _ = prune_old_epochs(c.dir, (Int)q.epoch);
     CgConfig none = CgConfig {.id = 0, .threshold = 0, .ecdsa = [], .elgamal = [], .p = [], .q = [], .rid = [], .chain_key = [], .public = []};
     Dealing d = dealing_cfg(c, q, es) else { Dealing {.cfg = none, .old_q = q} };
     Str bad = if (d.cfg.id == 0 || d.cfg.id != pos1(d.old_q.parties, c.cfg.party, 0)) { "no configuration of the epoch to deal from" }

@@ -1,0 +1,50 @@
+// Old-epoch shares go once a newer epoch is in force (SPEC 11.3, C-3).
+
+import "../types.resid";
+import "epochfiles.resid";
+import "crypto.resid";
+
+@requires(filesystem, declassify)
+Str tmp_dir() {
+    Str d = "/tmp/symbolon-epochfiles-test-" + hex_encode(random_bytes(8));
+    _ = filesystem.create_dir(d);
+    return d;
+}
+
+@requires(filesystem)
+Bool put(Str p) { return filesystem.write_secret(p, [1, 2, 3, 4]); }
+
+@requires(filesystem)
+Str present(Str d, List(Str) names, Int i, Str acc) {
+    if (i >= names.len()) { return acc; }
+    return present(d, names, i + 1, acc + (if (filesystem.exists(d + "/" + names[i])) { names[i] + " " } else { "" }));
+}
+
+List(Str) all_names() {
+    return ["cg-1.cfg", "kit-b-1", "kit-half-1.raw", "cg-2.cfg", "kit-b-2", "kit-half-2.raw", "cg-3.cfg", "kit-b-3"];
+}
+
+@requires(filesystem, declassify)
+test "old epochs' shares are removed once the log's epoch is held, and not before" {
+    Str d = tmp_dir();
+    _ = put(d + "/cg-1.cfg");
+    _ = put(d + "/kit-b-1");
+    _ = put(d + "/kit-half-1.raw");
+    _ = put(d + "/cg-2.cfg");
+    _ = put(d + "/kit-b-2");
+    _ = put(d + "/kit-half-2.raw");
+    // The log is at epoch 3 (say a recovery made it) with no configuration
+    // of it here: nothing goes, epoch 2 is still the one to deal from.
+    expect(prune_old_epochs(d, 3)).toBeFalse();
+    expect(present(d, all_names(), 0, "")).toEqual("cg-1.cfg kit-b-1 kit-half-1.raw cg-2.cfg kit-b-2 kit-half-2.raw ");
+    // At epoch 2: epoch 1 goes; a pending epoch 3 would stay.
+    _ = put(d + "/cg-3.cfg");
+    expect(prune_old_epochs(d, 2)).toBeTrue();
+    expect(present(d, all_names(), 0, "")).toEqual("cg-2.cfg kit-b-2 kit-half-2.raw cg-3.cfg ");
+    // At epoch 3: epoch 2 goes.
+    expect(prune_old_epochs(d, 3)).toBeTrue();
+    expect(present(d, all_names(), 0, "")).toEqual("cg-3.cfg ");
+    // An emptied configuration counts as none.
+    _ = filesystem.write_secret(d + "/cg-3.cfg", []);
+    expect(prune_old_epochs(d, 3)).toBeFalse();
+}

@@ -1,0 +1,51 @@
+// Files a party keeps per epoch: the old epochs' shares, deleted once a
+// newer epoch is in force (SPEC 11.3).
+//
+// Resid's filesystem has no secure delete: a file is overwritten with zeros
+// of its own length and then removed, which leaves whatever the file system
+// or the disk keeps of the old blocks (journal, copy-on-write, SSD
+// remapping). A secure overwrite-then-unlink belongs in Resid.
+
+import "../types.resid";
+
+List(Int) zeros(Int n, List(Int) acc) { return if (n <= 0) { acc } else { zeros(n - 1, acc.concat([0])) }; }
+
+// Overwrites `path` with zeros and removes it; true when it is gone.
+@requires(filesystem)
+pub Bool wipe_file(Str path) {
+    if (!filesystem.exists(path)) { return true; }
+    _ = filesystem.write_secret(path, zeros(filesystem.read_bytes(path).len(), []));
+    return filesystem.remove(path) || !filesystem.exists(path);
+}
+
+// The cosigner's secret files of epoch `e`: its configuration (share and
+// Paillier key), its kit contribution b and its half of the kit's material.
+pub List(Str) epoch_secret_files(Str dir, Int e) {
+    Str s = f"{e}";
+    return [dir + "/cg-" + s + ".cfg", dir + "/kit-b-" + s, dir + "/kit-half-" + s + ".raw"];
+}
+
+// Once the verified log is at epoch `e` and this party holds its
+// configuration of `e` (cg-<e>.cfg, not empty), every older epoch's secret
+// files go. Until then they stay: after a recovery the log is at an epoch
+// nobody holds shares of yet, and the cosigner still deals from the one
+// before it. True when nothing older is left.
+@requires(filesystem)
+pub Bool prune_old_epochs(Str dir, Int e) {
+    if (filesystem.read_bytes(dir + "/cg-" + f"{e}" + ".cfg").len() == 0) { return false; }
+    return wipe_below(dir, e - 1);
+}
+
+@requires(filesystem)
+Bool wipe_below(Str dir, Int k) {
+    if (k < 1) { return true; }
+    Bool ok = wipe_all(epoch_secret_files(dir, k), 0);
+    return wipe_below(dir, k - 1) && ok;
+}
+
+@requires(filesystem)
+Bool wipe_all(List(Str) ps, Int i) {
+    if (i >= ps.len()) { return true; }
+    Bool ok = wipe_file(ps[i]);
+    return wipe_all(ps, i + 1) && ok;
+}
