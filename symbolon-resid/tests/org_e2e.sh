@@ -215,7 +215,7 @@ grep -q "^removed" "$W/dsync.log" && fail "directory sync removed someone listed
 pin device org sync "$A" > "$W/dsync2.log" 2>&1 || fail "directory sync again"
 grep -q "^invite" "$W/dsync2.log" && fail "erin was invited twice: $(cat "$W/dsync2.log")"
 scim -X PATCH --data '{"schemas":["urn:ietf:params:scim:api:messages:2.0:PatchOp"],"Operations":[{"op":"Replace","path":"active","value":"False"}]}' "$RELAY/scim/v2/Users/$UC" | grep -q '"active":false' || fail "SCIM deactivate"
-[ "$(code -H "Authorization: Bearer $(tok "$C")" "$RELAY/blob/org-$ORG")" = 401 ] || fail "carol's session still worked after the directory turned her off"
+[ "$(code -H "Authorization: Bearer $(tok "$C")" "$RELAY/blob/org-$ORG")" = 403 ] || fail "carol's session still read the organization after its directory turned her off"
 run 120 "$BIN" device org show "$C" > /dev/null 2>&1 && fail "carol still reads the organization"
 pin device org sync "$A" > "$W/dsync3.log" 2>&1 || fail "directory sync after deactivation: $(cat "$W/dsync3.log")"
 grep -qx "removed $CLOG $(hx carol@acme.example)" "$W/dsync3.log" && grep -qx "$FID rekeyed 1" "$W/dsync3.log" || fail "directory sync after deactivation: $(cat "$W/dsync3.log")"

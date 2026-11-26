@@ -322,12 +322,14 @@ List(EventSig) collect_sigs(Endpoint relay, Local me, List(Remote) rem, Cursor c
 // The new epoch: the kit's fresh material (a to the kit, k_b to the
 // cosigner, the kit secrets under the new k_K), the secrets to the new
 // device, and this device's new share.
-@requires(filesystem, network, device, declassify, clock)
+@requires(filesystem, network, device, declassify, clock, environment)
 Int finish_enroll(Str dir, DeviceConfig c, Unlocked u, VerifiedHead vh, CgConfig ncfg, RsResult res, List(Remote) rem, KvDone kd) {
     Quorum nq = vh.head.quorum;
     Party kit = kit_of(nq.parties, 0) else { none_party() };
     Party cos = cosigner_of(nq.parties, 0) else { none_party() };
-    Endpoint relay = relay_ep(c);
+    // The kit's blobs go to the relay from a signed-in device of the log
+    // (SPEC 29.4): this one, a party of the new epoch.
+    Endpoint relay = relay_session(dir, c, u);
     Local me = Local {.party = c.party, .cg = 0, .hpke_sk = device_hpke(u.real.dek).sk};
     List(Int) kk = random_bytes(32);
     List(Int) kb = random_bytes(32);

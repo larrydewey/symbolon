@@ -156,38 +156,14 @@ Result(Ctx, Str) online(Str dir, Dev d) {
 }
 
 // ─── The relay's sign-in (SPEC 29.4) ────────────────────────────
-// An organization's relay serves its records to members' devices that
-// signed in: the device signs the relay's challenge, the relay answers a
-// session for seven days (dir/relay.token, "TOKEN UNTIL"). A device in an
-// organization signs in again when its PIN unlocks it and the session is
-// a day old; under the duress PIN it keeps the one it has.
+// relay_sign_in, session_fresh and relay_session are in device.resid: a
+// relay takes writes only from a signed-in device, a household's too.
 
-pub Int resign_secs() { return 86400; }
-
-@requires(filesystem, clock(readonly))
-Bool session_fresh(Str dir) {
-    List(Str) p = str_split(str_trim(filesystem.read_all(dir + "/relay.token")), " ");
-    return p.len() == 2 && str_len(p[0]) == 64 && str_parse_int(p[1]) - 604800 + resign_secs() > clock_now_seconds();
-}
-
-@requires(filesystem, network, device, declassify, clock, environment)
-pub Result(Int, Str) relay_sign_in(Str dir, DeviceConfig c, Unlocked u) {
-    Endpoint e = relay_ep(c);
-    HttpOut ch = http_call_ep(e, "GET", "/auth/challenge", []);
-    Str chal = str_trim(http_text(ch.body, 0, ch.body.len()));
-    if (ch.status != 200 || str_len(chal) != 64) { return Err("the relay gave no sign-in challenge"); }
-    List(Int) sig = dk_sign(c, u.real, u.st, utf8("symbolon v1 relay auth").concat(cose_hex_decode(chal)))?;
-    HttpOut r = http_call_ep(e, "POST", "/auth", http_bytes(chal + " " + hex_encode(c.log_id) + " " + hex_encode(c.party) + " " + hex_encode(sig)));
-    Str t = str_trim(http_text(r.body, 0, r.body.len()));
-    if (r.status != 200 || str_len(t) < 66) { return Err(f"the relay refused the sign-in ({r.status})"); }
-    return if (filesystem.write_all(dir + "/relay.token", t)) { Ok(0) } else { Err("cannot store the relay session") };
-}
-
-// Signs in when this device is in an organization and its session is
-// old; a relay without sign-in (a household's) is not an error.
+// Signs in when its session is old (a household's relay as an
+// organization's: every write needs a signed-in device).
 @requires(filesystem, network, device, declassify, clock, environment)
 Bool keep_signed_in(Str dir, Dev d) {
-    if (d.u.kind != 1 || !filesystem.exists(dir + "/org") || session_fresh(dir)) { return true; }
+    if (d.u.kind != 1 || session_fresh(dir)) { return true; }
     return match relay_sign_in(dir, d.c, d.u) { Ok(_) => true, Err(_) => false };
 }
 

@@ -371,3 +371,12 @@ pub Option(Endpoint) endpoint_of_url(Str u, Str ca) {
     List(Str) parts = str_split(hp, ":");
     return if (parts.len() == 2) { Some(Endpoint {.host = parts[0], .port = str_parse_int(parts[1]), .ca = ca, .token = ""}) } else { None };
 }
+
+// ─── The relay's sign-in message (SPEC 29.4) ────────────────────
+// What a device signs to sign in to its relay: the relay's name as the
+// device reaches it ("HOST:PORT", the host in lower case) bound in, so a
+// relay cannot pass another relay's challenge to a device and sign in
+// there as it. The relay checks the name is one of its own.
+pub Str relay_name(Str host, Int port) { return str_to_lower(host) + ":" + f"{port}"; }
+
+pub List(Int) relay_auth_message(Str name, List(Int) chal) { return utf8("symbolon v2 relay auth " + name + "\n").concat(chal); }

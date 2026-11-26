@@ -31,9 +31,14 @@ relays() {   # NAME STORE-SPEC PORT1 PORT2 [--store-ca FILE]
 
 exercise() {   # NAME PORT1 PORT2
     local name=$1 A="http://127.0.0.1:$2" B="http://127.0.0.1:$3"
-    python3 -c 'import sys; sys.stdout.buffer.write(bytes(range(256)) * 300)' > "$W/bin"
-    [ "$(c -X PUT --data-binary @"$W/bin" "$A/blob/vault-test")" = 200 ] || fail "$name: put"
-    [ "$(c "$B/blob/vault-test")" = 200 ] && cmp -s "$W/out" "$W/bin" || fail "$name: the other relay did not give the same bytes"
+    # Without a device to sign in, the blobs here are cosigner alerts (the
+    # one kind written without a session, once each).
+    local AL="alrt-$(printf 'ef%.0s' $(seq 32))"
+    python3 -c 'import sys; sys.stdout.buffer.write(bytes(range(256)) * 250)' > "$W/bin"
+    [ "$(c -X PUT --data-binary @"$W/bin" "$A/blob/$AL-1-00000000")" = 200 ] || fail "$name: put"
+    [ "$(c "$B/blob/$AL-1-00000000")" = 200 ] && cmp -s "$W/out" "$W/bin" || fail "$name: the other relay did not give the same bytes"
+    [ "$(c -X PUT --data junk "$B/blob/$AL-1-00000000")" = 409 ] || fail "$name: an alert replaced through the other relay"
+    [ "$(c -X PUT --data junk "$B/blob/vault-test")" = 401 ] || fail "$name: a blob written without a session"
     [ "$(c "$B/blob/nothing-here")" = 404 ] || fail "$name: a missing blob"
     L=$(printf 'ab%.0s' $(seq 32))
     [ "$(c -X POST --data first "$A/log/$L/0")" = 200 ] || fail "$name: log put"
@@ -44,9 +49,9 @@ exercise() {   # NAME PORT1 PORT2
     [ "$(c -X POST --data m1 "$B/mbox/$T")" = 200 ] && [ "$(cat "$W/out")" = 1 ] || fail "$name: mailbox 1 at the other relay"
     [ "$(c -X POST --data m2 "$A/mbox/$T")" = 200 ] && [ "$(cat "$W/out")" = 2 ] || fail "$name: mailbox 2"
     c "$A/mbox/$T/1" > /dev/null; [ "$(cat "$W/out")" = m1 ] || fail "$name: mailbox read"
-    for n in e c a d b; do c -X PUT --data "$n" "$B/blob/card-$n" > /dev/null; done
-    c "$A/list/card-" > /dev/null; [ "$(tr '\n' ' ' < "$W/out")" = "card-a card-b card-c card-d card-e" ] || fail "$name: list: $(cat "$W/out")"
-    c "$A/list/card-?after=card-c" > /dev/null; [ "$(tr '\n' ' ' < "$W/out")" = "card-d card-e" ] || fail "$name: list after: $(cat "$W/out")"
+    for n in 5 3 1 4 2; do c -X PUT --data "$n" "$B/blob/$AL-2-0000000$n" > /dev/null; done
+    c "$A/list/$AL-2-" > /dev/null; [ "$(tr '\n' ' ' < "$W/out")" = "$AL-2-00000001 $AL-2-00000002 $AL-2-00000003 $AL-2-00000004 $AL-2-00000005" ] || fail "$name: list: $(cat "$W/out")"
+    c "$A/list/$AL-2-?after=$AL-2-00000003" > /dev/null; [ "$(tr '\n' ' ' < "$W/out")" = "$AL-2-00000004 $AL-2-00000005" ] || fail "$name: list after: $(cat "$W/out")"
     [ "$(c "$B/healthz")" = 200 ] || fail "$name: healthz"
     echo "$name: blobs, logs written once, mailboxes and listings agree across two relays"
 }

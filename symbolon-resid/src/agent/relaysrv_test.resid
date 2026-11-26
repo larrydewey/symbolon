@@ -1,23 +1,110 @@
-// The organization relay (src/agent/relaysrv.resid): sign-in challenges
-// and the console's waiting passkeys. Anonymous requests must not make the
-// relay keep anything without bound.
+// The organization relay (src/agent/relaysrv.resid): sign-in challenges,
+// the console's waiting passkeys, and who may write what. Anonymous
+// requests must not make the relay keep anything without bound, and no
+// one writes another person's or another folder's records.
 
 import "relaysrv.resid";
 import "../net/store.resid";
+import "orgtypes.resid";
+import "orgcore.resid";
+import "sharetypes.resid";
+import "serials.resid";
+import "common.resid";
 import "crypto.resid";
+import "ecdsa.resid";
 import "cose.resid";
+import "cbor.resid";
 import "httpserv.resid";
 
 @requires(filesystem, network, clock(readonly), declassify)
-Store tmp_store() {
+Str tmp_dir() {
     Str d = "/tmp/symbolon-relaysrv-test-" + hex_encode(random_bytes(8));
     _ = filesystem.create_dir(d);
-    return FsStore(d);
+    return d;
 }
 
-HttpRequest get(Str path) {
+@requires(filesystem, network, clock(readonly), declassify)
+Store tmp_store() { return FsStore(tmp_dir()); }
+
+Str dir_of(Store s) { return match s { FsStore(d) => d, _ => "" }; }
+
+RelayCfg cfg_of(Store s, Str console) { return RelayCfg {.store = Fs(dir_of(s)), .ca = "", .console = console, .names = ""}; }
+
+HttpRequest treq(Str method, Str path, Str token, List(Int) body) {
     Map(Str, Str) none = {};
-    return HttpRequest { .method = "GET", .target = path, .path = path, .query = "", .version = "HTTP/1.1", .headers = none, .body = [], .keep_alive = false, .ok = true, .status = 0 };
+    Map(Str, Str) hs = if (str_len(token) > 0) { none.insert("authorization", "Bearer " + token) } else { none };
+    return HttpRequest { .method = method, .target = path, .path = path, .query = "", .version = "HTTP/1.1", .headers = hs, .body = body, .keep_alive = false, .ok = true, .status = 0 };
+}
+
+HttpRequest get(Str path) { return treq("GET", path, "", []); }
+
+List(Int) cb(Result(List(Int), SerialError) r) { return match r { Ok(b) => b, Err(_) => [] }; }
+
+Bool refused(Str why) { return str_len(why) > 0; }
+
+@requires(filesystem, network, clock(readonly), declassify)
+Bool absent(Store s, Str k) { return match st_get(s, k) { None => true, Some(_) => false }; }
+
+// A device: its log, party and P-256 key.
+type TDev = { List(Int) log; List(Int) party; List(Int) priv; List(Int) pub; };
+
+TDev tdev() {
+    List(Int) k = ec_generate(P256);
+    return TDev {.log = random_bytes(32), .party = random_bytes(16), .priv = k, .pub = ec_public_key(P256, k)};
+}
+
+Who twho(TDev d) { return Who {.on = true, .log = d.log, .party = d.party, .key = d.pub}; }
+
+List(Int) tsign(TDev d, List(Int) m) { return ecdsa_sign_raw(P256, Sha256, d.priv, m); }
+
+// A session for `d` written straight into the store, as /auth issues one:
+// "LOG PARTY KEY UNTIL LENGTH".
+@requires(filesystem, network, clock(readonly), declassify)
+Str tsession(Store s, TDev d, Int len) {
+    Str t = hex_encode(random_bytes(32));
+    _ = st_text(s, "auth/tok-" + hex_encode(sha256_bytes(utf8(t))), hex_encode(d.log) + " " + hex_encode(d.party) + " " + hex_encode(d.pub) + f" {clock_now_seconds() + 3600} {len}");
+    return t;
+}
+
+OrgPolicy tpolicy() {
+    return OrgPolicy {.min_pin_len = 4, .allow_biometric = true, .allow_duress = true, .allow_offline_copy = true, .max_offline_days = 0, .allow_personal_export = true, .require_attestation = [], .password_rules = ""};
+}
+
+// An organization at the relay: `owner` its owner, `rec` its recovery
+// administrators (delay `delay`), `members` everyone. The relay reads
+// these as stored (it checked them when they were written).
+@requires(filesystem, network, clock(readonly), declassify)
+Str put_org(Store s, TDev owner, List(List(Int)) rec, Int delay, List(List(Int)) members) {
+    List(Int) id = random_bytes(16);
+    OrgRecovery r = OrgRecovery {.on = rec.len() > 0, .public_key = [], .threshold = 1, .admins = rec, .delay_sec = delay, .since = (UInt(64))1, .owner = owner.log};
+    OrgGov g = OrgGov {.org_id = id, .version = (UInt(64))1, .founder = owner.log, .nonce = random_bytes(16), .name = "org", .owners = [owner.log], .admins = [], .policy = tpolicy(),
+                       .recovery = r, .log_sequence = (UInt(64))0, .signer_log = owner.log, .signer = owner.party, .sig = []};
+    Org o = Org {.org_id = id, .version = (UInt(64))1, .gov_version = (UInt(64))1, .members = org_members(members, 0, ListBuf()), .groups = [], .attested = [],
+                 .log_sequence = (UInt(64))0, .signer_log = owner.log, .signer = owner.party, .sig = []};
+    _ = st_put(s, "blob/" + gov_blob(id, (UInt(64))1), cb(to_cbor(g)));
+    _ = st_put(s, "blob/" + org_blob(id), cb(to_cbor(o)));
+    return hex_encode(id);
+}
+
+List(OrgMember) org_members(List(List(Int)) ls, Int i, ListBuf(OrgMember) acc) {
+    if (i >= ls.len()) { return acc.finish(); }
+    return org_members(ls, i + 1, acc.push(OrgMember {.log_id = ls[i], .label = f"m{i}", .ext_id = f"user{i}"}));
+}
+
+List(Int) roster_bytes(List(Int) cid, TDev owner, List(List(Int)) members) {
+    Roster r = Roster {.coll_id = cid, .version = (UInt(64))1, .owner = owner.log, .owner_label = "", .members = roster_members(members, 0, ListBuf()), .name_ct = [], .deleted = false,
+                       .log_sequence = (UInt(64))0, .signer = owner.party, .sig = []};
+    return cb(to_cbor(r));
+}
+
+List(Member) roster_members(List(List(Int)) ls, Int i, ListBuf(Member) acc) {
+    if (i >= ls.len()) { return acc.finish(); }
+    return roster_members(ls, i + 1, acc.push(Member {.log_id = ls[i], .label = ""}));
+}
+
+List(Int) wraps_bytes(List(Int) cid, List(Int) member, TDev from) {
+    WrapSet ws = WrapSet {.coll_id = cid, .roster_version = (UInt(64))1, .member = member, .wraps = [ShareWrap {.to = random_bytes(16), .from_log = from.log, .from_party = from.party, .enc = [1], .ct = [2]}]};
+    return cb(to_cbor(ws));
 }
 
 test "a challenge made by the relay is good for five minutes, for its own purpose, and refused when forged" {
@@ -47,7 +134,7 @@ test "a challenge made by the relay is good for five minutes, for its own purpos
 test "asking for challenges writes nothing to the store" {
     Store s = tmp_store();
     HttpRequest r = get("/auth/challenge");
-    RelayCfg g = RelayCfg {.store = Fs(match s { FsStore(d) => d, _ => "" }), .ca = "", .console = ""};
+    RelayCfg g = cfg_of(s, "");
     // The first one makes the relay's key; after that, nothing more.
     expect(relay_serve_handle(g, r).status).toEqual(200);
     Int before = st_list(s, "auth/", "", 1048576).len();
@@ -56,4 +143,342 @@ test "asking for challenges writes nothing to the store" {
     _ = relay_serve_handle(g, r);
     expect(st_list(s, "auth/", "", 1048576).len()).toEqual(before);
     expect(before).toEqual(1);
+}
+
+// S-3: a log's records (its vault, its recovery kit's halves, its card)
+// are that log's alone, and nothing is written without a sign-in.
+@requires(filesystem, network, clock(readonly), declassify)
+test "a log's records are written only by a signed-in device of that log" {
+    Store s = tmp_store();
+    TDev a = tdev();
+    TDev b = tdev();
+    Str la = hex_encode(a.log);
+    List(Str) names = ["vault-" + la, "kit-" + la + "-a", "kit-" + la + "-secrets", "kitv-" + la + "-a", "card-" + la];
+    expect(names.len()).toEqual(5);
+    expect(refused(may_write(s, names[0], [1], nobody()))).toBeTrue();
+    expect(refused(may_write(s, names[0], [1], twho(b)))).toBeTrue();
+    expect(refused(may_write(s, names[1], [1], twho(b)))).toBeTrue();
+    expect(refused(may_write(s, names[2], [1], twho(b)))).toBeTrue();
+    expect(refused(may_write(s, names[3], [1], twho(b)))).toBeTrue();
+    expect(refused(may_write(s, names[4], [1], twho(b)))).toBeTrue();
+    expect(may_write(s, names[0], [1], twho(a))).toEqual("");
+    expect(may_write(s, names[1], [1], twho(a))).toEqual("");
+    expect(may_write(s, names[2], [1], twho(a))).toEqual("");
+    expect(may_write(s, names[3], [1], twho(a))).toEqual("");
+    expect(may_write(s, names[4], [1], twho(a))).toEqual("");
+    // a name the relay has no rule for
+    expect(refused(may_write(s, "whatever-1", [1], twho(a)))).toBeTrue();
+    expect(refused(may_write(s, "vault-" + la + "x", [1], twho(a)))).toBeTrue();
+    // over HTTP: anonymous 401, someone else's session 403, the log's own 200
+    RelayCfg g = cfg_of(s, "");
+    expect(relay_serve_handle(g, treq("PUT", "/blob/" + names[0], "", [7])).status).toEqual(401);
+    expect(relay_serve_handle(g, treq("PUT", "/blob/" + names[0], tsession(s, b, 0), [7])).status).toEqual(403);
+    expect(relay_serve_handle(g, treq("PUT", "/blob/" + names[0], tsession(s, a, 0), [7])).status).toEqual(200);
+    expect(st_bytes(s, "blob/" + names[0])).toEqual([7]);
+}
+
+// S-3: a household folder's roster is its owner's; its items and wraps
+// its people's; a member's leave record theirs.
+@requires(filesystem, network, clock(readonly), declassify)
+test "a household folder is written only by its owner and its members" {
+    Store s = tmp_store();
+    TDev o = tdev();
+    TDev m = tdev();
+    TDev x = tdev();
+    List(Int) cid = random_bytes(16);
+    Str c = hex_encode(cid);
+    // the first roster of an id makes its writer the owner, and only as itself
+    expect(refused(may_write(s, "roster-" + c, roster_bytes(cid, o, [m.log]), twho(x)))).toBeTrue();
+    expect(may_write(s, "roster-" + c, roster_bytes(cid, o, [m.log]), twho(o))).toEqual("");
+    _ = st_put(s, "blob/roster-" + c, roster_bytes(cid, o, [m.log]));
+    // someone else cannot take the folder over with a roster of their own
+    expect(refused(may_write(s, "roster-" + c, roster_bytes(cid, x, [m.log]), twho(x)))).toBeTrue();
+    expect(refused(may_write(s, "roster-" + c, roster_bytes(cid, o, [m.log]), twho(m)))).toBeTrue();
+    // items: the owner and members, not others
+    expect(may_write(s, "coll-" + c, [1], twho(o))).toEqual("");
+    expect(may_write(s, "coll-" + c, [1], twho(m))).toEqual("");
+    expect(refused(may_write(s, "coll-" + c, [1], twho(x)))).toBeTrue();
+    expect(refused(may_write(s, "coll-" + c, [1], nobody()))).toBeTrue();
+    // wraps
+    expect(may_write(s, "wrap-" + hex_encode(m.log) + "-" + c, wraps_bytes(cid, m.log, o), twho(o))).toEqual("");
+    expect(refused(may_write(s, "wrap-" + hex_encode(m.log) + "-" + c, wraps_bytes(cid, m.log, x), twho(x)))).toBeTrue();
+    // a member leaves; the owner clears it; no one else
+    Str lv = "leave-" + c + "-" + hex_encode(m.log);
+    expect(may_write(s, lv, [1], twho(m))).toEqual("");
+    expect(may_write(s, lv, [], twho(o))).toEqual("");
+    expect(refused(may_write(s, lv, [1], twho(x)))).toBeTrue();
+    expect(refused(may_write(s, lv, [], twho(x)))).toBeTrue();
+    // items of an id with no roster: no folder
+    expect(refused(may_write(s, "coll-" + hex_encode(random_bytes(16)), [1], twho(o)))).toBeTrue();
+    // wraps with no roster yet (a folder being made, a recovery share) are
+    // their first writer's
+    List(Int) nid = random_bytes(16);
+    Str wn = "wrap-" + hex_encode(m.log) + "-" + hex_encode(nid);
+    expect(may_write(s, wn, wraps_bytes(nid, m.log, o), twho(o))).toEqual("");
+    expect(refused(may_write(s, wn, wraps_bytes(nid, m.log, o), twho(x)))).toBeTrue();
+    _ = st_put(s, "blob/" + wn, wraps_bytes(nid, m.log, o));
+    expect(refused(may_write(s, wn, wraps_bytes(nid, m.log, x), twho(x)))).toBeTrue();
+    expect(may_write(s, wn, wraps_bytes(nid, m.log, o), twho(o))).toEqual("");
+}
+
+// S-3: a cosigner's alert needs no sign-in (it has none) but is written
+// once: no one replaces a sealed alert.
+@requires(filesystem, network, clock(readonly), declassify)
+test "an alert is written once and never replaced" {
+    Store s = tmp_store();
+    RelayCfg g = cfg_of(s, "");
+    Str n = "alrt-" + hex_encode(random_bytes(32)) + "-1700000000-0a1b2c3d";
+    expect(relay_serve_handle(g, treq("PUT", "/blob/" + n, "", [1, 2, 3])).status).toEqual(200);
+    expect(relay_serve_handle(g, treq("PUT", "/blob/" + n, "", [9])).status).toEqual(409);
+    expect(st_bytes(s, "blob/" + n)).toEqual([1, 2, 3]);
+    expect(relay_serve_handle(g, treq("PUT", "/blob/alrt-zz", "", [9])).status).toEqual(401);
+}
+
+// S-6: founding an organization does not let anyone take a household
+// folder's id for a group folder.
+@requires(filesystem, network, clock(readonly), declassify)
+test "a group folder cannot take the id of someone else's folder" {
+    Store s = tmp_store();
+    TDev a = tdev();
+    TDev h = tdev();
+    Str org = put_org(s, a, [], 0, [a.log]);
+    List(Int) cid = random_bytes(16);
+    Str c = hex_encode(cid);
+    _ = st_put(s, "blob/roster-" + c, roster_bytes(cid, h, []));
+    GroupFolder f0 = GroupFolder {.coll_id = cid, .version = (UInt(64))1, .org_id = cose_hex_decode(org), .groups = [], .name_ct = [], .deleted = false,
+                                  .log_sequence = (UInt(64))0, .signer_log = a.log, .signer = a.party, .sig = []};
+    GroupFolder f = gfolder_signed(f0, tsign(a, gfolder_tbs(f0)));
+    expect(refused(may_write(s, "gfolder-" + c, cb(to_cbor(f)), twho(a)))).toBeTrue();
+    // a fresh id is the organization's
+    List(Int) cid2 = random_bytes(16);
+    GroupFolder g0 = GroupFolder {.coll_id = cid2, .version = (UInt(64))1, .org_id = cose_hex_decode(org), .groups = [], .name_ct = [], .deleted = false,
+                                  .log_sequence = (UInt(64))0, .signer_log = a.log, .signer = a.party, .sig = []};
+    GroupFolder g1 = gfolder_signed(g0, tsign(a, gfolder_tbs(g0)));
+    expect(may_write(s, "gfolder-" + hex_encode(cid2), cb(to_cbor(g1)), twho(a))).toEqual("");
+    // so is a folder whose roster is the signer's own
+    List(Int) cid3 = random_bytes(16);
+    _ = st_put(s, "blob/roster-" + hex_encode(cid3), roster_bytes(cid3, a, []));
+    GroupFolder k0 = GroupFolder {.coll_id = cid3, .version = (UInt(64))1, .org_id = cose_hex_decode(org), .groups = [], .name_ct = [], .deleted = false,
+                                  .log_sequence = (UInt(64))0, .signer_log = a.log, .signer = a.party, .sig = []};
+    GroupFolder k1 = gfolder_signed(k0, tsign(a, gfolder_tbs(k0)));
+    expect(may_write(s, "gfolder-" + hex_encode(cid3), cb(to_cbor(k1)), twho(a))).toEqual("");
+}
+
+// S-8: only the folder's owner escrows it.
+@requires(filesystem, network, clock(readonly), declassify)
+test "a member cannot replace another member's escrow" {
+    Store s = tmp_store();
+    TDev a = tdev();
+    TDev b = tdev();
+    Str org = put_org(s, a, [], 0, [a.log, b.log]);
+    List(Int) cid = random_bytes(16);
+    Str c = hex_encode(cid);
+    _ = st_put(s, "blob/roster-" + c, roster_bytes(cid, a, [b.log]));
+    OrgEscrow eb0 = OrgEscrow {.org_id = cose_hex_decode(org), .coll_id = cid, .owner = b.log, .roster_version = (UInt(64))1, .enc = [1], .ct = [2], .log_sequence = (UInt(64))0, .signer = b.party, .sig = []};
+    OrgEscrow eb = escrow_signed(eb0, tsign(b, escrow_tbs(eb0)));
+    expect(refused(may_write(s, escrow_blob(cose_hex_decode(org), c), cb(to_cbor(eb)), twho(b)))).toBeTrue();
+    OrgEscrow ea0 = OrgEscrow {.org_id = cose_hex_decode(org), .coll_id = cid, .owner = a.log, .roster_version = (UInt(64))1, .enc = [1], .ct = [2], .log_sequence = (UInt(64))0, .signer = a.party, .sig = []};
+    OrgEscrow ea = escrow_signed(ea0, tsign(a, escrow_tbs(ea0)));
+    expect(may_write(s, escrow_blob(cose_hex_decode(org), c), cb(to_cbor(ea)), twho(a))).toEqual("");
+}
+
+// S-4: a recovery request's time is its requester's word; the relay takes
+// it only near its own clock, writes when it took it, and the escrow
+// opens a delay after that.
+@requires(filesystem, network, clock(readonly), declassify)
+test "a recovery request cannot be dated back" {
+    Store s = tmp_store();
+    TDev a = tdev();
+    TDev o = tdev();
+    Str org = put_org(s, o, [a.log], 1000, [a.log, o.log]);
+    List(Int) oid = cose_hex_decode(org);
+    List(Int) cid = random_bytes(16);
+    Str c = hex_encode(cid);
+    Int now = clock_now_seconds();
+    OrgRecoveryRequest q0 = OrgRecoveryRequest {.org_id = oid, .coll_id = cid, .requester = a.log, .time = now - 5000, .log_sequence = (UInt(64))0, .signer = a.party, .sig = []};
+    List(Int) old = cb(to_cbor(recreq_signed(q0, tsign(a, recreq_tbs(q0)))));
+    expect(refused(may_write(s, recreq_blob(oid, c), old, twho(a)))).toBeTrue();
+    // A backdated request already in the store (an older relay took it):
+    // without the relay's receipt the escrow stays shut.
+    _ = st_put(s, "blob/roster-" + c, roster_bytes(cid, o, []));
+    OrgEscrow e0 = OrgEscrow {.org_id = oid, .coll_id = cid, .owner = o.log, .roster_version = (UInt(64))1, .enc = [1], .ct = [2], .log_sequence = (UInt(64))0, .signer = o.party, .sig = []};
+    _ = st_put(s, "blob/" + escrow_blob(oid, c), cb(to_cbor(escrow_signed(e0, []))));
+    _ = st_put(s, "blob/" + recreq_blob(oid, c), old);
+    expect(may_read(s, escrow_blob(oid, c), twho(a))).toBeFalse();
+    // a receipt from now: the delay runs from now
+    Str at = "blob/recat-" + org + "-" + c + "-" + hex_encode(sha256_bytes(old)[0..16]);
+    _ = st_put(s, at, utf8(f"{now}"));
+    expect(may_read(s, escrow_blob(oid, c), twho(a))).toBeFalse();
+    _ = st_put(s, at, utf8(f"{now - 1500}"));
+    expect(may_read(s, escrow_blob(oid, c), twho(a))).toBeTrue();
+    // a request is written once: a waiting one is cleared first
+    OrgRecoveryRequest q1 = OrgRecoveryRequest {.org_id = oid, .coll_id = cid, .requester = a.log, .time = now, .log_sequence = (UInt(64))0, .signer = a.party, .sig = []};
+    List(Int) fresh = cb(to_cbor(recreq_signed(q1, tsign(a, recreq_tbs(q1)))));
+    expect(refused(may_write(s, recreq_blob(oid, c), fresh, twho(a)))).toBeTrue();
+    // devices cannot write the relay's receipt
+    expect(refused(may_write(s, "recat-" + org + "-" + c + "-" + hex_encode(random_bytes(16)), utf8("1"), twho(a)))).toBeTrue();
+    // through the relay: a request of now is taken, with its receipt
+    Store s2 = tmp_store();
+    Str org2 = put_org(s2, o, [a.log], 1000, [a.log, o.log]);
+    List(Int) oid2 = cose_hex_decode(org2);
+    OrgRecoveryRequest q2 = OrgRecoveryRequest {.org_id = oid2, .coll_id = cid, .requester = a.log, .time = now, .log_sequence = (UInt(64))0, .signer = a.party, .sig = []};
+    List(Int) b2 = cb(to_cbor(recreq_signed(q2, tsign(a, recreq_tbs(q2)))));
+    expect(relay_serve_handle(cfg_of(s2, ""), treq("PUT", "/blob/" + recreq_blob(oid2, c), tsession(s2, a, 0), b2)).status).toEqual(200);
+    Int got = str_parse_int(st_read_text(s2, "blob/recat-" + org2 + "-" + c + "-" + hex_encode(sha256_bytes(b2)[0..16])));
+    expect(got >= now && got <= now + 60).toBeTrue();
+}
+
+// S-7: one organization's directory suspends people in that organization
+// only.
+@requires(filesystem, network, clock(readonly), declassify)
+test "a suspension is one organization's" {
+    Store s = tmp_store();
+    TDev a = tdev();
+    TDev o = tdev();
+    Str x = put_org(s, o, [], 0, [a.log, o.log]);
+    Str y = put_org(s, o, [], 0, [a.log, o.log]);
+    _ = st_text(s, "suspended/" + x + "/" + hex_encode(a.log), "directory: a");
+    expect(may_read(s, "org-" + x, twho(a))).toBeFalse();
+    expect(may_read(s, "org-" + y, twho(a))).toBeTrue();
+    // a suspension from before (one file for every organization) counts
+    // only where that organization's own directory has them turned off
+    TDev b = tdev();
+    Str z = put_org(s, o, [], 0, [b.log, o.log]);
+    _ = st_text(s, "suspended/" + hex_encode(b.log), "directory: b");
+    expect(may_read(s, "org-" + z, twho(b))).toBeTrue();
+}
+
+// S-9: a session is good while its device is a device of its log; when
+// the log grows the relay checks again.
+@requires(filesystem, network, clock(readonly), declassify)
+test "a session is checked again when its log grows" {
+    Store s = tmp_store();
+    RelayCfg g = cfg_of(s, "");
+    TDev a = tdev();
+    Str t = tsession(s, a, 0);
+    Str n = "card-" + hex_encode(a.log);
+    expect(relay_serve_handle(g, treq("PUT", "/blob/" + n, t, [1])).status).toEqual(200);
+    // a new event (here one that does not verify): the device is not
+    // known to be in the log any more
+    _ = st_put(s, "log/" + hex_encode(a.log) + "/0", [1, 2, 3]);
+    expect(relay_serve_handle(g, treq("PUT", "/blob/" + n, t, [2])).status).toEqual(401);
+    expect(st_bytes(s, "blob/" + n)).toEqual([1]);
+}
+
+test "the sign-in message names the relay, and a relay takes only its own names" {
+    List(Int) c = random_bytes(32);
+    expect(relay_auth_message("relay.example:443", c) == relay_auth_message("other.example:443", c)).toBeFalse();
+    expect(relay_name("Relay.Example", 443)).toEqual("relay.example:443");
+    RelayCfg g = RelayCfg {.store = Fs("/nonexistent"), .ca = "", .console = "https://home.test:8443", .names = "relay.example:443, 10.0.0.2:443"};
+    expect(name_ok(g, "relay.example:443")).toBeTrue();
+    expect(name_ok(g, "10.0.0.2:443")).toBeTrue();
+    expect(name_ok(g, "home.test:8443")).toBeTrue();
+    expect(name_ok(g, "evil.example:443")).toBeFalse();
+    expect(name_ok(g, "")).toBeFalse();
+}
+
+// S-10: a mailbox keeps its next index instead of listing every message
+// on each post.
+@requires(filesystem, network, clock(readonly), declassify)
+test "a mailbox post uses the kept next index" {
+    Store s = tmp_store();
+    RelayCfg g = cfg_of(s, "");
+    Str to = hex_encode(random_bytes(16));
+    expect(relay_serve_handle(g, treq("POST", "/mbox/" + to, "", [1])).status).toEqual(200);
+    expect(relay_serve_handle(g, treq("POST", "/mbox/" + to, "", [2])).status).toEqual(200);
+    expect(st_read_text(s, "mboxn/" + to)).toEqual("2");
+    expect(st_bytes(s, "mbox/" + to + "/1")).toEqual([2]);
+    // a stale hint: the next free index is still found
+    _ = st_text(s, "mboxn/" + to, "0");
+    expect(relay_serve_handle(g, treq("POST", "/mbox/" + to, "", [3])).status).toEqual(200);
+    expect(st_bytes(s, "mbox/" + to + "/2")).toEqual([3]);
+}
+
+// S-10: expired sessions and used challenges are removed.
+@requires(filesystem, network, clock(readonly), declassify)
+test "expired sessions and used challenges are pruned" {
+    Store s = tmp_store();
+    Int now = clock_now_seconds();
+    _ = st_text(s, "auth/tok-aa", f"l p k {now - 10} 1");
+    _ = st_text(s, "auth/tok-bb", f"l p k {now + 1000} 1");
+    _ = st_text(s, "auth/con-aa", f"o l {now - 10}");
+    _ = st_text(s, "auth/used-relay-aa", f"{now - 1000}");
+    _ = st_text(s, "auth/used-relay-bb", f"{now}");
+    _ = prune_auth(s);
+    expect(absent(s, "auth/tok-aa")).toBeTrue();
+    expect(st_bytes(s, "auth/tok-bb").len() > 0).toBeTrue();
+    expect(absent(s, "auth/con-aa")).toBeTrue();
+    expect(absent(s, "auth/used-relay-aa")).toBeTrue();
+    expect(st_bytes(s, "auth/used-relay-bb").len() > 0).toBeTrue();
+}
+
+// S-13: a directory store's write-once is claimed with O_EXCL and lands
+// whole by a rename.
+@requires(filesystem, network, clock(readonly), declassify)
+test "a directory store writes a new object once, whole" {
+    Store s = tmp_store();
+    expect(st_put_new(s, "log/ab/0", [1, 2])).toEqual(1);
+    expect(st_put_new(s, "log/ab/0", [3])).toEqual(0);
+    expect(st_bytes(s, "log/ab/0")).toEqual([1, 2]);
+    expect(filesystem.exists(dir_of(s) + "/log/ab/.0.claim")).toBeTrue();
+    // the claim alone (a writer between its claim and its rename) holds the name
+    _ = filesystem.write_bytes(dir_of(s) + "/log/ab/.1.claim", []);
+    expect(st_put_new(s, "log/ab/1", [4])).toEqual(0);
+    // nothing but the objects is listed
+    expect(st_list(s, "log/ab/", "", 100)).toEqual(["log/ab/0"]);
+    expect(st_delete(s, "log/ab/0")).toBeTrue();
+    expect(absent(s, "log/ab/0")).toBeTrue();
+}
+
+// S-14: an invite is answered only with its code.
+@requires(filesystem, network, clock(readonly), declassify)
+test "an answer to an invite needs the invite's code" {
+    Store s = tmp_store();
+    TDev o = tdev();
+    TDev p = tdev();
+    Str org = put_org(s, o, [], 0, [o.log]);
+    List(Int) oid = cose_hex_decode(org);
+    List(Int) code = ec_generate(P256);
+    List(Int) cpub = ec_public_key(P256, code);
+    List(Int) iid = invite_id_of(cpub);
+    OrgInvite v = OrgInvite {.org_id = oid, .id = iid, .public_key = cpub, .ext_id = "p", .label = "p", .groups = [], .expires = clock_now_seconds() + 3600,
+                             .log_sequence = (UInt(64))0, .signer_log = o.log, .signer = o.party, .sig = []};
+    _ = st_put(s, "blob/" + invite_blob(oid, iid), cb(to_cbor(v)));
+    OrgAccept bad0 = OrgAccept {.org_id = oid, .id = iid, .log_id = p.log, .code_sig = tsign(p, code_message(oid, p.log)), .log_sequence = (UInt(64))0, .signer = p.party, .sig = []};
+    OrgAccept bad = accept_signed(bad0, tsign(p, accept_tbs(bad0)));
+    expect(refused(may_write(s, accept_blob(oid, iid), cb(to_cbor(bad)), twho(p)))).toBeTrue();
+    OrgAccept ok0 = OrgAccept {.org_id = oid, .id = iid, .log_id = p.log, .code_sig = ecdsa_sign_raw(P256, Sha256, code, code_message(oid, p.log)), .log_sequence = (UInt(64))0, .signer = p.party, .sig = []};
+    OrgAccept ok = accept_signed(ok0, tsign(p, accept_tbs(ok0)));
+    expect(may_write(s, accept_blob(oid, iid), cb(to_cbor(ok)), twho(p))).toEqual("");
+}
+
+// S-14: a console change records who made it.
+@requires(filesystem, network, clock(readonly), declassify)
+test "a console change done records the administrator" {
+    Store s = tmp_store();
+    TDev o = tdev();
+    Str org = put_org(s, o, [], 0, [o.log]);
+    Str id = hex_encode(random_bytes(16));
+    _ = st_text(s, "console/" + org + "/change-" + id, id + " sync - - - " + hex_encode(o.log) + " pending -");
+    RelayCfg g = cfg_of(s, "https://relay.test:8443");
+    expect(relay_serve_handle(g, treq("POST", "/console/" + org + "/done/" + id, tsession(s, o, 0), utf8("ok"))).status).toEqual(200);
+    List(Str) p = str_split(str_trim(st_read_text(s, "console/" + org + "/change-" + id)), " ");
+    expect(p.len()).toEqual(9);
+    expect(p[6]).toEqual("done");
+    expect(p[8]).toEqual(hex_encode(o.log));
+}
+
+// S-12: the device recomputes a waiting passkey's code from its
+// credential id; a relay pairing the code with another key is not
+// believed, and two passkeys with one code are refused by the caller.
+test "a console code names only the passkey it is computed from" {
+    List(Int) cred = random_bytes(32);
+    Str code = console_code(cred);
+    Str pk = hex_encode(random_bytes(65));
+    Str good = code + " " + hex_encode(cred) + " " + pk + " relay.test";
+    Str forged = code + " " + hex_encode(random_bytes(32)) + " " + pk + " relay.test";
+    expect(pending_matching([forged], code, 0, ListBuf()).len()).toEqual(0);
+    expect(pending_matching([forged, good], code, 0, ListBuf()).len()).toEqual(1);
+    expect(pending_matching([good, good], code, 0, ListBuf()).len()).toEqual(2);
+    expect(str_len(key_fingerprint(cose_hex_decode(pk)))).toEqual(19);
 }

@@ -197,7 +197,10 @@ Int store_vault(Str dir, Opened o, VaultState st) {
     // Accepting our own state first: what other devices will check.
     Result(VaultState, SymbolonError) self_check = vault_accept(st, o.p.vid, o.vh.head, st.head.version);
     if (match self_check { Ok(_) => false, Err(_) => true }) { return dfail("the new vault state does not verify"); }
-    if (!blob_put(o.ep, place_blob(o.c, o.p.share), cbor_of_vault(st))) { return dfail("the relay refused the vault"); }
+    // Writes need a signed-in device (SPEC 29.4); a context that has no
+    // session yet signs in here.
+    Endpoint ep = if (str_len(o.ep.token) > 0) { o.ep } else { relay_session(dir, o.c, o.u) };
+    if (!blob_put(ep, place_blob(o.c, o.p.share), cbor_of_vault(st))) { return dfail("the relay refused the vault"); }
     _ = filesystem.write_all(place_local(dir, o.p.share) + ".version", f"{st.head.version}");
     _ = keep_place_copy(place_local(dir, o.p.share), o.p.vk, st);
     println(f"vault version {st.head.version}, {st.items.len()} items");

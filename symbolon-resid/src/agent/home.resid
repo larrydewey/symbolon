@@ -213,6 +213,12 @@ Bool name_chars(List(Int) b, Int i) {
 
 // ─── home serve ─────────────────────────────────────────────────
 
+// Every name the box answers at, for the relay's sign-in (SPEC 29.4).
+Str relay_names_of(List(Str) hosts, Int port, Int i, ListBuf(Str) acc) {
+    if (i >= hosts.len()) { return str_join(acc.finish(), ","); }
+    return relay_names_of(hosts, port, i + 1, acc.push(str_to_lower(hosts[i]) + f":{port}"));
+}
+
 // Each server runs under its own supervisor in a spawn region; a server
 // that stops is started again after a pause. People invited later get
 // their cosigner within ten seconds.
@@ -224,7 +230,7 @@ pub Int home_serve(Str dir, Str self) {
     Str tls = " --tls " + dir + "/tls/server.pem " + dir + "/tls/server.key --bind " + c.bind;
     List(Str) cmds = [
         self + " home pair-serve " + dir,
-        self + " relay serve " + dir + f"/relay {c.base + 1}" + tls + " --ca " + dir + "/tls/ca.pem --console-origin https://" + c.hosts[0] + f":{c.base + 1}",
+        self + " relay serve " + dir + f"/relay {c.base + 1}" + tls + " --ca " + dir + "/tls/ca.pem --console-origin https://" + c.hosts[0] + f":{c.base + 1}" + " --name " + relay_names_of(c.hosts, c.base + 1, 0, ListBuf()),
         self + " witness serve " + dir + f"/w1 {c.base + 2} " + dir + "/w1.key 0" + tls,
         self + " witness serve " + dir + f"/w2 {c.base + 3} " + dir + "/w2.key 0" + tls,
         self + " witness serve " + dir + f"/w3 {c.base + 4} " + dir + "/w3.key 0" + tls

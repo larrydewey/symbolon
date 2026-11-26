@@ -156,17 +156,19 @@ pub Bool names_user(Str ext, DirUser u) {
     return str_len(ext) > 0 && (str_to_lower(ext) == str_to_lower(u.user_name) || (str_len(u.external_id) > 0 && ext == u.external_id));
 }
 
-// Suspends (or lets back) every member the user names.
+// Suspends (or lets back) every member the user names, in this
+// organization only ("suspended/<org>/<log>"): one organization's
+// directory turns nobody off in another organization or a household.
 @requires(filesystem, network, clock(readonly), declassify)
-Bool set_suspended(Store root, Str org, DirUser u, Bool off) {
-    return match relay_org_members(root, org) { None => true, Some(ms) => suspend_each(root, ms, u, off, 0) };
+pub Bool set_suspended(Store root, Str org, DirUser u, Bool off) {
+    return match relay_org_members(root, org) { None => true, Some(ms) => suspend_each(root, org, ms, u, off, 0) };
 }
 
 @requires(filesystem, network, clock(readonly), declassify)
-Bool suspend_each(Store root, List(OrgMember) ms, DirUser u, Bool off, Int i) {
+Bool suspend_each(Store root, Str org, List(OrgMember) ms, DirUser u, Bool off, Int i) {
     if (i >= ms.len()) { return true; }
-    _ = if (names_user(ms[i].ext_id, u)) { st_text(root, "suspended/" + hex_encode(ms[i].log_id), if (off) { "directory: " + u.user_name } else { "" }) } else { true };
-    return suspend_each(root, ms, u, off, i + 1);
+    _ = if (names_user(ms[i].ext_id, u)) { st_text(root, "suspended/" + org + "/" + hex_encode(ms[i].log_id), if (off) { "directory: " + u.user_name } else { "" }) } else { true };
+    return suspend_each(root, org, ms, u, off, i + 1);
 }
 
 @requires(filesystem, network, clock(readonly), declassify)

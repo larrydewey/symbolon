@@ -138,6 +138,54 @@ pub List(Int) escrow_info(List(Int) org, List(Int) cid, UInt(64) version) {
 pub Str escrow_blob(List(Int) org, Str cid) { return "escrow-" + hex_encode(org) + "-" + cid; }
 pub Str recreq_blob(List(Int) org, Str cid) { return "recreq-" + hex_encode(org) + "-" + cid; }
 
+// "recat-<org>-<cid>-<h>": when the relay took the recovery request whose
+// CBOR hashes to `h` (first 16 bytes of SHA-256, hex), by its own clock,
+// written once by the relay (SPEC 29.8). The request's own time is only
+// its requester's word; the delay runs from the later of the two.
+pub Str recat_blob(List(Int) org, Str cid, List(Int) request) { return "recat-" + hex_encode(org) + "-" + cid + "-" + hex_encode(sha256_bytes(request)[0..16]); }
+
+// When a request opens: the later of its own time and the relay's receipt,
+// plus the delay.
+pub Int recovery_opens(Int requested, Int received, Int delay) { return (if (received > requested) { received } else { requested }) + delay; }
+
+// The CBOR of a record, or empty bytes.
+pub List(Int) rec_cbor(Result(List(Int), SerialError) r) { return cbor_bytes(r); }
+
+// A household folder's roster and wraps as the relay reads them (its
+// access checks; devices verify the signatures).
+pub Option(Roster) relay_roster_of(List(Int) b) {
+    if (b.len() == 0 || b.len() > 1048576 || !cbor_well_formed(b, 8)) { return None; }
+    Result(Roster, SerialError) r = from_cbor(b);
+    return match r { Ok(x) => Some(x), Err(_) => None };
+}
+
+pub Option(WrapSet) relay_wraps_of(List(Int) b) {
+    if (b.len() == 0 || b.len() > 1048576 || !cbor_well_formed(b, 8)) { return None; }
+    Result(WrapSet, SerialError) r = from_cbor(b);
+    return match r { Ok(x) => Some(x), Err(_) => None };
+}
+
+// The console's code for a waiting passkey: the first 8 hex digits of
+// SHA-256 of its credential id.
+pub Str console_code(List(Int) cred_id) { return str_slice(hex_encode(sha256_bytes(cred_id)), 0, 8); }
+
+// The waiting passkeys ("CODE CRED-HEX PUB-HEX RP" lines) whose code is
+// `code`, counting only lines whose code this device recomputes from the
+// credential id itself, so the relay cannot pair a code with another key.
+pub List(List(Str)) pending_matching(List(Str) lines, Str code, Int i, ListBuf(List(Str)) acc) {
+    if (i >= lines.len()) { return acc.finish(); }
+    List(Str) p = str_split(lines[i], " ");
+    Bool ok = p.len() == 4 && p[0] == code && str_len(p[1]) > 0 && str_len(p[1]) % 2 == 0 && console_code(cose_hex_decode(p[1])) == code;
+    return pending_matching(lines, code, i + 1, if (ok) { acc.push(p) } else { acc });
+}
+
+// A key's fingerprint to read out: SHA-256 of the public key, 4 groups of
+// 4 hex digits.
+pub Str key_fingerprint(List(Int) pk) {
+    Str h = hex_encode(sha256_bytes(pk));
+    return str_slice(h, 0, 4) + " " + str_slice(h, 4, 8) + " " + str_slice(h, 8, 12) + " " + str_slice(h, 12, 16);
+}
+
 pub Option(OrgConsoleKey) conkey_of(List(Int) b) {
     if (b.len() == 0 || b.len() > 8192 || !cbor_well_formed(b, 4)) { return None; }
     Result(OrgConsoleKey, SerialError) r = from_cbor(b);

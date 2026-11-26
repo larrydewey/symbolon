@@ -3166,17 +3166,30 @@ administrators.
 
 ### 29.4 Access at the server
 
-An organization's server (the relay) signs devices in and controls access
-to the organization's objects. Sign-in: the device fetches a challenge
-(32 random bytes, good once for five minutes), signs `"symbolon v1 relay
-auth" || challenge` with its DK and posts the challenge, its log id,
-party id and signature. The relay verifies the log itself, from the
-events it stores and at the time its witnesses sign (8.3), finds the
-device in the quorum and checks the signature; it answers a bearer token
-for seven days, kept by its SHA-256 with the log, party and the device's
-key. A device in an organization signs in again when its PIN unlocks it
-and its session is a day old; under the duress PIN it keeps the session
-it has (signing in would need the real profile).
+The relay (an organization's, a household's, Symbolon Home's) signs
+devices in and controls who writes what. Sign-in: the device fetches a
+challenge (32 bytes the relay MACs with its time, good once for five
+minutes), signs `"symbolon v2 relay auth " || NAME || "\n" || challenge`
+with its DK, NAME being the relay as the device reaches it
+(`HOST:PORT`, the host in lower case), and posts the challenge, its log
+id, party id, signature and NAME. The relay takes only its own names
+(`relay serve --name HOST:PORT[,...]`, and the console's origin), so a
+relay cannot hand a device another relay's challenge and sign in there
+as it; a relay started with no name takes any (and says so when it
+starts). The relay verifies the log itself, from the events it stores
+and at the time its witnesses sign (8.3), finds the device in the quorum
+and checks the signature; it answers a bearer token for seven days, kept
+by its SHA-256 with the log, party, the device's key and the length of
+the log at sign-in. When the log has grown since, the relay verifies it
+again before it honours the token, and the token is good only while its
+device is still a device of the log with the same key: a device removed
+from the quorum loses its sessions with the next event. Expired sessions
+and used challenges are removed as devices sign in. A device signs in
+again when its PIN unlocks it and its session is a day old, and before a
+write when it has none; under the duress PIN it keeps the session it has
+(signing in would need the real profile). (Version 1 signed `"symbolon
+v1 relay auth" || challenge`, bound to no relay; a relay no longer takes
+it, so devices and relay are upgraded together.)
 
 The relay then serves:
 
@@ -3187,18 +3200,40 @@ The relay then serves:
   read and to write, only to the folder's people, so someone taken out of
   a group can no longer write with the old key before the next re-key;
 - listings (`/list/`) without the names the caller may not read, a page
-  at a time (`?after=`), so listings are no longer capped at 4096 names.
+  at a time (`?after=`), so listings are no longer capped at 4096 names
+  (each request reads at most eight store pages of keys).
+
+Every write needs a signed-in device, but a cosigner's sealed alert
+(`alrt-<log>-<time>-<nonce>`, which a cosigner writes without a session:
+written once, never replaced, at most 64 KiB). A person's own objects
+(`vault-<log>`, `kit-<log>-a`, `kit-<log>-secrets`, `kitv-<log>-a`,
+`card-<log>`) are written only by a device of that log. A household
+folder (19): its first roster makes its writer the owner, and only the
+owner's devices write it after; its `coll-` and `wrap-` objects are
+written by the owner's and the members' devices; `leave-<id>-<log>` by
+that member, cleared by the owner. Wraps for an id with no roster yet (a
+folder being made, a recovery share) are their writer's: only that log
+replaces them. A name with no rule is refused. Mailboxes stay open to
+anyone (cosigners and peers post without a session; messages are sealed
+and a mailbox keeps its next index, so a post does not list it).
 
 It verifies records before storing them: a governance version is written
 once, in order, version 1 by the founder binding the org id and each
 later one by an owner of the version before; a membership record under
 the latest governance, by an owner or administrator, newer than the one
 stored; a group folder by an owner or administrator, newer than the one
-stored; an audit event once, by its own device, from a member; an answer
-to an invite once, by the device it names. Each record's signer must be
-the device that signed in, so the relay checks signatures with the key
-it verified at sign-in. A log the directory turned off (29.7) is refused
-at sign-in and its sessions stop at once.
+stored, never on an id that is already someone else's folder (a roster
+or items whose owner is neither the signer nor a member: the first
+record of an id wins); an audit event once, by its own device, from a
+member; an answer to an invite once, by the device it names, with a
+signature by the invite's code; an escrow only by the folder's owner (its
+roster's), never over another's; a recovery request once (cleared before
+another), with a time within five minutes of the relay's clock. Each
+record's signer must be the device that signed in, so the relay checks
+signatures with the key it verified at sign-in. A log an organization's
+directory turned off (29.7) reads and writes nothing of that
+organization's at once; it still signs in, and the suspension says
+nothing about another organization or a household.
 
 Access control is a second line only: every object is still verified on
 the device, and the server can still withhold or serve stale objects
@@ -3301,8 +3336,10 @@ case) or `externalId`. The server cannot sign the org record, so SCIM
 changes act in two ways:
 
 - at once, at the server (29.4): a user made inactive or deleted has every
-  member log they name suspended: sign-in is refused and their sessions
-  stop, so they read and write nothing of the organization's; and a
+  member log they name suspended in this organization
+  (`suspended/<org>/<log>`), so their sessions read and write nothing of
+  the organization's (one organization's directory cannot turn anyone
+  off elsewhere); and a
   directory group that no longer lists a member takes away, at once, the
   group folders the member has only through the organization's group of
   that name (the directory can take away, never give: owners and
@@ -3347,18 +3384,27 @@ An organization's owners may turn on recovery for **work folders** only
   version does not open.
 - A recovery administrator asks to open a folder (`org recover request`):
   a signed request with the witness time (`recreq-<org>-<cid>`). The
+  time is only the requester's word, so the relay takes a request only
+  within five minutes of its own clock and records, once, when it took it
+  (`recat-<org>-<cid>-<h>`, h the first 16 bytes of SHA-256 of the
+  request, written by the relay alone); a request is written once and
+  cleared before another. The request opens at the later of its time and
+  the relay's receipt, plus `delay_sec`. The
   folder's owner sees it at once in `org show` ("recovery-request CID
-  REQUESTER OPENS-AT"), and it is audited. No earlier than the request's
-  time plus `delay_sec` by witness time, each approving administrator's
+  REQUESTER OPENS-AT"), and it is audited. No earlier than that, by
+  witness time, each approving administrator's
   device opens its own share and wraps it to the requester's devices
   (`org recover approve`). With k shares the requester's device rebuilds
   the secret, checks it gives the recorded public key, opens the escrow
   and reads the folder (`org recover open`); each step is an audit event.
 
 The delay is enforced twice: approving devices refuse before the
-request's witness time plus `delay_sec`, and the relay serves an escrow
-to anyone but its owner only to a recovery administrator with a request
-of their own whose delay has passed by the relay's clock. A delay under
+opening time (by witness time), and the relay serves an escrow to anyone
+but its owner only to a recovery administrator with a request of their
+own whose delay, from the relay's receipt, has passed by the relay's
+clock. A relay that lies about its receipt can shorten the delay only
+for a requester who also controls it; witness signatures over the
+request's hash would close that and are not yet in the format. A delay under
 72 hours (259200 seconds) needs `--short-delay`, so an owner sets one
 only on purpose. The owner's device escrows a folder again by itself
 whenever it changes the folder's roster (people added or removed, a new
@@ -3392,9 +3438,17 @@ its own and several relay processes run behind a load balancer.
 - S3: path-style requests signed with Signature Version 4; objects
   written once use `If-None-Match: *` (412 for the loser); listings use
   ListObjectsV2 with `start-after` and continuation tokens.
+- A directory: an object written once is first claimed with an exclusive
+  create (`O_EXCL`) of `.NAME.claim` beside it, which one writer wins; the
+  winner writes the bytes to a temporary file and renames it onto the
+  name, so a reader sees nothing or all of it. Claims stay (listings skip
+  names starting with `.`); a writer that dies between its claim and its
+  rename leaves the name claimed and empty until an operator removes the
+  claim.
 
-A mailbox index is the first free one from the number stored, written
-once, so two relays never give out the same index. Witnesses run apart
+A mailbox index is the first free one from a kept hint (`mboxn/<to>`,
+the number after the last message), written once, so two relays never
+give out the same index. Witnesses run apart
 from the relay, ideally in different places and operated by different
 people (Section 13.4). The server is configured by the organization's
 device management: Android managed configurations and iOS managed app
@@ -3410,10 +3464,15 @@ administrators sign in with a passkey:
 - A browser registers a passkey at the console (ES256); the relay keeps it
   waiting for a day and shows a short code (the first 8 hex digits of the
   credential id's SHA-256). The administrator's own device approves that
-  code (`org console-key`, or the app): it signs a record binding the
+  code (`org console-key`, or the app): it recomputes the code from each
+  waiting credential id itself (the relay's pairing of code and key is not
+  taken on its word), refuses when more than one waiting passkey has the
+  code, shows the key's fingerprint (the first 16 hex digits of SHA-256 of
+  the public key, as the browser can show it) and signs a record binding the
   credential and its public key to their log (`conkey-<org>-<id>`), which
   the relay stores only from that device's session and only for a passkey
-  waiting with the same key.
+  waiting with the same key. Waiting passkeys older than a day are removed
+  as new ones register.
 - Signing in is a WebAuthn assertion over a fresh relay challenge (once,
   five minutes): the client data's type, challenge and origin, the
   authenticator data's RP ID hash and user-presence flag, and the ECDSA
@@ -3429,8 +3488,9 @@ a change made in the console (invite, add to or remove from a group,
 remove a person, a policy setting, a sync) is queued, and takes effect only
 when an owner's or administrator's device approves it (`org changes`, `org
 approve`, or the app's list): the device shows the change, signs it as it
-would its own, and tells the console the result. The server holds no
-administrator key.
+would its own, and tells the console the result; the relay records which
+administrator's log did (a ninth field, "BY-DONE", after the result). The
+server holds no administrator key.
 
 `org console DIR PORT` also serves a read-only page on the
 administrator's own machine (127.0.0.1, behind a token) with everything

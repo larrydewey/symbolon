@@ -50,6 +50,45 @@ Int unlock_b_handle() { return 0x81000113; }
 
 pub Endpoint relay_ep(DeviceConfig c) { return Endpoint {.host = c.relay_host, .port = c.relay_port, .ca = c.ca, .token = ""}; }
 
+// ─── The relay's sign-in (SPEC 29.4) ────────────────────────────
+// The relay takes writes only from a device that signed in: the device
+// signs the relay's challenge, with the relay's name, and the relay
+// answers a session for seven days (dir/relay.token, "TOKEN UNTIL"). A
+// device signs in again when its PIN unlocks it and the session is a day
+// old; under the duress PIN it keeps the one it has.
+
+pub Int resign_secs() { return 86400; }
+
+@requires(filesystem, clock(readonly))
+pub Bool session_fresh(Str dir) {
+    List(Str) p = str_split(str_trim(filesystem.read_all(dir + "/relay.token")), " ");
+    return p.len() == 2 && str_len(p[0]) == 64 && str_parse_int(p[1]) - 604800 + resign_secs() > clock_now_seconds();
+}
+
+@requires(filesystem, network, device, declassify, clock, environment)
+pub Result(Int, Str) relay_sign_in(Str dir, DeviceConfig c, Unlocked u) {
+    Endpoint e = relay_ep(c);
+    HttpOut ch = http_call_ep(e, "GET", "/auth/challenge", []);
+    Str chal = str_trim(http_text(ch.body, 0, ch.body.len()));
+    if (ch.status != 200 || str_len(chal) != 64) { return Err("the relay gave no sign-in challenge"); }
+    Str name = relay_name(c.relay_host, c.relay_port);
+    List(Int) sig = dk_sign(c, u.real, u.st, relay_auth_message(name, cose_hex_decode(chal)))?;
+    HttpOut r = http_call_ep(e, "POST", "/auth", http_bytes(chal + " " + hex_encode(c.log_id) + " " + hex_encode(c.party) + " " + hex_encode(sig) + " " + name));
+    Str t = str_trim(http_text(r.body, 0, r.body.len()));
+    if (r.status != 200 || str_len(t) < 66) { return Err(f"the relay refused the sign-in ({r.status})"); }
+    // A bearer session: readable by its owner only (0600).
+    return if (filesystem.write_secret(dir + "/relay.token", str_to_bytes(t))) { Ok(0) } else { Err("cannot store the relay session") };
+}
+
+// The relay with this device's session, for a write: signed in again
+// first when the session is old and the PIN is the real one.
+@requires(filesystem, network, device, declassify, clock, environment)
+pub Endpoint relay_session(Str dir, DeviceConfig c, Unlocked u) {
+    Int signed = if (u.kind == 1 && !session_fresh(dir)) { match relay_sign_in(dir, c, u) { Ok(_) => 0, Err(_) => 1 } } else { 0 };
+    List(Str) p = str_split(str_trim(filesystem.read_all(dir + "/relay.token")), " ");
+    return Endpoint {.host = c.relay_host, .port = c.relay_port, .ca = c.ca, .token = if (p.len() >= 1 && str_len(p[0]) == 64) { p[0] } else { "" }};
+}
+
 pub Int dfail(Str m) { eprintln("device: " + m); return 1; }
 
 @requires(filesystem)
@@ -456,11 +495,13 @@ pub Str duress_refusal(Str dir, DeviceConfig c) {
 
 // Publishes the log, wraps the kit's halves (SPEC 10.6), stores the share,
 // and prints the kit's seed.
-@requires(filesystem, network, device, declassify, clock)
+@requires(filesystem, network, device, declassify, clock, environment)
 Int publish(Str dir, DeviceConfig c, Unlocked u, KitKeys kit, List(PartyKeys) parties, Remote cr, InitArgs a,
             CgConfig mine, CgConfig kitc, StoredEvent se, List(Int) l, List(Int) seed, KvInit kv) {
-    Endpoint relay = relay_ep(c);
-    if (!log_put(relay, l, 0, cbor_of_event(se))) { return dfail("the relay refused the inception"); }
+    if (!log_put(relay_ep(c), l, 0, cbor_of_event(se))) { return dfail("the relay refused the inception"); }
+    // The relay takes the kit's blobs only from a signed-in device of the
+    // log (SPEC 29.4): this one, now that its log is there.
+    Endpoint relay = relay_session(dir, with_log(c, a.witnesses, l, c.mbox_next, parties), u);
     List(Int) kk = random_bytes(32);
     KitHalves halves = kit_split(kitc.ecdsa, kk, random_bytes(32), random_bytes(32));
     Wrapped wa = offline_wrap(kit.hpke_pub, l, 1, parties[1].party, half_bytes(halves.a, halves.ka), random_bytes(32)) else { Wrapped {.enc = [], .ct = []} };

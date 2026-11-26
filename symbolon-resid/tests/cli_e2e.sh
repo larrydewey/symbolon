@@ -159,10 +159,11 @@ grep -q 'not for this relying party' "$W/otherrp.log" || fail "other RP: $(cat "
 # the relay are refused.
 LOG=$(awk '/^log / {print $2}' "$W/init.log")
 # The vault as the relay stores it, through the relay itself (so this
-# works whatever the relay's store, RELAY_STORE).
+# works whatever the relay's store, RELAY_STORE); written back with the
+# device's own relay session, standing for a relay that tampers.
 RURL="$([ -n "${TLS:-}" ] && echo https || echo http)://127.0.0.1:$RP/blob/vault-$LOG"
 getb() { curl -sS ${TLS:+--cacert "$W/ca.pem"} -o "$1" "$RURL"; }
-putb() { curl -sS ${TLS:+--cacert "$W/ca.pem"} -X PUT --data-binary @"$1" "$RURL" > /dev/null; }
+putb() { curl -sS ${TLS:+--cacert "$W/ca.pem"} -H "Authorization: Bearer $(cut -d' ' -f1 "$W/dev/relay.token")" -X PUT --data-binary @"$1" "$RURL" > /dev/null; }
 printf '2468\nhunter2\n' | run 300 "$BIN" device vault put "$W/dev" mail > "$W/v1.log" 2>&1 || fail "vault put"
 getb "$W/vault.v1"
 printf '2468\nc0rrect-horse\n' | run 300 "$BIN" device vault put "$W/dev" mail > "$W/v2.log" 2>&1 || fail "vault overwrite"
