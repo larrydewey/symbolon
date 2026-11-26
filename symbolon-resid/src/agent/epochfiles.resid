@@ -41,14 +41,16 @@ pub Bool prune_old_epochs(Str dir, Int e) {
 Bool wipe_below(Str dir, Int k) {
     if (k < 1) { return true; }
     Bool ok = wipe_all(epoch_secret_files(dir, k), 0);
-    return wipe_below(dir, k - 1) && ok;
+    Bool rest = wipe_below(dir, k - 1);
+    return ok && rest;
 }
 
 @requires(filesystem)
 Bool wipe_all(List(Str) ps, Int i) {
     if (i >= ps.len()) { return true; }
     Bool ok = wipe_file(ps[i]);
-    return wipe_all(ps, i + 1) && ok;
+    Bool rest = wipe_all(ps, i + 1);
+    return ok && rest;
 }
 
 // The abort book of this party's log (SPEC 6.2), as threshold.resid's
