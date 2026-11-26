@@ -60,6 +60,10 @@ class SshAgentService : Service() {
 
     private val conns = ConcurrentHashMap<String, Conn>()
 
+    // A request code per consent sheet: PendingIntents that differ only in
+    // their extras are one PendingIntent to the system.
+    private val sheets = java.util.concurrent.atomic.AtomicInteger()
+
     override fun onBind(intent: Intent): IBinder = binder
 
     override fun onDestroy() {
@@ -169,7 +173,11 @@ class SshAgentService : Service() {
             .putExtra("request", request)
             .putExtra("peer", c.peer)
             .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        return PendingIntent.getActivity(this, request.hashCode(), i, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_ONE_SHOT)
+        // A new code each time, and CANCEL_CURRENT for one left from before
+        // the service restarted: an earlier sheet's PendingIntent is never
+        // given this request's extras (UPDATE_CURRENT on request.hashCode()
+        // did that whenever two requests' hashes collided).
+        return PendingIntent.getActivity(this, sheets.incrementAndGet(), i, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_CANCEL_CURRENT or PendingIntent.FLAG_ONE_SHOT)
     }
 
     private val binder = object : Binder() {
