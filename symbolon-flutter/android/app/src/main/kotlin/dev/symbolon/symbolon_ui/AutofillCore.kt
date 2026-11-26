@@ -57,22 +57,44 @@ object AutofillCore {
     private val OTP = Regex("\\b(otp|totp|2fa|mfa)\\b|one.?time.?(code|pass)|verification.?code|auth(entication|enticator)?.?code|two.?factor", RegexOption.IGNORE_CASE)
     private val USER = Regex("user.?name|login|e.?mail|account|identifier", RegexOption.IGNORE_CASE)
 
-    /** The fields of the screen: visible text fields we can classify. */
+    /**
+     * The fields of the screen: visible text fields we can classify, and the
+     * page they are on ("scheme://domain" as the browser reports it, "" for
+     * an app's own views).
+     *
+     * The page is the focused field's, else the first classified field's.
+     * Each field's page is the nearest web domain at or above it, so a frame
+     * of another site inside the page has its own; only the fields of the
+     * page itself are kept, never a frame's of another site (SPEC 22.2). The
+     * scheme is the node's own (API 28+); where the browser does not give
+     * one it is left "?", unknown, and [originOf] then names no page: http
+     * is never taken for https (SPEC 22.5 step 4).
+     */
     fun fields(s: AssistStructure): Pair<List<Found>, String> {
-        val out = mutableListOf<Found>()
-        var web = ""
-        fun walk(n: AssistStructure.ViewNode) {
+        val all = mutableListOf<Pair<Found, String>>()
+        var focused: String? = null
+        fun walk(n: AssistStructure.ViewNode, above: String) {
             val d = n.webDomain
-            if (web.isEmpty() && !d.isNullOrEmpty()) web = ((if (Build.VERSION.SDK_INT >= 28) n.webScheme else null) ?: "https") + "://" + d.lowercase()
+            val here = if (d.isNullOrEmpty()) above else {
+                val scheme = (if (Build.VERSION.SDK_INT >= 28) n.webScheme else null)?.lowercase()
+                (if (scheme.isNullOrEmpty()) "?" else scheme) + "://" + d.lowercase()
+            }
             val id = n.autofillId
             // Only visible fields: a hidden field is how a screen collects
             // more than it shows (SPEC 22.6 item 1).
-            if (id != null && n.visibility == View.VISIBLE && n.autofillType == View.AUTOFILL_TYPE_TEXT) kindOf(n)?.let { out += Found(it, id) }
-            for (i in 0 until n.childCount) walk(n.getChildAt(i))
+            if (id != null && n.visibility == View.VISIBLE && n.autofillType == View.AUTOFILL_TYPE_TEXT) kindOf(n)?.let {
+                all += Pair(Found(it, id), here)
+                if (n.isFocused && focused == null) focused = here
+            }
+            for (i in 0 until n.childCount) walk(n.getChildAt(i), here)
         }
-        for (i in 0 until s.windowNodeCount) walk(s.getWindowNodeAt(i).rootViewNode)
-        return Pair(out, web)
+        for (i in 0 until s.windowNodeCount) walk(s.getWindowNodeAt(i).rootViewNode, "")
+        val web = focused ?: all.firstOrNull()?.second ?: ""
+        return Pair(samePage(all, web), web)
     }
+
+    /** The fields of [all] on the page [web], the only ones a fill may reach. */
+    fun samePage(all: List<Pair<Found, String>>, web: String): List<Found> = all.filter { it.second == web }.map { it.first }
 
     private fun text(n: AssistStructure.ViewNode): String =
         listOfNotNull(n.idEntry, n.hint?.toString(), n.contentDescription?.toString(),
@@ -123,12 +145,23 @@ object AutofillCore {
         return Requester(pkg, label, certs, installer, origin)
     }
 
-    // https://host[:port] in lower case; http only on loopback (SPEC 22.5 step 4).
-    private fun originOf(web: String): String {
-        val u = try { android.net.Uri.parse(web) } catch (_: Exception) { return "" }
-        val host = u.host?.lowercase() ?: return ""
-        val scheme = if (u.scheme == "http" && (host == "localhost" || host == "127.0.0.1")) "http" else "https"
-        return "$scheme://$host" + (if (u.port > 0) ":${u.port}" else "")
+    // https://host[:port] in lower case; http only on loopback (SPEC 22.5
+    // step 4). Any other scheme, or one the browser did not give ("?"),
+    // names no page: "", so no login for a site is offered.
+    fun originOf(web: String): String {
+        val cut = web.indexOf("://")
+        if (cut <= 0) return ""
+        val scheme = web.substring(0, cut).lowercase()
+        val hp = web.substring(cut + 3).lowercase()
+        if (hp.isEmpty() || !hp.all { it in "abcdefghijklmnopqrstuvwxyz0123456789.-:" }) return ""
+        val parts = hp.split(":")
+        if (parts.size > 2 || parts[0].isEmpty() || (parts.size == 2 && (parts[1].isEmpty() || parts[1].length > 5 || !parts[1].all { it.isDigit() }))) return ""
+        val host = parts[0]
+        return when {
+            scheme == "https" -> "https://$hp"
+            scheme == "http" && (host == "localhost" || host == "127.0.0.1") -> "http://$hp"
+            else -> ""
+        }
     }
 
     /** Whether [pkg], signed by one of [certs], is on the privileged-browser list (22.1). */
