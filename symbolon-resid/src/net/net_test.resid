@@ -36,8 +36,17 @@ test "relay: mailboxes in order, a log takes only its valid next event, blobs; n
     List(Int) l = random_bytes(32);
     expect(log_put(e, l, 0, [9, 9])).toBeFalse();
     expect(match log_get(e, l, 0) { Some(_) => "found", None => "none" }).toEqual("none");
-    expect(blob_put(e, "vault.head", [7])).toBeTrue();
-    expect(hex_encode(blob_get(e, "vault.head") else { [] })).toEqual("07");
+    // Blobs: every write but a cosigner's alert needs a signed-in device
+    // (agent/relaysrv.resid; signing in needs a log with witnesses, which
+    // agent/relaysrv_test.resid covers): an anonymous write is refused; an
+    // alert is taken once and read back.
+    List(Int) vl = random_bytes(32);
+    expect(blob_put(e, "vault-" + hex_encode(vl), [7])).toBeFalse();
+    expect(match blob_get(e, "vault-" + hex_encode(vl)) { Some(_) => "found", None => "none" }).toEqual("none");
+    Str al = "alrt-" + hex_encode(vl) + "-1700000000-0a0b0c0d";
+    expect(blob_put(e, al, [7])).toBeTrue();
+    expect(blob_put(e, al, [8])).toBeFalse();
+    expect(hex_encode(blob_get(e, al) else { [] })).toEqual("07");
     expect(http_call_bytes(e.host, e.port, "GET", "/blob/..%2fetc", []).status).toEqual(404);
     expect(http_call_bytes(e.host, e.port, "GET", "/mbox/XYZ/0", []).status).toEqual(404);
 }
