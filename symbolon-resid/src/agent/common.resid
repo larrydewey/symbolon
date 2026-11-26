@@ -140,6 +140,17 @@ Fetched fetch_raw(Endpoint relay, List(Int) l, UInt(64) seq, List(List(Int)) acc
 @requires(network, clock(readonly), declassify)
 pub List(List(Int)) log_raw(Endpoint relay, List(Int) l) { return fetch_raw(relay, l, (UInt(64))0, []).evs; }
 
+// Whether `e` may be stored at sequence `seq` of log `l` after `before`
+// (the log as stored, from E0): the log with `e` verifies, `e`'s own
+// witness co-signatures included (SPEC 8.3); at 0, `e` is an inception whose
+// digest is `l`. The relay's test for a log write (relaysrv.resid).
+pub Bool log_next_ok(List(Int) l, List(SignedEvent) before, SignedEvent e, Int seq) {
+    if (before.len() != seq || (Int)e.payload.sequence != seq) { return false; }
+    // Verified as of the end of time: every check of every event uses its
+    // own witness time; `now` only decides what is still pending at the head.
+    return match il_verify(l, before.concat([e]), 4611686018427387904, lambda(x) { false }) { Ok(_) => true, Err(_) => false };
+}
+
 List(SignedEvent) events_of_raw(List(List(Int)) rs, Int i, List(SignedEvent) acc) {
     if (i >= rs.len()) { return acc; }
     Option(StoredEvent) se = event_of_cbor(rs[i]);

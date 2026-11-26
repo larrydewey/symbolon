@@ -24,17 +24,18 @@ Endpoint relay_at() { return Endpoint {.host = "127.0.0.1", .port = str_parse_in
 Endpoint witness_at() { return Endpoint {.host = "127.0.0.1", .port = str_parse_int(environment.get("SYM_WITNESS_PORT")), .ca = "", .token = ""}; }
 
 @requires(network, environment, declassify, clock(readonly))
-test "relay: mailboxes in order, append-only log, blobs; names are checked" {
+test "relay: mailboxes in order, a log takes only its valid next event, blobs; names are checked" {
     Endpoint e = relay_at();
     List(Int) to = random_bytes(32);
     expect(mbox_put(e, to, [1, 2, 3])).toEqual(0);
     expect(mbox_put(e, to, [4])).toEqual(1);
     expect(hex_encode(mbox_get(e, to, 1) else { [] })).toEqual("04");
     expect(match mbox_get(e, to, 2) { Some(_) => "found", None => "none" }).toEqual("none");
+    // Bytes that are not an inception of the log (SPEC 8.3) are not stored:
+    // they would hold the sequence forever (agent/relaysrv.resid).
     List(Int) l = random_bytes(32);
-    expect(log_put(e, l, 0, [9, 9])).toBeTrue();
-    expect(log_put(e, l, 0, [8, 8])).toBeFalse();
-    expect(hex_encode(log_get(e, l, 0) else { [] })).toEqual("0909");
+    expect(log_put(e, l, 0, [9, 9])).toBeFalse();
+    expect(match log_get(e, l, 0) { Some(_) => "found", None => "none" }).toEqual("none");
     expect(blob_put(e, "vault.head", [7])).toBeTrue();
     expect(hex_encode(blob_get(e, "vault.head") else { [] })).toEqual("07");
     expect(http_call_bytes(e.host, e.port, "GET", "/blob/..%2fetc", []).status).toEqual(404);

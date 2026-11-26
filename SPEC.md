@@ -2018,7 +2018,8 @@ but its co-signatures, which do not exist yet; at sequence 0, an inception
 whose digest is the log id, signed by every party of its quorum. So only
 the holders of a log's keys can take its next sequence, and a device's
 veto of a pending recovery is co-signable until the delay has run by the
-witness's clock.
+witness's clock. The relay likewise stores an event only as the verified
+next event of the log it holds.
 Agents and the cosigner MUST require a
 majority of the policy's witnesses on `recover`, delayed and `reshare`
 events and on heads they release material against, and SHOULD require

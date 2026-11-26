@@ -568,10 +568,28 @@ HttpReply plain(Store root, HttpRequest r, List(Str) p) {
     if (r.method == "GET") { return match st_get(root, k) { Some(b) => http_reply_bytes(200, "application/octet-stream", b), None => http_reply_status(404) }; }
     if (kind == "log" && r.method == "POST") {
         if (r.body.len() > max_body()) { return http_reply_status(413); }
+        if (!next_event_ok(root, who, str_parse_int(p[3]), r.body)) { return http_reply_status(403); }
         Int w = st_put_new(root, k, r.body);
         return http_reply_status(if (w == 1) { 200 } else { if (w == 0) { 409 } else { 500 } });
     }
     return http_reply_status(404);
+}
+
+// A log event is stored only as the next event of the log as stored here
+// (SPEC 8.3): with the events before it, from E0, it verifies, its own
+// witness co-signatures included; at sequence 0 it is an inception whose
+// digest is the log id. Anything else would sit at that sequence forever
+// (st_put_new) and keep the log's next event from being stored.
+@requires(filesystem, network, clock(readonly), declassify)
+Bool next_event_ok(Store root, Str who, Int seq, List(Int) body) {
+    List(Int) l = cose_hex_decode(who);
+    if (l.len() != 32) { return false; }
+    Option(StoredEvent) se = event_of_cbor(body);
+    Option(SignedEvent) oe = match se { None => None, Some(x) => signed_of(x) };
+    return match oe {
+        None => false,
+        Some(e) => log_next_ok(l, log_dir(root, l, (UInt(64))0, []), e, seq)
+    };
 }
 
 // The next free index from `n`: only one writer wins each.
