@@ -11,7 +11,8 @@
 // a history; and a person the company directory turns off loses access at
 // once (SPEC 29.7), before an administrator's device signs them out.
 //
-//   GET  /auth/challenge       32 random bytes, hex; good for five minutes, once
+//   GET  /auth/challenge       32 bytes, hex (time, nonce, MAC; nothing stored);
+//                              good for five minutes, once
 //   POST /auth                 "CHALLENGE LOG PARTY SIG" (hex): SIG by device PARTY of
 //                              log LOG over "symbolon v1 relay auth" || CHALLENGE;
 //                              answers "TOKEN UNTIL", a bearer token for seven days
@@ -87,21 +88,69 @@ pub Who who_of(Store root, HttpRequest r) {
 
 pub List(Int) auth_message(List(Int) chal) { return utf8("symbolon v1 relay auth").concat(chal); }
 
+// A challenge proves itself, so handing one out writes nothing: anyone may
+// ask for one, and a store written per anonymous request could be filled.
+// It is 32 bytes: the time it was made (8, big-endian), a nonce (8) and an
+// HMAC-SHA256 (first 16 bytes) over the purpose, the time and the nonce
+// under a key the relay keeps in its store (shared by every relay process
+// on the store). It is good for five minutes and once: the use is
+// recorded, write-once, only after a signature over it verifies, so only
+// a signed-in device's sign-in writes anything.
+pub Int challenge_secs() { return 300; }
+
+@requires(filesystem, network, clock(readonly), declassify)
+List(Int) challenge_key(Store root) {
+    Str k = "auth/challenge-key";
+    List(Int) b = st_bytes(root, k);
+    if (b.len() == 32) { return b; }
+    // The first relay process to come here makes it; the others read the
+    // winner's.
+    _ = st_put_new(root, k, random_bytes(32));
+    List(Int) b2 = st_bytes(root, k);
+    return if (b2.len() == 32) { b2 } else { [] };
+}
+
+List(Int) be64(Int v) { return [(v >> 56) & 255, (v >> 48) & 255, (v >> 40) & 255, (v >> 32) & 255, (v >> 24) & 255, (v >> 16) & 255, (v >> 8) & 255, v & 255]; }
+
+Int be64_of(List(Int) b) { return (b[0] << 56) | (b[1] << 48) | (b[2] << 40) | (b[3] << 32) | (b[4] << 24) | (b[5] << 16) | (b[6] << 8) | b[7]; }
+
+pub List(Int) challenge_mac(List(Int) key, Str purpose, List(Int) tn) {
+    return hmac_sha256_bytes(key, utf8("symbolon v1 challenge " + purpose + " ").concat(tn))[0..16];
+}
+
+// A new challenge for `purpose` ("relay" or "console"); [] without a key.
+pub List(Int) challenge_make(List(Int) key, Str purpose, Int now) {
+    if (key.len() != 32) { return []; }
+    List(Int) tn = be64(now).concat(random_bytes(8));
+    return tn.concat(challenge_mac(key, purpose, tn));
+}
+
+// Whether `c` is a challenge this relay made for `purpose` within the last
+// five minutes (and not in the future). Single use is checked apart, by
+// challenge_spend, after the signature.
+pub Bool challenge_good(List(Int) key, Str purpose, List(Int) c, Int now) {
+    if (key.len() != 32 || c.len() != 32) { return false; }
+    Int t = be64_of(c[0..8]);
+    return ct_equal(challenge_mac(key, purpose, c[0..16]), c[16..32]) && t <= now + 5 && t + challenge_secs() >= now;
+}
+
+// Records the challenge as used; false when it was used already.
+@requires(filesystem, network, clock(readonly), declassify)
+Bool challenge_spend(Store root, Str purpose, List(Int) c) {
+    return st_put_new(root, "auth/used-" + purpose + "-" + hex_encode(c), utf8(f"{clock_now_seconds()}")) == 1;
+}
+
 @requires(filesystem, network, clock(readonly), declassify)
 HttpReply challenge(Store root) {
-    List(Int) c = random_bytes(32);
-    return if (st_text(root, "auth/chal-" + hex_encode(c), f"{clock_now_seconds()}")) { http_reply_text(200, "text/plain", hex_encode(c)) } else { http_reply_status(500) };
+    List(Int) c = challenge_make(challenge_key(root), "relay", clock_now_seconds());
+    return if (c.len() == 32) { http_reply_text(200, "text/plain", hex_encode(c)) } else { http_reply_status(500) };
 }
 
 @requires(filesystem, network, clock(readonly), declassify)
 HttpReply sign_in(RelayCfg g, Store root, HttpRequest r) {
     List(Str) p = str_split(str_trim(http_body_text(r)), " ");
     if (p.len() != 4 || !hex_len(p[0], 64) || !hex_len(p[1], 64) || !hex_ok(p[2], 0) || !hex_ok(p[3], 0)) { return http_reply_status(400); }
-    Str cf = "auth/chal-" + p[0];
-    Str ct = str_trim(st_read_text(root, cf));
-    if (str_len(ct) == 0) { return http_reply_status(403); }
-    _ = st_text(root, cf, "used");
-    if (ct == "used" || str_parse_int(ct) + 300 < clock_now_seconds()) { return http_reply_status(403); }
+    if (!challenge_good(challenge_key(root), "relay", cose_hex_decode(p[0]), clock_now_seconds())) { return http_reply_status(403); }
     List(Int) l = cose_hex_decode(p[1]);
     if (suspended(root, l)) { return http_reply_status(403); }
     Result(VerifiedHead, SymbolonError) rv = verified_events(l, log_dir(root, l, (UInt(64))0, []), g.ca, "");
@@ -116,7 +165,7 @@ HttpReply signed_in(Store root, VerifiedHead vh, List(Int) l, List(Int) party, L
     Option(Party) d = device_party(vh.head.quorum.parties, party, 0);
     return match d {
         None => http_reply_status(403),
-        Some(x) => if (ecdsa_verify_raw(P256, Sha256, x.auth_key, auth_message(chal), sig)) { issue(root, l, x) } else { http_reply_status(403) }
+        Some(x) => if (ecdsa_verify_raw(P256, Sha256, x.auth_key, auth_message(chal), sig) && challenge_spend(root, "relay", chal)) { issue(root, l, x) } else { http_reply_status(403) }
     };
 }
 
@@ -647,8 +696,8 @@ HttpReply console_handle(RelayCfg g, Store root, HttpRequest r) {
     Str what = seg_at(p, 3);
     if (p.len() == 3 && r.method == "GET") { return console_page_html(org); }
     if (what == "challenge" && r.method == "GET") {
-        List(Int) c = random_bytes(32);
-        _ = st_text(root, "auth/conchal-" + hex_encode(c), f"{clock_now_seconds()}");
+        List(Int) c = challenge_make(challenge_key(root), "console", clock_now_seconds());
+        if (c.len() != 32) { return json_reply(500, "{}"); }
         return json_reply(200, "{\"challenge\":" + jq(b64u_text(c)) + ",\"rpId\":" + jq(rp_of(g.console)) + "}");
     }
     if (what == "register" && r.method == "POST") { return con_register(g, root, org, r); }
@@ -663,14 +712,23 @@ HttpReply console_handle(RelayCfg g, Store root, HttpRequest r) {
     return http_reply_status(404);
 }
 
+pub Int pending_max() { return 32; }
+
 @requires(filesystem, network, clock(readonly), declassify)
 HttpReply con_register(RelayCfg g, Store root, Str org, HttpRequest r) {
     Jv v = json_parse(r.body) else { JNull };
     List(Int) cid = b64u(jstr(jget(v, "credentialId")));
     List(Int) pt = spki_point(b64u(jstr(jget(v, "publicKey"))));
     if (cid.len() < 16 || cid.len() > 1023 || pt.len() != 65) { return json_reply(400, "{\"error\":\"a credential id and an ES256 public key\"}"); }
+    // Anyone may ask (the person has no session yet), so what they can make
+    // the relay keep is bounded: only for an organization this relay has,
+    // and at most pending_max() passkeys waiting at once per organization.
+    if (match relay_org(root, org) { None => true, Some(_) => false }) { return json_reply(404, "{\"error\":\"no such organization\"}"); }
+    Str pk = "console/" + org + "/pend-" + str_slice(hex_encode(sha256_bytes(cid)), 0, 32);
+    Bool again = str_len(str_trim(st_read_text(root, pk))) > 0;
+    if (!again && pend_lines(root, st_list(root, "console/" + org + "/pend-", "", 4096), 0, ListBuf()).len() >= pending_max()) { return json_reply(429, "{\"error\":\"too many passkeys are waiting for approval; ask an administrator\"}"); }
     Str code = str_slice(hex_encode(sha256_bytes(cid)), 0, 8);
-    Bool ok = st_text(root, "console/" + org + "/pend-" + str_slice(hex_encode(sha256_bytes(cid)), 0, 32), code + " " + hex_encode(cid) + " " + hex_encode(pt) + " " + rp_of(g.console) + f" {clock_now_seconds()}");
+    Bool ok = st_text(root, pk, code + " " + hex_encode(cid) + " " + hex_encode(pt) + " " + rp_of(g.console) + f" {clock_now_seconds()}");
     return if (ok) { json_reply(200, "{\"code\":" + jq(code) + "}") } else { json_reply(500, "{}") };
 }
 
@@ -694,15 +752,13 @@ HttpReply con_login(RelayCfg g, Store root, Str org, HttpRequest r) {
     if (cid.len() == 0 || sig.len() != 64 || ad.len() < 37) { return json_reply(400, "{\"error\":\"a WebAuthn assertion\"}"); }
     Jv cd = json_parse(cdj) else { JNull };
     List(Int) chal = b64u(jstr(jget(cd, "challenge")));
-    Str cf = "auth/conchal-" + hex_encode(chal);
-    Str ct = str_trim(st_read_text(root, cf));
-    _ = st_text(root, cf, "used");
-    Bool fresh = chal.len() == 32 && str_len(ct) > 0 && ct != "used" && str_parse_int(ct) + 300 >= clock_now_seconds();
+    Bool fresh = challenge_good(challenge_key(root), "console", chal, clock_now_seconds());
     Bool shape = jstr(jget(cd, "type")) == "webauthn.get" && jstr(jget(cd, "origin")) == g.console && bytes_eq(ad[0..32], sha256_bytes(utf8(rp_of(g.console)))) && (ad[32] & 1) == 1;
     return match ok {
         None => json_reply(403, "{\"error\":\"this passkey is not approved for the console\"}"),
         Some(k) => if (!fresh || !shape || !bytes_eq(k.cred_id, cid) || !bytes_eq(k.org_id, cose_hex_decode(org))) { json_reply(403, "{\"error\":\"the assertion is not for this console or challenge\"}") } else {
-            if (!ecdsa_verify_raw(P256, Sha256, k.public_key, ad.concat(sha256_bytes(cdj)), sig)) { json_reply(403, "{\"error\":\"the signature does not verify\"}") } else { con_open(root, org, k.log_id) } }
+            if (!ecdsa_verify_raw(P256, Sha256, k.public_key, ad.concat(sha256_bytes(cdj)), sig)) { json_reply(403, "{\"error\":\"the signature does not verify\"}") } else {
+                if (!challenge_spend(root, "console", chal)) { json_reply(403, "{\"error\":\"the challenge was used already\"}") } else { con_open(root, org, k.log_id) } } }
     };
 }
 

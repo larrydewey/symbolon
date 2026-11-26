@@ -1,0 +1,59 @@
+// The organization relay (src/agent/relaysrv.resid): sign-in challenges
+// and the console's waiting passkeys. Anonymous requests must not make the
+// relay keep anything without bound.
+
+import "relaysrv.resid";
+import "../net/store.resid";
+import "crypto.resid";
+import "cose.resid";
+import "httpserv.resid";
+
+@requires(filesystem, network, clock(readonly), declassify)
+Store tmp_store() {
+    Str d = "/tmp/symbolon-relaysrv-test-" + hex_encode(random_bytes(8));
+    _ = filesystem.create_dir(d);
+    return FsStore(d);
+}
+
+HttpRequest get(Str path) {
+    Map(Str, Str) none = {};
+    return HttpRequest { .method = "GET", .target = path, .path = path, .query = "", .version = "HTTP/1.1", .headers = none, .body = [], .keep_alive = false, .ok = true, .status = 0 };
+}
+
+test "a challenge made by the relay is good for five minutes, for its own purpose, and refused when forged" {
+    List(Int) k = random_bytes(32);
+    List(Int) c = challenge_make(k, "relay", 1000000);
+    expect(c.len()).toEqual(32);
+    expect(challenge_good(k, "relay", c, 1000000)).toBeTrue();
+    expect(challenge_good(k, "relay", c, 1000300)).toBeTrue();
+    expect(challenge_good(k, "relay", c, 1000301)).toBeFalse();
+    // from the future (beyond a little clock skew)
+    expect(challenge_good(k, "relay", c, 999990)).toBeFalse();
+    // the console's challenges are not the relay's, nor the reverse
+    expect(challenge_good(k, "console", c, 1000000)).toBeFalse();
+    // another relay's key
+    expect(challenge_good(random_bytes(32), "relay", c, 1000000)).toBeFalse();
+    // a changed time, nonce or MAC
+    List(Int) t = [c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7] ^ 1].concat(c[8..32]);
+    expect(challenge_good(k, "relay", t, 1000000)).toBeFalse();
+    List(Int) m = c[0..31].concat([c[31] ^ 1]);
+    expect(challenge_good(k, "relay", m, 1000000)).toBeFalse();
+    // random bytes, as the old relay handed out
+    expect(challenge_good(k, "relay", random_bytes(32), 1000000)).toBeFalse();
+    expect(challenge_good(k, "relay", c[0..31], 1000000)).toBeFalse();
+}
+
+@requires(filesystem, network, clock(readonly), declassify)
+test "asking for challenges writes nothing to the store" {
+    Store s = tmp_store();
+    HttpRequest r = get("/auth/challenge");
+    RelayCfg g = RelayCfg {.store = Fs(match s { FsStore(d) => d, _ => "" }), .ca = "", .console = ""};
+    // The first one makes the relay's key; after that, nothing more.
+    expect(relay_serve_handle(g, r).status).toEqual(200);
+    Int before = st_list(s, "auth/", "", 1048576).len();
+    expect(relay_serve_handle(g, r).status).toEqual(200);
+    _ = relay_serve_handle(g, r);
+    _ = relay_serve_handle(g, r);
+    expect(st_list(s, "auth/", "", 1048576).len()).toEqual(before);
+    expect(before).toEqual(1);
+}
