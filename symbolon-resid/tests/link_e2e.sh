@@ -51,7 +51,7 @@ if true; then   # always TLS: the link carries the relay's CA to the new device
 fi
 
 RP=$(port)
-runs 3600 "$BIN" relay serve "$W/relay" "$RP" --name "127.0.0.1:$RP" "${SERVE_TLS[@]}" ${RELAY_STORE:+--store "$RELAY_STORE"} > "$W/relay.log" 2>&1 & PIDS+=($!)
+runs 3600 "$BIN" relay serve "$W/relay" "$RP" --name "127.0.0.1:$RP" "${SERVE_TLS[@]}" "${CA[@]}" ${RELAY_STORE:+--store "$RELAY_STORE"} > "$W/relay.log" 2>&1 & PIDS+=($!)
 WS=()
 for i in 1 2 3; do
   P=$(port)

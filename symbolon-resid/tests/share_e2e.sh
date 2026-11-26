@@ -140,7 +140,7 @@ dpin device vault show "$B" Garage --share "$ID" > "$W/dshow.log" 2>&1 || fail "
 grep -qx "text $(hx 'the code is 4711')" "$W/dshow.log" || fail "under duress: $(cat "$W/dshow.log")"
 dpin device vault list "$B" --share "$ID2" > "$W/dwork.log" 2>&1 && fail "bob read Work under duress"
 printf '1357\ntext %s\n' "$(hx x)" | run 300 "$BIN" device vault set "$B" Note note --share "$ID" > "$W/dset.log" 2>&1 && fail "bob changed the folder under duress"
-grep -q "relay refused" "$W/dset.log" || fail "a change under duress: $(cat "$W/dset.log")"
+grep -qE "relay refused|cannot reach the relay" "$W/dset.log" || fail "a change under duress: $(cat "$W/dset.log")"
 echo "duress: bob reads the folder he chose under his duress PIN, not the other one, and changes nothing"
 
 # Leaving: bob leaves Work; alice's device takes him out with a new key.

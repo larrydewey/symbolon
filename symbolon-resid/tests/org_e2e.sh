@@ -179,7 +179,9 @@ echo "remove: carol leaves the organization; an administrator must lose the role
 # Invites (SPEC 29.3): carol comes back through the company directory.
 read -r ICODE IID < <(pin device org invite "$A" carol@acme.example Carol "$GID") || fail "invite"
 [[ "$ICODE" =~ ^[0-9a-f]{32}$ ]] || fail "invite: $ICODE"
-pin device org join "$C" "$ORG" "$FOUNDER" 0123456789abcdef0123456789abcdef > "$W/badcode.log" 2>&1 || fail "carol answers with a wrong code: $(cat "$W/badcode.log")"
+# A wrong code is refused at the relay already (accept_write checks the
+# code's signature against the stored invite, 412ce18).
+pin device org join "$C" "$ORG" "$FOUNDER" 0123456789abcdef0123456789abcdef > "$W/badcode.log" 2>&1 && fail "the relay took an answer with a wrong code: $(cat "$W/badcode.log")"
 pin device org sync "$A" > "$W/isync0.log" 2>&1 || fail "sync after a wrong code: $(cat "$W/isync0.log")"
 grep -q "^joined" "$W/isync0.log" && fail "a wrong code let carol in"
 pin device org join "$C" "$ORG" "$FOUNDER" "$ICODE" > "$W/ijoin.log" 2>&1 || fail "carol answers the invite: $(cat "$W/ijoin.log")"
@@ -236,6 +238,9 @@ run 120 "$BIN" device org show "$B" | grep -q "^recovery-request $WID $ALOG " ||
 pin device org recover approve "$B" "$WID" > "$W/early.log" 2>&1 && fail "approved before the delay"
 grep -q "opens at" "$W/early.log" || fail "early approval: $(cat "$W/early.log")"
 pin device org recovery on "$A" 2 0 "$ALOG,$BLOG" --short-delay > /dev/null 2>&1 || fail "recovery on, no delay"
+# A request stands until a recovery administrator clears it (S-4: one at a
+# time, written once); clear the first before asking again.
+[ "$(code -X PUT --data-binary '' -H "Authorization: Bearer $(tok "$A")" "$RELAY/blob/recreq-$ORG-$WID")" = 200 ] || fail "clear the first request"
 pin device org recover request "$A" "$WID" > /dev/null 2>&1 || fail "request again"
 pin device org recover open "$A" "$WID" > "$W/open0.log" 2>&1 && fail "opened without approvals"
 pin device org recover approve "$A" "$WID" > /dev/null 2>&1 || fail "alice approves"
