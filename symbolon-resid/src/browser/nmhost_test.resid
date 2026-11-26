@@ -212,3 +212,38 @@ test "the window's connection must open with the token line" {
     expect(opens_with(utf8("abcdx\n"), "abcd")).toBeFalse();
     expect(opens_with(utf8("\n"), "")).toBeFalse();
 }
+
+// Connections to `port` that each send `line` at once, kept open.
+@requires(network)
+List(Int) dial(Int port, Str line, Int n, List(Int) acc) {
+    if (n <= 0) { return acc; }
+    Int fd = resid_tcp_connect("127.0.0.1", port);
+    _ = resid_tcp_send_bin(fd, utf8(line));
+    return dial(port, line, n - 1, acc.concat([fd]));
+}
+
+@requires(network)
+Bool close_all(List(Int) fds, Int i) {
+    if (i >= fds.len()) { return true; }
+    _ = resid_tcp_close(fds[i]);
+    return close_all(fds, i + 1);
+}
+
+@requires(network, clock)
+test "connections that fail at once do not end the wait for the window (K-8)" {
+    Int lfd = resid_tcp_listen_at("127.0.0.1", 0);
+    Int port = resid_tcp_bound_port(lfd);
+    // Forty wrong tokens ahead of the window: each used to count as two
+    // seconds of a sixty-second wait, so the window was never heard.
+    List(Int) junk = dial(port, "not-the-token\n", 40, []);
+    List(Int) win = dial(port, "tok\nok card\n", 1, []);
+    Conn c = accept_valid(lfd, "tok", clock_monotonic_ns() + 30000 * 1000000);
+    expect(c.fd >= 0).toBeTrue();
+    expect(opens_with(c.head, "tok")).toBeTrue();
+    _ = resid_tcp_close(c.fd);
+    // Past the deadline, nothing more is accepted.
+    List(Int) late = dial(port, "tok\n", 1, []);
+    expect(accept_valid(lfd, "tok", clock_monotonic_ns() - 1).fd).toEqual(-1);
+    _ = close_all(junk.concat(win).concat(late), 0);
+    _ = resid_tcp_close(lfd);
+}

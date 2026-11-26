@@ -26,6 +26,7 @@ import "crypto.resid";
 import "word.resid";
 import "httpserv.resid";
 import "cose.resid";
+import "clock.resid";
 
 // ============================================================================
 // Framing
@@ -397,22 +398,24 @@ pub Bool opens_with(List(Int) b, Str token) {
 }
 
 // The window's connection: the first one that sends the token within two
-// seconds of connecting; any other is dropped and waiting goes on, so a
-// local process that connects first cannot block the window (about
-// `tries` tenths of a second in all).
+// seconds of connecting; any other is dropped and waiting goes on until
+// the monotonic clock passes `until_ns`, so a local process that connects
+// first cannot block the window, and connections that fail at once cost
+// it nothing (each used to count as two seconds of the wait, so thirty of
+// them ended it before the window was heard).
 @requires(network, clock)
-Conn accept_valid(Int lfd, Str token, Int tries) {
-    if (tries <= 0) { return Conn {.fd = -1, .head = []}; }
+pub Conn accept_valid(Int lfd, Str token, Int until_ns) {
+    if (clock_monotonic_ns() > until_ns) { return Conn {.fd = -1, .head = []}; }
     Int c = resid_tcp_accept_now(lfd);
     if (c < 0) {
         _ = nap(100);
-        return accept_valid(lfd, token, tries - 1);
+        return accept_valid(lfd, token, until_ns);
     }
     _ = resid_tcp_deadline(c, 2000);
     List(Int) h = read_line_bytes(c, []);
     if (opens_with(h, token)) { return Conn {.fd = c, .head = h}; }
     _ = resid_tcp_close(c);
-    return accept_valid(lfd, token, tries - 20);
+    return accept_valid(lfd, token, until_ns);
 }
 
 @requires(network)
@@ -452,13 +455,16 @@ pub Option(Chosen) ask_consent(Str top, Str want, List(FrameAsk) fs) {
     // person then has five minutes. If the host gives up, the connection
     // closes and the window stops offering Fill: nothing is ever sent to a
     // port this host no longer holds.
-    Conn cn = accept_valid(lfd, token, 600);
-    _ = resid_tcp_close(lfd);
+    // The listener stays open until the answer is in: the window names the
+    // program that started this host from the listening socket's owner
+    // (/proc), which it cannot find once the socket is closed.
+    Conn cn = accept_valid(lfd, token, clock_monotonic_ns() + 60000 * 1000000);
     _ = process.run("rm -f " + sh);
-    if (cn.fd < 0) { _ = process.run("rm -f " + req); return None; }
+    if (cn.fd < 0) { _ = resid_tcp_close(lfd); _ = process.run("rm -f " + req); return None; }
     _ = resid_tcp_deadline(cn.fd, 300000);
     List(Int) ans = read_answer(cn.fd, cn.head);
     _ = resid_tcp_close(cn.fd);
+    _ = resid_tcp_close(lfd);
     _ = process.run("rm -f " + req);
     return chosen_of(ans, token);
 }

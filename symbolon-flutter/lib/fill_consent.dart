@@ -111,6 +111,10 @@ class SocketLink extends FillLink {
 
   @override
   Future<String?> open(String token, int port) async {
+    // Who listens is looked up before connecting, while the host is surely
+    // still listening (it keeps the socket open until it has the answer,
+    // but an older host closed it as soon as it accepted).
+    final before = callerOf(port);
     try {
       final s = await Socket.connect(InternetAddress.loopbackIPv4, port, timeout: const Duration(seconds: 5));
       _s = s;
@@ -120,7 +124,7 @@ class SocketLink extends FillLink {
     } catch (_) {
       return null;
     }
-    return callerOf(port) ?? '';
+    return before ?? callerOf(port) ?? '';
   }
 
   @override
