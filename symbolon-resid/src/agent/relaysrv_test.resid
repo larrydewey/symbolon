@@ -951,39 +951,48 @@ test "the relay claims each sequence of a log once, and answers another event th
     WitnessRef me = WitnessRef {.url = "relay:1", .key = k};
     StoredEvent e0 = log_e0_seq("w1", [me]);
     List(Int) l = put_e0(s, e0);
-    Str at1 = "/claim/" + hex_encode(l) + "/1";
     List(Int) ra = kit_recover_at(l, e0, 4, 20);
     List(Int) rb = kit_recover_at(l, e0, 5, 20);
     // Not the kit's key, nor a sequence after the log stored here, nor 0.
-    expect(relay_serve_handle(g, treq("POST", at1, "", kit_recover_at(l, e0, 4, 21))).status).toEqual(403);
-    expect(relay_serve_handle(g, treq("POST", "/claim/" + hex_encode(l) + "/2", "", ra)).status).toEqual(400);
-    expect(relay_serve_handle(g, treq("POST", "/claim/" + hex_encode(l) + "/0", "", ra)).status).toEqual(404);
+    expect(claim_t(s, l, 1, kit_recover_at(l, e0, 4, 21)).status).toEqual(403);
+    expect(claim_t(s, l, 2, ra).status).toEqual(400);
+    expect(claim_t(s, l, 0, ra).status).toEqual(404);
     // The first valid event: claimed, under the name the policy gives.
-    HttpReply a = relay_serve_handle(g, treq("POST", at1, "", ra));
+    HttpReply a = claim_t(s, l, 1, ra);
     expect(a.status).toEqual(200);
     ClaimRecord ca = claim_record_of(a.body) else { ClaimRecord {.event = [], .claim = RelayClaim {.time = 0, .sig = []}} };
     expect(hex_encode(digest_of(ca.event))).toEqual(hex_encode(digest_of(ra)));
     expect(claim_ok(me, l, 1, digest_of(ra), ca.claim)).toBeTrue();
     // The same event again: the same claim. Another: 409 with that claim.
-    HttpReply again = relay_serve_handle(g, treq("POST", at1, "", ra));
+    HttpReply again = claim_t(s, l, 1, ra);
     expect(again.status).toEqual(200);
     expect(hex_encode(again.body)).toEqual(hex_encode(a.body));
-    HttpReply other = relay_serve_handle(g, treq("POST", at1, "", rb));
+    HttpReply other = claim_t(s, l, 1, rb);
     expect(other.status).toEqual(409);
     expect(hex_encode(other.body)).toEqual(hex_encode(a.body));
+    // Through HTTP the relay asks the log's witnesses for the time ("w1",
+    // "w2", "w3": unreachable here) and, without it, claims nothing.
+    StoredEvent h0 = log_e0_seq("w1h", [me]);
+    List(Int) hl = put_e0(s, h0);
+    expect(relay_serve_handle(g, treq("POST", "/claim/" + hex_encode(hl) + "/1", "", kit_recover_at(hl, h0, 4, 20))).status).toEqual(503);
+    expect(absent(s, "claim/" + hex_encode(hl) + "/1")).toBeTrue();
     // A log whose policy names another relay: not this relay's to claim.
     StoredEvent f0 = log_e0_seq("w1b", [WitnessRef {.url = "relay:2", .key = lpub(31)}]);
     List(Int) fl = put_e0(s, f0);
-    expect(relay_serve_handle(g, treq("POST", "/claim/" + hex_encode(fl) + "/1", "", kit_recover_at(fl, f0, 4, 20))).status).toEqual(403);
+    expect(claim_t(s, fl, 1, kit_recover_at(fl, f0, 4, 20)).status).toEqual(403);
     // A log made before policy field 8: a claim nobody requires, unnamed.
     StoredEvent o0 = log_e0("w1c");
     List(Int) ol = put_e0(s, o0);
     List(Int) oa = kit_recover_at(ol, o0, 4, 20);
-    HttpReply ob = relay_serve_handle(g, treq("POST", "/claim/" + hex_encode(ol) + "/1", "", oa));
+    HttpReply ob = claim_t(s, ol, 1, oa);
     expect(ob.status).toEqual(200);
     ClaimRecord oc = claim_record_of(ob.body) else { ClaimRecord {.event = [], .claim = RelayClaim {.time = 0, .sig = []}} };
     expect(claim_ok(WitnessRef {.url = "", .key = k}, ol, 1, digest_of(oa), oc.claim)).toBeTrue();
 }
+
+// POST /claim/<l>/<n> judged at witness time 5000 (E0's is 1000).
+@requires(filesystem, network, clock(readonly), declassify)
+HttpReply claim_t(Store s, List(Int) l, Int n, List(Int) body) { return claim_reply_at("", s, hex_encode(l), f"{n}", body, 5000); }
 
 // A kit recover at 1 co-signed by witnesses 7 and 8 at `t`, stored.
 @requires(filesystem, network, clock(readonly), declassify)
@@ -1006,22 +1015,28 @@ List(Int) veto_at(List(Int) l, List(Int) rd) {
 }
 
 @requires(filesystem, network, clock(readonly), declassify)
-test "the relay does not claim an event that will not be valid five minutes on (a veto at the end of its window)" {
+test "the relay judges a claim at witness time, five minutes on included, not by its own clock" {
     Store s = tmp_store();
     RelayCfg g = cfg_of(s, "");
     List(Int) k = cose_hex_decode(str_trim(http_body_text_of(relay_serve_handle(g, get("/claim-key")).body)));
     WitnessRef me = WitnessRef {.url = "relay:1", .key = k};
-    Int now = clock_now_seconds();
-    // The recover's delay (a day) runs out in 100 seconds: a veto now is
-    // valid, but would not be in 300; with an hour left, it is claimed.
+    // The recover was witnessed at w0, long before this relay's clock:
+    // by the relay's clock its day of delay ran out long ago, and a veto
+    // would be refused. At witness time the window is open: with an hour
+    // left the veto is claimed; with 100 seconds left (not five minutes),
+    // it is not. A relay whose clock is off neither refuses nor claims
+    // wrongly (cli_e2e moves the witnesses' clocks, not the relay's).
+    Int w0 = 10000000;
     StoredEvent e0 = log_e0_seq("w1", [me]);
     List(Int) l = put_e0(s, e0);
-    List(Int) rd = put_recover(s, l, e0, now - 86400 + 100);
-    expect(relay_serve_handle(g, treq("POST", "/claim/" + hex_encode(l) + "/2", "", veto_at(l, rd))).status).toEqual(403);
+    List(Int) rd = put_recover(s, l, e0, w0);
+    expect(claim_reply_at("", s, hex_encode(l), "2", veto_at(l, rd), w0 + 86400 - 100).status).toEqual(403);
+    expect(claim_reply_at("", s, hex_encode(l), "2", veto_at(l, rd), w0 + 86400 - 3600).status).toEqual(200);
+    // Once the delay has run by witness time, the veto is not claimed.
     StoredEvent f0 = log_e0_seq("w1b", [me]);
     List(Int) fl = put_e0(s, f0);
-    List(Int) fd = put_recover(s, fl, f0, now - 86400 + 3600);
-    expect(relay_serve_handle(g, treq("POST", "/claim/" + hex_encode(fl) + "/2", "", veto_at(fl, fd))).status).toEqual(200);
+    List(Int) fd = put_recover(s, fl, f0, w0);
+    expect(claim_reply_at("", s, hex_encode(fl), "2", veto_at(fl, fd), w0 + 86400 + 10).status).toEqual(403);
 }
 
 Str http_body_text_of(List(Int) b) {

@@ -72,7 +72,7 @@ Bool has_bytes(List(List(Int)) xs, List(Int) x, Int i) {
     return has_bytes(xs, x, i + 1);
 }
 
-Bool opt_bytes_is(Option(List(Int)) o, List(Int) want) {
+pub Bool opt_bytes_is(Option(List(Int)) o, List(Int) want) {
     return match o { Some(b) => bytes_eq(b, want), None => false };
 }
 
@@ -904,6 +904,16 @@ pub List(WitnessRef) il_sequencer(List(Int) l, List(SignedEvent) before) {
     return match start(before[0], l) {
         Err(_) => [],
         Ok(a) => match run(a, before, l, lambda(x) { false }, 1) { Err(_) => [], Ok(s1) => s1.policy.sequencer }
+    };
+}
+
+// The witnesses whose co-signatures the event after the verified log
+// `before` needs (as il_next reads them); [] when it does not verify.
+pub List(WitnessRef) il_witnesses(List(Int) l, List(SignedEvent) before) {
+    if (before.len() == 0) { return []; }
+    return match start(before[0], l) {
+        Err(_) => [],
+        Ok(a) => match run(a, before, l, lambda(x) { false }, 1) { Err(_) => [], Ok(s1) => s1.policy.witnesses }
     };
 }
 

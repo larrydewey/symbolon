@@ -2371,8 +2371,10 @@ independent operators.
 that sequences the log (field 8: its name and claim key). Before a device
 asks the witnesses to co-sign event `n >= 1`, it reserves `(log, n)` at
 that relay: `POST /claim/<log>/<n>` with the event. The relay checks the
-event is valid as the next event of the log it stores (as a witness does,
-at its own clock) and still valid five minutes later (so that an event
+event is valid as the next event of the log it stores at witness time (the
+median time a majority of the policy's witnesses gives it for a fresh nonce,
+never its own clock; with no majority answering it claims nothing), and
+still valid five minutes of witness time later (so that an event
 whose validity runs out, a veto at the end of its window or a party's
 event as a recovery's delay runs, does not hold a sequence the witnesses
 would then refuse it at), stores the first such claim write-once and answers

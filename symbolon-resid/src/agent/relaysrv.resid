@@ -1195,6 +1195,14 @@ HttpReply claim_key_reply(Store root) {
 
 @requires(filesystem, network, clock(readonly), declassify)
 HttpReply claim_reply(Str ca, Store root, Str who, Str n, List(Int) body) {
+    HttpReply r = claim_reply_at(ca, root, who, n, body, -1);
+    return r;
+}
+
+// As POST /claim, judged at witness time `t` (the relay's tests); with `t`
+// negative, the time the log's witnesses give now.
+@requires(filesystem, network, clock(readonly), declassify)
+pub HttpReply claim_reply_at(Str ca, Store root, Str who, Str n, List(Int) body, Int t) {
     if (!hex_len(who, 64) || !dec_ok(n, 0) || str_parse_int(n) < 1) { return http_reply_status(404); }
     if (body.len() > max_body()) { return http_reply_status(413); }
     Int seq = str_parse_int(n);
@@ -1202,7 +1210,7 @@ HttpReply claim_reply(Str ca, Store root, Str who, Str n, List(Int) body) {
     Option(SignedEvent) oe = match se { None => None, Some(x) => signed_of(x) };
     return match oe {
         None => http_reply_status(400),
-        Some(e) => claim_event(ca, root, cose_hex_decode(who), seq, e, body)
+        Some(e) => claim_event(ca, root, cose_hex_decode(who), seq, e, body, t)
     };
 }
 
@@ -1222,7 +1230,7 @@ List(Int) claimed_digest(List(Int) stored) {
 }
 
 @requires(filesystem, network, clock(readonly), declassify)
-HttpReply claim_event(Str ca, Store root, List(Int) l, Int seq, SignedEvent e, List(Int) body) {
+HttpReply claim_event(Str ca, Store root, List(Int) l, Int seq, SignedEvent e, List(Int) body, Int given) {
     if ((Int)e.payload.sequence != seq) { return http_reply_status(400); }
     List(Int) d = sha256_bytes(e.encoded);
     Str k = "claim/" + hex_encode(l) + "/" + f"{seq}";
@@ -1230,13 +1238,21 @@ HttpReply claim_event(Str ca, Store root, List(Int) l, Int seq, SignedEvent e, L
     if (match had { None => false, Some(_) => true }) { return claim_held(had else { [] }, d); }
     List(SignedEvent) all = log_dir(root, l, (UInt(64))0, []);
     if (all.len() < seq) { return http_reply_text(403, "text/plain", "the log before this sequence is not here"); }
-    // Valid as the next event of the log stored here, at this relay's
-    // clock (as a witness checks it at its own): only a holder of the
-    // log's keys can take a sequence. And still valid claim_margin_secs()
-    // from now: an event whose validity runs out (a veto at the end of
-    // its window, a party's event as a recovery's delay runs) must not
-    // hold a sequence the witnesses would then refuse it at.
-    Int now = clock_now_seconds();
+    // Not an event that follows the log stored here: refused before the
+    // witnesses are asked anything.
+    Bool follows = opt_bytes_is(e.payload.log_id, l) && opt_bytes_is(e.payload.predecessor_digest, sha256_bytes(all[seq - 1].encoded));
+    if (!follows) { return http_reply_text(403, "text/plain", "not the next event of this log"); }
+    // Valid as the next event of the log stored here at witness time,
+    // the time the witnesses will check it at (SPEC 20.3: a majority of
+    // the policy's witnesses is trusted for time; the relay's own clock
+    // is not): only a holder of the log's keys can take a sequence. And
+    // still valid claim_margin_secs() of witness time on: an event whose
+    // validity runs out (a veto at the end of its window, a party's event
+    // as a recovery's delay runs) must not hold a sequence the witnesses
+    // would then refuse it at. No witness time (a majority did not
+    // answer): no claim.
+    Int now = if (given >= 0) { given } else { witness_now(witnesses_at(il_witnesses(l, all[0..seq]), ""), ca, random_bytes(32)) };
+    if (now <= 0) { return http_reply_text(503, "text/plain", "the log's witnesses did not give the time"); }
     Result(NextOk, SymbolonError) ok = il_next(l, all[0..seq], e, now, lambda(x) { false });
     Result(NextOk, SymbolonError) later = il_next(l, all[0..seq], e, now + claim_margin_secs(), lambda(x) { false });
     Str why = match later { Ok(_) => "", Err(w) => match w { ErrInvalidLog(m) => m + " (in " + f"{claim_margin_secs()}" + " seconds)", _ => "refused" } };
