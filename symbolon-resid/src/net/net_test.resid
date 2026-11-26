@@ -42,18 +42,15 @@ test "relay: mailboxes in order, append-only log, blobs; names are checked" {
 }
 
 @requires(network, environment, declassify, clock(readonly))
-test "witness: one digest per (log, seq), signatures verify under its key" {
+test "witness: a claim on a sequence that is not a valid next event is refused" {
+    // The witness co-signs only an event valid as the next one of the log
+    // it is shown (agent/witnesssrv_test.resid has the valid cases).
     Endpoint e = witness_at();
     List(Int) wpub = cose_hex_decode(environment.get("SYM_WITNESS_KEY"));
     List(Int) l = random_bytes(32);
-    Option(WitnessCosignature) a = cosign_from(e, wpub, l, 3, rep(2, 32));
-    Option(WitnessCosignature) again = cosign_from(e, wpub, l, 3, rep(2, 32));
-    Option(WitnessCosignature) fork = cosign_from(e, wpub, l, 3, rep(3, 32));
-    Option(WitnessCosignature) wrong_key = cosign_from(e, ec_public_key(P256, rep(6, 32)), l, 4, rep(2, 32));
-    expect(match a { Some(c) => c.sequence == 3, None => false }).toBeTrue();
-    expect(match again { Some(_) => true, None => false }).toBeTrue();
-    expect(match fork { Some(_) => "signed", None => "refused" }).toEqual("refused");
-    expect(match wrong_key { Some(_) => "accepted", None => "refused" }).toEqual("refused");
+    Option(WitnessCosignature) a = cosign_from(e, wpub, l, 3, rep(2, 32), [[1], [2], [3], [4]]);
+    expect(match a { Some(_) => "signed", None => "refused" }).toEqual("refused");
+    expect(http_call_bytes(e.host, e.port, "POST", "/cosign", cosign_request(l, [[1], [2]])).status).toEqual(400);
 }
 
 @requires(network, filesystem, declassify, clock(readonly))

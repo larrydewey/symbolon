@@ -939,6 +939,10 @@ after the delay, measured by witness time, without a valid `veto`.
 - **Veto.** A veto is signed by the DK of a device in the quorum preceding
   the event, which requires that device to be unlocked (Section 9.1). A
   thief with a locked device therefore cannot veto.
+- **One at a time.** A `recover` filed while another `recover` is pending
+  is invalid. Otherwise whoever holds the kit could take every next
+  sequence with another `recover` as soon as the last was witnessed, and
+  no veto would ever be witnessed.
 - **Contest.** A veto pauses a recovery; it does not end the right to
   recover, since otherwise anyone holding one unlocked device could block
   the owner forever (A-04). A recovery vetoed twice is *contested*: with
@@ -2006,7 +2010,16 @@ plain HTTP.
 ### 20.3 Witnesses
 
 Witnesses co-sign `(log-id, seq, digest)` and refuse a second digest for
-the same `(log-id, seq)`. Agents and the cosigner MUST require a
+the same `(log-id, seq)`. A witness co-signs only an event that is valid
+as the next event of the log it is shown with the request (the whole log
+before it, with its co-signatures): the log verifies (Section 8.3), and
+the event passes every check of the next step at the witness's own time
+but its co-signatures, which do not exist yet; at sequence 0, an inception
+whose digest is the log id, signed by every party of its quorum. So only
+the holders of a log's keys can take its next sequence, and a device's
+veto of a pending recovery is co-signable until the delay has run by the
+witness's clock.
+Agents and the cosigner MUST require a
 majority of the policy's witnesses on `recover`, delayed and `reshare`
 events and on heads they release material against, and SHOULD require
 them on all heads. A policy MUST name at least three witnesses run by

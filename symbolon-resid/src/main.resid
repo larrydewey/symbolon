@@ -135,6 +135,7 @@ import "agent/link.resid";
 import "agent/orgcli.resid";
 import "agent/orgconsole.resid";
 import "agent/relaysrv.resid";
+import "agent/witnesssrv.resid";
 import "agent/scim.resid";
 import "agent/webauthn.resid";
 import "agent/home.resid";

@@ -1,0 +1,137 @@
+// A witness (SPEC 20.3) as an HTTP handler over a data directory:
+// `symbolon witness serve` (main.resid). The client side, and the wire
+// format, are in net/services.resid (cosign_request, cosign_from, time_from).
+//
+//   POST /cosign   CBOR [log id, E0, ..., En] (cosign_request): the whole log
+//                  before En, with its co-signatures, then En. Answers CBOR
+//                  [time, r || s] over witness_message(log, n, H(En)); 409
+//                  when the witness co-signed another digest at (log, n) or
+//                  at a sequence of the log shown; 403 when En is not valid
+//                  as the next event of that log; 400 when it does not parse.
+//   POST /time     a 32-byte nonce; answers CBOR [time, r || s] over
+//                  ["symbolon v1 witness time", nonce, time] (SPEC 13.4)
+//
+// The witness co-signs an event only once the log before it verifies (as
+// every agent verifies it, SPEC 8.3) and the event passes every check of
+// the next step under the signing rules in force at the witness's time:
+// sequence, predecessor, log id, field 6 and the signatures its body needs
+// (core/log.resid il_check_next). At sequence 0 the event must be an
+// inception whose digest is the log id, signed by every party of its
+// quorum. So only the holders of a log's keys can take its next sequence:
+// a stranger's claim, or a second recover filed by a kit while one is
+// pending, is refused, and a device's veto of a pending recovery is
+// co-signable until the delay has run by the witness's clock. Guardian
+// approvals are not accepted, as the agents do not accept them yet
+// (agent/common.resid verified_events).
+//
+// Files: seen/<log>/<seq>, the digest the witness co-signed there (32
+// bytes) and its answer; written once, never changed. A request re-verifies
+// the log it carries: an agent does the same on every fetch (SPEC 8.4), and
+// it is a few milliseconds per event.
+
+import "../types.resid";
+import "../core/log.resid";
+import "../core/event_decode.resid";
+import "../net/services.resid";
+import "state.resid";
+import "common.resid";
+import "httpserv.resid";
+import "ecdsa.resid";
+import "crypto.resid";
+import "cose.resid";
+import "clock.resid";
+
+// `offset` (seconds) is added to the witness's clock: a test witness that
+// claims later times stands for the time passing (a witness majority is
+// trusted for time by design, SPEC 20.3).
+@requires(filesystem, clock(readonly), declassify)
+pub HttpReply witness_handle(Str root, List(Secret(UInt(8))) wpriv, Int offset, HttpRequest r) {
+    if (r.method == "POST" && r.path == "/time") {
+        if (r.body.len() != 32) { return http_reply_status(400); }
+        Int t = clock_now_seconds() + offset;
+        return http_reply_bytes(200, "application/cbor", cbe_bytes(ecdsag_sign_raw(P256, Sha256, wpriv, time_message(r.body, t)), cbe_uint(t, cbe_array(2, []))));
+    }
+    if (r.method != "POST" || r.path != "/cosign") { return http_reply_status(404); }
+    Option(CoReq) oq = parse_cosign(r.body);
+    return match oq {
+        None => http_reply_status(400),
+        Some(q) => witness_sign(root, wpriv, offset, q)
+    };
+}
+
+type CoReq = { List(Int) l; List(SignedEvent) before; SignedEvent e; };
+
+// [bstr(32) log id, bstr event, ...], at least one event, nothing after.
+Option(CoReq) parse_cosign(List(Int) b) {
+    Rd h = rd(b, 0);
+    if (h.major != 4 || h.val < 2) { return None; }
+    Option(List(List(Int))) items = byte_strings(b, h.next, h.val, []);
+    return match items {
+        None => None,
+        Some(xs) => if (xs[0].len() != 32) { None } else { coreq_of(xs[0], events_of(xs, 1, [])) }
+    };
+}
+
+Option(CoReq) coreq_of(List(Int) l, Option(List(SignedEvent)) oes) {
+    return match oes {
+        None => None,
+        Some(es) => Some(CoReq {.l = l, .before = es[0..es.len() - 1], .e = es[es.len() - 1]})
+    };
+}
+
+Option(List(List(Int))) byte_strings(List(Int) b, Int p, Int n, List(List(Int)) acc) {
+    if (n == 0) { return if (p == b.len()) { Some(acc) } else { None }; }
+    Rd h = rd(b, p);
+    if (h.major != 2 || h.next + h.val > b.len()) { return None; }
+    return byte_strings(b, h.next + h.val, n - 1, acc.concat([b[h.next..h.next + h.val]]));
+}
+
+Option(List(SignedEvent)) events_of(List(List(Int)) xs, Int i, List(SignedEvent) acc) {
+    if (i >= xs.len()) { return Some(acc); }
+    Option(StoredEvent) se = event_of_cbor(xs[i]);
+    Option(SignedEvent) e = match se { None => None, Some(x) => signed_of(x) };
+    return match e { None => None, Some(x) => events_of(xs, i + 1, acc.concat([x])) };
+}
+
+@requires(filesystem, clock(readonly), declassify)
+HttpReply witness_sign(Str root, List(Secret(UInt(8))) wpriv, Int offset, CoReq q) {
+    UInt(64) seq = q.e.payload.sequence;
+    if ((Int)seq != q.before.len()) { return http_reply_status(400); }
+    List(Int) d = sha256_bytes(q.e.encoded);
+    Str dir = root + "/seen/" + hex_encode(q.l);
+    Str f = dir + "/" + f"{seq}";
+    if (filesystem.exists(f)) {
+        List(Int) held = filesystem.read_bytes(f);
+        if (held.len() <= 32 || !bytes_eq(held[0..32], d)) { return http_reply_status(409); }
+        return http_reply_bytes(200, "application/cbor", held[32..held.len()]);
+    }
+    // The log shown must be the one this witness co-signed, where it did.
+    if (!seen_agree(dir, q.before, 0)) { return http_reply_status(409); }
+    Int t = clock_now_seconds() + offset;
+    Result(UInt(64), SymbolonError) ok = il_check_next(q.l, q.before, q.e, t, lambda(p) { false });
+    return match ok {
+        Err(e) => http_reply_text(403, "text/plain", match e { ErrInvalidLog(why) => why, _ => "refused" }),
+        Ok(_) => witness_store(f, dir, wpriv, q.l, seq, d, t)
+    };
+}
+
+@requires(filesystem, declassify)
+HttpReply witness_store(Str f, Str dir, List(Secret(UInt(8))) wpriv, List(Int) l, UInt(64) seq, List(Int) d, Int t) {
+    List(Int) sig = ecdsag_sign_raw(P256, Sha256, wpriv, witness_message(l, seq, d));
+    List(Int) answer = cbe_bytes(sig, cbe_uint(t, cbe_array(2, [])));
+    _ = filesystem.create_dir(str_slice(dir, 0, str_len(dir) - 65));
+    _ = filesystem.create_dir(dir);
+    if (!filesystem.write_bytes(f, d.concat(answer))) { return http_reply_status(500); }
+    return http_reply_bytes(200, "application/cbor", answer);
+}
+
+@requires(filesystem)
+Bool seen_agree(Str dir, List(SignedEvent) es, Int i) {
+    if (i >= es.len()) { return true; }
+    Str f = dir + "/" + f"{i}";
+    if (filesystem.exists(f)) {
+        List(Int) held = filesystem.read_bytes(f);
+        if (held.len() < 32 || !bytes_eq(held[0..32], sha256_bytes(es[i].encoded))) { return false; }
+    }
+    return seen_agree(dir, es, i + 1);
+}

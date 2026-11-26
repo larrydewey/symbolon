@@ -16,10 +16,13 @@
 //                              line, sorted, at most max_listed() (people's cards, the
 //                              shared collections a person's devices have keys for)
 //
-// A witness co-signs (log, seq, digest) once: a second digest for the same
-// (log, seq) is refused (409), the first is re-signed on request.
+// A witness (agent/witnesssrv.resid) co-signs (log, seq, digest) once, and
+// only for an event valid as the next one of the log it is shown: a second
+// digest for the same (log, seq) is refused (409), the first is re-signed
+// on request; an event that is not valid there is refused (403).
 //
-//   POST /cosign               CBOR [log, seq, digest]; answers CBOR [time, r || s]
+//   POST /cosign               CBOR [log, E0, ..., En]; answers CBOR [time, r || s]
+//                              over ["symbolon v1 witness", log, n, H(En)]
 //   POST /time                 a 32-byte nonce; answers CBOR [time, r || s] over
 //                              ["symbolon v1 witness time", nonce, time]: the witness
 //                              time devices and the cosigner measure delays by (SPEC 13.4)
@@ -130,32 +133,20 @@ HttpReply file_reply(Str f) {
 // A witness
 // ============================================================================
 
-// The witness's request: CBOR [log id, sequence, digest].
-pub List(Int) cosign_request(List(Int) l, UInt(64) seq, List(Int) d) {
-    return cbe_bytes(d, cbe_uint((Int)seq, cbe_bytes(l, cbe_array(3, []))));
+// The witness's request (SPEC 20.3): CBOR [log id, E0, ..., En], each
+// event a byte string holding the event as the relay stores it
+// (StoredEvent, agent/state.resid): the whole log before the event to
+// co-sign, with its co-signatures, then that event (its co-signatures are
+// not read). The witness (agent/witnesssrv.resid) co-signs En only if the
+// log verifies and En is valid as its next event under the signing rules
+// in force, at the witness's time.
+pub List(Int) cosign_request(List(Int) l, List(List(Int)) events) {
+    return cosign_items(events, 0, cbe_bytes(l, cbe_array(events.len() + 1, [])));
 }
 
-type CoReq = { List(Int) l; Int seq; List(Int) d; };
-
-Option(CoReq) parse_cosign(List(Int) b) {
-    if (b.len() < 3 || b[0] != 131) { return None; }
-    Int at = 1;
-    if (b[at] != 88 || at + 2 + 32 > b.len() || b[at + 1] != 32) { return None; }
-    List(Int) l = b[at + 2..at + 34];
-    Int sp = at + 34;
-    if (sp >= b.len()) { return None; }
-    Int ib = b[sp];
-    Int ai = ib & 31;
-    if ((ib >> 5) != 0) { return None; }
-    Int n = if (ai < 24) { 0 } else { if (ai == 24) { 1 } else { if (ai == 25) { 2 } else { if (ai == 26) { 4 } else { if (ai == 27) { 8 } else { -1 } } } } };
-    if (n < 0 || sp + 1 + n + 34 != b.len()) { return None; }
-    Int seq = if (n == 0) { ai } else { be_at(b, sp + 1, n, 0) };
-    Int dp = sp + 1 + n;
-    if (b[dp] != 88 || b[dp + 1] != 32) { return None; }
-    List(Int) d = b[dp + 2..dp + 34];
-    // Canonical only: the bytes must be what cosign_request writes.
-    if (!bytes_eq(cosign_request(l, (UInt(64))seq, d), b)) { return None; }
-    return Some(CoReq {.l = l, .seq = seq, .d = d});
+List(Int) cosign_items(List(List(Int)) es, Int i, List(Int) acc) {
+    if (i >= es.len()) { return acc; }
+    return cosign_items(es, i + 1, cbe_bytes(es[i], acc));
 }
 
 Int be_at(List(Int) b, Int p, Int n, Int acc) { return if (n == 0) { acc } else { be_at(b, p + 1, n - 1, acc * 256 + b[p]) }; }
@@ -164,41 +155,6 @@ Int be_at(List(Int) b, Int p, Int n, Int acc) { return if (n == 0) { acc } else 
 // What a witness signs for a time query.
 pub List(Int) time_message(List(Int) nonce, Int t) {
     return cbe_uint(t, cbe_bytes(nonce, cbe_text("symbolon v1 witness time", cbe_array(3, []))));
-}
-
-// `offset` (seconds) is added to the witness's clock: a test witness that
-// claims later times stands for the time passing (a witness majority is
-// trusted for time by design, SPEC 20.3).
-@requires(filesystem, clock(readonly), declassify)
-pub HttpReply witness_handle(Str root, List(Secret(UInt(8))) wpriv, Int offset, HttpRequest r) {
-    if (r.method == "POST" && r.path == "/time") {
-        if (r.body.len() != 32) { return http_reply_status(400); }
-        Int t = clock_now_seconds() + offset;
-        return http_reply_bytes(200, "application/cbor", cbe_bytes(ecdsag_sign_raw(P256, Sha256, wpriv, time_message(r.body, t)), cbe_uint(t, cbe_array(2, []))));
-    }
-    if (r.method != "POST" || r.path != "/cosign") { return http_reply_status(404); }
-    Option(CoReq) oq = parse_cosign(r.body);
-    return match oq {
-        None => http_reply_status(400),
-        Some(q) => witness_sign(root, wpriv, offset, q)
-    };
-}
-
-@requires(filesystem, clock(readonly), declassify)
-HttpReply witness_sign(Str root, List(Secret(UInt(8))) wpriv, Int offset, CoReq q) {
-    Str dir = root + "/seen/" + hex_encode(q.l);
-    Str f = dir + "/" + f"{q.seq}";
-    if (filesystem.exists(f)) {
-        List(Int) held = filesystem.read_bytes(f);
-        if (!bytes_eq(held[0..32], q.d)) { return http_reply_status(409); }
-        return http_reply_bytes(200, "application/cbor", held[32..held.len()]);
-    }
-    Int t = clock_now_seconds() + offset;
-    List(Int) sig = ecdsag_sign_raw(P256, Sha256, wpriv, witness_message(q.l, (UInt(64))q.seq, q.d));
-    List(Int) answer = cbe_bytes(sig, cbe_uint(t, cbe_array(2, [])));
-    _ = filesystem.create_dir(dir);
-    if (!filesystem.write_bytes(f, q.d.concat(answer))) { return http_reply_status(500); }
-    return http_reply_bytes(200, "application/cbor", answer);
 }
 
 // ============================================================================
@@ -577,9 +533,11 @@ Str text_of_body(List(Int) b, Int i, StrBuf acc) {
 }
 
 // A witness's co-signature on (l, seq, d), checked here under its key.
+// `events`: the log up to and including the event at `seq` whose digest is
+// `d`, as cosign_request takes it.
 @requires(network, clock(readonly), declassify)
-pub Option(WitnessCosignature) cosign_from(Endpoint e, List(Int) wkey, List(Int) l, UInt(64) seq, List(Int) d) {
-    HttpOut o = http_call_ep(e, "POST", "/cosign", cosign_request(l, seq, d));
+pub Option(WitnessCosignature) cosign_from(Endpoint e, List(Int) wkey, List(Int) l, UInt(64) seq, List(Int) d, List(List(Int)) events) {
+    HttpOut o = http_call_ep(e, "POST", "/cosign", cosign_request(l, events));
     if (o.status != 200) { return None; }
     List(Int) b = o.body;
     // [uint time, bytes(64)]

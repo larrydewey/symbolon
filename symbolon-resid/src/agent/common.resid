@@ -135,6 +135,11 @@ Fetched fetch_raw(Endpoint relay, List(Int) l, UInt(64) seq, List(List(Int)) acc
     };
 }
 
+// The raw events of log `l` from 0 until the first gap (each as the relay
+// stores it): what a device shows the witnesses before the next event.
+@requires(network, clock(readonly), declassify)
+pub List(List(Int)) log_raw(Endpoint relay, List(Int) l) { return fetch_raw(relay, l, (UInt(64))0, []).evs; }
+
 List(SignedEvent) events_of_raw(List(List(Int)) rs, Int i, List(SignedEvent) acc) {
     if (i >= rs.len()) { return acc; }
     Option(StoredEvent) se = event_of_cbor(rs[i]);

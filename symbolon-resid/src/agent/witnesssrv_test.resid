@@ -1,0 +1,143 @@
+// The witness (agent/witnesssrv.resid), called as its HTTP handler over a
+// fresh directory under target/: it co-signs only an event that is valid
+// as the next one of the log it is shown (SPEC 20.3).
+
+import "../types.resid";
+import "../core/log.resid";
+import "../core/event.resid";
+import "../core/event_decode.resid";
+import "../net/services.resid";
+import "state.resid";
+import "common.resid";
+import "witnesssrv.resid";
+import "httpserv.resid";
+import "hash.resid";
+import "ecdsa.resid";
+import "crypto.resid";
+import "random.resid";
+
+// Fixed private keys: scalar n.
+List(Int) priv(Int n) { return [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, n]; }
+List(Int) pubk(Int n) { return ec_public_key(P256, priv(n)); }
+List(Int) sign(Int n, List(Int) msg) { return ecdsa_raw_of(P256, ecdsa_sign_digest(P256, Sha256, priv(n), hash_bytes(Sha256, msg))); }
+List(Int) id32(Int n) { return sha256_bytes([n]); }
+
+Party dev_party(Int n) {
+    return Party {.id = id32(n), .kind = party_kind_device(), .auth_key = pubk(n), .hpke_key = pubk(n), .label = "d", .attestation = NoAttestation};
+}
+
+Policy policy_with(List(Int) wpub) {
+    return Policy {.device_sigs_for_authority = 2, .recovery_delay_sec = 86400, .guardians = [], .guardian_threshold = 0,
+                   .witnesses = [WitnessRef {.url = "w1", .key = wpub}, WitnessRef {.url = "w2", .key = pubk(8)}, WitnessRef {.url = "w3", .key = pubk(11)}],
+                   .duress_window_sec = 3600, .cosigner_policy = NoCosignerPolicy};
+}
+
+List(EventSig) sigs(List(Int) who, List(Int) msg, Int i, List(EventSig) acc) {
+    if (i >= who.len()) { return acc; }
+    return sigs(who, msg, i + 1, acc.concat([EventSig {.signer = id32(who[i]), .sig = sign(who[i], msg)}]));
+}
+
+StoredEvent ev(EventPayload p, List(Int) who) {
+    List(Int) enc = payload_cbor(p) else { [] };
+    return StoredEvent {.encoded = enc, .sigs = sigs(who, enc, 0, []), .cosigs = []};
+}
+
+List(Int) dig(StoredEvent e) { return sha256_bytes(e.encoded); }
+
+EventPayload e0_payload(List(Int) wpub) {
+    Quorum q = Quorum {.parties = [dev_party(2), dev_party(3)], .t = 2, .root_pubkey = pubk(9), .epoch = 0, .transcript_digest = id32(99), .kv_commits = []};
+    return EventPayload {.log_id = None, .sequence = 0, .predecessor_digest = None, .suite = 1, .body = InceptionBody(q, policy_with(wpub)),
+                         .next_recovery_key_digests = [sha256_bytes(pubk(20))], .advisory_time = 0};
+}
+
+EventPayload after(List(Int) l, UInt(64) seq, StoredEvent prev, EventBody b, List(List(Int)) field6) {
+    return EventPayload {.log_id = Some(l), .sequence = seq, .predecessor_digest = Some(dig(prev)), .suite = 1, .body = b,
+                         .next_recovery_key_digests = field6, .advisory_time = 0};
+}
+
+EventBody kit_recover(Int dev) {
+    return RecoverBody(RecoverBodyInner {.path = recover_path_kit(), .new_parties = [dev_party(dev)], .revealed_recovery_key = Some(pubk(20)), .guardian_approvals = []});
+}
+
+HttpRequest post(Str path, List(Int) body) {
+    Map(Str, Str) none = {};
+    return HttpRequest {.method = "POST", .target = path, .path = path, .query = "", .version = "HTTP/1.1", .headers = none, .body = body, .keep_alive = false, .ok = true, .status = 0};
+}
+
+List(List(Int)) raws(List(StoredEvent) es, Int i, List(List(Int)) acc) {
+    if (i >= es.len()) { return acc; }
+    return raws(es, i + 1, acc.concat([cbor_of_event(es[i])]));
+}
+
+@requires(filesystem, clock(readonly), declassify)
+HttpReply ask(Str root, List(Secret(UInt(8))) wpriv, List(Int) l, List(StoredEvent) shown) {
+    return witness_handle(root, wpriv, 0, post("/cosign", cosign_request(l, raws(shown, 0, []))));
+}
+
+// The co-signatures that complete event `e` at `seq`: the witness's answer
+// and witness 2's (key 8) at the same time.
+List(Int) last64(List(Int) b) { return if (b.len() < 64) { [] } else { b[b.len() - 64..b.len()] }; }
+
+List(WitnessCosignature) completed(HttpReply a, List(Int) wpub, List(Int) l, UInt(64) seq, StoredEvent e) {
+    Int t = rd(a.body, 1).val;
+    List(Int) d = dig(e);
+    return [WitnessCosignature {.log_id = l, .sequence = seq, .digest = d, .witness_key = wpub, .signature = last64(a.body), .witness_time = (UInt(64))t},
+            WitnessCosignature {.log_id = l, .sequence = seq, .digest = d, .witness_key = pubk(8), .signature = sign(8, witness_message(l, seq, d)), .witness_time = (UInt(64))t}];
+}
+
+StoredEvent with_cosigs(StoredEvent e, List(WitnessCosignature) cs) { return StoredEvent {.encoded = e.encoded, .sigs = e.sigs, .cosigs = cs}; }
+
+Bool answer_verifies(HttpReply a, List(Int) wpub, List(Int) l, UInt(64) seq, StoredEvent e) {
+    return a.status == 200 && a.body.len() > 64 && ecdsa_verify_raw(P256, Sha256, wpub, witness_message(l, seq, dig(e)), a.body[a.body.len() - 64..a.body.len()]);
+}
+
+@requires(filesystem, clock(readonly), declassify)
+test "a witness co-signs a device's veto of a pending kit recovery, and refuses the kit's claim on that sequence and a stranger's" {
+    Str root = "target/witness-test-" + hex_encode(random_bytes(8));
+    _ = filesystem.create_dir("target");
+    _ = filesystem.create_dir(root);
+    List(Secret(UInt(8))) wpriv = random_secret(32);
+    List(Int) wpub = ec_public_keyg(P256, wpriv);
+    // E0: two devices, a kit (key 20) in field 6; signed by both devices.
+    StoredEvent e0 = ev(e0_payload(wpub), [2, 3]);
+    List(Int) l = dig(e0);
+    // An inception that is not of this log id, or not signed by every party.
+    expect(ask(root, wpriv, id32(1), [e0]).status).toEqual(403);
+    expect(ask(root, wpriv, l, [ev(e0_payload(wpub), [2])]).status).toEqual(403);
+    HttpReply a0 = ask(root, wpriv, l, [e0]);
+    expect(a0.status).toEqual(200);
+    expect(answer_verifies(a0, wpub, l, 0, e0)).toBeTrue();
+    StoredEvent e0c = with_cosigs(e0, completed(a0, wpub, l, 0, e0));
+    // The kit files a recover at 1: co-signed.
+    StoredEvent r1 = ev(after(l, 1, e0, kit_recover(4), [id32(51)]), [20]);
+    HttpReply a1 = ask(root, wpriv, l, [e0c, r1]);
+    expect(a1.status).toEqual(200);
+    expect(answer_verifies(a1, wpub, l, 1, r1)).toBeTrue();
+    StoredEvent r1c = with_cosigs(r1, completed(a1, wpub, l, 1, r1));
+    // The kit's second recover at 2 (to keep a veto from being witnessed),
+    // a veto signed by a key outside the quorum, an unsigned one, a log
+    // shown without E0's co-signatures: refused, sequence 2 stays free.
+    expect(ask(root, wpriv, l, [e0c, r1c, ev(after(l, 2, r1, kit_recover(5), [id32(52)]), [20])]).status).toEqual(403);
+    expect(ask(root, wpriv, l, [e0c, r1c, ev(after(l, 2, r1, VetoBody(1), [sha256_bytes(pubk(20))]), [5])]).status).toEqual(403);
+    expect(ask(root, wpriv, l, [e0c, r1c, ev(after(l, 2, r1, VetoBody(1), [sha256_bytes(pubk(20))]), [])]).status).toEqual(403);
+    StoredEvent veto = ev(after(l, 2, r1, VetoBody(1), [sha256_bytes(pubk(20))]), [2]);
+    expect(ask(root, wpriv, l, [e0, r1c, veto]).status).toEqual(403);
+    // A log that is valid but forks from what this witness co-signed at 1
+    // (another recover there, co-signed by witnesses 2 and 3): refused.
+    StoredEvent r1x = ev(after(l, 1, e0, kit_recover(6), [id32(51)]), [20]);
+    List(WitnessCosignature) xcs = [WitnessCosignature {.log_id = l, .sequence = 1, .digest = dig(r1x), .witness_key = pubk(8), .signature = sign(8, witness_message(l, 1, dig(r1x))), .witness_time = (UInt(64))rd(a1.body, 1).val},
+                                    WitnessCosignature {.log_id = l, .sequence = 1, .digest = dig(r1x), .witness_key = pubk(11), .signature = sign(11, witness_message(l, 1, dig(r1x))), .witness_time = (UInt(64))rd(a1.body, 1).val}];
+    expect(ask(root, wpriv, l, [e0c, with_cosigs(r1x, xcs), ev(after(l, 2, r1x, VetoBody(1), [sha256_bytes(pubk(20))]), [2])]).status).toEqual(409);
+    // The device's veto: co-signed, and again on request.
+    HttpReply a2 = ask(root, wpriv, l, [e0c, r1c, veto]);
+    expect(answer_verifies(a2, wpub, l, 2, veto)).toBeTrue();
+    expect(hex_encode(ask(root, wpriv, l, [e0c, r1c, veto]).body)).toEqual(hex_encode(a2.body));
+    // Another valid event at 2 once the veto has it (a rotate-recovery by
+    // device 3, delayed): refused. The veto signed by device 3 instead is
+    // the same event (signatures are not in the digest): its answer.
+    expect(ask(root, wpriv, l, [e0c, r1c, ev(after(l, 2, r1, RotateRecoveryBody, [id32(60)]), [3])]).status).toEqual(409);
+    expect(ask(root, wpriv, l, [e0c, r1c, ev(after(l, 2, r1, VetoBody(1), [sha256_bytes(pubk(20))]), [3])]).status).toEqual(200);
+    // What does not parse.
+    expect(witness_handle(root, wpriv, 0, post("/cosign", cosign_request(l, [[1, 2, 3]]))).status).toEqual(400);
+    expect(witness_handle(root, wpriv, 0, post("/cosign", [131, 1, 2, 3])).status).toEqual(400);
+}

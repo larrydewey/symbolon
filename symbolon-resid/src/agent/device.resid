@@ -389,7 +389,7 @@ Int sign_inception_event(Str dir, DeviceConfig c, Unlocked u, KitKeys kit, List(
     List(Int) l = sha256_bytes(enc);
     List(EventSig) sigs = [EventSig {.signer = c.party, .sig = mysig}, EventSig {.signer = parties[1].party, .sig = ecdsa_sign_raw(P256, Sha256, kit.sign_priv, enc)},
                            EventSig {.signer = cr.party, .sig = csig}];
-    List(WitnessCosignature) cs = cosigs(a.witnesses, c.ca, l, 0, []);
+    List(WitnessCosignature) cs = cosigs(a.witnesses, c.ca, l, StoredEvent {.encoded = enc, .sigs = sigs, .cosigs = []});
     SignedEvent se = SignedEvent {.payload = e0, .encoded = enc, .sigs = sigs, .cosigs = cs};
     Result(VerifiedHead, SymbolonError) v = il_verify(l, [se], last_time([se], policy_of_e0([se])), lambda(p) { false });
     return match v {
@@ -399,14 +399,17 @@ Int sign_inception_event(Str dir, DeviceConfig c, Unlocked u, KitKeys kit, List(
 }
 
 @requires(network, clock(readonly), declassify)
-List(WitnessCosignature) cosigs(List(WitnessEp) ws, Str ca, List(Int) l, Int i, List(WitnessCosignature) acc) { return cosigs_for(ws, ca, l, 0, l, i, acc); }
+List(WitnessCosignature) cosigs(List(WitnessEp) ws, Str ca, List(Int) l, StoredEvent e0) { return cosigs_for(ws, ca, l, 0, l, [cbor_of_event(e0)], 0, []); }
 
-// Every witness's co-signature on (l, seq, d) that verifies.
+// Every witness's co-signature on (l, seq, d) that verifies. `events`: the
+// log before the event, with its co-signatures, then the event (each as
+// the relay stores it), which the witness verifies before it co-signs
+// (SPEC 20.3, agent/witnesssrv.resid).
 @requires(network, clock(readonly), declassify)
-pub List(WitnessCosignature) cosigs_for(List(WitnessEp) ws, Str ca, List(Int) l, UInt(64) seq, List(Int) d, Int i, List(WitnessCosignature) acc) {
+pub List(WitnessCosignature) cosigs_for(List(WitnessEp) ws, Str ca, List(Int) l, UInt(64) seq, List(Int) d, List(List(Int)) events, Int i, List(WitnessCosignature) acc) {
     if (i >= ws.len()) { return acc; }
-    Option(WitnessCosignature) c = cosign_from(Endpoint {.host = ws[i].host, .port = ws[i].port, .ca = ca, .token = ""}, ws[i].key, l, seq, d);
-    return cosigs_for(ws, ca, l, seq, d, i + 1, match c { Some(x) => acc.concat([x]), None => acc });
+    Option(WitnessCosignature) c = cosign_from(Endpoint {.host = ws[i].host, .port = ws[i].port, .ca = ca, .token = ""}, ws[i].key, l, seq, d, events);
+    return cosigs_for(ws, ca, l, seq, d, events, i + 1, match c { Some(x) => acc.concat([x]), None => acc });
 }
 
 @requires(network, declassify, clock)
