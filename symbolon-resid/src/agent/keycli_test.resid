@@ -269,3 +269,14 @@ test "the files have one shape with and without a duress PIN, keys or changes un
     expect(hex_encode(get_file(profile_file(d2, "b"))) == b2).toBeFalse();
     expect(unlock_dir(d2, c2, "2222").kind).toEqual(0);
 }
+
+@requires(filesystem, device, declassify, provision, network, environment, clock)
+test "under the duress PIN the fill policy change is acted: success shown, the device's policy unchanged" {
+    Str dir = fresh_dir();
+    DeviceConfig c = made_with(dir, "2222");
+    expect(key_fills_pin(dir, "any", "1111")).toEqual(0);
+    expect(filesystem.read_all(dir + "/fill-policy")).toEqual("any\n");
+    expect(key_fills_pin(dir, "keys", "2222")).toEqual(0);
+    expect(filesystem.read_all(dir + "/fill-policy")).toEqual("any\n");
+    expect(key_fills_pin(dir, "keys", "9999")).toEqual(1);
+}

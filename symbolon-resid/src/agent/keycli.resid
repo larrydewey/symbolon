@@ -175,17 +175,26 @@ pub Int key_add_commit(Str dir, DeviceConfig c, Unlocked u, Str name, List(Int) 
 // security key (SPEC 22.7 item 2). The PIN, and a touch when a key is
 // enrolled: the policy is changed only by whoever can open the device.
 @requires(filesystem, network, device, declassify, clock, provision, environment)
-pub Int key_fills(Str dir, Str mode) {
+pub Int key_fills(Str dir, Str mode) { Int r = key_fills_pin(dir, mode, read_pin()); return r; }
+
+// Under the duress PIN the change is acted (SPEC 14.2): the same unlock,
+// list and file write, the same answer for the duress profile's own keys,
+// but the device's fill policy is written back as it was, since it is the
+// real profile's.
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+pub Int key_fills_pin(Str dir, Str mode, Str pin) {
     if (mode != "keys" && mode != "any") { return dfail("say keys (fill only with a security key) or any"); }
     Option(DeviceConfig) oc = load_config(dir);
     DeviceConfig c = oc else { return_cfg_none() };
     if (c.log_id.len() == 0) { return dfail("not set up (device new, device init)"); }
-    Unlocked u = unlock_dir(dir, c, read_pin());
-    if (u.kind != 1) { return dfail("wrong PIN, or no enrolled key present"); }
+    Unlocked u = unlock_dir(dir, c, pin);
+    if (u.kind != 1 && u.kind != 2) { return dfail("wrong PIN, or no enrolled key present"); }
     OwnList o = if (keys_v2(dir)) { own_list(dir, u) } else { no_own() };
     KeyList ol = o.list;
     Bool keyed = if (keys_v2(dir)) { ol.keys.len() > 0 } else { keys_enrolled(dir) };
-    if (!filesystem.write_all(fill_policy_file(dir), mode + "\n")) { return dfail("cannot write " + fill_policy_file(dir)); }
+    Str was = filesystem.read_all(fill_policy_file(dir));
+    Str written = if (u.kind == 1) { mode + "\n" } else { was };
+    if (!filesystem.write_all(fill_policy_file(dir), written)) { return dfail("cannot write " + fill_policy_file(dir)); }
     println(if (mode == "keys") { "fills need a security key" + if (keyed) { "" } else { "; none is enrolled, so this device fills nothing until one is" } } else { "fills need the PIN" + if (keyed) { " and the enrolled key" } else { "" } });
     return 0;
 }
