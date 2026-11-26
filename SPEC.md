@@ -1195,7 +1195,10 @@ covers every device of the identity.
   user-authentication request whose session identifier, or whose server
   host key (`publickey-hostbound-v00@openssh.com`), differs from the bound
   session's is refused. A forwarded agent request is marked and warned
-  about.
+  about. As in OpenSSH's agent, a connection binds again only along a
+  forwarding chain: a bind after a non-forwarding one is refused, the
+  forwarding mark stays once any hop forwarded, the first host is the one
+  shown and requests are checked against the latest hop.
 
 The window takes the PIN and runs `symbolon device ssh sign`, which opens
 the item and signs. Only the signature, which is public, goes back to the

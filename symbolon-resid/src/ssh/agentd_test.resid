@@ -1,0 +1,70 @@
+// The SSH agent's session binding (session-bind@openssh.com) across more
+// than one bind on a connection: as OpenSSH's agent, a bind after a
+// non-forwarding bind is refused, forwarding is sticky and the first host
+// stays the one shown.
+
+import "agentd.resid";
+import "sshwire.resid";
+import "../agent/sshcli.resid";
+import "crypto.resid";
+import "ecdsa.resid";
+import "hash.resid";
+
+List(Int) rep(Int b, Int n) { return if (n <= 0) { [] } else { [b].concat(rep(b, n - 1)) }; }
+
+List(Int) priv(Int n) { return rep(0, 31).concat([n]); }
+
+List(Int) host(Int n) { return ecdsa_blob("nistp256", ec_public_key(P256, priv(n))); }
+
+List(Int) sid(Int n) { return rep(n, 32); }
+
+// A session-bind extension body: host n's signature over session id s.
+List(Int) bind_body(Int n, Int s, Bool fwd) {
+    EcSig g = ecdsa_sign_digest(P256, Sha256, priv(n), hash_bytes(Sha256, sid(s)));
+    return sstr("session-bind@openssh.com").concat(sstring(host(n))).concat(sstring(sid(s)))
+        .concat(sstring(ecdsa_sig_blob("nistp256", ecdsa_raw_of(P256, g)))).concat([if (fwd) { 1 } else { 0 }]);
+}
+
+@requires(filesystem, network, clock, process, environment)
+Reply bind(AgentSession s, Int n, Int sn, Bool fwd) { return answer_via("", "", 0, "", s, msg_extension(), bind_body(n, sn, fwd)); }
+
+Bool ok(Reply r) { return hex_encode(r.out) == hex_encode(agent_msg(msg_success(), [])); }
+
+@requires(filesystem, network, clock, process, environment)
+test "a bind after a non-forwarding bind is refused and changes nothing" {
+    Reply a = bind(unbound(), 2, 10, false);
+    expect(ok(a)).toBeTrue();
+    expect(hex_encode(a.s.host_key)).toEqual(hex_encode(host(2)));
+    Reply b = bind(a.s, 3, 11, false);
+    expect(ok(b)).toBeFalse();
+    expect(hex_encode(b.s.host_key)).toEqual(hex_encode(host(2)));
+    expect(hex_encode(b.s.session_id)).toEqual(hex_encode(sid(10)));
+    // Not even as a forwarding bind.
+    Reply c = bind(a.s, 3, 11, true);
+    expect(ok(c)).toBeFalse();
+    expect(c.s.forwarding).toBeFalse();
+    // The same session again with the same key: accepted, unchanged.
+    Reply d = bind(a.s, 2, 10, false);
+    expect(ok(d)).toBeTrue();
+    expect(hex_encode(d.s.session_id)).toEqual(hex_encode(sid(10)));
+}
+
+@requires(filesystem, network, clock, process, environment)
+test "along a forwarding chain forwarding stays set and the first host is shown" {
+    Reply a = bind(unbound(), 2, 10, true);
+    expect(ok(a)).toBeTrue();
+    expect(a.s.forwarding).toBeTrue();
+    // The forwarded client's own bind, non-forwarding: taken as the next hop.
+    Reply b = bind(a.s, 3, 11, false);
+    expect(ok(b)).toBeTrue();
+    expect(b.s.forwarding).toBeTrue();
+    expect(hex_encode(b.s.host_key)).toEqual(hex_encode(host(2)));
+    expect(hex_encode(b.s.session_id)).toEqual(hex_encode(sid(11)));
+    // The chain ended there.
+    Reply c = bind(b.s, 4, 12, true);
+    expect(ok(c)).toBeFalse();
+    expect(hex_encode(c.s.session_id)).toEqual(hex_encode(sid(11)));
+    // A session already bound under another host key is refused.
+    Reply d = bind(a.s, 3, 10, true);
+    expect(ok(d)).toBeFalse();
+}

@@ -37,16 +37,40 @@ import "clock.resid";
 pub Bool verifies(List(Int) blob, List(Int) data, List(Int) sig_blob) { return sig_verifies(blob, data, sig_blob); }
 
 // The session a client bound (session-bind@openssh.com), checked: the
-// host key's signature over the session identifier.
-pub type AgentSession = { List(Int) host_key; List(Int) session_id; Bool forwarding; Bool bound; };
+// host key's signature over the session identifier. A connection may bind
+// more than once only along a forwarding chain, as in OpenSSH's agent: the
+// first host is kept for the consent window (host_key), the latest hop is
+// what requests are checked against (dest_key, session_id), forwarding is
+// sticky once any hop forwarded, and after a non-forwarding bind (final)
+// nothing more is bound.
+pub type AgentSession = { List(Int) host_key; List(Int) session_id; Bool forwarding; Bool bound; List(Int) dest_key; Bool final; Int hops; };
 
-pub AgentSession unbound() { return AgentSession {.host_key = [], .session_id = [], .forwarding = false, .bound = false}; }
+pub AgentSession unbound() { return AgentSession {.host_key = [], .session_id = [], .forwarding = false, .bound = false, .dest_key = [], .final = false, .hops = 0}; }
+
+// OpenSSH's limit on a connection's bindings (AGENT_MAX_SESSION_IDS).
+pub Int max_hops() { return 16; }
+
+// The connection's session after a further checked bind `b`, or None when
+// it is refused: after a non-forwarding bind (which would let a client on
+// the bound host, or whoever controls the connection, replace the host the
+// window shows and clear "forwarding"), past max_hops, or for a session
+// already bound under another host key. The same session bound again with
+// the same host key changes nothing.
+pub Option(AgentSession) rebind(AgentSession s, AgentSession b) {
+    if (!b.bound) { return None; }
+    if (!s.bound) { return Some(b); }
+    if (hex_encode(b.session_id) == hex_encode(s.session_id)) { return if (hex_encode(b.dest_key) == hex_encode(s.dest_key)) { Some(s) } else { None }; }
+    if (s.final || s.hops >= max_hops()) { return None; }
+    return Some(AgentSession {.host_key = s.host_key, .session_id = b.session_id, .forwarding = s.forwarding || b.forwarding, .bound = true,
+                              .dest_key = b.dest_key, .final = b.final, .hops = s.hops + 1});
+}
 
 pub Option(AgentSession) checked_bind(List(Int) body) {
     Option(Bind) ob = bind_of(body);
     return match ob {
         None => None,
-        Some(b) => if (verifies(b.host_key, b.session_id, b.sig)) { Some(AgentSession {.host_key = b.host_key, .session_id = b.session_id, .forwarding = b.forwarding, .bound = true}) } else { None }
+        Some(b) => if (verifies(b.host_key, b.session_id, b.sig)) { Some(AgentSession {.host_key = b.host_key, .session_id = b.session_id, .forwarding = b.forwarding, .bound = true,
+                                                                                .dest_key = b.host_key, .final = !b.forwarding, .hops = 1}) } else { None }
     };
 }
 
@@ -54,7 +78,7 @@ pub Option(AgentSession) checked_bind(List(Int) body) {
 pub Str refused(AgentSession s, List(Int) key, Signed w) {
     if (w.kind == "auth" && hex_encode(w.key) != hex_encode(key)) { return "the request names another key"; }
     if (w.kind == "auth" && s.bound && hex_encode(w.session_id) != hex_encode(s.session_id)) { return "the request is for another session than the one bound"; }
-    if (w.kind == "auth" && w.host_key.len() > 0 && s.bound && hex_encode(w.host_key) != hex_encode(s.host_key)) { return "the request names another server than the one bound"; }
+    if (w.kind == "auth" && w.host_key.len() > 0 && s.bound && hex_encode(w.host_key) != hex_encode(s.dest_key)) { return "the request names another server than the one bound"; }
     return "";
 }
 
@@ -292,7 +316,8 @@ pub Reply answer_via(Str dir, Str rt, Int pid, Str peer, AgentSession s, Int t, 
     if (t == msg_request_identities()) { return Reply {.out = identities_answer(idents_of(read_index(dir), read_certs(dir), clock_now_seconds(), 0, [])), .s = s}; }
     if (t == msg_extension()) {
         Option(AgentSession) b = checked_bind(body);
-        return match b { None => Reply {.out = failure(), .s = s}, Some(x) => Reply {.out = agent_msg(msg_success(), []), .s = x} };
+        Option(AgentSession) n = match b { None => None, Some(x) => rebind(s, x) };
+        return match n { None => Reply {.out = failure(), .s = s}, Some(x) => Reply {.out = agent_msg(msg_success(), []), .s = x} };
     }
     if (t == msg_sign_request()) { return Reply {.out = sign_reply(dir, rt, pid, peer, s, body), .s = s}; }
     return Reply {.out = failure(), .s = s};

@@ -59,7 +59,7 @@ def auth(s): return sstr(s) + bytes([50]) + sstr(b'git') + sstr(b'ssh-connection
 other = os.urandom(32)
 def hbauth(s, hk): return sstr(s) + bytes([50]) + sstr(b'git') + sstr(b'ssh-connection') + sstr(b'publickey-hostbound-v00@openssh.com') + b'\x01' + sstr(b'ssh-ed25519') + sstr(kb) + sstr(hk)
 out.append('test "a user authentication request must name the key and the bound session" {')
-out.append(f'    AgentSession s = AgentSession {{.host_key = {L(B(p256))}, .session_id = {L(sid)}, .forwarding = false, .bound = true}};')
+out.append(f'    AgentSession s = AgentSession {{.host_key = {L(B(p256))}, .session_id = {L(sid)}, .forwarding = false, .bound = true, .dest_key = {L(B(p256))}, .final = true, .hops = 1}};')
 out.append(f'    expect(refused(s, {L(kb)}, signed_of({L(auth(sid))}))).toEqual("");')
 out.append(f'    expect(refused(s, {L(kb)}, signed_of({L(auth(other))}))).toEqual("the request is for another session than the one bound");')
 out.append(f'    expect(refused(s, {L(B(p256))}, signed_of({L(auth(sid))}))).toEqual("the request names another key");')
