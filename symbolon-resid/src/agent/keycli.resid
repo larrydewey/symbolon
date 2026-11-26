@@ -1,5 +1,19 @@
-// `symbolon device key add|list|remove` (SPEC 9.4): security keys that
-// must be present to open this device's profiles. See fidokey.resid.
+// `symbolon device key add|list|remove|fills` (SPEC 9.4): security keys
+// that must be present to open this device's profiles. See fidokey.resid.
+//
+// Each profile has its own key list, sealed under a key only its PIN
+// gives (fidokey.resid, format 2), so whichever PIN opens the device sees
+// and changes its own profile's keys only:
+// - under the real PIN, a key added or removed is added to or removed from
+//   both lists (the real profile holds the duress profile's list key and
+//   W), so the duress profile asks for the same keys as the real one, as a
+//   coerced principal expects;
+// - under the duress PIN (SPEC 14.2), the change is made to the duress
+//   profile's list alone: a key added there is asked for at the next
+//   duress unlock (its touch gives the duress profile's W, never the real
+//   one's), and one removed is not. The real profile and its keys are not
+//   touched.
+// The output is the same under either PIN.
 
 import "../duress/duress.resid";
 import "../vault/vault.resid";
@@ -19,31 +33,36 @@ DeviceConfig return_cfg_none() {
         .tpm_dk = 0, .tpm_unlock_a = 0, .tpm_unlock_b = 0, .party = [], .dk_pub = [], .hpke_pub = [], .log_id = [], .mbox_next = 0, .peers = []};
 }
 
-Option(SecKey) named(List(SecKey) ks, Str n, Int i) {
-    if (i >= ks.len()) { return None; }
-    if (ks[i].name == n) { return Some(ks[i]); }
-    return named(ks, n, i + 1);
-}
-
-List(SecKey) without_named(List(SecKey) ks, Str n, Int i, List(SecKey) acc) {
-    if (i >= ks.len()) { return acc; }
-    return without_named(ks, n, i + 1, if (ks[i].name == n) { acc } else { acc.concat([ks[i]]) });
-}
+pub Str update_first(Str dir) { return "finish the security update first: symbolon device security-update " + dir; }
 
 // `device key list DIR [--pin]`: the enrolled keys' names, hex, one a
-// line. With --pin, the PIN on standard input: under the duress PIN the
-// list is the one its acted changes left (below); under any other PIN, or
-// without one, the security-keys file's.
+// line. In format 2 the list is sealed: --pin (the PIN on standard input)
+// is needed, and shows the list of the profile that PIN opens; no touch
+// is asked for. Before format 2, the security-keys file's list.
 @requires(filesystem)
-pub Int key_list(Str dir) { return print_names(names_of(read_keys(dir).keys, 0, []), 0); }
+pub Int key_list(Str dir) {
+    if (keys_v2(dir)) { return dfail("the list opens with the PIN: device key list " + dir + " --pin (the PIN on standard input)"); }
+    return print_names(names_of(read_keys(dir).keys, 0, []), 0);
+}
 
 @requires(filesystem, device, declassify, provision, network, environment)
 pub Int key_list_pin(Str dir) {
+    if (!keys_v2(dir)) { return key_list(dir); }
     Option(DeviceConfig) oc = load_config(dir);
     DeviceConfig c = oc else { return_cfg_none() };
-    if (c.log_id.len() == 0) { return key_list(dir); }
-    List(Secret(UInt(8))) st = stretch(c, pin_bytes(read_pin()));
-    return print_names(shown_names(dir, c, st), 0);
+    List(Str) ns = shown_names(dir, c, stretch(c, pin_bytes(read_pin())));
+    if (ns.len() == 1 && ns[0] == "\n") { return dfail("wrong PIN"); }
+    return print_names(ns, 0);
+}
+
+// The names in the list the PIN stretched to `st` opens; ["\n"] (no name
+// can be a newline) when it opens none.
+@requires(filesystem, device, declassify, provision, network, environment)
+pub List(Str) shown_names(Str dir, DeviceConfig c, List(Secret(UInt(8))) st) {
+    Found f = find_own(dir, c, st, (random_bytes(1)[0] & 1) == 0);
+    OwnList o = f.o;
+    if (o.which == "") { return ["\n"]; }
+    return list_names(o.list);
 }
 
 Int print_names(List(Str) ns, Int i) {
@@ -57,147 +76,47 @@ List(Str) names_of(List(SecKey) ks, Int i, List(Str) acc) {
     return names_of(ks, i + 1, acc.concat([ks[i].name]));
 }
 
-// ─── Under the duress PIN (SPEC 9.4, 14.2) ──────────────────────
-// Adding or removing a key, under the duress PIN, is acted: the same
-// checks, touches and file writes as a real change, and the same output,
-// but the security-keys file and the profiles keep what they held. What
-// the acted changes were is kept in security-keys.view, sealed under a key
-// only the duress PIN gives (from the duress profile's unlock key), so a
-// later `key list --pin` under the duress PIN shows them; under the real
-// PIN it does not open, and the real list is shown. The file is always
-// view_file_len() bytes; a real add or remove writes it too, with random
-// bytes (which ends an earlier acted view), so its presence, size and
-// time tell nothing.
-// Residual: the security-keys file itself (names, credential IDs) is
-// readable without any PIN and shows the real keys; an acted key is not
-// asked for when the device opens, and a key acted away still is.
-
-pub Str key_view_file(Str dir) { return dir + "/security-keys.view"; }
-pub Int view_plain_len() { return 2048; }
-pub Int view_file_len() { return 12 + view_plain_len() + 16; }
-List(Int) view_aad() { return utf8("symbolon v1 duress key view"); }
-
-// Keys the acted changes added, and real keys they removed.
-pub type KeyView = { List(Str) added; List(Str) removed; };
-
-pub KeyView empty_view() { return KeyView {.added = [], .removed = []}; }
-
-// The view key: from the unlock key the PIN gives for the duress profile.
-@requires(device, declassify, provision, network, environment)
-pub List(Secret(UInt(8))) view_key(DeviceConfig c, List(Secret(UInt(8))) st) {
-    List(Secret(UInt(8))) k = unlock_key_for(c, st, false);
-    List(Secret(UInt(8))) none = [];
-    return if (k.len() == 0) { none } else { hk(k, "symbolon v1 duress key view", 32) };
-}
-
-// "+NAME-HEX" and "-NAME-HEX" lines, then zero bytes to view_plain_len();
-// [] when they do not fit.
-pub List(Int) view_plain(KeyView v) {
-    List(Int) t = utf8(view_lines(v.added, "+", 0, "") + view_lines(v.removed, "-", 0, ""));
-    if (t.len() > view_plain_len()) { return []; }
-    return t.concat(zeros(view_plain_len() - t.len(), ListBuf()));
-}
-
-Str view_lines(List(Str) ns, Str sign, Int i, Str acc) {
-    if (i >= ns.len()) { return acc; }
-    return view_lines(ns, sign, i + 1, acc + sign + hex_encode(utf8(ns[i])) + "\n");
-}
-
-List(Int) zeros(Int n, ListBuf(Int) acc) { return if (n <= 0) { acc.finish() } else { zeros(n - 1, acc.push(0)) }; }
-
-pub KeyView view_of_plain(List(Int) p) {
-    Int end = first_zero(p, 0);
-    Str t = text_of_bytes(p[0..end]);
-    return view_from_lines(str_split(t, "\n"), 0, [], []);
-}
-
-Int first_zero(List(Int) p, Int i) { return if (i >= p.len() || p[i] == 0) { i } else { first_zero(p, i + 1) }; }
-
-Str text_of_bytes(List(Int) b) { Str t = http_text(b, 0, b.len()); return t; }
-
-KeyView view_from_lines(List(Str) ls, Int i, List(Str) add, List(Str) rem) {
-    if (i >= ls.len()) { return KeyView {.added = add, .removed = rem}; }
-    Str l = ls[i];
-    Int k = str_len(l);
-    if (k < 1) { return view_from_lines(ls, i + 1, add, rem); }
-    Str n = text_of_bytes(cose_hex_decode(str_slice(l, 1, k)));
-    Str sign = str_slice(l, 0, 1);
-    return view_from_lines(ls, i + 1, if (sign == "+") { add.concat([n]) } else { add }, if (sign == "-") { rem.concat([n]) } else { rem });
-}
-
-// The sealed view, view_file_len() bytes; [] when it does not fit.
-@requires(declassify)
-pub List(Int) seal_view(List(Secret(UInt(8))) key, KeyView v) {
-    List(Int) p = view_plain(v);
-    if (p.len() == 0 || key.len() != 32) { return []; }
-    List(Int) iv = random_bytes(12);
-    return iv.concat(reveal(aes_gcmg_seal(key, iv, secret_bytes(p), view_aad())));
-}
-
-// The view in `b` under `key`; None when it does not open (another PIN's
-// key, random bytes, no file).
-@requires(declassify)
-pub Option(KeyView) open_view(List(Secret(UInt(8))) key, List(Int) b) {
-    if (b.len() != view_file_len() || key.len() != 32) { return None; }
-    Option(List(Secret(UInt(8)))) p = aes_gcmg_decrypt(key, b[0..12], b[12..b.len()], view_aad());
-    return match p { None => None, Some(x) => Some(view_of_plain(reveal(x))) };
-}
-
-// The real names with an acted view applied: removed ones out, added ones in.
-pub List(Str) apply_view(List(Str) real, KeyView v) {
-    List(Str) kept = minus(real, v.removed, 0, []);
-    return kept.concat(minus(v.added, kept, 0, []));
-}
-
-List(Str) minus(List(Str) xs, List(Str) out, Int i, List(Str) acc) {
-    if (i >= xs.len()) { return acc; }
-    return minus(xs, out, i + 1, if (out.contains(xs[i])) { acc } else { acc.concat([xs[i]]) });
-}
-
-List(Str) without_str(List(Str) xs, Str n) { return minus(xs, [n], 0, []); }
-
-// The view after acting an add, or a remove, of `name`.
-pub KeyView view_add(KeyView v, Str name) {
-    return KeyView {.added = without_str(v.added, name).concat(if (v.removed.contains(name)) { [] } else { [name] }), .removed = without_str(v.removed, name)};
-}
-pub KeyView view_remove(KeyView v, Str name, List(Str) real) {
-    return KeyView {.added = without_str(v.added, name), .removed = without_str(v.removed, name).concat(if (real.contains(name)) { [name] } else { [] })};
-}
-
-// The view the PIN stretched to `st` reads: its acted view, or none.
-@requires(filesystem, device, declassify, provision, network, environment)
-pub KeyView view_for(Str dir, DeviceConfig c, List(Secret(UInt(8))) st) {
-    Option(KeyView) v = open_view(view_key(c, st), get_file(key_view_file(dir)));
-    return v else { empty_view() };
-}
-
-// The names `key list --pin` shows for the PIN stretched to `st`.
-@requires(filesystem, device, declassify, provision, network, environment)
-pub List(Str) shown_names(Str dir, DeviceConfig c, List(Secret(UInt(8))) st) {
-    List(Str) real = names_of(read_keys(dir).keys, 0, []);
-    return apply_view(real, view_for(dir, c, st));
-}
-
-// An acted add or remove: both profile files written again with what they
-// hold, sealed as they are (under W, with a fresh IV, when keys are
-// enrolled). A file that does not read is left alone.
+// The unlocked profile's own list (format 2).
 @requires(filesystem, declassify)
-Bool rewrite_blobs(Str dir, List(Secret(UInt(8))) w) {
-    List(Int) a = read_blob(dir, "a", w);
-    List(Int) b = read_blob(dir, "b", w);
-    Bool ra = a.len() == 0 || write_blob(dir, "a", a, w);
-    Bool rb = b.len() == 0 || write_blob(dir, "b", b, w);
-    return ra && rb;
+OwnList own_list(Str dir, Unlocked u) { OwnList o = open_own(dir, u.ukey); return o; }
+
+// The profile file with its list `nl` (sealed under its L), header and
+// blob as they are. False when the list does not fit or the file cannot
+// be written.
+@requires(filesystem, declassify)
+Bool write_list(Str dir, OwnList o, KeyList nl) {
+    List(Int) f = get_file(profile_file(dir, o.which));
+    List(Int) body = seal_list(o.l, nl);
+    return body.len() == list_len() && put_profile(dir, o.which, hdr_part(f), body, wblob_part(f));
 }
 
-// After a real add or remove: random bytes in the view file (see above).
+Str other_file(Str which) { return if (which == "a") { "b" } else { "a" }; }
+
+// A real change carried to the duress profile's list (`nl`, sealed under
+// the L the real list holds for it), its header and blob as they are.
+@requires(filesystem, declassify)
+Bool peer_write(Str dir, Unlocked u, OwnList o, KeyList nl) {
+    Str other = other_file(o.which);
+    List(Int) f = get_file(profile_file(dir, other));
+    List(Int) body = seal_list(o.list.peer_l, nl);
+    return body.len() == list_len() && put_profile(dir, other, hdr_part(f), body, wblob_part(f));
+}
+
+// No duress profile's list to change: without a duress PIN the other file
+// is random bytes, written again as a duress profile's would be; with one
+// whose list the real one cannot read (it never happens), it is left.
 @requires(filesystem)
-Bool scrub_view(Str dir) { return filesystem.write_bytes(key_view_file(dir), random_bytes(view_file_len())); }
+Bool peer_none(Str dir, Unlocked u, OwnList o) {
+    if (u.real.duress_hpke_pub.len() != 65) { return put_decoy_profile(dir, other_file(o.which)); }
+    return true;
+}
 
+// The duress profile's list, as the real one reads it; None without one.
 @requires(filesystem, declassify)
-Bool write_view(Str dir, List(Secret(UInt(8))) key, KeyView v) {
-    List(Int) b = seal_view(key, v);
-    return b.len() == view_file_len() && filesystem.write_bytes(key_view_file(dir), b);
+Option(KeyList) peer_list(Str dir, Unlocked u, OwnList o) {
+    if (u.real.duress_hpke_pub.len() != 65) { return None; }
+    Option(KeyList) l = open_list(o.list.peer_l, get_file(profile_file(dir, other_file(o.which))));
+    return l;
 }
 
 // `device key add DIR NAME`: the PIN; then the key is touched to make its
@@ -211,13 +130,11 @@ pub Int key_add_pin(Str dir, Str name, Str pin) {
     Option(DeviceConfig) oc = load_config(dir);
     DeviceConfig c = oc else { return_cfg_none() };
     if (c.log_id.len() == 0) { return dfail("not set up (device new, device init)"); }
-    SecKeys ks = read_keys(dir);
+    if (!keys_v2(dir)) { return dfail(update_first(dir)); }
     Unlocked u = unlock_dir(dir, c, pin);
-    if (u.kind != 1 && u.kind != 2) { return dfail("wrong PIN"); }
-    // Under the duress PIN, the names its acted changes left.
-    List(Str) shown = if (u.kind == 2) { apply_view(names_of(ks.keys, 0, []), view_for(dir, c, u.st)) } else { names_of(ks.keys, 0, []) };
-    if (shown.contains(name)) { return dfail("a key named " + name + " is already enrolled"); }
-    if (ks.keys.len() > 0 && u.wrap.len() != 32) { return dfail("an enrolled key must be present to add another"); }
+    if (u.kind != 1 && u.kind != 2) { return dfail("wrong PIN, or no enrolled key present"); }
+    OwnList o = own_list(dir, u);
+    if (names_of(o.list.keys, 0, []).contains(name)) { return dfail("a key named " + name + " is already enrolled"); }
     Resp ir = resp_of(fido_exchange(req_get_info()));
     if (ir.status != 0) { return dfail(if (ir.status == -1) { "no security key answers" } else { ctap_status_text(ir.status) }); }
     Info info = info_of(ir.body);
@@ -225,39 +142,31 @@ pub Int key_add_pin(Str dir, Str name, Str pin) {
     eprintln("device: touch the new security key");
     Made m = made_of(resp_of(fido_exchange(req_make_credential(random_bytes(32), "symbolon.unlock", c.party, "symbolon device"))), "symbolon.unlock");
     if (!m.ok) { return dfail(m.why); }
-    List(Int) salt = if (ks.salt.len() == 32) { ks.salt } else { random_bytes(32) };
     SecKey fresh = SecKey {.name = name, .cred_id = m.cred_id, .cred_point = m.cred_point, .sealed = []};
     eprintln("device: touch it once more");
-    Touch t = touch_key([fresh], salt, random_bytes(32));
+    Touch t = touch_key([fresh], o.list.salt, random_bytes(32));
     if (!t.ok) { return dfail(t.why); }
-    Int r = key_add_commit(dir, c, u, ks, name, m.cred_id, m.cred_point, salt, t.out);
+    Int r = key_add_commit(dir, c, u, name, m.cred_id, m.cred_point, t.out);
     return r;
 }
 
-// The writes of an add, after the touches. Under the duress PIN (u.kind
-// 2): the same sealing and the same files written with what they held,
-// the acted view written, the same output.
+// The writes of an add, after the touches (`out`: the key's hmac-secret
+// output for the device's salt). The profile's W sealed under it in the
+// profile's list; under the real PIN, the duress profile's W in its list
+// too (the key opens each profile only with that profile's PIN).
 @requires(filesystem, device, declassify, provision, network, environment)
-pub Int key_add_commit(Str dir, DeviceConfig c, Unlocked u, SecKeys ks, Str name, List(Int) cred_id, List(Int) cred_point, List(Int) salt, List(Secret(UInt(8))) out) {
-    Bool acted = u.kind == 2;
-    List(Secret(UInt(8))) w = if (u.wrap.len() == 32) { u.wrap } else { secret_bytes(random_bytes(32)) };
-    SecKey sealed = SecKey {.name = name, .cred_id = cred_id, .cred_point = cred_point, .sealed = seal_w(out, cred_id, w, random_bytes(12))};
-    // The key list first: if the profiles were sealed and the list not
-    // written, nothing could open them.
-    SecKeys next = if (acted) { ks } else { SecKeys {.salt = salt, .keys = ks.keys.concat([sealed])} };
-    if (!write_keys(dir, next)) { return dfail("cannot write " + keys_file(dir)); }
-    // The first key: the profiles sealed under W. Acted when the list the
-    // duress PIN sees is empty: the profiles written again as they are
-    // (under W again when real keys are enrolled).
-    Bool first = if (acted) { apply_view(names_of(ks.keys, 0, []), view_for(dir, c, u.st)).len() == 0 } else { ks.keys.len() == 0 };
-    if (first && !acted) {
-        List(Int) a = read_blob(dir, "a", []);
-        List(Int) b = read_blob(dir, "b", []);
-        if (!write_blob(dir, "a", a, w) || !write_blob(dir, "b", b, w)) { return dfail("cannot seal the profiles"); }
+pub Int key_add_commit(Str dir, DeviceConfig c, Unlocked u, Str name, List(Int) cred_id, List(Int) cred_point, List(Secret(UInt(8))) out) {
+    OwnList o = own_list(dir, u);
+    if (o.which == "" || u.wrap.len() != 32) { return dfail("wrong PIN, or no enrolled key present"); }
+    List(SecKey) ks = keys_without_name(o.list.keys, name, 0, ListBuf()).concat([key_entry(name, cred_id, cred_point, out, u.wrap)]);
+    if (!write_list(dir, o, list_with_keys(o.list, ks, u.wrap))) { return dfail("cannot write " + profile_file(dir, o.which) + " (at most a few keys fit)"); }
+    if (u.kind == 1) {
+        Option(KeyList) pl = peer_list(dir, u, o);
+        KeyList dl = pl else { no_list() };
+        List(SecKey) dks = keys_without_cred(keys_without_name(dl.keys, name, 0, ListBuf()), cred_id, 0, ListBuf()).concat([key_entry(name, cred_id, cred_point, out, o.list.peer_w)]);
+        Bool fine = match pl { None => peer_none(dir, u, o), Some(_) => peer_write(dir, u, o, list_with_keys(dl, dks, o.list.peer_w)) };
+        if (!fine) { return dfail("cannot write " + profile_file(dir, other_file(o.which))); }
     }
-    if (first && acted && !rewrite_blobs(dir, u.wrap)) { return dfail("cannot seal the profiles"); }
-    Bool viewed = if (acted) { write_view(dir, view_key(c, u.st), view_add(view_for(dir, c, u.st), name)) } else { scrub_view(dir) };
-    if (!viewed) { return dfail("cannot write " + keys_file(dir)); }
     println("security key " + name + " added; this device now opens only with it (or another enrolled key) present");
     return 0;
 }
@@ -273,14 +182,17 @@ pub Int key_fills(Str dir, Str mode) {
     if (c.log_id.len() == 0) { return dfail("not set up (device new, device init)"); }
     Unlocked u = unlock_dir(dir, c, read_pin());
     if (u.kind != 1) { return dfail("wrong PIN, or no enrolled key present"); }
+    OwnList o = if (keys_v2(dir)) { own_list(dir, u) } else { no_own() };
+    KeyList ol = o.list;
+    Bool keyed = if (keys_v2(dir)) { ol.keys.len() > 0 } else { keys_enrolled(dir) };
     if (!filesystem.write_all(fill_policy_file(dir), mode + "\n")) { return dfail("cannot write " + fill_policy_file(dir)); }
-    println(if (mode == "keys") { "fills need a security key" + if (keys_enrolled(dir)) { "" } else { "; none is enrolled, so this device fills nothing until one is" } } else { "fills need the PIN" + if (keys_enrolled(dir)) { " and the enrolled key" } else { "" } });
+    println(if (mode == "keys") { "fills need a security key" + if (keyed) { "" } else { "; none is enrolled, so this device fills nothing until one is" } } else { "fills need the PIN" + if (keyed) { " and the enrolled key" } else { "" } });
     return 0;
 }
 
-// `device key remove DIR NAME`: the PIN and a touch of any enrolled key.
-// Removing the last key returns the profiles to PIN only. Under the duress
-// PIN, acted (see above).
+// `device key remove DIR NAME`: the PIN and a touch of any enrolled key
+// of the profile it opens. Removing the last key returns that profile to
+// the PIN alone (W kept in its list).
 @requires(filesystem, network, device, declassify, clock, provision, environment)
 pub Int key_remove(Str dir, Str name) { Int r = key_remove_pin(dir, name, read_pin()); return r; }
 
@@ -289,28 +201,29 @@ pub Int key_remove_pin(Str dir, Str name, Str pin) {
     Option(DeviceConfig) oc = load_config(dir);
     DeviceConfig c = oc else { return_cfg_none() };
     if (c.log_id.len() == 0) { return dfail("not set up (device new, device init)"); }
-    SecKeys ks = read_keys(dir);
+    if (!keys_v2(dir)) { return dfail(update_first(dir)); }
     Unlocked u = unlock_dir(dir, c, pin);
-    Bool acted = u.kind == 2;
-    List(Str) real = names_of(ks.keys, 0, []);
-    KeyView v = if (acted) { view_for(dir, c, u.st) } else { empty_view() };
-    List(Str) shown = apply_view(real, v);
-    // A wrong PIN is told as before; a name not in the list the PIN sees, too.
-    if (u.kind != 1 && !acted) { return dfail(if (real.contains(name)) { "wrong PIN, or no enrolled key present" } else { "no key named " + name }); }
-    if (!shown.contains(name)) { return dfail("no key named " + name); }
-    if (ks.keys.len() > 0 && u.wrap.len() != 32) { return dfail("wrong PIN, or no enrolled key present"); }
-    List(SecKey) rest = without_named(ks.keys, name, 0, []);
-    Bool last = if (acted) { apply_view(real, view_remove(v, name, real)).len() == 0 } else { rest.len() == 0 };
-    if (last && !acted) {
-        List(Int) a = read_blob(dir, "a", u.wrap);
-        List(Int) b = read_blob(dir, "b", u.wrap);
-        if (!write_blob(dir, "a", a, []) || !write_blob(dir, "b", b, [])) { return dfail("cannot unseal the profiles"); }
+    if (u.kind != 1 && u.kind != 2) { return dfail("wrong PIN, or no enrolled key present"); }
+    Int r = key_remove_commit(dir, u, name);
+    return r;
+}
+
+// The writes of a remove, after the unlock: the key out of the profile's
+// list; under the real PIN, out of the duress profile's too.
+@requires(filesystem, declassify)
+pub Int key_remove_commit(Str dir, Unlocked u, Str name) {
+    OwnList o = own_list(dir, u);
+    Option(SecKey) x = key_named(o.list.keys, name, 0);
+    SecKey k = x else { SecKey {.name = "", .cred_id = [], .cred_point = [], .sealed = []} };
+    if (str_len(k.name) == 0 || u.wrap.len() != 32) { return dfail("no key named " + name); }
+    List(SecKey) rest = keys_without_name(o.list.keys, name, 0, ListBuf());
+    if (!write_list(dir, o, list_with_keys(o.list, rest, u.wrap))) { return dfail("cannot write " + profile_file(dir, o.which)); }
+    if (u.kind == 1) {
+        Option(KeyList) pl = peer_list(dir, u, o);
+        KeyList dl = pl else { no_list() };
+        Bool fine = match pl { None => peer_none(dir, u, o), Some(_) => peer_write(dir, u, o, list_with_keys(dl, keys_without_cred(dl.keys, k.cred_id, 0, ListBuf()), o.list.peer_w)) };
+        if (!fine) { return dfail("cannot write " + profile_file(dir, other_file(o.which))); }
     }
-    if (last && acted && !rewrite_blobs(dir, u.wrap)) { return dfail("cannot unseal the profiles"); }
-    SecKeys next = if (acted) { ks } else { SecKeys {.salt = ks.salt, .keys = rest} };
-    if (!write_keys(dir, next)) { return dfail("cannot write " + keys_file(dir)); }
-    Bool viewed = if (acted) { write_view(dir, view_key(c, u.st), view_remove(v, name, real)) } else { scrub_view(dir) };
-    if (!viewed) { return dfail("cannot write " + keys_file(dir)); }
-    println("security key " + name + " removed" + if (last) { "; this device opens with the PIN alone" } else { "" });
+    println("security key " + name + " removed" + if (rest.len() == 0) { "; this device opens with the PIN alone" } else { "" });
     return 0;
 }

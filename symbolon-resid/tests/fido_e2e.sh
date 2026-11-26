@@ -73,8 +73,11 @@ get() { printf '2468\n' | run 300 "$BIN" device vault get "$W/dev" "$1" 2> "$W/g
 
 put before secret-0 || fail "vault put before any key: $(cat "$W/put.log")"
 printf '2468\n' | run 300 "$BIN" device key add "$W/dev" main > "$W/add.log" 2>&1 || fail "key add: $(cat "$W/add.log") $(tail -3 "$W/fido/log")"
-[ "$(run 30 "$BIN" device key list "$W/dev")" = "$(printf main | od -v -An -tx1 | tr -d ' \n')" ] || fail "key list"
-[ -s "$W/dev/blob_a.k" ] && [ -s "$W/dev/blob_b.k" ] && [ ! -s "$W/dev/blob_a" ] && [ ! -s "$W/dev/blob_b" ] || fail "the profiles were not sealed under W"
+[ "$(printf '2468\n' | run 30 "$BIN" device key list "$W/dev" --pin)" = "$(printf main | od -v -An -tx1 | tr -d ' \n')" ] || fail "key list"
+[ "$(printf '1357\n' | run 30 "$BIN" device key list "$W/dev" --pin)" = "$(printf main | od -v -An -tx1 | tr -d ' \n')" ] || fail "key list under the duress PIN"
+run 30 "$BIN" device key list "$W/dev" > /dev/null 2>&1 && fail "the key list was shown without the PIN"
+[ "$(stat -c %s "$W/dev/profile_a")" = 12432 ] && [ "$(stat -c %s "$W/dev/profile_b")" = 12432 ] && [ ! -e "$W/dev/security-keys" ] || fail "the profile files are not of format 2"
+grep -q main "$W/dev/profile_a" "$W/dev/profile_b" && fail "a key's name is readable in the profile files"
 [ "$(get before)" = secret-0 ] || fail "vault get with the key: $(cat "$W/get.err")"
 put after secret-1 || fail "vault put with the key: $(cat "$W/put.log")"
 grep -c assert "$W/fido/log" > /dev/null || fail "the key was not asked"
@@ -102,15 +105,18 @@ echo "refused: another key, no key, no touch, a wrong signature, a wrong PIN"
 REQ='fill login https://mail.example https://mail.example current-password,username'
 printf '2468\n' | SYMBOLON_FILL="$REQ" run 300 "$BIN" device vault list "$W/dev" > "$W/fill.log" 2>&1 || fail "a fill's vault list: $(cat "$W/fill.log")"
 [ "$(grep -c '^fill ' "$W/dev/fill-record")" = 1 ] || fail "no fill record: $(cat "$W/dev/fill-record" 2>&1)"
-python3 -I - "$W/dev/fill-record" "$W/dev/security-keys" "$REQ" <<'PY' || fail "the fill record does not check out"
+python3 -I - "$W/dev/fill-record" "$W/fido/main.json" "$REQ" <<'PY' || fail "the fill record does not check out"
 import sys, hashlib
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives import hashes
 _, t, cred, cdh, ad, sig, req = open(sys.argv[1]).read().split("\n")[0].split(" ")
 assert bytes.fromhex(req).decode() == sys.argv[3], "the request is not the one asked"
 assert bytes.fromhex(cdh) == hashlib.sha256(b"symbolon v1 fill" + sys.argv[3].encode()).digest(), "the key did not sign over the request"
-keys = {l.split(" ")[1]: l.split(" ")[2] for l in open(sys.argv[2]).read().split("\n")[1:] if l.count(" ") == 3}
-pub = ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256R1(), bytes.fromhex(keys[cred]))
+import json
+from cryptography.hazmat.primitives import serialization
+# The credential's public key, from the authenticator's own record (the
+# device's list is sealed under the PIN).
+pub = serialization.load_der_private_key(bytes.fromhex(json.load(open(sys.argv[2]))['creds'][cred]['priv']), None).public_key()
 pub.verify(bytes.fromhex(sig), bytes.fromhex(ad) + bytes.fromhex(cdh), ec.ECDSA(hashes.SHA256()))
 assert bytes.fromhex(ad)[32] & 1, "no user presence in the record"
 PY
@@ -130,7 +136,7 @@ echo "a backup key added and the first removed: only the backup opens it"
 
 present backup
 printf '2468\n' | run 300 "$BIN" device key remove "$W/dev" backup > "$W/rm2.log" 2>&1 || fail "remove the last key: $(cat "$W/rm2.log")"
-[ -s "$W/dev/blob_a" ] && [ ! -s "$W/dev/blob_a.k" ] || fail "the profiles were not returned to the PIN alone"
+[ -z "$(printf '2468\n' | run 30 "$BIN" device key list "$W/dev" --pin)" ] || fail "the list is not empty after the last key"
 present
 [ "$(get after)" = secret-1 ] || fail "PIN alone after removing every key: $(cat "$W/get.err")"
 echo "the last key removed: the PIN alone opens the device again"

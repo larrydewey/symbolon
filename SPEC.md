@@ -539,13 +539,28 @@ unlock_key  = HKDF(hw_secret, salt_local, "symbolon v1 unlock", 32)
 
 `unlock_key` decrypts the device's share, chain code, vault keys and DEK.
 The TPM's lockout limits PIN guesses. A TPM holds one Symbolon device: its
-device key and unlock keys sit at fixed persistent handles, so a second
+device key and unlock keys sit at persistent handles from a fixed set
+(the device key at one, each unlock key at one of four), so a second
 `device new` on the same TPM is refused rather than replacing them, and
 `device forget` removes only keys whose device key is the one its
 configuration names. The DK MUST be usable only after
 local unlock (a TPM policy bound to `pin_stretch`, or the platform's
 user-verification gate), so that a thief holding a locked device can
-neither sign log events, veto, nor request co-signatures (A-04). The
+neither sign log events, veto, nor request co-signatures (A-04). In the
+TPM profile the DK's authValue is `HKDF(DEK, "symbolon v1 tpm device key
+auth", 32)`: the DEK is in the real profile, which only the real PIN
+opens, so the DK is usable only after a local unlock with it, and a PIN
+change (of either PIN) does not touch the DK. A DK made before profile
+format 2 (Section 9.4) has `pin_stretch` as its authValue, and moves to a
+new handle at every change of the real PIN, until `device
+security-update` gives it the DEK's. Each profile has its own unlock key
+(two TPM HMAC keys, or two Keystore keys); which of the two is the real
+profile's is chosen at random at setup and recorded only inside the
+profiles, so the configuration, the handles and the Keystore aliases do
+not say. A PIN change, under either PIN, gives that profile's unlock key
+its new authValue (TPM2_ObjectChangeAuth) and moves it to a free handle of
+the four, chosen at random; its HMAC output does not depend on the
+authValue, so the profile files stay as they are. The
 optional PCR term MUST use `PolicyAuthorize` over signed policies, never
 raw PCR values: a firmware or kernel update must not make the blob
 unsealable. A blob that does fail to unseal is recovered through another
@@ -559,7 +574,8 @@ agent (a separate process) does not; the app serves it to the agent on
 loopback behind a per-start token (the **Keystore profile**). Two
 non-exportable HMAC-SHA256 keys, in StrongBox where present and the TEE
 otherwise, take the TPM's place: `hw_secret = HMAC(K_a, pin_stretch ||
-salt_local)` (`K_b` for the duress blob), and the DK is a Keystore P-256
+salt_local)` (`K_b` for the other profile; which is the real one's is
+random), and the DK is a Keystore P-256
 key. On a phone with a secure lock screen (Android 11+) all three are
 usable only within 30 seconds of a biometric or lock-screen check of the
 person (the platform's user-verification gate A-04 allows); when a key
@@ -622,7 +638,13 @@ PIN, then the duress PIN or an empty line), which under the PIN only:
    the registered keys become decoys as on a device made without one;
 2. publishes a `party-key` event (Section 8.1) naming the v2 key, signed
    by the DK, and records it in the device's configuration;
-3. makes every collection's wraps again (Section 19.2).
+3. makes every collection's wraps again (Section 19.2);
+4. moves the profiles to format 2 (Section 9.4): each profile in its own
+   file with its own sealed key list and wrap key; in the TPM profile the
+   DK gets its authValue from the DEK and the unlock-key fields are
+   swapped at random. The old profile files and `security-keys` are
+   removed. A device that ran steps 1-3 before (its `security-update`
+   file without `keys-v2`) runs this step alone.
 
 The reminder depends only on whether the device directory holds the file
 `security-update` (written by `device new` and at the end of the update),
@@ -652,28 +674,56 @@ touched, besides the PIN, before a device opens its profiles
   `hmac-secret` output O for a 32-byte salt the device chose (a second
   touch). The salt is the same for every key of a device; O differs per
   credential.
-- **Sealing.** With the first key, the device draws a random 32-byte wrap
-  key W and seals `blob_a` and `blob_b` (Section 9.1) again under W with
-  AES-256-GCM (`blob_a.k`, `blob_b.k`); the plain files are emptied. Each
-  enrolled key keeps W sealed under HKDF(O) with AES-256-GCM in
-  `security-keys`, beside its credential ID and public key, so a backup
-  key is a second entry. The list is written before the profiles are
-  sealed, so an interruption cannot leave profiles no entry opens.
-- **Opening.** The device asks the present key for its `hmac-secret`
-  output (getAssertion with user presence, the salt encrypted under the
-  protocol-2 shared secret) for each enrolled credential until one is
-  held. It checks the assertion's signature with that credential's public
-  key and the relying party, and unseals W. Without a key, without a touch,
-  or with a wrong signature, nothing opens; the PIN still goes through
-  Section 9.1 as before, and the TPM's or Keystore's limits on PIN
-  attempts are unchanged. Both profiles are under W, so the duress PIN
-  needs the key too: a coerced principal hands over the key with the PIN,
-  and the duress profile behaves as in Section 9.2.
-- **Removal** needs the PIN and any enrolled key. Removing the last key
-  unseals the profiles and returns the device to the PIN alone.
-- **Listing.** `device key list DIR` prints the names in `security-keys`;
-  with `--pin` (the PIN on standard input) it prints the list as that PIN
-  sees it, which differs only under the duress PIN (Section 14.2).
+- **Profile files (format 2).** Each profile is one file, `profile_a` or
+  `profile_b` (which one is real is random and not recorded), always
+  12432 bytes, with or without keys and with or without a duress PIN:
+  `hdr` (60: a random 32-byte list key L sealed with AES-256-GCM under
+  `HKDF(unlock_key, "symbolon v1 key list")`), `list` (8220: the
+  profile's key list, padded to 8192 bytes, under L) and `wblob` (4152:
+  the profile's blob of Section 9.2 under the profile's own random wrap
+  key W). The list holds the `hmac-secret` salt, which unlock key is the
+  profile's, and per enrolled key its name, credential ID, public key and
+  W sealed under HKDF(O); with no key enrolled, W itself. The real
+  profile's list also holds the other profile's L and W, so the
+  principal's key changes reach the duress profile (below). A device
+  without a duress PIN has random bytes in the other file, written again
+  whenever a real key change would write a duress profile's. Every
+  write of a profile file replaces it whole (a new file, renamed), so a
+  PIN change or a key change is all or nothing.
+- **Sealing.** Adding a key seals the profile's W under the new key's O
+  in the profile's list and takes W itself out of it; W does not change
+  (the profile's contents do not either, so a fresh W would protect
+  nothing that whoever held the PIN before could not already read). A
+  backup key is a second entry.
+- **Opening.** The PIN's unlock key opens its profile's list (both
+  headers are always tried); a wrong PIN opens none, and no key is asked
+  for. With keys in the list, the device asks the present key for its
+  `hmac-secret` output (getAssertion with user presence, the salt
+  encrypted under the protocol-2 shared secret) for each of the list's
+  credentials until one is held. It checks the assertion's signature with
+  that credential's public key and the relying party, and unseals W.
+  Without a key, without a touch, or with a wrong signature, nothing
+  opens; the TPM's or Keystore's limits on PIN attempts are unchanged.
+  On the unprotected-device profile the list (like the blob of a device
+  without a key) can be tried against guessed PINs offline; the profile
+  still needs the key.
+- **Under either PIN.** A key added or removed under the real PIN is
+  added to or removed from both lists (the duress profile's sealed to its
+  own W), so the duress PIN asks for the same keys: a coerced principal
+  hands over the key with the PIN, and the duress profile behaves as in
+  Section 9.2. Under the duress PIN the change is made to the duress
+  profile's list alone (Section 14.2); its keys never give the real
+  profile's W.
+- **Removal** needs the PIN and any of the profile's keys. Removing its
+  last key puts W back in the list: that profile opens with the PIN alone.
+- **Listing.** `device key list DIR --pin` (the PIN on standard input)
+  prints the names in the list of the profile the PIN opens, without a
+  touch; without the PIN nothing is listed. Before format 2,
+  `security-keys` held the list in the clear and both profiles were under
+  one W; such a device still opens, and moves with `device
+  security-update` (Section 9.2), which keeps every enrolled key for both
+  profiles (the duress profile's entries reach its new W through its
+  list's `via`, W sealed under the old one).
 - **Transport.** USB keys over CTAPHID, through Resid's isolated device
   host (`lib/dev/fido.resid`): the host writes only to a hidraw node whose
   report descriptor declares the FIDO usage page, and waits up to 45 s for
@@ -1085,39 +1135,48 @@ Unlocking with the duress PIN:
 3. otherwise behaves like a normal unlock, with identical timing,
    interface and network pattern.
 
-**Changes to the device, acted.** Under the duress PIN, adding or
-removing a security key (9.4) and changing the PIN (`device pin`) appear
-to succeed and print what a real change prints, but change nothing that
-lasts:
+**Changes to the device under the duress PIN.** Adding or removing a
+security key (9.4) and changing the PIN (`device pin`) work under the
+duress PIN as under the real one, on the duress profile: they print the
+same, and what they change lasts, for the duress profile only.
 
-- They make the same checks, PIN stretches, unlocks, touches of the key
-  and file writes as a real change. Every file is written with what it
-  held: `security-keys` with its own content, the profile files re-sealed
-  with their own plaintext (a fresh IV: the bytes change, as a real
-  change's do), the configuration unchanged. In TPM mode a PIN change asks
-  the TPM for two authValue changes of the duress unlock key to the same
-  value, whose results are dropped.
-- A key change acted under the duress PIN is remembered in
-  `security-keys.view`: the names added and the real names removed, padded
-  to 2048 bytes and sealed (AES-256-GCM) under
-  `HKDF(unlock_key_duress, "symbolon v1 duress key view")`, so the file is
-  always 2076 bytes. `key list --pin` under the duress PIN shows the real
-  list with those changes; under the real PIN the file does not open and
-  the real list is shown. A real add or remove writes the file too, with
-  random bytes of the same size (ending any acted view), so its presence,
-  size and time say nothing.
-- The real PIN is never told apart: a new PIN that opens the real
-  profile, chosen under the duress PIN, is "taken" like any other; under
-  the real PIN, a new PIN that opens the duress profile is refused with
-  "this PIN cannot be used; choose another", which does not name it.
+- A PIN change re-seals the duress profile (its header and blob, in one
+  file write) under the new PIN's unlock key; in TPM mode it gives the
+  duress unlock key the new authValue and moves it to a free handle, as a
+  real change does with the real one's (Section 9.1). From then on the
+  new PIN is the duress PIN everywhere and the old one opens nothing. The
+  real profile, its PIN, its file and the DK are not touched.
+- A key added goes into the duress profile's list with the duress
+  profile's W sealed under it, so the next duress unlock asks for it, and
+  its touch opens the duress profile only (it never gives the real
+  profile's W). A key removed leaves the duress list (its last one puts W
+  back: the duress PIN alone opens it again), and is not asked for under
+  the duress PIN; the real profile still asks for its own keys. `key list
+  --pin` under each PIN shows that profile's list.
+- The real PIN is never told apart. Under the real PIN a new PIN that
+  opens the duress profile is refused with "this PIN cannot be used;
+  choose another", which does not name it. Under the duress PIN, a new PIN
+  that opens the real profile cannot be refused without telling it, nor
+  taken (it would open two profiles): the change is acted (the same work,
+  the profile's file written again with fresh IVs, in TPM mode its unlock
+  key moved with its authValue as it was, and "PIN changed"), and the
+  duress PIN stays what it was.
+- The files have one shape: two profile files of one size, no other key
+  file, with or without a duress PIN, keys or changes. The configuration
+  holds the same fields whichever profile is real, and a PIN change under
+  either PIN moves one unlock-key handle.
 
-Residual risk: the new PIN of an acted change does not open the device
-afterwards; a key acted in is not asked for at the next unlock, and one
-acted away still is; `security-keys` (names, credential IDs) is readable
-without a PIN and lists the real keys; in TPM mode an acted PIN change
-leaves the key handles in the configuration where they were (a real one
-moves them); the app shows the duress list while it holds the PIN, and
-the file's list once it no longer does.
+Residual risk: a copy of the device's files from before and after a
+change shows which files changed: a key change under the real PIN writes
+both profile files, one under the duress PIN writes one (a PIN change
+writes one under either), and the copies do not show which profile a
+file is. A new duress PIN equal to the real one is acted, so the old
+duress PIN still opens the duress profile. On a device made before format
+2 (Section 9.4), until `device security-update`: the key list is in the
+clear, a key change under the duress PIN is refused as needing the
+update (as under the real PIN), and in TPM mode a real PIN change moves
+the DK as well; until the first PIN change after the update, the unlock
+keys' handles of such a TPM device show which is real.
 
 ### 14.3 Containment
 

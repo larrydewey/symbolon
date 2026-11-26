@@ -2,17 +2,23 @@
 // any CTAP2 key with hmac-secret) that must be present and touched to open
 // this device's profiles.
 //
-//   symbolon device key add DIR NAME      PIN on stdin; touch the key twice
-//   symbolon device key list DIR          "NAME-HEX" per key, no PIN
-//   symbolon device key remove DIR NAME   PIN on stdin; touch any enrolled key
+//   symbolon device key add DIR NAME          PIN on stdin; touch the key twice
+//   symbolon device key list DIR --pin        "NAME-HEX" per key of the PIN's profile
+//   symbolon device key remove DIR NAME       PIN on stdin; touch any enrolled key
 //
-// With a key enrolled, blob_a and blob_b are sealed again under a random
-// wrap key W (blob_a.k, blob_b.k; AES-256-GCM). W is kept once per key in
-// DIR/security-keys, sealed under that key's hmac-secret output for this
-// device's salt: one credential per key (made on the key, not stored on
-// it), so a backup key is a second line. Opening the profiles asks the
-// key (getAssertion, all credentials allowed, a touch), checks the
-// assertion's signature with the credential's public key, and unseals W.
+// Format 2 (below, "Profile files"): each profile has its own file with
+// its own key list, sealed under a key its PIN gives, and its own wrap key
+// W; each enrolled key keeps W sealed under that key's hmac-secret output
+// for this device's salt: one credential per key (made on the key, not
+// stored on it), so a backup key is a second entry. Opening a profile asks
+// the key (getAssertion, the list's credentials allowed, a touch), checks
+// the assertion's signature with the credential's public key, and unseals
+// W.
+//
+// Before format 2, blob_a and blob_b were sealed under one W (blob_a.k,
+// blob_b.k) and DIR/security-keys listed the keys in the clear; such a
+// device still opens (read_keys, unwrap_key) and moves with `device
+// security-update`.
 //
 // The key is reached through SYMBOLON_FIDO_SOCKET when set (a Unix socket
 // speaking length-prefixed CTAP2 messages: tests, and any bridge), else the
@@ -236,11 +242,16 @@ pub Bool fills_need_key(Str dir) {
     return filesystem.exists(f) && str_starts_with(filesystem.read_all(f), "keys");
 }
 
+pub Str fills_key_refusal() { return "this device fills only with a security key: enrol one under Security keys"; }
+
 // Why an opening for a fill is refused before the PIN is even asked, or "".
 @requires(filesystem, environment)
 pub Str fill_refusal(Str dir) {
     if (str_len(environment.get("SYMBOLON_FILL")) == 0) { return ""; }
-    if (fills_need_key(dir) && !keys_enrolled(dir)) { return "this device fills only with a security key: enrol one under Security keys"; }
+    // Format 2: whether keys are enrolled is known only once the PIN has
+    // opened the list (unlock_dir refuses the fill there).
+    if (keys_v2(dir)) { return ""; }
+    if (fills_need_key(dir) && !keys_enrolled(dir)) { return fills_key_refusal(); }
     return "";
 }
 
@@ -264,6 +275,7 @@ Bool present(Str f) { return filesystem.exists(f) && get_file(f).len() > 0; }
 
 @requires(filesystem, declassify)
 pub List(Int) read_blob(Str dir, Str which, List(Secret(UInt(8))) w) {
+    if (keys_v2(dir)) { return open_wblob(w, which, get_file(profile_file(dir, which))); }
     Str k = dir + "/blob_" + which + ".k";
     if (!present(k)) { return get_file(dir + "/blob_" + which); }
     if (w.len() != 32) { return []; }
@@ -274,13 +286,314 @@ pub List(Int) read_blob(Str dir, Str which, List(Secret(UInt(8))) w) {
 }
 
 // Writes blob_X under W (and empties blob_X), or plain (and empties
-// blob_X.k) when `w` is [].
+// blob_X.k) when `w` is []. In format 2, the wrapped blob in profile_X
+// (under W always), its header and list as they are.
 @requires(filesystem, declassify)
 pub Bool write_blob(Str dir, Str which, List(Int) blob, List(Secret(UInt(8))) w) {
+    if (keys_v2(dir)) {
+        List(Int) f = get_file(profile_file(dir, which));
+        return put_profile(dir, which, hdr_part(f), list_part(f), seal_wblob(w, which, blob));
+    }
     Str plain = dir + "/blob_" + which;
     Str k = plain + ".k";
     if (w.len() != 32) { return filesystem.write_bytes(plain, blob) && (!filesystem.exists(k) || filesystem.write_bytes(k, [])); }
     List(Int) iv = random_bytes(12);
     List(Int) sealed = iv.concat(reveal(aes_gcmg_seal(w, iv, secret_bytes(blob), bw_aad(which))));
     return filesystem.write_bytes(k, sealed) && filesystem.write_bytes(plain, []);
+}
+
+// ============================================================================
+// Profile files, format 2 (SPEC 9.4, 14.2)
+// ============================================================================
+// Each profile has one file, profile_a or profile_b (which one is real is
+// not recorded), always profile_file_len() bytes, whether or not keys are
+// enrolled and whether or not a duress PIN exists:
+//
+//   hdr   (60)    iv || AES-256-GCM(HKDF(unlock_key, "symbolon v1 key list"), iv, L)
+//   list  (8220)  iv || AES-256-GCM(L, iv, the profile's key list, padded to 8192)
+//   wblob (4152)  iv || AES-256-GCM(W, iv, blob_X)       (blob_X as in SPEC 9.2)
+//
+// L and W are random, one pair per profile; they stay through PIN changes
+// (a PIN change writes hdr and the blob again, in one file write). The
+// list holds the profile's own security keys, each with W sealed under
+// that key's hmac-secret output, or W itself when it has none: so the PIN
+// alone opens the list (which key to touch), and only a touch of one of
+// the profile's own keys gives W when it has any. The real profile's list
+// also holds the other profile's L and W, so that a key the principal adds
+// or removes is added to or removed from the duress profile too (it has no
+// way to read the real one's). A device without a duress PIN has random
+// bytes of the same size in the other file, written whenever a real key
+// change would write a duress profile's.
+
+pub Int list_plain_len() { return 8192; }
+pub Int hdr_len() { return 12 + 32 + 16; }
+pub Int list_len() { return 12 + list_plain_len() + 16; }
+pub Int wblob_len() { return 12 + blob_len() + 16; }
+pub Int profile_file_len() { return hdr_len() + list_len() + wblob_len(); }
+
+pub Str profile_file(Str dir, Str which) { return dir + "/profile_" + which; }
+
+// Whether this device's profiles are in format 2 (a device made before
+// moves with `device security-update`).
+@requires(filesystem)
+pub Bool keys_v2(Str dir) { return filesystem.exists(profile_file(dir, "a")); }
+
+// One profile's key list. w: W when no key is enrolled, else []. salt: the
+// hmac-secret salt (the same in both lists). via: [] or W sealed under the
+// W the profiles shared before format 2, for keys enrolled then (their
+// entries give that one). mine: "a" or "b", which of the two unlock keys
+// (TPM handle field, Keystore alias) is this profile's. peer_l, peer_w: the
+// real profile's only, the other profile's L and W (random without one).
+pub type KeyList = { List(Secret(UInt(8))) w; List(Int) salt; List(Int) via; Str mine;
+                     List(Secret(UInt(8))) peer_l; List(Secret(UInt(8))) peer_w; List(SecKey) keys; };
+
+pub KeyList no_list() { return KeyList {.w = [], .salt = [], .via = [], .mine = "", .peer_l = [], .peer_w = [], .keys = []}; }
+
+// The list with keys `ks`: W kept in it (`w`) when there are none.
+pub KeyList list_with_keys(KeyList l, List(SecKey) ks, List(Secret(UInt(8))) w) {
+    List(Secret(UInt(8))) none = [];
+    return KeyList {.w = if (ks.len() == 0) { w } else { none }, .salt = l.salt, .via = if (ks.len() == 0) { [] } else { l.via }, .mine = l.mine,
+                    .peer_l = l.peer_l, .peer_w = l.peer_w, .keys = ks};
+}
+
+pub KeyList list_with_peer(KeyList l, List(Secret(UInt(8))) pl, List(Secret(UInt(8))) pw) {
+    return KeyList {.w = l.w, .salt = l.salt, .via = l.via, .mine = l.mine, .peer_l = pl, .peer_w = pw, .keys = l.keys};
+}
+
+pub KeyList list_with_mine(KeyList l, Str mine) {
+    return KeyList {.w = l.w, .salt = l.salt, .via = l.via, .mine = mine, .peer_l = l.peer_l, .peer_w = l.peer_w, .keys = l.keys};
+}
+
+pub List(Str) list_names(KeyList l) { return key_names(l.keys, 0, ListBuf()); }
+
+List(Str) key_names(List(SecKey) ks, Int i, ListBuf(Str) acc) {
+    if (i >= ks.len()) { return acc.finish(); }
+    return key_names(ks, i + 1, acc.push(ks[i].name));
+}
+
+// The list's text: "w HEX", "salt HEX", "via HEX", "mine X", "peer L W",
+// then "key NAME CRED POINT SEALED" per key; zero bytes to
+// list_plain_len(). [] when it does not fit.
+@requires(declassify)
+pub List(Int) list_plain(KeyList l) {
+    Str t = (if (l.w.len() == 32) { "w " + hex_encode(reveal(l.w)) + "\n" } else { "" })
+          + "salt " + hex_encode(l.salt) + "\n"
+          + (if (l.via.len() > 0) { "via " + hex_encode(l.via) + "\n" } else { "" })
+          + "mine " + l.mine + "\n"
+          + (if (l.peer_l.len() == 32 && l.peer_w.len() == 32) { "peer " + hex_encode(reveal(l.peer_l)) + " " + hex_encode(reveal(l.peer_w)) + "\n" } else { "" })
+          + key_entries(l.keys, 0, "");
+    List(Int) b = utf8(t);
+    if (b.len() > list_plain_len()) { return []; }
+    return b.concat(zero_bytes(list_plain_len() - b.len(), ListBuf()));
+}
+
+Str key_entries(List(SecKey) ks, Int i, Str acc) {
+    if (i >= ks.len()) { return acc; }
+    SecKey x = ks[i];
+    return key_entries(ks, i + 1, acc + "key " + hex_encode(utf8(x.name)) + " " + hex_encode(x.cred_id) + " " + hex_encode(x.cred_point) + " " + hex_encode(x.sealed) + "\n");
+}
+
+List(Int) zero_bytes(Int n, ListBuf(Int) acc) { return if (n <= 0) { acc.finish() } else { zero_bytes(n - 1, acc.push(0)) }; }
+
+Int zero_at(List(Int) p, Int i) { return if (i >= p.len() || p[i] == 0) { i } else { zero_at(p, i + 1) }; }
+
+pub KeyList list_of_plain(List(Int) p) {
+    Int end = zero_at(p, 0);
+    return list_lines(str_split(http_text(p, 0, end), "\n"), 0, no_list());
+}
+
+List(Int) hex_field(List(Str) f, Int i) { return if (f.len() > i && hexy(f[i])) { cose_hex_decode(f[i]) } else { [] }; }
+
+KeyList list_lines(List(Str) ls, Int i, KeyList l) {
+    if (i >= ls.len()) { return l; }
+    List(Str) f = str_split(str_trim(ls[i]), " ");
+    Str tag = if (f.len() > 0) { f[0] } else { "" };
+    KeyList n = list_line(f, tag, l);
+    return list_lines(ls, i + 1, n);
+}
+
+KeyList list_line(List(Str) f, Str tag, KeyList l) {
+    if (tag == "w") { return KeyList {.w = secret_bytes(hex_field(f, 1)), .salt = l.salt, .via = l.via, .mine = l.mine, .peer_l = l.peer_l, .peer_w = l.peer_w, .keys = l.keys}; }
+    if (tag == "salt") { return KeyList {.w = l.w, .salt = hex_field(f, 1), .via = l.via, .mine = l.mine, .peer_l = l.peer_l, .peer_w = l.peer_w, .keys = l.keys}; }
+    if (tag == "via") { return KeyList {.w = l.w, .salt = l.salt, .via = hex_field(f, 1), .mine = l.mine, .peer_l = l.peer_l, .peer_w = l.peer_w, .keys = l.keys}; }
+    if (tag == "mine" && f.len() == 2) { return list_with_mine(l, f[1]); }
+    if (tag == "peer") { return list_with_peer(l, secret_bytes(hex_field(f, 1)), secret_bytes(hex_field(f, 2))); }
+    if (tag == "key" && f.len() == 5 && hexy(f[1]) && hexy(f[2]) && hexy(f[3]) && hexy(f[4])) {
+        SecKey k = SecKey {.name = http_text(cose_hex_decode(f[1]), 0, str_len(f[1]) / 2), .cred_id = cose_hex_decode(f[2]), .cred_point = cose_hex_decode(f[3]), .sealed = cose_hex_decode(f[4])};
+        return KeyList {.w = l.w, .salt = l.salt, .via = l.via, .mine = l.mine, .peer_l = l.peer_l, .peer_w = l.peer_w, .keys = l.keys.concat([k])};
+    }
+    return l;
+}
+
+List(Int) hdr_aad() { return utf8("symbolon v1 key list key"); }
+List(Int) list_aad() { return utf8("symbolon v1 key list"); }
+List(Int) via_aad() { return utf8("symbolon v1 key list via"); }
+
+pub List(Secret(UInt(8))) list_key_of(List(Secret(UInt(8))) unlock_k) { return hk(unlock_k, "symbolon v1 key list", 32); }
+
+// L sealed under the unlock key a PIN gives: hdr_len() bytes.
+@requires(declassify)
+pub List(Int) seal_hdr(List(Secret(UInt(8))) unlock_k, List(Secret(UInt(8))) l) {
+    if (unlock_k.len() != 32 || l.len() != 32) { return []; }
+    List(Int) iv = random_bytes(12);
+    return iv.concat(reveal(aes_gcmg_seal(list_key_of(unlock_k), iv, l, hdr_aad())));
+}
+
+// L from a profile file, when `unlock_k` opens its header.
+@requires(declassify)
+pub Option(List(Secret(UInt(8)))) open_hdr(List(Secret(UInt(8))) unlock_k, List(Int) file) {
+    if (file.len() != profile_file_len() || unlock_k.len() != 32) { return None; }
+    return aes_gcmg_decrypt(list_key_of(unlock_k), file[0..12], file[12..hdr_len()], hdr_aad());
+}
+
+// The list sealed under L: list_len() bytes, or [] when it does not fit.
+@requires(declassify)
+pub List(Int) seal_list(List(Secret(UInt(8))) l, KeyList kl) {
+    List(Int) p = list_plain(kl);
+    if (p.len() == 0 || l.len() != 32) { return []; }
+    List(Int) iv = random_bytes(12);
+    return iv.concat(reveal(aes_gcmg_seal(l, iv, secret_bytes(p), list_aad())));
+}
+
+@requires(declassify)
+pub Option(KeyList) open_list(List(Secret(UInt(8))) l, List(Int) file) {
+    if (file.len() != profile_file_len() || l.len() != 32) { return None; }
+    Int s = hdr_len();
+    Option(List(Secret(UInt(8)))) p = aes_gcmg_decrypt(l, file[s..s + 12], file[s + 12..s + list_len()], list_aad());
+    return match p { None => None, Some(x) => Some(list_of_plain(reveal(x))) };
+}
+
+// blob_X wrapped under W: wblob_len() bytes.
+@requires(declassify)
+pub List(Int) seal_wblob(List(Secret(UInt(8))) w, Str which, List(Int) blob) {
+    if (w.len() != 32 || blob.len() != blob_len()) { return []; }
+    List(Int) iv = random_bytes(12);
+    return iv.concat(reveal(aes_gcmg_seal(w, iv, secret_bytes(blob), bw_aad(which))));
+}
+
+@requires(declassify)
+pub List(Int) open_wblob(List(Secret(UInt(8))) w, Str which, List(Int) file) {
+    if (file.len() != profile_file_len() || w.len() != 32) { return []; }
+    Int s = hdr_len() + list_len();
+    Option(List(Secret(UInt(8)))) p = aes_gcmg_decrypt(w, file[s..s + 12], file[s + 12..file.len()], bw_aad(which));
+    return match p { None => [], Some(x) => reveal(x) };
+}
+
+// A profile file's three parts.
+pub List(Int) hdr_part(List(Int) file) { return if (file.len() == profile_file_len()) { file[0..hdr_len()] } else { [] }; }
+pub List(Int) list_part(List(Int) file) { return if (file.len() == profile_file_len()) { file[hdr_len()..hdr_len() + list_len()] } else { [] }; }
+pub List(Int) wblob_part(List(Int) file) { return if (file.len() == profile_file_len()) { file[hdr_len() + list_len()..file.len()] } else { [] }; }
+
+// A profile file written whole, by a rename: a PIN change (header and
+// blob) or a key change (list) is all or nothing.
+@requires(filesystem)
+pub Bool put_profile(Str dir, Str which, List(Int) hdr, List(Int) list, List(Int) wblob) {
+    if (hdr.len() != hdr_len() || list.len() != list_len() || wblob.len() != wblob_len()) { return false; }
+    Str f = profile_file(dir, which);
+    Str tmp = f + ".new";
+    if (filesystem.write_secret(tmp, hdr.concat(list).concat(wblob)) && filesystem.rename(tmp, f)) { return true; }
+    _ = filesystem.remove(tmp);
+    return false;
+}
+
+// Random bytes in place of a profile file (a device without a duress PIN).
+@requires(filesystem)
+pub Bool put_decoy_profile(Str dir, Str which) {
+    List(Int) r = random_bytes(profile_file_len());
+    return put_profile(dir, which, r[0..hdr_len()], r[hdr_len()..hdr_len() + list_len()], r[hdr_len() + list_len()..r.len()]);
+}
+
+// The profile a PIN's unlock key opens: which file, its L and its list
+// (which is "" when neither opens). Both headers are always tried.
+pub type OwnList = { Str which; List(Secret(UInt(8))) l; KeyList list; };
+
+pub OwnList no_own() { return OwnList {.which = "", .l = [], .list = no_list()}; }
+
+@requires(filesystem, declassify)
+pub OwnList open_own(Str dir, List(Secret(UInt(8))) unlock_k) {
+    List(Int) fa = get_file(profile_file(dir, "a"));
+    List(Int) fb = get_file(profile_file(dir, "b"));
+    Option(List(Secret(UInt(8)))) la = open_hdr(unlock_k, fa);
+    Option(List(Secret(UInt(8)))) lb = open_hdr(unlock_k, fb);
+    OwnList o = match la {
+        Some(l) => own_in("a", l, fa),
+        None => match lb { Some(l) => own_in("b", l, fb), None => no_own() }
+    };
+    return o;
+}
+
+@requires(declassify)
+OwnList own_in(Str which, List(Secret(UInt(8))) l, List(Int) file) {
+    Option(KeyList) kl = open_list(l, file);
+    OwnList o = match kl { None => no_own(), Some(x) => OwnList {.which = which, .l = l, .list = x} };
+    return o;
+}
+
+// W from a list: the list's own when no key is enrolled; else from a touch
+// of one of its keys (and through `via` for a key enrolled before format
+// 2), or [] with the reason printed. A fill's touch is recorded as in
+// unwrap_key.
+@requires(filesystem, network, environment, declassify, device, clock)
+pub List(Secret(UInt(8))) list_wrap(Str dir, KeyList l) {
+    if (l.keys.len() == 0) { return l.w; }
+    Str fill = environment.get("SYMBOLON_FILL");
+    eprintln("device: touch your security key");
+    Touch t = touch_key(l.keys, l.salt, if (str_len(fill) > 0) { fill_hash(fill) } else { random_bytes(32) });
+    if (!t.ok) { eprintln("device: " + t.why); return []; }
+    List(Secret(UInt(8))) w = list_w_for(l, t.cred_id, t.out);
+    if (str_len(fill) > 0 && w.len() == 32) {
+        if (!record_fill(dir, fill, t)) { eprintln("device: cannot write the fill record"); return []; }
+    }
+    return w;
+}
+
+// W from the list's entry for credential `cred_id`, given that key's
+// hmac-secret output `out`; [] when it does not open.
+@requires(declassify)
+pub List(Secret(UInt(8))) list_w_for(KeyList l, List(Int) cred_id, List(Secret(UInt(8))) out) {
+    SecKey x = key_with(l.keys, cred_id, 0) else { SecKey {.name = "", .cred_id = [], .cred_point = [], .sealed = []} };
+    Option(List(Secret(UInt(8)))) e = open_w(out, x);
+    List(Secret(UInt(8))) none = [];
+    List(Secret(UInt(8))) ek = e else { none };
+    if (ek.len() != 32) { return none; }
+    List(Secret(UInt(8))) w = via_open(l.via, ek);
+    return w;
+}
+
+// W through `via` when it opens under `e` (a key enrolled before format
+// 2), else `e` itself.
+@requires(declassify)
+pub List(Secret(UInt(8))) via_open(List(Int) via, List(Secret(UInt(8))) e) {
+    if (via.len() != 12 + 32 + 16 || e.len() != 32) { return e; }
+    Option(List(Secret(UInt(8)))) w = aes_gcmg_decrypt(e, via[0..12], via[12..via.len()], via_aad());
+    return w else { e };
+}
+
+@requires(declassify)
+pub List(Int) seal_via(List(Secret(UInt(8))) w, List(Secret(UInt(8))) e) {
+    List(Int) iv = random_bytes(12);
+    return iv.concat(reveal(aes_gcmg_seal(e, iv, w, via_aad())));
+}
+
+// A key's entry for a list: W sealed under its hmac-secret output.
+@requires(declassify)
+pub SecKey key_entry(Str name, List(Int) cred_id, List(Int) cred_point, List(Secret(UInt(8))) out, List(Secret(UInt(8))) w) {
+    return SecKey {.name = name, .cred_id = cred_id, .cred_point = cred_point, .sealed = seal_w(out, cred_id, w, random_bytes(12))};
+}
+
+// The keys without the one named `n` / with credential `id`.
+pub List(SecKey) keys_without_name(List(SecKey) ks, Str n, Int i, ListBuf(SecKey) acc) {
+    if (i >= ks.len()) { return acc.finish(); }
+    return keys_without_name(ks, n, i + 1, if (ks[i].name == n) { acc } else { acc.push(ks[i]) });
+}
+
+pub List(SecKey) keys_without_cred(List(SecKey) ks, List(Int) id, Int i, ListBuf(SecKey) acc) {
+    if (i >= ks.len()) { return acc.finish(); }
+    return keys_without_cred(ks, id, i + 1, if (hex_encode(ks[i].cred_id) == hex_encode(id)) { acc } else { acc.push(ks[i]) });
+}
+
+pub Option(SecKey) key_named(List(SecKey) ks, Str n, Int i) {
+    if (i >= ks.len()) { return None; }
+    if (ks[i].name == n) { return Some(ks[i]); }
+    return key_named(ks, n, i + 1);
 }

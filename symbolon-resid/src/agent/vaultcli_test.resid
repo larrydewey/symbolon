@@ -83,16 +83,16 @@ RealProfile real_none() { return RealProfile {.share = [], .cc = [], .vault_key 
 DuressFull duress_none() { return DuressFull {.share = [], .subkey = [], .vault_key = [], .hpke_priv = [], .tweaks = []}; }
 
 Unlocked as_real() {
-    return Unlocked {.kind = 1, .duress = duress_none(), .st = [], .wrap = [],
+    return Unlocked {.kind = 1, .duress = duress_none(), .st = [], .wrap = [], .ukey = [],
         .real = RealProfile {.share = secret_bytes(rep(1, 32)), .cc = secret_bytes(rep(2, 32)), .vault_key = vk(), .dek = secret_bytes(rep(3, 32)), .duress_hpke_pub = []}};
 }
 
 Unlocked as_duress() {
-    return Unlocked {.kind = 2, .real = real_none(), .st = [], .wrap = [],
+    return Unlocked {.kind = 2, .real = real_none(), .st = [], .wrap = [], .ukey = [],
         .duress = DuressFull {.share = secret_bytes(rep(6, 32)), .subkey = secret_bytes(rep(7, 32)), .vault_key = secret_bytes(rep(8, 32)), .hpke_priv = secret_bytes(rep(4, 32)), .tweaks = []}};
 }
 
-Unlocked as_neither() { return Unlocked {.kind = 0, .real = real_none(), .duress = duress_none(), .st = [], .wrap = []}; }
+Unlocked as_neither() { return Unlocked {.kind = 0, .real = real_none(), .duress = duress_none(), .st = [], .wrap = [], .ukey = []}; }
 
 Str err_of(Result(View, Str) r) { return match r { Ok(_) => "ok", Err(m) => m }; }
 Int count_of(Result(View, Str) r) { return match r { Ok(v) => v.st.items.len(), Err(_) => 0 - 1 }; }

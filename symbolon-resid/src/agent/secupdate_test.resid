@@ -22,6 +22,7 @@ import "sharecli.resid";
 import "recover.resid";
 import "cosignerd.resid";
 import "secupdate.resid";
+import "keycli.resid";
 import "hpkeg.resid";
 import "crypto.resid";
 import "word.resid";
@@ -134,11 +135,36 @@ test "the duress profile opens no folder-key wrap, kit half, re-share or enrolme
     expect(hex_encode(dp[65..130])).toEqual(hex_encode(hpkeg_derive_keypair(16, d.duress.share).pk));
 }
 
+// The profile files as before format 2: blob_a and blob_b in the clear
+// (no security key), no profile_ files and no key list.
+@requires(filesystem, device, declassify, provision, network, environment, clock)
+Bool to_legacy(Str dir, Bool duress) {
+    DeviceConfig c = cfg(dir);
+    Found fr = find_own(dir, c, stretch(c, pin_bytes(pin())), true);
+    OwnList o = fr.o;
+    Str rw = o.which;
+    Str dw = if (rw == "a") { "b" } else { "a" };
+    List(Int) rb = read_blob(dir, rw, o.list.w);
+    List(Int) db = if (duress) { duress_blob(dir, c, dw) } else { random_bytes(blob_len()) };
+    Bool gone = filesystem.remove(profile_file(dir, "a")) && filesystem.remove(profile_file(dir, "b"));
+    return rb.len() == blob_len() && db.len() == blob_len() && gone && filesystem.write_bytes(dir + "/blob_" + rw, rb) && filesystem.write_bytes(dir + "/blob_" + dw, db);
+}
+
+@requires(filesystem, device, declassify, provision, network, environment)
+List(Int) duress_blob(Str dir, DeviceConfig c, Str dw) {
+    Found fd = find_own(dir, c, stretch(c, pin_bytes(dpin())), true);
+    OwnList o = fd.o;
+    List(Int) b = read_blob(dir, dw, o.list.w);
+    return b;
+}
+
 // A device as one made before the update: the duress profile's share field
 // holds the device's v1 seed, the configuration names v1, duress.pub is the
-// sub-key alone and `security-update` is missing.
+// sub-key alone, `security-update` is missing and the profiles are in the
+// format before 2.
 @requires(filesystem, device, declassify, provision, network, environment, clock)
 Bool make_old(Str dir, Bool duress) {
+    if (!to_legacy(dir, duress)) { return false; }
     DeviceConfig c = cfg(dir);
     Unlocked u = open_as(dir, pin());
     List(Int) v1 = device_hpke(u.real.dek).pk;
@@ -193,8 +219,66 @@ test "an old device after the security update: no device key under the duress PI
     // PIN, until it is made again; not under the duress PIN any more.
     expect(opened(unwrap_with(device_open_keys(c1, u1.real.dek), 0, info(), other.pk, old_wrap))).toBeTrue();
     expect(opened(unwrap_with(duress_material(d1.duress), 0, info(), other.pk, old_wrap))).toBeFalse();
+    // The profiles are in format 2: each in its own file, no plain list.
+    expect(keys_v2(dir)).toBeTrue();
+    expect(filesystem.exists(dir + "/blob_a") || filesystem.exists(dir + "/blob_b") || filesystem.exists(dir + "/security-keys")).toBeFalse();
+    expect(get_file(profile_file(dir, "a")).len()).toEqual(profile_file_len());
+    expect(get_file(profile_file(dir, "b")).len()).toEqual(profile_file_len());
     // Running it again changes nothing.
     expect(update_with(dir, c1, pin(), dpin())).toEqual(0);
+}
+
+// key `n`'s hmac-secret output and credential, as the test's keys give them.
+List(Secret(UInt(8))) out_of(Int n) { return secret_bytes(rep(n, 32)); }
+List(Int) cred_of(Int n) { return rep(n, 16); }
+
+// An unlock in format 2 with key `n` touched, as unlock_v2 makes it.
+@requires(filesystem, device, declassify, provision, network, environment)
+Unlocked touched(Str dir, DeviceConfig c, Str p, Int n) {
+    List(Secret(UInt(8))) st = stretch(c, pin_bytes(p));
+    Found f = find_own(dir, c, st, true);
+    OwnList o = f.o;
+    if (o.which == "") { return unlocked_none(); }
+    KeyList l = o.list;
+    List(Secret(UInt(8))) w = if (l.keys.len() == 0) { l.w } else { list_w_for(l, cred_of(n), out_of(n)) };
+    return with_ukey(with_wrap(with_stretched(unlock(f.k, read_blob(dir, o.which, w), []), st), w), f.k);
+}
+
+@requires(filesystem, device, declassify, provision, network, environment, clock)
+test "a device with a security key, moved to format 2: each profile asks for the key, a key added under the duress PIN opens only the duress profile" {
+    Str dir = new_device(true);
+    expect(make_old(dir, true)).toBeTrue();
+    DeviceConfig c = cfg(dir);
+    // A key enrolled before format 2: both profiles under one W, the list in the clear.
+    List(Secret(UInt(8))) w = random_secret(32);
+    expect(write_blob(dir, "a", read_blob(dir, "a", []), w) && write_blob(dir, "b", read_blob(dir, "b", []), w)).toBeTrue();
+    expect(write_keys(dir, SecKeys {.salt = rep(4, 32), .keys = [SecKey {.name = "main", .cred_id = cred_of(5), .cred_point = [4].concat(rep(2, 64)), .sealed = seal_w(out_of(5), cred_of(5), w, random_bytes(12))}]})).toBeTrue();
+    List(Secret(UInt(8))) st = stretch(c, pin_bytes(pin()));
+    List(Secret(UInt(8))) k = unlock_key(st, c.salt);
+    Unlocked u = with_ukey(with_wrap(with_stretched(unlock(k, read_blob(dir, "a", w), read_blob(dir, "b", w)), st), w), k);
+    expect(u.kind).toEqual(1);
+    Str before = hex_encode(reveal(u.real.dek));
+    expect(match to_format2(dir, c, u, dpin(), false) { Ok(_) => true, Err(_) => false }).toBeTrue();
+    expect(keys_v2(dir)).toBeTrue();
+    // Each profile asks for the key, and opens with its touch only.
+    expect(open_as(dir, pin()).kind).toEqual(0);
+    expect(open_as(dir, dpin()).kind).toEqual(0);
+    Unlocked u2 = touched(dir, c, pin(), 5);
+    expect(u2.kind).toEqual(1);
+    expect(hex_encode(reveal(u2.real.dek))).toEqual(before);
+    expect(touched(dir, c, dpin(), 5).kind).toEqual(2);
+    expect(touched(dir, c, pin(), 6).kind).toEqual(0);
+    // A key added under the duress PIN: the duress profile opens with it,
+    // and the W it gives does not open the real profile.
+    expect(key_add_commit(dir, c, touched(dir, c, dpin(), 5), "coerced", cred_of(6), [4].concat(rep(2, 64)), out_of(6))).toEqual(0);
+    expect(touched(dir, c, dpin(), 6).kind).toEqual(2);
+    expect(touched(dir, c, pin(), 6).kind).toEqual(0);
+    Found fd = find_own(dir, c, stretch(c, pin_bytes(dpin())), true);
+    OwnList od = fd.o;
+    List(Secret(UInt(8))) wd = list_w_for(od.list, cred_of(6), out_of(6));
+    expect(wd.len()).toEqual(32);
+    expect(read_blob(dir, if (od.which == "a") { "b" } else { "a" }, wd).len()).toEqual(0);
+    expect(read_blob(dir, if (od.which == "a") { "b" } else { "a" }, w).len()).toEqual(blob_len());
 }
 
 @requires(filesystem, device, declassify, provision, network, environment, clock)
@@ -221,8 +305,9 @@ test "without a duress PIN the update leaves decoys of the same shape" {
     expect(make_old(d1, false)).toBeTrue();
     expect(update_with(d1, cfg(d1), pin(), "")).toEqual(0);
     expect(security_update_due(d1)).toBeFalse();
-    expect(read_blob(d1, "a", []).len()).toEqual(blob_len());
-    expect(read_blob(d1, "b", []).len()).toEqual(blob_len());
+    expect(get_file(profile_file(d1, "a")).len()).toEqual(profile_file_len());
+    expect(get_file(profile_file(d1, "b")).len()).toEqual(profile_file_len());
+    expect(filesystem.exists(d1 + "/blob_a")).toBeFalse();
     expect(get_file(d1 + "/slot").len()).toEqual(slot_len());
     expect(duress_pub(d1).len()).toEqual(130);
     // One that had one, and is told it has none: the old duress PIN opens
@@ -232,8 +317,8 @@ test "without a duress PIN the update leaves decoys of the same shape" {
     expect(update_with(d2, cfg(d2), pin(), "")).toEqual(0);
     expect(open_as(d2, dpin()).kind).toEqual(0);
     expect(open_as(d2, pin()).real.duress_hpke_pub.len()).toEqual(0);
-    expect(read_blob(d2, "a", []).len()).toEqual(blob_len());
-    expect(read_blob(d2, "b", []).len()).toEqual(blob_len());
+    expect(get_file(profile_file(d2, "a")).len()).toEqual(profile_file_len());
+    expect(get_file(profile_file(d2, "b")).len()).toEqual(profile_file_len());
     expect(duress_pub(d2).len()).toEqual(130);
 }
 

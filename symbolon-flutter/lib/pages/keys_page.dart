@@ -18,6 +18,7 @@ class SecurityKeysPage extends StatefulWidget {
 
 class _SecurityKeysPageState extends State<SecurityKeysPage> {
   List<String>? names;
+  bool needsPin = false;   // the list is sealed under the PIN (SPEC 9.4) and none is held
   bool fillsNeedKey = false;   // the device's fill policy (SPEC 22.7 item 2), from its fill-policy file
   App get app => widget.app;
 
@@ -27,18 +28,29 @@ class _SecurityKeysPageState extends State<SecurityKeysPage> {
     load();
   }
 
-  // With the PIN the session holds (or the one an add or remove just used),
-  // so that the list is the one that PIN sees (under the duress PIN, its
-  // acted changes: SPEC 14.2).
+  // With the PIN the session holds (or the one an add or remove just used):
+  // each profile has its own list, sealed under its PIN (SPEC 9.4, 14.2).
+  // Without one the agent lists nothing, and the page asks for the PIN.
   Future<void> load({String? pin}) async {
-    final r = await app.cli.keyList(app.dir, pin: pin ?? app.session.held);
+    final p = pin ?? app.session.held;
+    final r = await app.cli.keyList(app.dir, pin: p);
     final policy = File('${app.dir}/fill-policy');
     final need = await policy.exists() && (await policy.readAsString()).startsWith('keys');
     if (!mounted) return;
     setState(() {
       names = r.ok ? [for (final l in r.lines) unhex(l.trim())] : [];
+      needsPin = !r.ok && p == null;
       fillsNeedKey = need;
     });
+  }
+
+  Future<void> showWithPin() async {
+    String? used;
+    await app.withPin(context, (p) {
+      used = p;
+      return app.cli.keyList(app.dir, pin: p);
+    });
+    if (used != null && mounted) await load(pin: used);
   }
 
   Future<void> setFills(bool needKey) async {
@@ -117,7 +129,10 @@ class _SecurityKeysPageState extends State<SecurityKeysPage> {
               const Text('A security key (a YubiKey or another FIDO2 key) adds something you have to the PIN: '
                   'this device opens only with an enrolled key plugged in and touched. Enroll a second key as a backup.'),
               const SizedBox(height: 12),
-              if (ns.isEmpty) const Card(child: ListTile(key: Key('keys-none'), title: Text('No security key: the PIN alone opens this device'))),
+              if (needsPin)
+                Card(child: ListTile(key: const Key('keys-locked'), leading: const Icon(Icons.lock_outline), title: const Text("Enter the PIN to see this device's keys"), onTap: showWithPin))
+              else if (ns.isEmpty)
+                const Card(child: ListTile(key: Key('keys-none'), title: Text('No security key: the PIN alone opens this device'))),
               for (final n in ns)
                 Card(
                   child: ListTile(

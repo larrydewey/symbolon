@@ -657,7 +657,7 @@ Bool reshare_matches(EventPayload p, RsResult res, ReshareInvite inv) {
 Int joined(Str dir, DeviceConfig c, Unlocked u, Str pin, CgConfig ncfg, EnrollSecrets es, VerifiedHead vh, Cursor cur, Option(KvOut) kvo, ReshareInvite inv) {
     if (es.cc.len() != 32 || es.vault_key.len() != 32) { return dfail("malformed secrets"); }
     RealProfile real = RealProfile {.share = u.real.share, .cc = secret_bytes(es.cc), .vault_key = secret_bytes(es.vault_key), .dek = u.real.dek, .duress_hpke_pub = u.real.duress_hpke_pub};
-    List(Secret(UInt(8))) k = unlock_key_for(c, u.st, true);
+    List(Secret(UInt(8))) k = u.ukey;
     List(Secret(UInt(8))) rp = encode_real(real) else { [] };
     // Which file held the real profile: the one this key opens.
     Bool a_real = unlock(k, read_blob(dir, "a", u.wrap), []).kind == 1;

@@ -1,9 +1,10 @@
 // The device agent (SPEC 9, 10): `symbolon device new | init | register |
 // sign | status`.
 //
-// Files in its directory: config.cbor (public configuration), blob_a and
-// blob_b (the two sealed profiles, src/duress/, which one is real is not
-// recorded), slot (the duress update slot), share.enc (the CGGMP21
+// Files in its directory: config.cbor (public configuration), profile_a
+// and profile_b (the two sealed profiles, src/duress/, each with its key
+// list, fidokey.resid; which one is real is not recorded; blob_a, blob_b
+// and security-keys before format 2), slot (the duress update slot), share.enc (the CGGMP21
 // configuration under the profile's DEK), log/ (the identity log as fetched
 // and verified).
 //
@@ -47,6 +48,12 @@ Int srk_handle() { return 0x81000110; }
 Int dk_handle() { return 0x81000111; }
 Int unlock_a_handle() { return 0x81000112; }
 Int unlock_b_handle() { return 0x81000113; }
+// The device key of format 2 (authValue from the DEK): it never moves.
+pub Int dk_v2_handle() { return 0x81000311; }
+// The persistent handles an unlock key can be at: a PIN change, under
+// either PIN, moves the profile's key to a random free one, so neither the
+// handle nor the configuration field says whose it is.
+List(Int) unlock_pool() { return [unlock_a_handle(), unlock_a_handle() + 256, unlock_b_handle(), unlock_b_handle() + 256]; }
 
 pub Endpoint relay_ep(DeviceConfig c) { return Endpoint {.host = c.relay_host, .port = c.relay_port, .ca = c.ca, .token = ""}; }
 
@@ -134,26 +141,95 @@ List(UInt(8)) u8s_at(List(Int) b, Int i, ListBuf(UInt(8)) acc) {
     return u8s_at(b, i + 1, acc.push((UInt(8))(b[i] & 255)));
 }
 
+// The unlock key a PIN gives through one of the two unlock keys: `on_a`,
+// the TPM key in tpm_unlock_a (else tpm_unlock_b), or the Keystore's
+// unlock_a (else unlock_b); the unprotected profile has one. [] when the
+// TPM refuses the PIN. Which of the two is the real profile's is recorded
+// only inside the profiles (KeyList.mine, SPEC 9.4).
+@requires(device, declassify, provision, network, environment)
+pub List(Secret(UInt(8))) unlock_key_at(DeviceConfig c, List(Secret(UInt(8))) st, Bool on_a) {
+    if (c.unprotected) { List(Secret(UInt(8))) k = unlock_key(st, c.salt); return k; }
+    if (on_keystore(c)) { List(Secret(UInt(8))) k = ks_unlock_key(c, if (on_a) { "unlock_a" } else { "unlock_b" }, st); return k; }
+    Result(List(Secret(UInt(8))), TpmError) h = tpm_hmac(if (on_a) { c.tpm_unlock_a } else { c.tpm_unlock_b }, st, u8s(c.salt));
+    List(Secret(UInt(8))) none = [];
+    List(Secret(UInt(8))) out = match h {
+        Ok(x) => unlock_key(provisioned_key(x, "the TPM's HMAC of the stretched PIN under a TPM-held unlock key"), c.salt),
+        Err(_) => none
+    };
+    return out;
+}
+
 @requires(filesystem, device, declassify, provision, network, environment, clock)
 pub Unlocked unlock_dir(Str dir, DeviceConfig c, Str pin) {
     List(Secret(UInt(8))) st = stretch(c, pin_bytes(pin));
     Bool a_first = (random_bytes(1)[0] & 1) == 0;
-    // With security keys enrolled (SPEC 9.4) the profiles are sealed under
-    // W, which only a present, touched key gives back.
+    if (keys_v2(dir)) { Unlocked v = unlock_v2(dir, c, st, a_first); return v; }
+    // Before format 2: with security keys enrolled (SPEC 9.4) both
+    // profiles are sealed under one W, which a present, touched key gives.
     List(Secret(UInt(8))) w = if (keys_enrolled(dir)) { unwrap_key(dir) } else { [] };
     // The Keystore refuses no PIN (it has no auth value): an unlock key
     // that opens neither profile is the other key's, or a wrong PIN.
     if (on_keystore(c)) { return with_wrap(with_stretched(ks_unlock_either(dir, c, st, a_first, w), st), w); }
     List(Secret(UInt(8))) k = unlock_key_for(c, st, a_first);
-    if (k.len() == 0) { return Unlocked {.kind = 0, .wrap = [], .real = RealProfile {.share = [], .cc = [], .vault_key = [], .dek = [], .duress_hpke_pub = []},
-                                         .duress = DuressFull {.share = [], .subkey = [], .vault_key = [], .hpke_priv = [], .tweaks = []}, .st = []}; }
-    return with_wrap(with_stretched(unlock(k, read_blob(dir, "a", w), read_blob(dir, "b", w)), st), w);
+    if (k.len() == 0) { return unlocked_none(); }
+    return with_ukey(with_wrap(with_stretched(unlock(k, read_blob(dir, "a", w), read_blob(dir, "b", w)), st), w), k);
 }
 
 @requires(declassify, provision, network, environment, device, filesystem)
 Unlocked ks_unlock_either(Str dir, DeviceConfig c, List(Secret(UInt(8))) st, Bool a_first, List(Secret(UInt(8))) w) {
-    Unlocked u = unlock(unlock_key_for(c, st, a_first), read_blob(dir, "a", w), read_blob(dir, "b", w));
-    return if (u.kind != 0) { u } else { unlock(unlock_key_for(c, st, !a_first), read_blob(dir, "a", w), read_blob(dir, "b", w)) };
+    List(Secret(UInt(8))) k1 = unlock_key_for(c, st, a_first);
+    Unlocked u = unlock(k1, read_blob(dir, "a", w), read_blob(dir, "b", w));
+    if (u.kind != 0) { return with_ukey(u, k1); }
+    List(Secret(UInt(8))) k2 = unlock_key_for(c, st, !a_first);
+    return with_ukey(unlock(k2, read_blob(dir, "a", w), read_blob(dir, "b", w)), k2);
+}
+
+// The unlock key a PIN gives and the profile file whose list it opens
+// (OwnList.which "" when none does: a wrong PIN). TPM mode asks the two
+// unlock keys in a random order (unlock_key_for); the Keystore, which
+// refuses no PIN, gives a key from each, and the one whose list opens is
+// the PIN's.
+pub type Found = { List(Secret(UInt(8))) k; OwnList o; };
+
+@requires(filesystem, device, declassify, provision, network, environment)
+pub Found find_own(Str dir, DeviceConfig c, List(Secret(UInt(8))) st, Bool a_first) {
+    List(Secret(UInt(8))) k1 = if (on_keystore(c)) { unlock_key_at(c, st, a_first) } else { unlock_key_for(c, st, a_first) };
+    OwnList o1 = if (k1.len() == 32) { open_own(dir, k1) } else { no_own() };
+    if (o1.which != "" || !on_keystore(c)) { return Found {.k = k1, .o = o1}; }
+    List(Secret(UInt(8))) k2 = unlock_key_at(c, st, !a_first);
+    OwnList o2 = if (k2.len() == 32) { open_own(dir, k2) } else { no_own() };
+    return Found {.k = k2, .o = o2};
+}
+
+// Format 2 (SPEC 9.4): the PIN opens its profile's key list; the list
+// says which security key to touch (none: W is in it), the touch gives W,
+// and W the profile's blob. A wrong PIN opens no list, and no key is
+// asked for.
+@requires(filesystem, device, declassify, provision, network, environment, clock)
+Unlocked unlock_v2(Str dir, DeviceConfig c, List(Secret(UInt(8))) st, Bool a_first) {
+    Found f = find_own(dir, c, st, a_first);
+    OwnList o = f.o;
+    if (o.which == "") { return with_stretched(unlocked_none(), st); }
+    KeyList l = o.list;
+    if (str_len(environment.get("SYMBOLON_FILL")) > 0 && fills_need_key(dir) && l.keys.len() == 0) {
+        eprintln("device: " + fills_key_refusal());
+        return with_stretched(unlocked_none(), st);
+    }
+    List(Secret(UInt(8))) w = list_wrap(dir, l);
+    Unlocked u = unlock(f.k, read_blob(dir, o.which, w), []);
+    return with_ukey(with_wrap(with_stretched(u, st), w), f.k);
+}
+
+// Whether this profile's unlock key is unlock key "a" (unlock_key_at):
+// format 2 records it in the profile's list; before it, the real
+// profile's was a, except on a TPM whose fields an interrupted update
+// swapped, which the TPM answers.
+@requires(filesystem, device, declassify, provision, network, environment)
+pub Bool own_on_a(Str dir, DeviceConfig c, Unlocked u) {
+    if (keys_v2(dir)) { OwnList o = open_own(dir, u.ukey); return o.list.mine == "a"; }
+    if (c.unprotected || on_keystore(c)) { return u.kind == 1; }
+    List(Secret(UInt(8))) ka = unlock_key_at(c, u.st, true);
+    return ka.len() == 32 && hex_encode(reveal(ka)) == hex_encode(reveal(u.ukey));
 }
 
 // The DK's signature over `msg` (ECDSA P-256, SHA-256): the TPM key under
@@ -162,7 +238,21 @@ Unlocked ks_unlock_either(Str dir, DeviceConfig c, List(Secret(UInt(8))) st, Boo
 pub Result(List(Int), Str) dk_sign(DeviceConfig c, RealProfile p, List(Secret(UInt(8))) st, List(Int) msg) {
     if (c.unprotected) { return Ok(sw_sign(software_key(p.dek, "symbolon v1 software dk"), msg)); }
     if (on_keystore(c)) { return ks_sign(c, msg); }
-    return match tpm_sign_policy(c.tpm_dk, st, u8s(sha256_bytes(msg))) { Ok(s) => Ok(ints(s)), Err(e) => Err(tpm_error_text(e)) };
+    // The device key made since format 2 has an authValue from the DEK, so
+    // a PIN change does not touch it (SPEC 9.1); one made before has the
+    // stretched PIN until `device security-update` moves it.
+    List(Secret(UInt(8))) auth = if (c.tpm_dk == dk_v2_handle()) { dk_auth(p.dek) } else { st };
+    return match tpm_sign_policy(c.tpm_dk, auth, u8s(sha256_bytes(msg))) { Ok(s) => Ok(ints(s)), Err(e) => Err(tpm_error_text(e)) };
+}
+
+// The TPM device key's authValue (format 2): from the real profile's DEK,
+// which only the real PIN opens; random when there is none (a duress
+// unlock), so the TPM refuses it as it refused the duress PIN before.
+@requires(declassify)
+pub List(Secret(UInt(8))) dk_auth(List(Secret(UInt(8))) dek) {
+    if (dek.len() != 32) { return random_secret(32); }
+    List(Secret(UInt(8))) a = hk(dek, "symbolon v1 tpm device key auth", 32);
+    return a;
 }
 
 // ─── `device new` ───────────────────────────────────────────────
@@ -197,7 +287,7 @@ pub Int device_new_pins(Str dir, Str host, Int port, Bool unprotected, Bool keys
     Int m = if (fast) { 64 } else { argon_m_kib() };
     Int t = if (fast) { 1 } else { argon_t() };
     DeviceConfig c0 = DeviceConfig {.relay_host = host, .relay_port = port, .ca = ca, .witnesses = [], .unprotected = unprotected, .argon_m_kib = m, .argon_t = t,
-        .salt = salt, .tpm_dk = if (keystore && !unprotected) { keystore_profile() } else { dk_handle() }, .tpm_unlock_a = unlock_a_handle(), .tpm_unlock_b = unlock_b_handle(),
+        .salt = salt, .tpm_dk = if (keystore && !unprotected) { keystore_profile() } else { dk_v2_handle() }, .tpm_unlock_a = unlock_a_handle(), .tpm_unlock_b = unlock_b_handle(),
         .party = [], .dk_pub = [], .hpke_pub = device_hpke2(dek).pk, .log_id = [], .mbox_next = 0, .peers = []};
     List(Secret(UInt(8))) st = stretch(c0, pin_bytes(pin));
     List(Secret(UInt(8))) dst = if (str_len(dpin) > 0) { stretch(c0, pin_bytes(dpin)) } else { random_secret(32) };
@@ -213,7 +303,7 @@ Result(List(Int), Str) make_dk(DeviceConfig c, List(Secret(UInt(8))) dek, List(S
     if (c.unprotected) { return Ok(sw_public(software_key(dek, "symbolon v1 software dk"))); }
     if (on_keystore(c)) { return ks_make_dk(c); }
     _ = tpm_srk_setup(srk_handle());
-    Result(TpmBlob, TpmError) b = tpm_create(srk_handle(), tpm_policy_signing_template(tpm_policy_auth_value_digest()), st);
+    Result(TpmBlob, TpmError) b = tpm_create(srk_handle(), tpm_policy_signing_template(tpm_policy_auth_value_digest()), dk_auth(dek));
     return match b {
         Err(e) => Err("TPM: " + tpm_error_text(e)),
         Ok(blob) => match tpm_persist(srk_handle(), blob, c.tpm_dk) {
@@ -238,11 +328,15 @@ Bool make_unlock_key(Int handle, List(Secret(UInt(8))) auth) {
 @requires(filesystem, device, declassify, provision, network, environment)
 Int finish_new(Str dir, DeviceConfig c0, List(Int) dk_pub, List(Secret(UInt(8))) dek, List(Secret(UInt(8))) st, List(Secret(UInt(8))) dst, Bool has_duress) {
     if (dk_pub.len() != 65) { return dfail("no device key"); }
+    // Which of the two unlock keys (TPM handle field, Keystore alias) is
+    // the real profile's is random, and recorded only in the profiles.
+    Bool real_on_a = (random_bytes(1)[0] & 1) == 0;
     if (on_keystore(c0) && (!ks_make_hmac(c0, "unlock_a") || !ks_make_hmac(c0, "unlock_b"))) { return dfail("Keystore: cannot make the unlock keys"); }
-    if (!c0.unprotected && !on_keystore(c0) && (!make_unlock_key(c0.tpm_unlock_a, st) || !make_unlock_key(c0.tpm_unlock_b, dst))) { return dfail("TPM: cannot make the unlock keys"); }
+    if (!c0.unprotected && !on_keystore(c0) && (!make_unlock_key(if (real_on_a) { c0.tpm_unlock_a } else { c0.tpm_unlock_b }, st)
+                                              || !make_unlock_key(if (real_on_a) { c0.tpm_unlock_b } else { c0.tpm_unlock_a }, dst))) { return dfail("TPM: cannot make the unlock keys"); }
     DeviceConfig c = with_identity(c0, dk_pub);
-    List(Secret(UInt(8))) ka = unlock_key_for(c, st, true);
-    List(Secret(UInt(8))) kb = if (c.unprotected) { unlock_key(dst, c.salt) } else { unlock_key_for(c, dst, false) };
+    List(Secret(UInt(8))) ka = unlock_key_at(c, st, real_on_a);
+    List(Secret(UInt(8))) kb = unlock_key_at(c, dst, !real_on_a);
     HpkeKeyPairG(Secret(UInt(8))) dh = hpkeg_derive_keypair(16, random_secret(32));
     RealProfile real = RealProfile {.share = random_secret(32), .cc = random_secret(32), .vault_key = random_secret(32), .dek = dek,
                                     .duress_hpke_pub = if (has_duress) { dh.pk } else { [] }};
@@ -262,12 +356,34 @@ Int finish_new(Str dir, DeviceConfig c0, List(Int) dk_pub, List(Secret(UInt(8)))
     // The duress sub-key's public key and the duress transport key's; a
     // device without a duress PIN has both too, for keys no one holds.
     List(Int) dpub = duress_pub_of(if (has_duress) { dur.subkey } else { random_secret(32) }, if (has_duress) { dur.share } else { random_secret(32) });
-    Bool ok = filesystem.write_bytes(dir + "/duress.pub", dpub) && filesystem.write_bytes(dir + "/blob_a", if (real_first) { blob_real } else { blob_dur })
-           && filesystem.write_bytes(dir + "/blob_b", if (real_first) { blob_dur } else { blob_real })
+    Bool ok = filesystem.write_bytes(dir + "/duress.pub", dpub) && write_profiles(dir, if (real_first) { "a" } else { "b" }, ka, kb, blob_real, blob_dur, real_on_a, has_duress)
            && filesystem.write_bytes(dir + "/slot", slot) && save_config(dir, c) && security_update_done(dir);
     if (!ok) { return dfail("cannot write the profile"); }
     println(hex_encode(cbor_of_keys(PartyKeys {.party = c.party, .auth_key = c.dk_pub, .hpke_key = c.hpke_pub})));
     return 0;
+}
+
+// The two profile files of a new device (format 2, SPEC 9.4): each with
+// its own L and W and no security key yet; the real profile's list holds
+// the other's L and W. Without a duress PIN the other file is random. The
+// file named "a" is written last: its presence marks format 2.
+@requires(filesystem, declassify)
+Bool write_profiles(Str dir, Str rw, List(Secret(UInt(8))) ka, List(Secret(UInt(8))) kb, List(Int) blob_real, List(Int) blob_dur, Bool real_on_a, Bool has_duress) {
+    Str dw = if (rw == "a") { "b" } else { "a" };
+    List(Int) salt = random_bytes(32);
+    List(Secret(UInt(8))) lr = random_secret(32);
+    List(Secret(UInt(8))) wr = random_secret(32);
+    List(Secret(UInt(8))) ld = random_secret(32);
+    List(Secret(UInt(8))) wd = random_secret(32);
+    List(Secret(UInt(8))) none = [];
+    KeyList rl = KeyList {.w = wr, .salt = salt, .via = [], .mine = if (real_on_a) { "a" } else { "b" }, .peer_l = ld, .peer_w = wd, .keys = []};
+    KeyList dl = KeyList {.w = wd, .salt = salt, .via = [], .mine = if (real_on_a) { "b" } else { "a" }, .peer_l = none, .peer_w = none, .keys = []};
+    if (rw == "b") {
+        Bool r1 = put_profile(dir, rw, seal_hdr(ka, lr), seal_list(lr, rl), seal_wblob(wr, rw, blob_real));
+        return r1 && (if (has_duress) { put_profile(dir, dw, seal_hdr(kb, ld), seal_list(ld, dl), seal_wblob(wd, dw, blob_dur)) } else { put_decoy_profile(dir, dw) });
+    }
+    Bool d1 = if (has_duress) { put_profile(dir, dw, seal_hdr(kb, ld), seal_list(ld, dl), seal_wblob(wd, dw, blob_dur)) } else { put_decoy_profile(dir, dw) };
+    return d1 && put_profile(dir, rw, seal_hdr(ka, lr), seal_list(lr, rl), seal_wblob(wr, rw, blob_real));
 }
 
 // duress.pub (SPEC 14.2): the duress DK sub-key's public key (65) and the
@@ -277,25 +393,37 @@ pub List(Int) duress_pub_of(List(Secret(UInt(8))) subkey, List(Secret(UInt(8))) 
     return sw_public(subkey).concat(hpkeg_derive_keypair(16, transport_seed).pk);
 }
 
-// ─── The security update (D-4, SPEC 9.2) ────────────────────────
+// ─── The security update (D-4, SPEC 9.2, 9.4) ───────────────────
 // A device made before it has a duress profile holding the device's v1
-// transport key; `device security-update` (secupdate.resid) re-seals the
-// duress profile with a transport key of its own and moves the device to
-// its v2 key. The file `security-update` records that it ran (a device
-// made since writes it at once). Whether it is due depends on that file
-// alone, never on a PIN: the reminder looks the same under the PIN, the
-// duress PIN, or none.
+// transport key, and its profiles in the format before 2 (security keys
+// listed in the clear, both profiles under one W); `device
+// security-update` (secupdate.resid) re-seals the duress profile with a
+// transport key of its own, moves the device to its v2 key, and moves the
+// profiles to format 2. The file `security-update` records what ran
+// ("transport-v2 duress-transport", then "keys-v2"; a device made since
+// writes both at once). Whether it is due depends on that file alone,
+// never on a PIN: the reminder looks the same under the PIN, the duress
+// PIN, or none.
 
 pub Str security_update_file(Str dir) { return dir + "/security-update"; }
 
 @requires(filesystem)
-pub Bool security_update_due(Str dir) { return filesystem.exists(dir + "/config.cbor") && !filesystem.exists(security_update_file(dir)); }
+pub Bool security_update_due(Str dir) {
+    return filesystem.exists(dir + "/config.cbor") && !(filesystem.exists(security_update_file(dir)) && str_contains(filesystem.read_all(security_update_file(dir)), "keys-v2"));
+}
+
+// Whether the first part (D-4: the transport keys) ran.
+@requires(filesystem)
+pub Bool transport_update_done(Str dir) { return filesystem.exists(security_update_file(dir)); }
 
 @requires(filesystem)
-pub Bool security_update_done(Str dir) { return filesystem.write_all(security_update_file(dir), "transport-v2 duress-transport\n"); }
+pub Bool transport_update_record(Str dir) { return filesystem.write_all(security_update_file(dir), "transport-v2 duress-transport\n"); }
+
+@requires(filesystem)
+pub Bool security_update_done(Str dir) { return filesystem.write_all(security_update_file(dir), "transport-v2 duress-transport keys-v2\n"); }
 
 pub Str security_update_reminder(Str dir) {
-    return "Finish the security update: run `symbolon device security-update " + dir + "` (it asks for the PIN, then the duress PIN). Until then a duress PIN gives access to your shared folders.";
+    return "Finish the security update: run `symbolon device security-update " + dir + "` (it asks for the PIN, then the duress PIN). Until then a duress PIN may give access to your shared folders, and this device's files show its security keys to anyone.";
 }
 
 DeviceConfig with_identity(DeviceConfig c, List(Int) dk_pub) {
@@ -813,7 +941,7 @@ Int forget_keys(DeviceConfig c) {
 Bool tpm_taken() {
     Result(List(Int), TpmError) r = tpm_handles(dk_handle(), 512);
     List(Int) hs = match r { Ok(x) => x, Err(_) => [] };
-    List(Int) ours = [dk_handle(), unlock_a_handle(), unlock_b_handle(), other_handle(dk_handle(), dk_handle()), other_handle(unlock_a_handle(), unlock_a_handle()), other_handle(unlock_b_handle(), unlock_b_handle())];
+    List(Int) ours = [dk_handle(), other_handle(dk_handle(), dk_handle()), dk_v2_handle()].concat(unlock_pool());
     return any_in(ours, hs, 0);
 }
 
@@ -860,13 +988,18 @@ Int print_head(VerifiedHead vh) {
 // ─── `device pin` ───────────────────────────────────────────────
 
 // `symbolon device pin DIR`: the PIN, then the new PIN, on standard
-// input. The real profile opens under the new PIN; the duress PIN stays.
-// Unprotected and Keystore profiles: the real profile sealed again under
-// the new PIN's unlock key. TPM profile: the device key's and the real
-// unlock key's authValue changed (TPM2_ObjectChangeAuth with the old
-// one), the keys made persistent again at the other of two handles and
-// the old ones evicted; the unlock key's output does not depend on its
-// authValue, so the profile stays as it is. An organization's
+// input. The profile the PIN opens opens under the new PIN from then on,
+// under either PIN (SPEC 14.2): under the duress PIN it is the duress
+// profile, whose new PIN is the duress PIN from then on; the other
+// profile and its PIN are never touched. Unprotected and Keystore
+// profiles: the profile sealed again under the new PIN's unlock key, its
+// key list's header too, in one write of its file. TPM profile: the
+// profile's unlock key's authValue changed (TPM2_ObjectChangeAuth with the
+// old one) and the key made persistent at a random free handle of the
+// four, the old one evicted; its output does not depend on its authValue,
+// so the files stay as they are. The device key (format 2) does not depend
+// on the PIN and does not move; one made before (its authValue the
+// stretched PIN) moves too on a change of the real PIN. An organization's
 // min_pin_len (SPEC 29.5, from dir/org.policy) holds.
 @requires(filesystem, device, declassify, provision, network, environment, clock)
 pub Int device_pin(Str dir) {
@@ -879,10 +1012,13 @@ pub Int device_pin(Str dir) {
     return r;
 }
 
-// `device pin` with the PINs read. Under the duress PIN (SPEC 14.2) the
-// change is acted, not made: the same checks, stretches, unlocks and
-// writes as a real change, and "PIN changed", but every file holds what
-// it held (the duress profile sealed again unchanged): see duress_pin_act.
+// `device pin` with the PINs read. A new PIN that opens the other profile
+// cannot be taken (two profiles under one PIN): under the real PIN it is
+// refused with "this PIN cannot be used; choose another", which does not
+// name it; under the duress PIN refusing would tell the real PIN, so the
+// change is acted (act_pin): the same work and "PIN changed", the duress
+// PIN unchanged. The check is made under both PINs, so their timing is
+// alike.
 @requires(filesystem, device, declassify, provision, network, environment, clock)
 pub Int device_pin_with(Str dir, DeviceConfig c, Str pin, Str npin) {
     Int need = org_min_pin(dir);
@@ -890,62 +1026,62 @@ pub Int device_pin_with(Str dir, DeviceConfig c, Str pin, Str npin) {
     if (npin == pin) { return dfail("the new PIN is the PIN"); }
     Unlocked u = unlock_dir(dir, c, pin);
     if (u.kind != 1 && u.kind != 2) { return dfail("wrong PIN"); }
-    // A new PIN that opens the duress profile is refused without naming
-    // it, so that whoever reads the screen does not learn that the other
-    // PIN exists. (Under the duress PIN the same unlock is made, and its
-    // answer is not used: refusing a new PIN that opens the real profile
-    // would tell the real PIN.)
-    Int nk = unlock_dir(dir, c, npin).kind;
-    if (u.kind == 1 && nk == 2) { return dfail("this PIN cannot be used; choose another"); }
-    List(Secret(UInt(8))) st = stretch(c, pin_bytes(pin));
     List(Secret(UInt(8))) nst = stretch(c, pin_bytes(npin));
-    if (u.kind == 2) { Int d = duress_pin_act(dir, c, u, st, nst); return d; }
-    return if (c.unprotected || on_keystore(c)) { reseal_real(dir, c, u, st, nst) } else { tpm_new_auth(dir, c, st, nst) };
+    Bool taken = pin_taken(dir, c, u, nst);
+    if (u.kind == 1 && taken) { return dfail("this PIN cannot be used; choose another"); }
+    Bool on_a = own_on_a(dir, c, u);
+    if (taken) { Int a = act_pin(dir, c, u, on_a, nst); return a; }
+    Int r = if (c.unprotected || on_keystore(c)) { repin_own(dir, c, u, on_a, nst) } else { tpm_repin(dir, c, u, on_a, nst) };
+    return r;
 }
 
-// A PIN change under the duress PIN: the work of reseal_real (the old
-// unlock key, which file, a profile sealed under the new PIN's key and
-// checked, one profile file written) or of tpm_new_auth (two authValue
-// changes in the TPM, the configuration written), with nothing that
-// lasts. The duress profile's own blob is sealed again, the same
-// plaintext under its own key and a fresh IV, so the file changes as a
-// real change's does; when that does not check, its old bytes are written
-// back. Residual: the new PIN does not open the device afterwards, and in
-// TPM mode the configuration keeps its key handles (a real change moves
-// them).
+// Whether the PIN stretched to `nst` opens a profile already (without a
+// touch: its key list in format 2, the shared W before).
 @requires(filesystem, device, declassify, provision, network, environment)
-Int duress_pin_act(Str dir, DeviceConfig c, Unlocked u, List(Secret(UInt(8))) st, List(Secret(UInt(8))) nst) {
-    if (!c.unprotected && !on_keystore(c)) {
-        _ = change_auth(c.tpm_unlock_b, srk_handle(), st, st);
-        _ = change_auth(c.tpm_unlock_b, srk_handle(), st, st);
-        if (!save_config(dir, c)) { return dfail("cannot store the configuration (the keys at the new handles are made)"); }
-        println("PIN changed");
-        return 0;
-    }
-    List(Secret(UInt(8))) k = unlock_key_for(c, st, false);
+Bool pin_taken(Str dir, DeviceConfig c, Unlocked u, List(Secret(UInt(8))) nst) {
+    Bool a_first = (random_bytes(1)[0] & 1) == 0;
+    if (keys_v2(dir)) { Found f = find_own(dir, c, nst, a_first); return f.o.which != ""; }
     List(Int) a = read_blob(dir, "a", u.wrap);
     List(Int) b = read_blob(dir, "b", u.wrap);
-    Bool in_a = unlock(k, a, []).kind == 2;
-    List(Int) old = if (in_a) { a } else { b };
-    List(Int) again = reseal_same(k, old);
-    _ = reseal_same(unlock_key_for(c, nst, false), old);
-    Bool ok = again.len() == old.len() && unlock(k, again, []).kind == 2;
-    if (!write_blob(dir, if (in_a) { "a" } else { "b" }, if (ok) { again } else { old }, u.wrap)) { return dfail("cannot write the profile"); }
+    if (on_keystore(c)) { return unlock(unlock_key_at(c, nst, true), a, b).kind != 0 || unlock(unlock_key_at(c, nst, false), a, b).kind != 0; }
+    List(Secret(UInt(8))) k = unlock_key_for(c, nst, a_first);
+    return k.len() == 32 && unlock(k, a, b).kind != 0;
+}
+
+// The unlocked profile's plaintext, to be sealed again.
+List(Secret(UInt(8))) own_plain(Unlocked u) {
+    List(Secret(UInt(8))) none = [];
+    List(Secret(UInt(8))) p = if (u.kind == 1) { encode_real(u.real) else { none } } else { encode_duress(u.duress) else { none } };
+    return p;
+}
+
+// Unprotected and Keystore: the profile sealed under the new PIN's unlock
+// key (and, in format 2, its list's header), checked, and its file written
+// once.
+@requires(filesystem, device, declassify, provision, network, environment)
+Int repin_own(Str dir, DeviceConfig c, Unlocked u, Bool on_a, List(Secret(UInt(8))) nst) {
+    List(Secret(UInt(8))) nk = unlock_key_at(c, nst, on_a);
+    List(Secret(UInt(8))) p = own_plain(u);
+    if (p.len() == 0 || nk.len() != 32) { return dfail("cannot encode the profile"); }
+    List(Int) blob = seal_blob(nk, random_bytes(12), p);
+    if (unlock(nk, blob, []).kind != u.kind) { return dfail("the profile does not open under the new PIN; nothing changed"); }
+    Bool ok = if (keys_v2(dir)) { repin_file(dir, u, nk, blob) } else { write_blob(dir, own_blob_legacy(dir, u), blob, u.wrap) };
+    if (!ok) { return dfail("cannot write the profile"); }
     println("PIN changed");
     return 0;
 }
 
-// A profile blob (SPEC 9.2: iv || AES-256-GCM(key, iv, profile, aad))
-// sealed again under the same key and a fresh IV, its plaintext as it was;
-// [] when it does not open under `key`.
-@requires(declassify)
-List(Int) reseal_same(List(Secret(UInt(8))) key, List(Int) blob) {
-    if (blob.len() < 28 || key.len() != 32) { return []; }
-    List(Int) aad = utf8("symbolon v1 profile blob");
-    Option(List(Secret(UInt(8)))) p = aes_gcmg_decrypt(key, blob[0..12], blob[12..blob.len()], aad);
-    List(Int) iv = random_bytes(12);
-    return match p { None => [], Some(x) => iv.concat(reveal(aes_gcmg_seal(key, iv, x, aad))) };
+@requires(filesystem, declassify)
+Bool repin_file(Str dir, Unlocked u, List(Secret(UInt(8))) nk, List(Int) blob) {
+    OwnList o = open_own(dir, u.ukey);
+    if (o.which == "") { return false; }
+    List(Int) f = get_file(profile_file(dir, o.which));
+    return put_profile(dir, o.which, seal_hdr(nk, o.l), list_part(f), seal_wblob(u.wrap, o.which, blob));
 }
+
+// Before format 2: which file holds the unlocked profile.
+@requires(filesystem, declassify, provision)
+Str own_blob_legacy(Str dir, Unlocked u) { return if (unlock(u.ukey, read_blob(dir, "a", u.wrap), []).kind == u.kind) { "a" } else { "b" }; }
 
 // The organization's minimum PIN length the device last verified, or 0.
 @requires(filesystem)
@@ -954,46 +1090,71 @@ pub Int org_min_pin(Str dir) {
     return if (p.len() == 2) { str_parse_int(str_split(p[1], " ")[0]) } else { 0 };
 }
 
+// A new duress PIN equal to the real one (act_pin): the same work as a
+// change, under the PIN the profile has. Its file is written again, sealed
+// under its own key with fresh IVs (the new PIN's key made and dropped);
+// in TPM mode its unlock key moves to a free handle with its authValue as
+// it was. "PIN changed" is printed; the duress PIN stays.
 @requires(filesystem, device, declassify, provision, network, environment)
-Int reseal_real(Str dir, DeviceConfig c, Unlocked u, List(Secret(UInt(8))) st, List(Secret(UInt(8))) nst) {
-    List(Secret(UInt(8))) old_key = unlock_key_for(c, st, true);
-    Bool in_a = unlock(old_key, read_blob(dir, "a", u.wrap), []).kind == 1;
-    List(Secret(UInt(8))) rp = encode_real(u.real) else { [] };
-    if (rp.len() == 0) { return dfail("cannot encode the profile"); }
-    List(Int) blob = seal_blob(unlock_key_for(c, nst, true), random_bytes(12), rp);
-    if (unlock(unlock_key_for(c, nst, true), blob, []).kind != 1) { return dfail("the profile does not open under the new PIN; nothing changed"); }
-    if (!write_blob(dir, if (in_a) { "a" } else { "b" }, blob, u.wrap)) { return dfail("cannot write the profile"); }
+Int act_pin(Str dir, DeviceConfig c, Unlocked u, Bool on_a, List(Secret(UInt(8))) nst) {
+    if (c.unprotected || on_keystore(c)) {
+        _ = unlock_key_at(c, nst, on_a);
+        Int r = repin_own(dir, c, u, on_a, u.st);
+        return r;
+    }
+    Int t = tpm_repin(dir, c, u, on_a, u.st);
+    return t;
+}
+
+// The other of a device key's two persistent handles (before format 2).
+Int other_handle(Int h, Int base) { return if (h == base) { base + 256 } else { base }; }
+
+// A random handle of the unlock pool that neither unlock key is at.
+Int free_unlock_handle(DeviceConfig c) {
+    List(Int) free = pool_free(unlock_pool(), [c.tpm_unlock_a, c.tpm_unlock_b], 0, []);
+    return if (free.len() == 0) { 0 } else { free[(random_bytes(1)[0] & 255) % free.len()] };
+}
+
+List(Int) pool_free(List(Int) pool, List(Int) used, Int i, List(Int) acc) {
+    if (i >= pool.len()) { return acc; }
+    return pool_free(pool, used, i + 1, if (used.contains(pool[i])) { acc } else { acc.concat([pool[i]]) });
+}
+
+// TPM: this profile's unlock key with authValue `nst` at a free handle,
+// the configuration naming it, the old one evicted. The device key moves
+// too only when it is one made before format 2 and the real PIN changes.
+@requires(filesystem, device, declassify, provision, network, environment)
+Int tpm_repin(Str dir, DeviceConfig c, Unlocked u, Bool on_a, List(Secret(UInt(8))) nst) {
+    Int h = if (on_a) { c.tpm_unlock_a } else { c.tpm_unlock_b };
+    Int h2 = free_unlock_handle(c);
+    Bool dk_too = u.kind == 1 && c.tpm_dk != dk_v2_handle();
+    Int dk2 = if (dk_too) { other_handle(c.tpm_dk, dk_handle()) } else { c.tpm_dk };
+    if (dk_too) {
+        Result(Int, Str) r1 = moved_key(c.tpm_dk, dk2, u.st, nst);
+        if (match r1 { Err(_) => true, Ok(_) => false }) { return dfail(match r1 { Err(m) => m, Ok(_) => "" }); }
+    }
+    Result(Int, Str) r2 = moved_key(h, h2, u.st, nst);
+    if (match r2 { Err(_) => true, Ok(_) => false }) {
+        if (dk_too) { _ = tpm_evict(dk2); }
+        return dfail(match r2 { Err(m) => m, Ok(_) => "" });
+    }
+    DeviceConfig n = with_handles(c, dk2, if (on_a) { h2 } else { c.tpm_unlock_a }, if (on_a) { c.tpm_unlock_b } else { h2 });
+    if (!save_config(dir, n)) { return dfail("cannot store the configuration (the keys at the new handles are made)"); }
+    if (dk_too) { _ = tpm_evict(c.tpm_dk); }
+    _ = tpm_evict(h);
     println("PIN changed");
     return 0;
 }
 
-// The other of a key's two persistent handles.
-Int other_handle(Int h, Int base) { return if (h == base) { base + 256 } else { base }; }
-
-@requires(filesystem, device, declassify, provision, network, environment)
-Int tpm_new_auth(Str dir, DeviceConfig c, List(Secret(UInt(8))) st, List(Secret(UInt(8))) nst) {
-    Int dk2 = other_handle(c.tpm_dk, dk_handle());
-    Int ua2 = other_handle(c.tpm_unlock_a, unlock_a_handle());
-    Result(Int, Str) r1 = moved_key(c.tpm_dk, dk2, st, nst);
-    if (match r1 { Err(_) => true, Ok(_) => false }) { return dfail(match r1 { Err(m) => m, Ok(_) => "" }); }
-    Result(Int, Str) r2 = moved_key(c.tpm_unlock_a, ua2, st, nst);
-    if (match r2 { Err(_) => true, Ok(_) => false }) {
-        _ = tpm_evict(dk2);
-        return dfail(match r2 { Err(m) => m, Ok(_) => "" });
-    }
-    DeviceConfig n = DeviceConfig {.relay_host = c.relay_host, .relay_port = c.relay_port, .ca = c.ca, .witnesses = c.witnesses, .unprotected = c.unprotected,
-        .argon_m_kib = c.argon_m_kib, .argon_t = c.argon_t, .salt = c.salt, .tpm_dk = dk2, .tpm_unlock_a = ua2, .tpm_unlock_b = c.tpm_unlock_b,
+pub DeviceConfig with_handles(DeviceConfig c, Int dk, Int ua, Int ub) {
+    return DeviceConfig {.relay_host = c.relay_host, .relay_port = c.relay_port, .ca = c.ca, .witnesses = c.witnesses, .unprotected = c.unprotected,
+        .argon_m_kib = c.argon_m_kib, .argon_t = c.argon_t, .salt = c.salt, .tpm_dk = dk, .tpm_unlock_a = ua, .tpm_unlock_b = ub,
         .party = c.party, .dk_pub = c.dk_pub, .hpke_pub = c.hpke_pub, .log_id = c.log_id, .mbox_next = c.mbox_next, .peers = c.peers};
-    if (!save_config(dir, n)) { return dfail("cannot store the configuration (the keys at the new handles are made)"); }
-    _ = tpm_evict(c.tpm_dk);
-    _ = tpm_evict(c.tpm_unlock_a);
-    println("PIN changed");
-    return 0;
 }
 
 // The key at `from` with authValue `nst`, persistent at `to` (the old one stays until the caller evicts it).
 @requires(device, declassify)
-Result(Int, Str) moved_key(Int from, Int to, List(Secret(UInt(8))) st, List(Secret(UInt(8))) nst) {
+pub Result(Int, Str) moved_key(Int from, Int to, List(Secret(UInt(8))) st, List(Secret(UInt(8))) nst) {
     Result(TpmPublic, TpmError) rp = tpm_read_public(from);
     TpmPublic p = match rp { Ok(x) => x, Err(e) => return_none_pub() };
     if (p.public_area.len() == 0) { return Err("TPM: cannot read the key's public area"); }

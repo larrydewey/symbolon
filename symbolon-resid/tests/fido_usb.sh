@@ -66,7 +66,7 @@ add() { printf '2468\n' | run 300 "$BIN" device key add "$W/dev" yubikey > "$W/a
 echo ">>> touch the key twice as it blinks (enrolling)"
 tries add || fail "key add: $(cat "$W/add.log")"
 cat "$W/add.log"
-[ -s "$W/dev/blob_a.k" ] && [ ! -s "$W/dev/blob_a" ] || fail "the profiles were not sealed"
+[ "$(printf '2468\n' | run 60 "$BIN" device key list "$W/dev" --pin)" = "$(printf yubikey | od -v -An -tx1 | tr -d ' \n')" ] || fail "the key is not in the profile's list"
 get() { printf '2468\n' | run 300 "$BIN" device vault get "$W/dev" before > "$W/got" 2> "$W/get.err" && [ "$(cat "$W/got")" = secret-0 ]; }
 echo ">>> touch the key once (opening the vault)"
 tries get || fail "vault get with the key: $(cat "$W/get.err")"

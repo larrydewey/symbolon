@@ -1,10 +1,14 @@
-// Under the duress PIN (SPEC 14.2), adding or removing a security key
-// (keycli.resid) and changing the PIN (device.resid device_pin_with) are
-// acted: they report success, the real profile and the key list are as
-// they were, and a later list under the duress PIN shows the acted change.
+// Security keys and the PIN under either PIN (SPEC 9.4, 14.2): each
+// profile has its own sealed key list and W (fidokey.resid, format 2), so
+// a key change or PIN change under the duress PIN is made to the duress
+// profile alone, really, and the real profile and its keys are untouched.
 // A fast-KDF unprotected device in target/test-keycli/ (a fresh directory
-// per test); the touches of a key are past (key_add_commit takes their
-// results), since no authenticator answers here.
+// per test). No authenticator answers here: a key's touches are past
+// (key_add_commit takes their result), and an unlock that needs a touch is
+// made with the key's known hmac-secret output (touched), as unlock_v2
+// makes it with the one the key gives. The TPM and Keystore paths
+// (unlock_key_at, tpm_repin, the device key's authValue) are checked by
+// reading only.
 
 import "../types.resid";
 import "../duress/duress.resid";
@@ -20,6 +24,7 @@ List(Int) rep(Int b, Int n) { return if (n <= 0) { [] } else { [b].concat(rep(b,
 
 @requires(filesystem)
 Str fresh_dir() {
+    _ = filesystem.create_dir("target");
     _ = filesystem.create_dir("target/test-keycli");
     Str d = "target/test-keycli/" + hex_encode(random_bytes(8));
     _ = filesystem.create_dir(d);
@@ -31,134 +36,236 @@ DeviceConfig cfg_none() {
         .tpm_dk = 0, .tpm_unlock_a = 0, .tpm_unlock_b = 0, .party = [], .dk_pub = [], .hpke_pub = [], .log_id = [], .mbox_next = 0, .peers = []};
 }
 
-// A device with PIN 1111 and duress PIN 2222, its log id set (no relay is asked).
+// A device with PIN 1111 and duress PIN `dpin` ("" for none), its log id set (no relay is asked).
 @requires(filesystem, device, declassify, provision, network, environment)
-DeviceConfig made(Str dir) {
-    _ = device_new_pins(dir, "relay.invalid", 1, true, false, true, "", "1111", "2222");
+DeviceConfig made_with(Str dir, Str dpin) {
+    _ = device_new_pins(dir, "relay.invalid", 1, true, false, true, "", "1111", dpin);
     DeviceConfig c0 = load_config(dir) else { cfg_none() };
     DeviceConfig c = with_log(c0, [], rep(9, 32), 0, []);
     _ = save_config(dir, c);
     return c;
 }
 
-@requires(filesystem)
-Str files(Str dir) {
-    return hex_encode(get_file(dir + "/blob_a")) + "/" + hex_encode(get_file(dir + "/blob_b")) + "/" + hex_encode(get_file(dir + "/blob_a.k")) + "/"
-         + hex_encode(get_file(dir + "/blob_b.k")) + "/" + hex_encode(get_file(dir + "/security-keys")) + "/" + hex_encode(get_file(dir + "/config.cbor"));
-}
-
-@requires(filesystem, declassify, provision)
-Str real_blob(DeviceConfig c, Str dir, Str pin) {
-    List(Secret(UInt(8))) k = unlock_key(stretch(c, pin_bytes(pin)), c.salt);
-    List(Int) a = get_file(dir + "/blob_a");
-    return hex_encode(if (unlock(k, a, []).kind == 1) { a } else { get_file(dir + "/blob_b") });
-}
+@requires(filesystem, device, declassify, provision, network, environment)
+DeviceConfig made(Str dir) { return made_with(dir, "2222"); }
 
 Str joined(List(Str) ns) { return str_join(ns, ","); }
 
-@requires(filesystem, device, declassify, provision, network, environment, clock)
-Int add_acted(Str dir, DeviceConfig c, Str pin, Str name) {
-    Unlocked u = unlock_dir(dir, c, pin);
-    Int r = key_add_commit(dir, c, u, read_keys(dir), name, rep(1, 16), [4].concat(rep(2, 64)), rep(5, 32), secret_bytes(rep(3, 32)));
+@requires(filesystem, device, declassify, provision, network, environment)
+Str names_under(Str dir, DeviceConfig c, Str pin) { return joined(shown_names(dir, c, stretch(c, pin_bytes(pin)))); }
+
+// A key's hmac-secret output, and its credential, as the test's keys give them.
+List(Secret(UInt(8))) out_of(Int n) { return secret_bytes(rep(n, 32)); }
+List(Int) cred_of(Int n) { return rep(n, 16); }
+
+// An unlock as unlock_v2 makes it, with key `n` touched (0: none present).
+@requires(filesystem, device, declassify, provision, network, environment)
+Unlocked touched(Str dir, DeviceConfig c, Str pin, Int n) {
+    List(Secret(UInt(8))) st = stretch(c, pin_bytes(pin));
+    Found f = find_own(dir, c, st, true);
+    OwnList o = f.o;
+    if (o.which == "") { return unlocked_none(); }
+    KeyList l = o.list;
+    List(Secret(UInt(8))) none = [];
+    List(Secret(UInt(8))) w = if (l.keys.len() == 0) { l.w } else { if (n == 0) { none } else { list_w_for(l, cred_of(n), out_of(n)) } };
+    return with_ukey(with_wrap(with_stretched(unlock(f.k, read_blob(dir, o.which, w), []), st), w), f.k);
+}
+
+// key add's writes, with key `n` (its touches past), under `pin` with key `t` touched.
+@requires(filesystem, device, declassify, provision, network, environment)
+Int add_key(Str dir, DeviceConfig c, Str pin, Int t, Str name, Int n) {
+    Int r = key_add_commit(dir, c, touched(dir, c, pin, t), name, cred_of(n), [4].concat(rep(2, 64)), out_of(n));
     return r;
 }
 
-@requires(filesystem, device, declassify, provision, network, environment, clock)
-test "under the duress PIN a key add and remove report success, change nothing, and a later list shows them" {
-    Str dir = fresh_dir();
-    DeviceConfig c = made(dir);
-    Str before = files(dir);
-    Str realb = real_blob(c, dir, "1111");
-    expect(unlock_dir(dir, c, "2222").kind).toEqual(2);
-    expect(add_acted(dir, c, "2222", "yubi")).toEqual(0);
-    expect(add_acted(dir, c, "2222", "backup")).toEqual(0);
-    // Nothing the real PIN sees changed: no key enrolled, the profiles as they were.
-    expect(read_keys(dir).keys.len()).toEqual(0);
-    expect(files(dir)).toEqual(before);
-    expect(unlock_dir(dir, c, "1111").kind).toEqual(1);
-    expect(real_blob(c, dir, "1111")).toEqual(realb);
-    // The list under each PIN.
-    expect(joined(shown_names(dir, c, stretch(c, pin_bytes("2222"))))).toEqual("yubi,backup");
-    expect(joined(shown_names(dir, c, stretch(c, pin_bytes("1111"))))).toEqual("");
-    expect(joined(shown_names(dir, c, stretch(c, pin_bytes("9999"))))).toEqual("");
-    expect(get_file(key_view_file(dir)).len()).toEqual(view_file_len());
-    // Adding a name the duress list has is refused as a real one would be,
-    // before any key is asked for.
-    expect(key_add_pin(dir, "yubi", "2222")).toEqual(1);
-    // Removing: success for a name in the acted list; refused otherwise.
-    expect(key_remove_pin(dir, "yubi", "2222")).toEqual(0);
-    expect(key_remove_pin(dir, "nope", "2222")).toEqual(1);
-    expect(joined(shown_names(dir, c, stretch(c, pin_bytes("2222"))))).toEqual("backup");
-    expect(key_remove_pin(dir, "backup", "2222")).toEqual(0);
-    expect(joined(shown_names(dir, c, stretch(c, pin_bytes("2222"))))).toEqual("");
-    expect(get_file(key_view_file(dir)).len()).toEqual(view_file_len());
-    expect(files(dir)).toEqual(before);
-    expect(unlock_dir(dir, c, "1111").kind).toEqual(1);
-    expect(unlock_dir(dir, c, "2222").kind).toEqual(2);
-    // The real PIN still refuses a name that is not enrolled.
-    expect(key_remove_pin(dir, "backup", "1111")).toEqual(1);
+@requires(filesystem, device, declassify, provision, network, environment)
+Int remove_key(Str dir, DeviceConfig c, Str pin, Int t, Str name) {
+    Unlocked u = touched(dir, c, pin, t);
+    if (u.kind == 0) { return 1; }
+    Int r = key_remove_commit(dir, u, name);
+    return r;
+}
+
+@requires(filesystem, declassify)
+Str real_bytes(Unlocked u) { return hex_encode(reveal(u.real.share)) + hex_encode(reveal(u.real.cc)) + hex_encode(reveal(u.real.vault_key)) + hex_encode(reveal(u.real.dek)); }
+
+@requires(filesystem, declassify)
+Str duress_bytes(Unlocked u) { return hex_encode(reveal(u.duress.share)) + hex_encode(reveal(u.duress.subkey)) + hex_encode(reveal(u.duress.vault_key)) + hex_encode(reveal(u.duress.hpke_priv)); }
+
+// The file of the profile PIN `pin` opens.
+@requires(filesystem, device, declassify, provision, network, environment)
+Str file_of(Str dir, DeviceConfig c, Str pin) {
+    Found f = find_own(dir, c, stretch(c, pin_bytes(pin)), true);
+    OwnList o = f.o;
+    return hex_encode(get_file(profile_file(dir, o.which)));
+}
+
+// Which files a device directory has, with their sizes.
+@requires(filesystem)
+Str shape(Str dir) { return shape_of(dir, ["profile_a", "profile_b", "blob_a", "blob_b", "blob_a.k", "blob_b.k", "security-keys", "security-keys.view", "slot", "duress.pub", "security-update"], 0, ""); }
+
+@requires(filesystem)
+Str shape_of(Str dir, List(Str) fs, Int i, Str acc) {
+    if (i >= fs.len()) { return acc; }
+    Str f = dir + "/" + fs[i];
+    return shape_of(dir, fs, i + 1, acc + fs[i] + "=" + (if (filesystem.exists(f)) { f"{get_file(f).len()}" } else { "-" }) + " ");
 }
 
 @requires(filesystem, device, declassify, provision, network, environment, clock)
-test "a real add writes the view file too, so its size and presence tell nothing, and ends an acted view" {
+test "under the duress PIN a PIN change takes: the new PIN is the duress PIN, the old one opens nothing, the real profile is untouched" {
     Str dir = fresh_dir();
     DeviceConfig c = made(dir);
-    expect(add_acted(dir, c, "2222", "fake")).toEqual(0);
-    List(Int) v1 = get_file(key_view_file(dir));
-    // The real add (after its touches): the key enrolled, the view file random, same size.
-    expect(add_acted(dir, c, "1111", "real")).toEqual(0);
-    expect(read_keys(dir).keys.len()).toEqual(1);
-    List(Int) v2 = get_file(key_view_file(dir));
-    expect(v2.len()).toEqual(v1.len());
-    expect(hex_encode(v2) == hex_encode(v1)).toBeFalse();
-    expect(joined(shown_names(dir, c, stretch(c, pin_bytes("2222"))))).toEqual("real");
-    expect(joined(shown_names(dir, c, stretch(c, pin_bytes("1111"))))).toEqual("real");
-}
-
-@requires(declassify)
-test "the acted view: sealed to one size, opened only by its key, applied to the real list" {
-    List(Secret(UInt(8))) k = secret_bytes(rep(7, 32));
-    KeyView small = view_add(empty_view(), "a");
-    KeyView big = view_remove(view_add(view_add(empty_view(), "a"), "bb"), "main", ["main", "spare"]);
-    expect(seal_view(k, small).len()).toEqual(view_file_len());
-    expect(seal_view(k, big).len()).toEqual(view_file_len());
-    expect(match open_view(k, seal_view(k, big)) { None => "none", Some(v) => joined(apply_view(["main", "spare"], v)) }).toEqual("spare,a,bb");
-    expect(match open_view(secret_bytes(rep(8, 32)), seal_view(k, big)) { None => true, Some(_) => false }).toBeTrue();
-    expect(match open_view(k, random_bytes(view_file_len())) { None => true, Some(_) => false }).toBeTrue();
-    // Removing a key the act added takes it out; adding back a real one acted away restores it.
-    expect(joined(apply_view(["main"], view_remove(view_add(empty_view(), "x"), "x", ["main"])))).toEqual("main");
-    expect(joined(apply_view(["main"], view_add(view_remove(empty_view(), "main", ["main"]), "main")))).toEqual("main");
-    expect(joined(apply_view(["main"], view_remove(empty_view(), "main", ["main"])))).toEqual("");
-}
-
-@requires(filesystem, device, declassify, provision, network, environment, clock)
-test "under the duress PIN a PIN change reports success and changes nothing that lasts" {
-    Str dir = fresh_dir();
-    DeviceConfig c = made(dir);
-    Str realb = real_blob(c, dir, "1111");
-    Int la = get_file(dir + "/blob_a").len();
-    Int lb = get_file(dir + "/blob_b").len();
-    Str cfg = hex_encode(get_file(dir + "/config.cbor"));
-    Str both = hex_encode(get_file(dir + "/blob_a")) + "/" + hex_encode(get_file(dir + "/blob_b"));
+    Unlocked r0 = unlock_dir(dir, c, "1111");
+    Unlocked d0 = unlock_dir(dir, c, "2222");
+    Str realf = file_of(dir, c, "1111");
+    Str sh = shape(dir);
     expect(device_pin_with(dir, c, "2222", "3333")).toEqual(0);
-    expect(unlock_dir(dir, c, "1111").kind).toEqual(1);
-    expect(unlock_dir(dir, c, "2222").kind).toEqual(2);
-    expect(unlock_dir(dir, c, "3333").kind).toEqual(0);
-    expect(real_blob(c, dir, "1111")).toEqual(realb);
-    // The duress profile's file was written again (other bytes, same size),
-    // as the real profile's is on a real change.
-    expect(get_file(dir + "/blob_a").len()).toEqual(la);
-    expect(get_file(dir + "/blob_b").len()).toEqual(lb);
-    expect(hex_encode(get_file(dir + "/blob_a")) + "/" + hex_encode(get_file(dir + "/blob_b")) == both).toBeFalse();
-    expect(hex_encode(get_file(dir + "/config.cbor"))).toEqual(cfg);
-    // A new PIN equal to the real one, under the duress PIN: success, nothing changed.
+    Unlocked d1 = unlock_dir(dir, c, "3333");
+    expect(d1.kind).toEqual(2);
+    expect(duress_bytes(d1)).toEqual(duress_bytes(d0));
+    expect(unlock_dir(dir, c, "2222").kind).toEqual(0);
+    // The real PIN and profile: the same, byte for byte.
+    Unlocked r1 = unlock_dir(dir, c, "1111");
+    expect(r1.kind).toEqual(1);
+    expect(real_bytes(r1)).toEqual(real_bytes(r0));
+    expect(file_of(dir, c, "1111")).toEqual(realf);
+    expect(shape(dir)).toEqual(sh);
+    // The new PIN is the duress PIN everywhere: the real PIN cannot take
+    // it, but can take the old one now; a key list opens under it.
+    expect(device_pin_with(dir, c, "1111", "3333")).toEqual(1);
+    expect(names_under(dir, c, "3333")).toEqual("");
+    expect(names_under(dir, c, "2222")).toEqual("\n");
+    // Changed again under the duress PIN, then the real PIN changed to the
+    // duress PIN given up.
+    expect(device_pin_with(dir, c, "3333", "4444")).toEqual(0);
+    expect(unlock_dir(dir, c, "4444").kind).toEqual(2);
+    expect(device_pin_with(dir, c, "1111", "3333")).toEqual(0);
+    expect(unlock_dir(dir, c, "3333").kind).toEqual(1);
+    expect(unlock_dir(dir, c, "1111").kind).toEqual(0);
+    expect(unlock_dir(dir, c, "4444").kind).toEqual(2);
+    expect(real_bytes(unlock_dir(dir, c, "3333"))).toEqual(real_bytes(r0));
+    expect(duress_bytes(unlock_dir(dir, c, "4444"))).toEqual(duress_bytes(d0));
+}
+
+@requires(filesystem, device, declassify, provision, network, environment, clock)
+test "a new duress PIN equal to the real one is acted: success shown, both PINs open what they did" {
+    Str dir = fresh_dir();
+    DeviceConfig c = made(dir);
+    Str sh = shape(dir);
+    Str durf = file_of(dir, c, "2222");
     expect(device_pin_with(dir, c, "2222", "1111")).toEqual(0);
     expect(unlock_dir(dir, c, "1111").kind).toEqual(1);
     expect(unlock_dir(dir, c, "2222").kind).toEqual(2);
-    // The real PIN: the duress PIN refused as a new PIN; another one taken.
+    // Its file was written again (other bytes, same size), as on a change.
+    expect(file_of(dir, c, "2222") == durf).toBeFalse();
+    expect(shape(dir)).toEqual(sh);
+    // The real PIN refuses the duress PIN without naming it.
     expect(device_pin_with(dir, c, "1111", "2222")).toEqual(1);
-    expect(device_pin_with(dir, c, "1111", "4444")).toEqual(0);
-    expect(unlock_dir(dir, c, "4444").kind).toEqual(1);
-    expect(unlock_dir(dir, c, "1111").kind).toEqual(0);
+}
+
+@requires(filesystem, device, declassify, provision, network, environment, clock)
+test "the key lists are sealed: no name in the files, listing needs the PIN, each PIN sees its own profile's" {
+    Str dir = fresh_dir();
+    DeviceConfig c = made(dir);
+    expect(add_key(dir, c, "1111", 0, "realkey", 5)).toEqual(0);
+    expect(add_key(dir, c, "2222", 5, "coerced", 6)).toEqual(0);
+    // No plain list: security-keys is gone, the names are in no file.
+    expect(filesystem.exists(dir + "/security-keys")).toBeFalse();
+    Str all = hex_encode(get_file(profile_file(dir, "a"))) + hex_encode(get_file(profile_file(dir, "b"))) + hex_encode(get_file(dir + "/config.cbor"));
+    expect(str_contains(all, hex_encode(utf8("realkey")))).toBeFalse();
+    expect(str_contains(all, hex_encode(utf8(hex_encode(utf8("realkey")))))).toBeFalse();
+    expect(str_contains(all, hex_encode(cred_of(5)))).toBeFalse();
+    expect(key_list(dir)).toEqual(1);
+    expect(names_under(dir, c, "1111")).toEqual("realkey");
+    expect(names_under(dir, c, "2222")).toEqual("realkey,coerced");
+    expect(names_under(dir, c, "9999")).toEqual("\n");
+}
+
+@requires(filesystem, device, declassify, provision, network, environment, clock)
+test "a key added under the duress PIN is asked for at the next duress unlock, opens only the duress profile, and once removed is not asked for" {
+    Str dir = fresh_dir();
+    DeviceConfig c = made(dir);
+    Unlocked r0 = unlock_dir(dir, c, "1111");
+    Str realf = file_of(dir, c, "1111");
+    expect(add_key(dir, c, "2222", 0, "coerced", 6)).toEqual(0);
+    // The duress unlock asks for it now: without it nothing opens (no
+    // authenticator answers here), with its touch the duress profile does.
+    expect(unlock_dir(dir, c, "2222").kind).toEqual(0);
+    expect(touched(dir, c, "2222", 0).kind).toEqual(0);
+    expect(touched(dir, c, "2222", 7).kind).toEqual(0);
+    expect(touched(dir, c, "2222", 6).kind).toEqual(2);
+    // The real profile: no key asked for, its file as it was, and the
+    // duress key's touch gives nothing that opens it.
+    expect(unlock_dir(dir, c, "1111").kind).toEqual(1);
+    expect(file_of(dir, c, "1111")).toEqual(realf);
+    Found fd = find_own(dir, c, stretch(c, pin_bytes("2222")), true);
+    OwnList od = fd.o;
+    List(Secret(UInt(8))) wd = list_w_for(od.list, cred_of(6), out_of(6));
+    expect(wd.len()).toEqual(32);
+    Str rw = if (od.which == "a") { "b" } else { "a" };
+    expect(read_blob(dir, rw, wd).len()).toEqual(0);
+    // Removed under the duress PIN (with its touch): not asked for any more.
+    expect(remove_key(dir, c, "2222", 6, "coerced")).toEqual(0);
     expect(unlock_dir(dir, c, "2222").kind).toEqual(2);
+    expect(names_under(dir, c, "2222")).toEqual("");
+    expect(real_bytes(unlock_dir(dir, c, "1111"))).toEqual(real_bytes(r0));
+    expect(file_of(dir, c, "1111")).toEqual(realf);
+}
+
+@requires(filesystem, device, declassify, provision, network, environment, clock)
+test "a real key change reaches the duress profile too; a real key removed under the duress PIN is still the real profile's" {
+    Str dir = fresh_dir();
+    DeviceConfig c = made(dir);
+    expect(add_key(dir, c, "1111", 0, "main", 5)).toEqual(0);
+    // Both profiles ask for it now, and each opens with its touch.
+    expect(unlock_dir(dir, c, "1111").kind).toEqual(0);
+    expect(unlock_dir(dir, c, "2222").kind).toEqual(0);
+    expect(touched(dir, c, "1111", 5).kind).toEqual(1);
+    expect(touched(dir, c, "2222", 5).kind).toEqual(2);
+    // Acted away under the duress PIN: the duress unlock does not ask for
+    // it; the real one still does, and still opens only with it.
+    expect(remove_key(dir, c, "2222", 5, "main")).toEqual(0);
+    expect(unlock_dir(dir, c, "2222").kind).toEqual(2);
+    expect(unlock_dir(dir, c, "1111").kind).toEqual(0);
+    expect(touched(dir, c, "1111", 5).kind).toEqual(1);
+    expect(names_under(dir, c, "1111")).toEqual("main");
+    // A second real key and the first removed, under the real PIN: the
+    // duress profile asks for the second.
+    expect(add_key(dir, c, "1111", 5, "backup", 8)).toEqual(0);
+    expect(remove_key(dir, c, "1111", 8, "main")).toEqual(0);
+    expect(names_under(dir, c, "1111")).toEqual("backup");
+    expect(names_under(dir, c, "2222")).toEqual("backup");
+    expect(touched(dir, c, "1111", 5).kind).toEqual(0);
+    expect(touched(dir, c, "1111", 8).kind).toEqual(1);
+    expect(touched(dir, c, "2222", 8).kind).toEqual(2);
+    // The last real key removed: the PIN alone opens both again.
+    expect(remove_key(dir, c, "1111", 8, "backup")).toEqual(0);
+    expect(unlock_dir(dir, c, "1111").kind).toEqual(1);
+    expect(unlock_dir(dir, c, "2222").kind).toEqual(2);
+}
+
+@requires(filesystem, device, declassify, provision, network, environment, clock)
+test "the files have one shape with and without a duress PIN, keys or changes under the duress PIN" {
+    Str d1 = fresh_dir();
+    Str d2 = fresh_dir();
+    DeviceConfig c1 = made(d1);
+    DeviceConfig c2 = made_with(d2, "");
+    Str sh = shape(d1);
+    expect(shape(d2)).toEqual(sh);
+    expect(get_file(profile_file(d1, "a")).len()).toEqual(profile_file_len());
+    expect(get_file(profile_file(d1, "b")).len()).toEqual(profile_file_len());
+    expect(device_pin_with(d1, c1, "2222", "3333")).toEqual(0);
+    expect(add_key(d1, c1, "3333", 0, "coerced", 6)).toEqual(0);
+    expect(shape(d1)).toEqual(sh);
+    expect(add_key(d2, c2, "1111", 0, "main", 5)).toEqual(0);
+    expect(add_key(d1, c1, "1111", 0, "main", 5)).toEqual(0);
+    expect(shape(d1)).toEqual(sh);
+    expect(shape(d2)).toEqual(sh);
+    // A real add writes both files, with or without a duress PIN.
+    Str a2 = hex_encode(get_file(profile_file(d2, "a")));
+    Str b2 = hex_encode(get_file(profile_file(d2, "b")));
+    expect(add_key(d2, c2, "1111", 5, "backup", 8)).toEqual(0);
+    expect(hex_encode(get_file(profile_file(d2, "a"))) == a2).toBeFalse();
+    expect(hex_encode(get_file(profile_file(d2, "b"))) == b2).toBeFalse();
+    expect(unlock_dir(d2, c2, "2222").kind).toEqual(0);
 }

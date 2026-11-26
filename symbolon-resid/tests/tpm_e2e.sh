@@ -118,11 +118,17 @@ else
     case "$WHY" in *stale*|*CRL*) echo "attestation: the exchange completes; refused as expected without a current CRL from the TPM maker ($WHY)" ;; *) fail "attestation refused: $WHY" ;; esac
 fi
 
-# A new PIN (TPM2_ObjectChangeAuth on the device key and the real unlock key).
+# A new PIN (TPM2_ObjectChangeAuth on the real unlock key, moved to a free
+# handle; the device key's authValue is from the DEK and stays).
 printf '2468\n1357\n' | run 300 "$BIN" device pin "$W/dev" > "$W/pin0.log" 2>&1 && fail "the new PIN was the duress PIN"
 printf '2468\n86420\n' | run 300 "$BIN" device pin "$W/dev" > "$W/pin.log" 2>&1 || fail "PIN change: $(cat "$W/pin.log")"
 printf '86420\n' | run 300 "$BIN" device sign "$W/dev" login.example.com "$CID" "$MSG" > "$W/sign3.log" 2>&1 || fail "sign with the new PIN: $(tail -2 "$W/sign3.log")"
 [ "$(printf '86420\n' | run 300 "$BIN" device vault get "$W/dev" mail 2>&1)" = "hunter2" ] || fail "vault under the new PIN"
 printf '1357\n' | run 600 "$BIN" device sign "$W/dev" login2.example.com "$CID2" "$MSGD" > /dev/null 2>&1 || fail "the duress PIN after the change"
+# The duress PIN changed under itself (SPEC 14.2): the duress unlock key
+# takes the new one, the real PIN and device key stay.
+printf '1357\n97531\n' | run 300 "$BIN" device pin "$W/dev" > "$W/dpin.log" 2>&1 || fail "duress PIN change: $(cat "$W/dpin.log")"
+printf '97531\n' | run 600 "$BIN" device sign "$W/dev" login2.example.com "$CID2" "$MSGD" > /dev/null 2>&1 || fail "the new duress PIN"
+printf '86420\n' | run 300 "$BIN" device sign "$W/dev" login.example.com "$CID" "$MSG" > /dev/null 2>&1 || fail "the PIN after the duress PIN change"
 echo "PIN change: the TPM keys take the new PIN, the duress PIN stays (the old PIN's refusal is checked in cli_e2e: a wrong try here counts toward the TPM's lockout)"
 echo "PASS tpm_e2e"
