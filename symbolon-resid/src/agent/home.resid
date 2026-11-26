@@ -130,7 +130,7 @@ pub Int home_init(Str dir, List(Str) hosts, Int base, Str bind) {
     Bool ok = filesystem.write_all(dir + "/tls/ca.pem", ca_pem)
            && filesystem.write_secret(dir + "/tls/ca.key", ca_priv)
            && filesystem.write_all(dir + "/tls/server.pem", x509g_pem("CERTIFICATE", srv_der) + ca_pem)
-           && filesystem.write_all(dir + "/tls/server.key", x509g_pem("EC PRIVATE KEY", x509g_sec1_key(srv_priv, srv_pub)))
+           && filesystem.write_secret(dir + "/tls/server.key", str_to_bytes(x509g_pem("EC PRIVATE KEY", x509g_sec1_key(srv_priv, srv_pub))))
            && make_witnesses(dir, 1)
            && filesystem.write_all(dir + "/bind.txt", bind)
            && filesystem.write_all(dir + "/home.txt", f"{base}\n" + lines(hosts, 0, StrBuf()));
