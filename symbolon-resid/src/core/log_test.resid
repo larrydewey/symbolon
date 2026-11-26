@@ -345,7 +345,7 @@ test "a kit recovery keeps the vault OPRF key" {
 
 // ─── What a witness co-signs (SPEC 20.3, il_check_next) ─────────
 
-Bool next_ok(Result(UInt(64), SymbolonError) r) { return match r { Ok(_) => true, Err(_) => false }; }
+Bool next_ok(Result(Int, SymbolonError) r) { return match r { Ok(_) => true, Err(_) => false }; }
 
 SignedEvent bare(SignedEvent e) { return SignedEvent {.payload = e.payload, .encoded = e.encoded, .sigs = e.sigs, .cosigs = []}; }
 
@@ -393,4 +393,104 @@ test "a log before the event that does not verify gets nothing co-signed" {
     SignedEvent veto = next(2, 2, enc(1), VetoBody(1), [3], 0);
     expect(next_ok(il_check_next(l, [e0([2, 3]), ev], bare(veto), 3000, lambda(x) { false }))).toBeTrue();
     expect(next_ok(il_check_next(l, [e0([2, 3]), bare(ev)], bare(veto), 3000, lambda(x) { false }))).toBeFalse();
+}
+
+// ─── Bounded verification (R2W-1) ───────────────────────────────
+
+List(EventSig) fakes(Int who, List(Int) msg, Int n, List(EventSig) acc) {
+    if (n == 0) { return acc; }
+    return fakes(who, msg, n - 1, acc.concat([EventSig {.signer = id32(who), .sig = sign(4, msg)}]));
+}
+
+SignedEvent with_sigs(SignedEvent e, List(EventSig) ss) { return SignedEvent {.payload = e.payload, .encoded = e.encoded, .sigs = ss, .cosigs = e.cosigs}; }
+SignedEvent with_cosigs(SignedEvent e, List(WitnessCosignature) cs) { return SignedEvent {.payload = e.payload, .encoded = e.encoded, .sigs = e.sigs, .cosigs = cs}; }
+
+test "an event padded with signature entries beyond its signers is refused before they are verified" {
+    List(Int) l = log_id();
+    SignedEvent ev = next(1, 1, enc(0), SetPolicyBody(policy(172800)), [2, 3], 2000);
+    expect(ok(il_verify(l, [e0([2, 3]), ev], 2000, lambda(x) { false }))).toBeTrue();
+    // Two parties: at most three entries (one for a kit's key).
+    SignedEvent padded = with_sigs(ev, ev.sigs.concat(fakes(3, ev.encoded, 2, [])));
+    expect(ok(il_verify(l, [e0([2, 3]), padded], 2000, lambda(x) { false }))).toBeFalse();
+    SignedEvent first = e0([2, 3]);
+    SignedEvent padded0 = with_sigs(first, first.sigs.concat(fakes(2, enc(0), 2, [])));
+    expect(ok(il_verify(l, [padded0], 1000, lambda(x) { false }))).toBeFalse();
+}
+
+test "only a party's first signature entry is tried" {
+    List(Int) l = log_id();
+    SignedEvent ev = next(1, 1, enc(0), SetPolicyBody(policy(172800)), [2, 3], 2000);
+    // A bad entry for device 3 ahead of its good one: device 3 is not
+    // tried again, so one device signed: delayed.
+    SignedEvent bad_first = with_sigs(ev, [ev.sigs[0]].concat(fakes(3, ev.encoded, 1, [])).concat([ev.sigs[1]]));
+    expect(pending_n(il_verify(l, [e0([2, 3]), bad_first], 2000, lambda(x) { false }))).toEqual(1);
+}
+
+test "more co-signatures than the policy has witnesses are refused" {
+    List(Int) l = log_id();
+    SignedEvent ev = next(1, 1, enc(0), SetPolicyBody(policy(172800)), [2, 3], 2000);
+    List(WitnessCosignature) cs = ev.cosigs;
+    expect(ok(il_verify(l, [e0([2, 3]), with_cosigs(ev, cs.concat([cs[0]]))], 2000, lambda(x) { false }))).toBeTrue();
+    expect(ok(il_verify(l, [e0([2, 3]), with_cosigs(ev, cs.concat([cs[0], cs[1]]))], 2000, lambda(x) { false }))).toBeFalse();
+}
+
+// ─── Removed parties (R2W-6) ────────────────────────────────────
+
+test "a removed device's signature no longer counts, and it is not removed twice" {
+    List(Int) l = log_id();
+    SignedEvent rm = next(1, 1, enc(0), RemovePartyBody(id32(3)), [2, 3], 2000);
+    SignedEvent pol = next(2, 2, enc(1), SetPolicyBody(policy(172800)), [2, 3], 3000);
+    Result(VerifiedHead, SymbolonError) r = il_verify(l, [e0([2, 3]), rm, pol], 3000, lambda(x) { false });
+    // Device 3 is removed: one device signed, so the policy change waits.
+    expect(pending_n(r)).toEqual(1);
+    expect(delay_of(r)).toEqual(86400);
+    SignedEvent again = next(2, 2, enc(1), RemovePartyBody(id32(3)), [2], 3000);
+    expect(ok(il_verify(l, [e0([2, 3]), rm, again], 3000, lambda(x) { false }))).toBeFalse();
+}
+
+// ─── The time a witness signs (R2W-3) ───────────────────────────
+
+Int checked_at(Result(Int, SymbolonError) r) { return match r { Ok(t) => t, Err(_) => -1 }; }
+
+test "a witness whose clock is behind the last event checks at the last event's time" {
+    List(Int) l = log_id();
+    SignedEvent ev = next(1, 1, enc(0), SetPolicyBody(policy(172800)), [2], 2000);
+    SignedEvent veto = next(2, 2, enc(1), VetoBody(1), [3], 0);
+    expect(checked_at(il_check_next(l, [e0([2, 3]), ev], bare(veto), 1500, lambda(x) { false }))).toEqual(2000);
+    expect(checked_at(il_check_next(l, [e0([2, 3]), ev], bare(veto), 2500, lambda(x) { false }))).toEqual(2500);
+}
+
+// ─── Witness heads (R2W-5) and the freeze alarm (R2W-2) ─────────
+
+Option(WitnessHead) wh(Int seq, Int tag) { return Some(WitnessHead {.seq = seq, .digest = id32(tag), .time = 5000}); }
+Option(WitnessHead) nothing_cosigned() { return Some(WitnessHead {.seq = 0, .digest = [], .time = 5000}); }
+
+test "the head is fresh only when a majority answers and none co-signed past it" {
+    // Head at 4 with digest id32(40).
+    expect(heads_problem([wh(4, 40), wh(4, 40), wh(4, 40)], 3, 4, id32(40))).toEqual("");
+    expect(heads_problem([wh(4, 40), None, wh(3, 30)], 3, 4, id32(40))).toEqual("");
+    // A witness co-signed sequence 5 (a veto the relay does not serve).
+    expect(str_len(heads_problem([wh(4, 40), wh(5, 50), None], 3, 4, id32(40))) > 0).toBeTrue();
+    expect(str_len(heads_problem([wh(4, 40), wh(4, 40), wh(5, 50)], 3, 4, id32(40))) > 0).toBeTrue();
+    // Another digest at the head: a fork.
+    expect(str_len(heads_problem([wh(4, 40), wh(4, 41), wh(4, 40)], 3, 4, id32(40))) > 0).toBeTrue();
+    // Fewer than a majority answered: fail closed.
+    expect(str_len(heads_problem([wh(4, 40), None, None], 3, 4, id32(40))) > 0).toBeTrue();
+    // A log no witness co-signed anything of, at its head 0, fails closed
+    // only for want of answers.
+    expect(heads_problem([nothing_cosigned(), nothing_cosigned(), None], 3, 0, id32(1))).toEqual("");
+}
+
+test "a log is frozen only when no digest can still get a majority at the sequence" {
+    // Three witnesses, three different events at 7: frozen.
+    expect(str_len(freeze_problem([wh(7, 1), wh(7, 2), wh(7, 3)], 3, 7)) > 0).toBeTrue();
+    // Two different, the third free (or silent): one may still complete.
+    expect(freeze_problem([wh(7, 1), wh(7, 2), wh(6, 3)], 3, 7)).toEqual("");
+    expect(freeze_problem([wh(7, 1), wh(7, 2), None], 3, 7)).toEqual("");
+    // Two hold the same digest: that event has its majority, no freeze.
+    expect(freeze_problem([wh(7, 1), wh(7, 1), wh(7, 2)], 3, 7)).toEqual("");
+    // A witness past 7: the log moved on.
+    expect(freeze_problem([wh(7, 1), wh(8, 2), wh(7, 3)], 3, 7)).toEqual("");
+    // Five witnesses, 2 + 2 + 1 at 9: none can reach 3.
+    expect(str_len(freeze_problem([wh(9, 1), wh(9, 1), wh(9, 2), wh(9, 2), wh(9, 3)], 5, 9)) > 0).toBeTrue();
 }

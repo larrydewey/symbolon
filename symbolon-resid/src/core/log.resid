@@ -191,19 +191,43 @@ Bool sig_ok(List(Int) key, List(Int) msg, List(Int) sig) {
 }
 
 // Distinct ids of parties in `ps` (filtered to devices when `devices_only`)
-// with a valid signature over the event's encoding.
+// with a valid signature over the event's encoding. Each party's first
+// signature entry is the only one tried (`tried`): signatures are not
+// covered by the event's digest, so anyone may pad an event, a victim's
+// co-signed one included, with entries naming a real party, and every one
+// of them would otherwise cost a verification (R2W-1).
 List(List(Int)) valid_signers(List(EventSig) sigs, List(Party) ps, Bool devices_only, List(Int) msg, Int i, List(List(Int)) acc) {
+    List(List(Int)) got = signers_from(sigs, ps, devices_only, msg, i, [], acc);
+    return got;
+}
+
+List(List(Int)) signers_from(List(EventSig) sigs, List(Party) ps, Bool devices_only, List(Int) msg, Int i, List(List(Int)) tried, List(List(Int)) acc) {
     if (i >= sigs.len()) { return acc; }
     EventSig s = sigs[i];
     Option(Party) found = party_by_id(ps, s.signer, 0);
-    Bool counts = match found {
-        Some(p) => (!devices_only || p.kind == party_kind_device())
-                   && !has_bytes(acc, s.signer, 0)
-                   && sig_ok(p.auth_key, msg, s.sig),
+    Bool fresh = !has_bytes(tried, s.signer, 0);
+    Bool counts = fresh && match found {
+        Some(p) => (!devices_only || p.kind == party_kind_device()) && sig_ok(p.auth_key, msg, s.sig),
         None => false
     };
+    List(List(Int)) tried2 = if (fresh && known_party(found)) { tried.concat([s.signer]) } else { tried };
     List(List(Int)) next = if (counts) { acc.concat([s.signer]) } else { acc };
-    return valid_signers(sigs, ps, devices_only, msg, i + 1, next);
+    return signers_from(sigs, ps, devices_only, msg, i + 1, tried2, next);
+}
+
+// The parties of `ps` not in `removed`: a removed party's signature no
+// longer counts (R2W-6), although its share lives until the next re-share.
+List(Party) not_removed(List(Party) ps, List(List(Int)) removed, Int i, ListBuf(Party) acc) {
+    if (i >= ps.len()) { return acc.finish(); }
+    return not_removed(ps, removed, i + 1, if (has_bytes(removed, ps[i].id, 0)) { acc } else { acc.push(ps[i]) });
+}
+
+// The most signature entries an event may carry (R2W-1): one per party
+// that can sign it (the quorum's, and those of the quorum a re-share or a
+// recover names) and one for a kit's recovery key.
+Int sigs_max(LogState s, EventBody body) {
+    Int extra = match body { ReshareBody(nq) => nq.parties.len(), RecoverBody(r) => r.new_parties.len(), _ => 0 };
+    return s.quorum.parties.len() + extra + 1;
 }
 
 // Whether any signature verifies under `key` (for the kit's recovery key).
@@ -237,23 +261,30 @@ Option(WitnessRef) witness_by_key(List(WitnessRef) ws, List(Int) k, Int i) {
     return witness_by_key(ws, k, i + 1);
 }
 
-// Witness times of the distinct, valid co-signatures of one event.
+// Witness times of the distinct, valid co-signatures of one event. Each
+// witness key's first co-signature on (l, seq, d) is the only one tried
+// (`seen`), as for valid_signers (R2W-1).
 List(Int) cosig_times(List(WitnessCosignature) cs, List(WitnessRef) ws, List(Int) l, UInt(64) seq, List(Int) d, Int i, List(List(Int)) seen, List(Int) times) {
     if (i >= cs.len()) { return times; }
     WitnessCosignature c = cs[i];
-    Bool good = c.sequence == seq
+    Bool tryit = c.sequence == seq
         && bytes_eq(c.log_id, l)
         && bytes_eq(c.digest, d)
         && !has_bytes(seen, c.witness_key, 0)
-        && known_witness(witness_by_key(ws, c.witness_key, 0))
-        && sig_ok(c.witness_key, witness_message(l, seq, d), c.signature);
-    List(List(Int)) seen2 = if (good) { seen.concat([c.witness_key]) } else { seen };
+        && known_witness(witness_by_key(ws, c.witness_key, 0));
+    Bool good = tryit && sig_ok(c.witness_key, witness_message(l, seq, d), c.signature);
+    List(List(Int)) seen2 = if (tryit) { seen.concat([c.witness_key]) } else { seen };
     List(Int) times2 = if (good) { times.concat([(Int)c.witness_time]) } else { times };
     return cosig_times(cs, ws, l, seq, d, i + 1, seen2, times2);
 }
 
-// Median witness time, provided a majority of the policy's witnesses signed.
+// Median witness time, provided a majority of the policy's witnesses
+// signed. More co-signatures than the policy has witnesses is refused
+// before any is verified (R2W-1).
 pub Result(Int, SymbolonError) witness_time(List(WitnessCosignature) cs, Policy pol, List(Int) l, UInt(64) seq, List(Int) d) {
+    if (cs.len() > pol.witnesses.len()) {
+        return Err(ErrInvalidLog("more co-signatures than the policy has witnesses"));
+    }
     List(Int) ts = cosig_times(cs, pol.witnesses, l, seq, d, 0, [], []);
     Int need = pol.witnesses.len() / 2 + 1;
     if (ts.len() < need) {
@@ -261,6 +292,100 @@ pub Result(Int, SymbolonError) witness_time(List(WitnessCosignature) cs, Policy 
     }
     List(Int) sorted = sort(ts);
     return Ok(sorted[sorted.len() / 2]);
+}
+
+// ============================================================================
+// A witness's head for a log (SPEC 20.3: POST /head)
+// ============================================================================
+
+// What a witness signs when asked, for a fresh nonce, how far it has
+// co-signed log `l`: the highest sequence `seq` it co-signed and the digest
+// `d` it co-signed there; `d` empty (and `seq` 0) when it co-signed none.
+pub List(Int) head_message(List(Int) l, Int seq, List(Int) d, List(Int) nonce, Int t) {
+    return cbe_uint(t, cbe_bytes(nonce, cbe_bytes(d, cbe_uint(seq, cbe_bytes(l, cbe_text("symbolon v1 witness head", cbe_array(6, [])))))));
+}
+
+// One witness's verified answer; `digest` empty when it co-signed nothing
+// of the log.
+pub type WitnessHead = { Int seq; List(Int) digest; Int time; };
+
+Bool head_above(WitnessHead h, Int seq) { return h.digest.len() == 32 && h.seq > seq; }
+
+Int heads_answered(List(Option(WitnessHead)) hs, Int i, Int acc) {
+    if (i >= hs.len()) { return acc; }
+    Option(WitnessHead) o = hs[i];
+    return heads_answered(hs, i + 1, acc + (match o { Some(_) => 1, None => 0 }));
+}
+
+// The first answer above sequence `seq`, or that co-signed another digest
+// than `d` at `seq`; None when there is none.
+Option(WitnessHead) head_beyond(List(Option(WitnessHead)) hs, Int seq, List(Int) d, Int i) {
+    if (i >= hs.len()) { return None; }
+    Option(WitnessHead) o = hs[i];
+    Bool bad = match o { None => false, Some(h) => head_above(h, seq) || (h.digest.len() == 32 && h.seq == seq && !bytes_eq(h.digest, d)) };
+    return if (bad) { o } else { head_beyond(hs, seq, d, i + 1) };
+}
+
+// Whether the head at `seq` with digest `d` is the log's head as the
+// witnesses know it (R2W-5): `hs` are the answers of the policy's `n`
+// witnesses to POST /head for a fresh nonce (None where a witness did not
+// answer or its answer did not verify). "" when a majority answered and
+// none co-signed past `seq` or another digest at `seq`; else why not. A
+// relay that hides an event (a veto) past `seq` cannot hide it from the
+// witnesses that co-signed it, and those are a majority, so at least one
+// of any majority that answers. The check fails closed: an event a witness
+// co-signed past `seq` that never reached a majority blocks it as well,
+// until the log's next event takes that sequence.
+pub Str heads_problem(List(Option(WitnessHead)) hs, Int n, Int seq, List(Int) d) {
+    Option(WitnessHead) b = head_beyond(hs, seq, d, 0);
+    Str why = match b {
+        None => "",
+        Some(h) => if (h.seq > seq) { f"a witness co-signed sequence {h.seq}, past the head {seq} the relay serves: it may be hiding events (SPEC 20.4)" }
+                   else { f"a witness co-signed another event at the head {seq}: a fork (SPEC 20.4)" }
+    };
+    if (str_len(why) > 0) { return why; }
+    if (heads_answered(hs, 0, 0) * 2 <= n) { return "fewer than a majority of the witnesses answered for the log's head"; }
+    return "";
+}
+
+// Whether no event can be co-signed by a majority at `seq` any more (R2W-2:
+// a freeze): `hs` as for heads_problem, after the witnesses refused the
+// event a device took there. Witnesses that did not answer, or co-signed
+// nothing at `seq`, may still co-sign any one event there; the others hold
+// their digest at `seq` for good. "" when some event can still get a
+// majority (or the log has moved past `seq`); else the alarm.
+pub Str freeze_problem(List(Option(WitnessHead)) hs, Int n, Int seq) {
+    if (head_past(hs, seq, 0)) { return ""; }
+    List(List(Int)) at = digests_at(hs, seq, 0, []);
+    Int free = n - at.len();
+    if (most_of(at, 0, 0) + free >= n / 2 + 1) { return ""; }
+    return f"log frozen at sequence {seq}: the witnesses co-signed different events there, so none can get a majority; possible attack (SPEC 20.4)";
+}
+
+Bool head_past(List(Option(WitnessHead)) hs, Int seq, Int i) {
+    if (i >= hs.len()) { return false; }
+    Option(WitnessHead) o = hs[i];
+    Bool past = match o { None => false, Some(h) => head_above(h, seq) };
+    return past || head_past(hs, seq, i + 1);
+}
+
+List(List(Int)) digests_at(List(Option(WitnessHead)) hs, Int seq, Int i, List(List(Int)) acc) {
+    if (i >= hs.len()) { return acc; }
+    Option(WitnessHead) o = hs[i];
+    List(Int) hd = match o { None => [], Some(h) => if (h.seq == seq) { h.digest } else { [] } };
+    Bool here = hd.len() == 32;
+    return digests_at(hs, seq, i + 1, if (here) { acc.concat([hd]) } else { acc });
+}
+
+Int count_of(List(List(Int)) xs, List(Int) x, Int i, Int acc) {
+    if (i >= xs.len()) { return acc; }
+    return count_of(xs, x, i + 1, acc + (if (bytes_eq(xs[i], x)) { 1 } else { 0 }));
+}
+
+Int most_of(List(List(Int)) xs, Int i, Int best) {
+    if (i >= xs.len()) { return best; }
+    Int c = count_of(xs, xs[i], 0, 0);
+    return most_of(xs, i + 1, if (c > best) { c } else { best });
 }
 
 // ============================================================================
@@ -434,6 +559,7 @@ Result(LogState, SymbolonError) do_propose(LogState s, SignedEvent e, List(Int) 
 
 Result(LogState, SymbolonError) do_remove(LogState s, SignedEvent e, List(Int) dig, Int dev_sigs, List(Int) id) {
     if (!known_party(party_by_id(s.quorum.parties, id, 0))) { return refuse("removing an unknown party"); }
+    if (has_bytes(s.removed, id, 0)) { return refuse("party already removed"); }
     return authority(s, e, dig, false, dev_sigs);
 }
 
@@ -526,7 +652,9 @@ Result(LogState, SymbolonError) do_veto(LogState s, Int dev_sigs, UInt(64) targe
 
 Result(LogState, SymbolonError) apply_body(LogState s, SignedEvent e, List(Int) dig, Bool closure(EventPayload) approvals_ok) {
     EventBody body = e.payload.body;
-    Int dev_sigs = valid_signers(e.sigs, s.quorum.parties, true, e.encoded, 0, []).len();
+    // Device signatures of the quorum's parties that are not removed: a
+    // removed device no longer authorizes, vetoes or delays (R2W-6).
+    Int dev_sigs = valid_signers(e.sigs, not_removed(s.quorum.parties, s.removed, 0, ListBuf()), true, e.encoded, 0, []).len();
     return match body {
         InceptionBody(_, _) => refuse("inception only as event 0"),
         ProposePartyBody(party, _) => do_propose(s, e, dig, dev_sigs, party),
@@ -574,6 +702,7 @@ Result(LogState, SymbolonError) step_at(LogState s, SignedEvent e, List(Int) l, 
     if (!opt_bytes_is(ep.log_id, l)) { return refuse("log id"); }
     if (!opt_bytes_is(ep.predecessor_digest, settled.prev_digest)) { return refuse("predecessor digest"); }
     if (!field6_stable(settled, ep)) { return refuse("recovery-key digests changed without rotate or recover"); }
+    if (e.sigs.len() > sigs_max(settled, ep.body)) { return refuse("more signatures than parties that could sign"); }
     // Delays run from this event's own witness time (A-07).
     LogState applied = apply_body(with_time(settled, t), e, dig, approvals_ok)?;
     return Ok(advance(applied, dig, t, e.cosigs));
@@ -607,6 +736,7 @@ Result(LogState, SymbolonError) start_inception(SignedEvent e0, List(Int) l, Lis
     Result(Int, SymbolonError) wt = if (pre) { Ok(now) } else { witness_time(e0.cosigs, pol, l, 0, dig) };
     Int t = wt?;
     // E0 is signed by every party of its own quorum.
+    if (e0.sigs.len() > q.parties.len() + 1) { return refuse("more signatures than parties that could sign"); }
     List(List(Int)) signers = valid_signers(e0.sigs, q.parties, false, e0.encoded, 0, []);
     if (signers.len() < q.parties.len()) { return refuse("E0 not signed by every party"); }
     return Ok(LogState {
@@ -647,18 +777,22 @@ pub Result(VerifiedHead, SymbolonError) il_verify(List(Int) l, List(SignedEvent)
 // sequence, predecessor, log id, suite, field 6 and the signing rule in
 // force, after settling what is pending by `now` (so a veto once the delay
 // has run is refused). With `before` empty, `e` must be an inception whose
-// digest is `l`, signed by every party of its quorum. Ok(the sequence of
-// `e`) or the refusal.
-pub Result(UInt(64), SymbolonError) il_check_next(List(Int) l, List(SignedEvent) before, SignedEvent e, Int now, Bool closure(EventPayload) approvals_ok) {
+// digest is `l`, signed by every party of its quorum. Ok(the witness time
+// `e` was checked at: `now`, or the last event's time when `now` is
+// earlier) or the refusal. A witness signs that time, never an earlier
+// one: a co-signature with a time before the last event's would be refused
+// by every agent ("witness time went backwards") while the witness holds
+// the sequence (R2W-3).
+pub Result(Int, SymbolonError) il_check_next(List(Int) l, List(SignedEvent) before, SignedEvent e, Int now, Bool closure(EventPayload) approvals_ok) {
     if (before.len() == 0) {
         LogState s = start_at(e, l, true, now)?;
-        return Ok(e.payload.sequence);
+        return Ok(now);
     }
     LogState s0 = start(before[0], l)?;
     LogState s1 = run(s0, before, l, approvals_ok, 1)?;
     Int t = if (now > s1.last_time) { now } else { s1.last_time };
     LogState s2 = step_at(s1, e, l, t, approvals_ok)?;
-    return Ok(e.payload.sequence);
+    return Ok(t);
 }
 
 // The parties proposed and not yet re-shared in, as il_verify's state holds
