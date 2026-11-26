@@ -8,10 +8,6 @@
           {
             "build": "release",
             "cert_fingerprint_sha256": "F0:FD:6C:5B:41:0F:25:CB:25:C3:B5:33:46:C8:97:2F:AE:30:F8:EE:74:11:DF:91:04:80:AD:6B:2D:60:DB:83"
-          },
-          {
-            "build": "userdebug",
-            "cert_fingerprint_sha256": "19:75:B2:F1:71:77:BC:89:A5:DF:F3:1F:9E:64:A6:CA:E2:81:A5:3D:C1:D1:D5:9B:1D:14:7F:E1:C8:2A:FA:00"
           }
         ]
       }
@@ -68,34 +64,6 @@
           {
             "build": "release",
             "cert_fingerprint_sha256": "C6:AD:B8:B8:3C:6D:4C:17:D2:92:AF:DE:56:FD:48:8A:51:D3:16:FF:8F:2C:11:C5:41:02:23:BF:F8:A7:DB:B3"
-          },
-          {
-            "build": "userdebug",
-            "cert_fingerprint_sha256": "19:75:B2:F1:71:77:BC:89:A5:DF:F3:1F:9E:64:A6:CA:E2:81:A5:3D:C1:D1:D5:9B:1D:14:7F:E1:C8:2A:FA:00"
-          }
-        ]
-      }
-    },
-    {
-      "type": "android",
-      "info": {
-        "package_name": "com.google.android.apps.chrome",
-        "signatures": [
-          {
-            "build": "userdebug",
-            "cert_fingerprint_sha256": "19:75:B2:F1:71:77:BC:89:A5:DF:F3:1F:9E:64:A6:CA:E2:81:A5:3D:C1:D1:D5:9B:1D:14:7F:E1:C8:2A:FA:00"
-          }
-        ]
-      }
-    },
-    {
-      "type": "android",
-      "info": {
-        "package_name": "org.mozilla.fennec_webauthndebug",
-        "signatures": [
-          {
-            "build": "userdebug",
-            "cert_fingerprint_sha256": "BD:AE:82:02:80:D2:AF:B7:74:94:EF:22:58:AA:78:A9:AE:A1:36:41:7E:8B:C2:3D:C9:87:75:2E:6F:48:E8:48"
           }
         ]
       }
@@ -168,18 +136,6 @@
           {
             "build": "release",
             "cert_fingerprint_sha256": "50:04:77:90:88:E7:F9:88:D5:BC:5C:C5:F8:79:8F:EB:F4:F8:CD:08:4A:1B:2A:46:EF:D4:C8:EE:4A:EA:F2:11"
-          }
-        ]
-      }
-    },
-    {
-      "type": "android",
-      "info": {
-        "package_name": "org.mozilla.fenix.debug",
-        "signatures": [
-          {
-            "build": "userdebug",
-            "cert_fingerprint_sha256": "BD:AE:82:02:80:D2:AF:B7:74:94:EF:22:58:AA:78:A9:AE:A1:36:41:7E:8B:C2:3D:C9:87:75:2E:6F:48:E8:48"
           }
         ]
       }
@@ -276,30 +232,6 @@
           {
             "build": "release",
             "cert_fingerprint_sha256": "01:E1:99:97:10:A8:2C:27:49:B4:D5:0C:44:5D:C8:5D:67:0B:61:36:08:9D:0A:76:6A:73:82:7C:82:A1:EA:C9"
-          }
-        ]
-      }
-    },
-    {
-      "type": "android",
-      "info": {
-        "package_name": "com.microsoft.emmx.rolling",
-        "signatures": [
-          {
-            "build": "userdebug",
-            "cert_fingerprint_sha256": "32:A2:FC:74:D7:31:10:58:59:E5:A8:5D:F1:6D:95:F1:02:D8:5B:22:09:9B:80:64:C5:D8:91:5C:61:DA:D1:E0"
-          }
-        ]
-      }
-    },
-    {
-      "type": "android",
-      "info": {
-        "package_name": "com.microsoft.emmx.local",
-        "signatures": [
-          {
-            "build": "userdebug",
-            "cert_fingerprint_sha256": "32:A2:FC:74:D7:31:10:58:59:E5:A8:5D:F1:6D:95:F1:02:D8:5B:22:09:9B:80:64:C5:D8:91:5C:61:DA:D1:E0"
           }
         ]
       }
@@ -428,10 +360,6 @@
           {
             "build": "release",
             "cert_fingerprint_sha256": "34:DF:0E:7A:9F:1C:F1:89:2E:45:C0:56:B4:97:3C:D8:1C:CF:14:8A:40:50:D1:1A:EA:4A:C5:A6:5F:90:0A:42"
-          },
-          {
-            "build": "userdebug",
-            "cert_fingerprint_sha256": "C8:A2:E9:BC:CF:59:7C:2F:B6:DC:66:BE:E2:93:FC:13:F2:FC:47:EC:77:BC:6B:2B:0D:52:C1:1F:51:19:2A:B8"
           }
         ]
       }
@@ -444,10 +372,6 @@
           {
             "build": "release",
             "cert_fingerprint_sha256": "34:DF:0E:7A:9F:1C:F1:89:2E:45:C0:56:B4:97:3C:D8:1C:CF:14:8A:40:50:D1:1A:EA:4A:C5:A6:5F:90:0A:42"
-          },
-          {
-            "build": "userdebug",
-            "cert_fingerprint_sha256": "C8:A2:E9:BC:CF:59:7C:2F:B6:DC:66:BE:E2:93:FC:13:F2:FC:47:EC:77:BC:6B:2B:0D:52:C1:1F:51:19:2A:B8"
           }
         ]
       }
@@ -680,10 +604,6 @@
           {
             "build": "release",
             "cert_fingerprint_sha256": "D9:C3:39:AC:9C:3A:EE:E1:75:1D:85:8C:35:D9:BA:C5:CC:87:B3:CE:76:30:93:F0:F5:10:64:F5:A2:F6:9B:04"
-          },
-          {
-            "build": "userdebug",
-            "cert_fingerprint_sha256": "6C:65:BD:B0:33:F5:CE:B1:74:09:EF:F9:99:48:D5:58:9F:55:63:9A:63:78:D5:A5:00:EB:95:FC:01:BC:6D:44"
           }
         ]
       }
@@ -696,10 +616,6 @@
           {
             "build": "release",
             "cert_fingerprint_sha256": "90:17:13:23:45:6E:6F:39:CB:FD:CF:B2:56:BE:1D:CF:F3:BC:1C:59:8A:15:93:30:E4:97:73:D0:4C:B9:C9:05"
-          },
-          {
-            "build": "userdebug",
-            "cert_fingerprint_sha256": "6C:65:BD:B0:33:F5:CE:B1:74:09:EF:F9:99:48:D5:58:9F:55:63:9A:63:78:D5:A5:00:EB:95:FC:01:BC:6D:44"
           }
         ]
       }
@@ -712,22 +628,6 @@
           {
             "build": "release",
             "cert_fingerprint_sha256": "35:31:83:1A:9E:2B:21:1D:E6:AA:C3:69:4B:45:83:6E:56:09:B9:D7:D0:04:C3:1B:21:87:40:FB:77:17:38:D1"
-          },
-          {
-            "build": "userdebug",
-            "cert_fingerprint_sha256": "6C:65:BD:B0:33:F5:CE:B1:74:09:EF:F9:99:48:D5:58:9F:55:63:9A:63:78:D5:A5:00:EB:95:FC:01:BC:6D:44"
-          }
-        ]
-      }
-    },
-    {
-      "type": "android",
-      "info": {
-        "package_name": "io.island.IslandDev",
-        "signatures": [
-          {
-            "build": "userdebug",
-            "cert_fingerprint_sha256": "6C:65:BD:B0:33:F5:CE:B1:74:09:EF:F9:99:48:D5:58:9F:55:63:9A:63:78:D5:A5:00:EB:95:FC:01:BC:6D:44"
           }
         ]
       }
@@ -740,10 +640,6 @@
           {
             "build": "release",
             "cert_fingerprint_sha256": "C2:38:24:15:41:20:A0:8F:C3:95:42:AC:D8:2A:E9:24:94:78:80:1E:47:FD:6C:66:2B:18:1C:28:CA:7E:59:4E"
-          },
-          {
-            "build": "userdebug",
-            "cert_fingerprint_sha256": "6C:65:BD:B0:33:F5:CE:B1:74:09:EF:F9:99:48:D5:58:9F:55:63:9A:63:78:D5:A5:00:EB:95:FC:01:BC:6D:44"
           }
         ]
       }
@@ -756,10 +652,6 @@
           {
             "build": "release",
             "cert_fingerprint_sha256": "1E:16:74:BB:79:EA:09:FB:37:CF:9F:1B:07:1B:1D:51:8D:46:03:0E:D3:EE:F2:C1:4E:AD:93:9E:C6:EE:3A:4C"
-          },
-          {
-            "build": "userdebug",
-            "cert_fingerprint_sha256": "6C:65:BD:B0:33:F5:CE:B1:74:09:EF:F9:99:48:D5:58:9F:55:63:9A:63:78:D5:A5:00:EB:95:FC:01:BC:6D:44"
           }
         ]
       }
@@ -772,22 +664,6 @@
           {
             "build": "release",
             "cert_fingerprint_sha256": "D2:5E:AD:F6:1C:E6:36:6C:A4:23:A4:7F:C4:DB:9B:8C:9C:8A:35:B4:B0:19:E8:D9:82:FB:D0:8A:D9:DB:49:5A"
-          },
-          {
-            "build": "userdebug",
-            "cert_fingerprint_sha256": "6C:65:BD:B0:33:F5:CE:B1:74:09:EF:F9:99:48:D5:58:9F:55:63:9A:63:78:D5:A5:00:EB:95:FC:01:BC:6D:44"
-          }
-        ]
-      }
-    },
-    {
-      "type": "android",
-      "info": {
-        "package_name": "io.island.island.dev.intune",
-        "signatures": [
-          {
-            "build": "userdebug",
-            "cert_fingerprint_sha256": "6C:65:BD:B0:33:F5:CE:B1:74:09:EF:F9:99:48:D5:58:9F:55:63:9A:63:78:D5:A5:00:EB:95:FC:01:BC:6D:44"
           }
         ]
       }
@@ -800,10 +676,6 @@
           {
             "build": "release",
             "cert_fingerprint_sha256": "BE:FE:E7:31:12:6A:A5:6E:7E:FD:AE:AF:5E:F3:FA:EA:44:1C:19:CC:E0:CA:EC:42:6B:65:BB:F8:2C:59:46:80"
-          },
-          {
-            "build": "userdebug",
-            "cert_fingerprint_sha256": "F1:38:00:4F:38:04:51:D4:8A:05:2B:B3:A3:EF:17:24:23:D4:B0:D0:C8:A3:AA:DD:FB:DB:66:30:31:48:EC:A4"
           }
         ]
       }
@@ -864,10 +736,6 @@
           {
             "build": "release",
             "cert_fingerprint_sha256": "89:58:A4:05:40:1F:69:F5:B0:FB:54:44:24:74:6C:40:DE:C3:0C:09:1F:40:1F:95:1F:61:3C:48:35:C3:E5:EC"
-          },
-          {
-            "build": "userdebug",
-            "cert_fingerprint_sha256": "68:75:3A:54:59:93:C1:34:D3:BD:A3:72:2A:30:53:BF:4D:48:AD:23:63:2C:4E:27:8B:B3:BF:C1:FB:F6:52:8C"
           }
         ]
       }
@@ -884,10 +752,6 @@
           {
             "build": "release",
             "cert_fingerprint_sha256": "70:D5:68:EC:6A:E6:F3:38:BC:1A:63:99:A6:53:7E:E0:69:08:CA:1D:72:FB:8F:F0:48:74:AB:95:43:3B:25:0E"
-          },
-          {
-            "build": "userdebug",
-            "cert_fingerprint_sha256": "7C:AC:39:19:37:98:1B:61:34:BD:CE:1F:D9:83:4C:25:31:81:F5:AB:F9:1D:ED:60:78:21:0D:0F:91:AC:E3:60"
           }
         ]
       }

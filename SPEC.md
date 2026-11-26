@@ -2337,10 +2337,16 @@ interface that shows, as the platform reports it, where it goes.
    reports them. Its identity is `android:apk-key-hash:` and the base64url
    SHA-256 of the signing certificate, with the package name.
    - A browser on the privileged-browser list (22.1), matched by package
-     and certificate, also reports a page: the origin is the web domain
-     the request gives for the focused field, `https` unless it is
-     `localhost` or `127.0.0.1`, as in 22.5 step 4. The platform's
-     compatibility mode is used only for browsers on that list.
+     and by a certificate the list marks as a release build (a debug or
+     `userdebug` key, such as the platform test key, is one anyone can
+     sign with, so it never counts and is not shipped), also reports a
+     page: the origin is the scheme and web domain the request gives for
+     the focused field, `https://host[:port]`, or `http://` only for
+     `localhost` or `127.0.0.1`, as in 22.5 step 4. A page on any other
+     scheme, or one whose scheme the request does not give, is refused:
+     it names no site, so no login is offered there; `http` is never
+     taken for `https`. The platform's compatibility mode is used only
+     for browsers on that list.
    - For any other app, every web domain in the request is ignored. An
      app's WebView shows whatever page the app chooses, and the app can
      read what is filled into it (the AutoSpill attacks, Black Hat Europe

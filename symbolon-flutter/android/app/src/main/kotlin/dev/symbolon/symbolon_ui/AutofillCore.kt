@@ -164,7 +164,12 @@ object AutofillCore {
         }
     }
 
-    /** Whether [pkg], signed by one of [certs], is on the privileged-browser list (22.1). */
+    /**
+     * Whether [pkg], signed by one of [certs], is on the privileged-browser
+     * list (22.1). Only "release" signatures count: a "userdebug" key (the
+     * AOSP test key, a debug keystore) is one anyone can sign an app with,
+     * and such an app could then name any page it liked.
+     */
     fun privilegedBrowser(c: Context, pkg: String, certs: List<String>): Boolean {
         val apps = JSONObject(c.assets.open("privileged_browsers.json").bufferedReader().readText()).getJSONArray("apps")
         for (i in 0 until apps.length()) {
@@ -172,6 +177,7 @@ object AutofillCore {
             if (info.getString("package_name") != pkg) continue
             val sigs = info.getJSONArray("signatures")
             for (j in 0 until sigs.length()) {
+                if (sigs.getJSONObject(j).optString("build") != "release") continue
                 val f = sigs.getJSONObject(j).getString("cert_fingerprint_sha256").replace(":", "").lowercase()
                 if (f in certs) return true
             }
