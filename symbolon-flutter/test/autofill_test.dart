@@ -30,6 +30,20 @@ void main() {
       expect(allowsLogins('{"relation":[]}', 'com.example.mailer', [cert]), isFalse);
     });
 
+    test('a verified host covers only a login saved for that very host, www. aside', () {
+      expect(appSiteIs('https://mail.example.com', 'mail.example.com'), isTrue);
+      expect(appSiteIs('https://www.example.com', 'example.com'), isTrue);
+      expect(appSiteIs('https://example.com', 'www.example.com'), isTrue);
+      // A subdomain's file (a hosting customer's, one team's) never reaches the apex login.
+      expect(appSiteIs('https://example.com', 'evil.example.com'), isFalse);
+      expect(appSiteIs('https://www.example.com', 'x.example.com'), isFalse);
+      expect(appSiteIs('https://example.com', 'example.com.evil'), isFalse);
+      expect(appSiteIs('http://example.com', 'example.com'), isFalse);
+      expect(appSiteIs('https://example.com:8443', 'example.com'), isFalse);
+      expect(appSiteIs('https://example.com/path', 'example.com'), isFalse);
+      expect(appSiteIs('', 'example.com'), isFalse);
+    });
+
     test('answers are kept for a day, then asked again; a failed fetch is no link', () async {
       final d = await Directory.systemTemp.createTemp('applinks');
       addTearDown(() => d.delete(recursive: true));
@@ -146,6 +160,16 @@ void main() {
       expect(fetched, ['mail.example.com']);   // only the site the app claims
       expect(find.text('These sites say this app may use their logins'), findsOneWidget);
       expect(find.byKey(const Key('af-item-mail')), findsOneWidget);
+    });
+
+    testWidgets('an app verified only by a subdomain\'s Digital Asset Links gets none of the parent\'s logins', (t) async {
+      // The login is saved for https://mail.example.com; the app claims,
+      // and is listed by, a host under it.
+      await show(t, AutofillRequest(package: 'com.example.mailer', label: 'Mailer', certs: [cert], claimed: const ['user1.mail.example.com'], kinds: const ['username', 'current-password']),
+          fetch: (h) async => links);
+      await unlock(t);
+      expect(find.byKey(const Key('af-item-mail')), findsNothing);
+      expect(find.byKey(const Key('af-none')), findsOneWidget);
     });
 
     testWidgets('a card field: the cards, with their kinds only', (t) async {

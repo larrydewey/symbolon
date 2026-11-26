@@ -87,7 +87,7 @@ class AutofillRequest {
     if (it.type != 'login') return false;
     if (isPage) return siteCovers(it.detail, origin);
     if (it.appLinks.any((l) => l.$1 == package && certs.contains(l.$2))) return true;
-    return verifiedHosts.any((h) => siteCovers(it.detail, 'https://$h'));
+    return verifiedHosts.any((h) => appSiteIs(it.detail, h));
   }
 }
 

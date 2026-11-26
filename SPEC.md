@@ -2362,6 +2362,10 @@ interface that shows, as the platform reports it, where it goes.
      directly from that host over TLS, without redirects and at most
      128 KiB, lists `delegate_permission/common.get_login_creds` for an
      `android_app` target with that package and certificate fingerprint.
+     The file covers only a login saved for that very host (`https`, no
+     port, a leading `www.` aside on either side): unlike a page in a
+     browser, a subdomain's file never reaches the parent site's login,
+     since a subdomain may be a hosting customer's or one team's.
      Only the sites the app itself claims (its manifest's
      `asset_statements`) are looked up, never every site in the vault,
      which would tell the network what the vault holds. The file is

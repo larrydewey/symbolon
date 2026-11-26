@@ -63,6 +63,20 @@ bool allowsLogins(String json, String pkg, List<String> certs) {
   return false;
 }
 
+/// Whether a login saved for [saved] belongs to [host], a host whose
+/// Digital Asset Links list the app: `https`, no port or path, and the same
+/// host once a leading "www." is dropped from each. Unlike a page in a
+/// browser (SPEC 22.5 step 6), a subdomain does not inherit the parent's
+/// login: an app verified by any subdomain's file (one a hosting customer
+/// or a single team controls) would otherwise get the apex site's login.
+bool appSiteIs(String saved, String host) {
+  final a = Uri.tryParse(saved);
+  if (a == null || a.scheme != 'https' || a.hasPort || a.path.isNotEmpty || a.hasQuery || a.hasFragment || a.userInfo.isNotEmpty) return false;
+  String bare(String h) => h.startsWith('www.') ? h.substring(4) : h;
+  final h = host.toLowerCase();
+  return a.host.isNotEmpty && bare(a.host) == bare(h);
+}
+
 /// The answers, kept in [cache] (a JSON file) for a day.
 class AppLinks {
   final File cache;
