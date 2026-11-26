@@ -1,0 +1,290 @@
+// D-4: the duress profile holds no key that opens what is addressed to the
+// device (SPEC 9.2, 14.2), and the security update moves a device made
+// before that (secupdate.resid). Devices are made as `device new` makes
+// them (unprotected, a cheap stretch) under target/test-secupdate/, with
+// no relay: the update's network steps are skipped for a device not in a
+// log, and the cosigner's side is checked on its own.
+
+import "../types.resid";
+import "../core/log.resid";
+import "../duress/duress.resid";
+import "../net/proto.resid";
+import "../net/envelope.resid";
+import "../threshold/threshold.resid";
+import "state.resid";
+import "common.resid";
+import "session.resid";
+import "device.resid";
+import "fidokey.resid";
+import "duresscli.resid";
+import "sharetypes.resid";
+import "sharecli.resid";
+import "recover.resid";
+import "cosignerd.resid";
+import "secupdate.resid";
+import "hpkeg.resid";
+import "crypto.resid";
+import "word.resid";
+
+List(Int) rep(Int b, Int n) { return if (n <= 0) { [] } else { [b].concat(rep(b, n - 1)) }; }
+
+@requires(filesystem)
+Str fresh_dir() {
+    _ = filesystem.create_dir("target");
+    _ = filesystem.create_dir("target/test-secupdate");
+    return "target/test-secupdate/" + hex_encode(random_bytes(8));
+}
+
+Str pin() { return "1234"; }
+Str dpin() { return "5678"; }
+
+// A device as `device new` makes it, with a duress PIN or without.
+@requires(filesystem, device, declassify, provision, network, environment)
+Str new_device(Bool duress) {
+    Str dir = fresh_dir();
+    _ = filesystem.create_dir(dir);
+    _ = device_new_pins(dir, "127.0.0.1", 1, true, false, true, "", pin(), if (duress) { dpin() } else { "" });
+    return dir;
+}
+
+DeviceConfig no_config() {
+    return DeviceConfig {.relay_host = "", .relay_port = 0, .ca = "", .witnesses = [], .unprotected = true, .argon_m_kib = 0, .argon_t = 0, .salt = [],
+        .tpm_dk = 0, .tpm_unlock_a = 0, .tpm_unlock_b = 0, .party = [], .dk_pub = [], .hpke_pub = [], .log_id = [], .mbox_next = 0, .peers = []};
+}
+
+@requires(filesystem)
+DeviceConfig cfg(Str dir) { return load_config(dir) else { no_config() }; }
+
+@requires(filesystem, device, declassify, provision, network, environment, clock)
+Unlocked open_as(Str dir, Str p) { return unlock_dir(dir, cfg(dir), p); }
+
+// Every key the duress profile could try: each of its 32-byte fields as
+// an HPKE seed and as a raw HPKE private key.
+@requires(declassify)
+List(List(Secret(UInt(8)))) duress_material(DuressFull d) {
+    return [hpkeg_derive_keypair(16, d.share).sk, hpkeg_derive_keypair(16, d.subkey).sk, hpkeg_derive_keypair(16, d.vault_key).sk,
+            hpkeg_derive_keypair(16, d.hpke_priv).sk, d.share, d.subkey, d.vault_key, d.hpke_priv];
+}
+
+List(Int) info() { return utf8("symbolon v1 share test"); }
+
+// A folder key wrapped to `to` by another member's device (`from`).
+@requires(declassify)
+ShareWrap wrap_to_key(List(Int) to, HpkeKeyPairG(Secret(UInt(8))) from) {
+    List(Secret(UInt(8))) none = [];
+    List(Secret(UInt(8))) fresh = [];
+    HpkeSenderG(Secret(UInt(8))) s = hpkeg_setup_sender_full(share_suite(), to, info(), none, [], from.sk, fresh);
+    HpkeSealedG(Secret(UInt(8))) sealed = hpkeg_seal(s.ctx, [], secret_bytes(rep(42, 32)));
+    return ShareWrap {.to = [], .from_log = [], .from_party = [], .enc = s.enc, .ct = reveal(sealed.ct)};
+}
+
+Bool opened(Result(List(Secret(UInt(8))), Str) r) { return match r { Ok(_) => true, Err(_) => false }; }
+
+// Whether any of `sks` opens the envelope `e` from `from`.
+@requires(declassify)
+Bool env_opens(List(List(Secret(UInt(8)))) sks, Int i, Envelope e, List(Int) me, List(Int) from) {
+    if (i >= sks.len()) { return false; }
+    return match open(e, me, sks[i], from) { Some(_) => true, None => env_opens(sks, i + 1, e, me, from) };
+}
+
+@requires(declassify)
+Envelope env_to(List(Int) party, List(Int) pk, HpkeKeyPairG(Secret(UInt(8))) from, Packet w) {
+    List(Secret(UInt(8))) fresh = [];
+    return seal(rep(3, 32), from.sk, party, pk, w, fresh) else { Envelope {.from = [], .to = [], .enc = [], .ct = []} };
+}
+
+Packet reshare_packet() {
+    return WReshare(ReshareInvite {.session_id = rep(1, 32), .log_id = rep(2, 32), .new_parties = [], .dealers = [1], .receivers = [1], .offline = [],
+                                   .degree = 1, .epoch = 2, .requester = rep(3, 32), .sig = []});
+}
+
+@requires(filesystem, device, declassify, provision, network, environment, clock)
+test "the duress profile opens no folder-key wrap, kit half, re-share or enrolment envelope made to the device" {
+    Str dir = new_device(true);
+    DeviceConfig c = cfg(dir);
+    Unlocked u = open_as(dir, pin());
+    Unlocked d = open_as(dir, dpin());
+    expect(u.kind).toEqual(1);
+    expect(d.kind).toEqual(2);
+    // A new device starts on its v2 key and needs no update.
+    expect(hex_encode(c.hpke_pub)).toEqual(hex_encode(device_hpke2(u.real.dek).pk));
+    expect(security_update_due(dir)).toBeFalse();
+    List(List(Secret(UInt(8)))) mine = device_open_keys(c, u.real.dek);
+    List(List(Secret(UInt(8)))) dur = duress_material(d.duress);
+    HpkeKeyPairG(Secret(UInt(8))) other = hpkeg_derive_keypair(16, random_secret(32));
+    // A shared folder's key.
+    ShareWrap w = wrap_to_key(c.hpke_pub, other);
+    expect(opened(unwrap_with(mine, 0, info(), other.pk, w))).toBeTrue();
+    expect(opened(unwrap_with(dur, 0, info(), other.pk, w))).toBeFalse();
+    // The cosigner's kit half.
+    List(Int) half = rep(7, 64);
+    Wrapped kh = offline_wrap(c.hpke_pub, rep(9, 32), (UInt(32))1, c.party, half, random_bytes(32)) else { Wrapped {.enc = [], .ct = []} };
+    expect(hex_encode(half_unwrap(mine, 0, rep(9, 32), (UInt(32))1, c.party, kh))).toEqual(hex_encode(half));
+    expect(half_unwrap(dur, 0, rep(9, 32), (UInt(32))1, c.party, kh).len()).toEqual(0);
+    // A re-share invitation and an enrolment's secrets.
+    Envelope e1 = env_to(c.party, c.hpke_pub, other, reshare_packet());
+    Envelope e2 = env_to(c.party, c.hpke_pub, other, WEnrollSecrets(EnrollSecrets {.cc = rep(4, 32), .vault_key = rep(5, 32)}));
+    expect(env_opens([device_transport(c, u.real.dek).sk], 0, e1, c.party, other.pk)).toBeTrue();
+    expect(env_opens([device_transport(c, u.real.dek).sk], 0, e2, c.party, other.pk)).toBeTrue();
+    expect(env_opens(dur, 0, e1, c.party, other.pk)).toBeFalse();
+    expect(env_opens(dur, 0, e2, c.party, other.pk)).toBeFalse();
+    // Its own transport key is registered: duress.pub is the sub-key and it.
+    List(Int) dp = duress_pub(dir);
+    expect(dp.len()).toEqual(130);
+    expect(hex_encode(dp[65..130])).toEqual(hex_encode(hpkeg_derive_keypair(16, d.duress.share).pk));
+}
+
+// A device as one made before the update: the duress profile's share field
+// holds the device's v1 seed, the configuration names v1, duress.pub is the
+// sub-key alone and `security-update` is missing.
+@requires(filesystem, device, declassify, provision, network, environment, clock)
+Bool make_old(Str dir, Bool duress) {
+    DeviceConfig c = cfg(dir);
+    Unlocked u = open_as(dir, pin());
+    List(Int) v1 = device_hpke(u.real.dek).pk;
+    Bool cfg_ok = save_config(dir, with_transport(c, v1)) && filesystem.remove(security_update_file(dir));
+    if (!duress) { return cfg_ok && filesystem.write_bytes(dir + "/duress.pub", duress_pub(dir)[0..65]); }
+    Unlocked d = open_as(dir, dpin());
+    List(Secret(UInt(8))) kb = unlock_key(stretch(c, pin_bytes(dpin())), c.salt);
+    Str which = if (unlock(kb, read_blob(dir, "a", []), []).kind == 2) { "a" } else { "b" };
+    DuressFull old = new_transport(d.duress, hk(u.real.dek, "symbolon v1 device hpke", 32));
+    List(Secret(UInt(8))) p = encode_duress(old) else { [] };
+    return cfg_ok && write_blob(dir, which, seal_blob(kb, random_bytes(12), p), []) && filesystem.write_bytes(dir + "/duress.pub", sw_public(d.duress.subkey));
+}
+
+@requires(filesystem, device, declassify, provision, network, environment, clock)
+test "an old device after the security update: no device key under the duress PIN, new wraps to v2, old ones still open under the PIN" {
+    Str dir = new_device(true);
+    expect(make_old(dir, true)).toBeTrue();
+    DeviceConfig c0 = cfg(dir);
+    Unlocked u = open_as(dir, pin());
+    Unlocked d0 = open_as(dir, dpin());
+    HpkeKeyPairG(Secret(UInt(8))) other = hpkeg_derive_keypair(16, random_secret(32));
+    List(Int) v1 = device_hpke(u.real.dek).pk;
+    List(Int) v2 = device_hpke2(u.real.dek).pk;
+    // Before: the reminder is due, and the duress profile opens a wrap to
+    // the device (the finding).
+    expect(security_update_due(dir)).toBeTrue();
+    expect(hex_encode(c0.hpke_pub)).toEqual(hex_encode(v1));
+    ShareWrap old_wrap = wrap_to_key(v1, other);
+    expect(opened(unwrap_with(duress_material(d0.duress), 0, info(), other.pk, old_wrap))).toBeTrue();
+    // The update (no log yet: no registration or log event to make).
+    expect(update_with(dir, c0, pin(), dpin())).toEqual(0);
+    DeviceConfig c1 = cfg(dir);
+    Unlocked u1 = open_as(dir, pin());
+    Unlocked d1 = open_as(dir, dpin());
+    expect(u1.kind).toEqual(1);
+    expect(d1.kind).toEqual(2);
+    expect(security_update_due(dir)).toBeFalse();
+    // The duress profile has its own transport key, and nothing else changed in it.
+    expect(hex_encode(reveal(d1.duress.share)) == hex_encode(reveal(hk(u.real.dek, "symbolon v1 device hpke", 32)))).toBeFalse();
+    expect(hex_encode(hpkeg_derive_keypair(16, d1.duress.share).pk) == hex_encode(v1)).toBeFalse();
+    expect(hex_encode(hpkeg_derive_keypair(16, d1.duress.share).pk) == hex_encode(v2)).toBeFalse();
+    expect(hex_encode(reveal(d1.duress.subkey))).toEqual(hex_encode(reveal(d0.duress.subkey)));
+    expect(hex_encode(reveal(d1.duress.hpke_priv))).toEqual(hex_encode(reveal(d0.duress.hpke_priv)));
+    expect(hex_encode(duress_pub(dir))).toEqual(hex_encode(duress_pub_of(d1.duress.subkey, d1.duress.share)));
+    // The device speaks with v2 now; a wrap to v2 opens under the PIN only.
+    expect(hex_encode(c1.hpke_pub)).toEqual(hex_encode(v2));
+    expect(hex_encode(device_transport(c1, u1.real.dek).pk)).toEqual(hex_encode(v2));
+    ShareWrap new_wrap = wrap_to_key(c1.hpke_pub, other);
+    expect(opened(unwrap_with(device_open_keys(c1, u1.real.dek), 0, info(), other.pk, new_wrap))).toBeTrue();
+    expect(opened(unwrap_with(duress_material(d1.duress), 0, info(), other.pk, new_wrap))).toBeFalse();
+    // A wrap others made to v1 before the update still opens under the
+    // PIN, until it is made again; not under the duress PIN any more.
+    expect(opened(unwrap_with(device_open_keys(c1, u1.real.dek), 0, info(), other.pk, old_wrap))).toBeTrue();
+    expect(opened(unwrap_with(duress_material(d1.duress), 0, info(), other.pk, old_wrap))).toBeFalse();
+    // Running it again changes nothing.
+    expect(update_with(dir, c1, pin(), dpin())).toEqual(0);
+}
+
+@requires(filesystem, device, declassify, provision, network, environment, clock)
+test "the update takes only the PIN first and this device's duress PIN second, and changes nothing otherwise" {
+    Str dir = new_device(true);
+    expect(make_old(dir, true)).toBeTrue();
+    DeviceConfig c = cfg(dir);
+    List(Int) a = read_blob(dir, "a", []);
+    List(Int) b = read_blob(dir, "b", []);
+    // The duress PIN as the PIN: refused as under duress, nothing written.
+    expect(update_with(dir, c, dpin(), pin()) == 0).toBeFalse();
+    expect(update_with(dir, c, pin(), "9999") == 0).toBeFalse();
+    expect(update_with(dir, c, pin(), pin()) == 0).toBeFalse();
+    expect(security_update_due(dir)).toBeTrue();
+    expect(hex_encode(read_blob(dir, "a", []))).toEqual(hex_encode(a));
+    expect(hex_encode(read_blob(dir, "b", []))).toEqual(hex_encode(b));
+    expect(duress_pub(dir).len()).toEqual(65);
+}
+
+@requires(filesystem, device, declassify, provision, network, environment, clock)
+test "without a duress PIN the update leaves decoys of the same shape" {
+    // A device that never had one.
+    Str d1 = new_device(false);
+    expect(make_old(d1, false)).toBeTrue();
+    expect(update_with(d1, cfg(d1), pin(), "")).toEqual(0);
+    expect(security_update_due(d1)).toBeFalse();
+    expect(read_blob(d1, "a", []).len()).toEqual(blob_len());
+    expect(read_blob(d1, "b", []).len()).toEqual(blob_len());
+    expect(get_file(d1 + "/slot").len()).toEqual(slot_len());
+    expect(duress_pub(d1).len()).toEqual(130);
+    // One that had one, and is told it has none: the old duress PIN opens
+    // nothing any more, and the real profile stops writing to it.
+    Str d2 = new_device(true);
+    expect(make_old(d2, true)).toBeTrue();
+    expect(update_with(d2, cfg(d2), pin(), "")).toEqual(0);
+    expect(open_as(d2, dpin()).kind).toEqual(0);
+    expect(open_as(d2, pin()).real.duress_hpke_pub.len()).toEqual(0);
+    expect(read_blob(d2, "a", []).len()).toEqual(blob_len());
+    expect(read_blob(d2, "b", []).len()).toEqual(blob_len());
+    expect(duress_pub(d2).len()).toEqual(130);
+}
+
+// ─── The cosigner's side (SPEC 14.2) ────────────────────────────
+
+@requires(declassify)
+Cosigner cosigner_with(Str dir, List(Int) dev, List(Int) dev_pk, List(Secret(UInt(8))) root) {
+    CosignerConfig cfg = CosignerConfig {.relay_host = "127.0.0.1", .relay_port = 1, .ca = "", .party = rep(1, 32), .dk_pub = [], .hpke_pub = [],
+                                         .log_id = rep(7, 32), .mbox_next = 0, .peers = [PartyKeys {.party = dev, .auth_key = [], .hpke_key = dev_pk}], .accept_inception = false};
+    return Cosigner {.dir = dir, .cfg = cfg, .root = root};
+}
+
+List(Int) got_key(Option(Got) g) { return match g { None => [], Some(x) => x.key }; }
+
+@requires(filesystem, declassify)
+test "the cosigner knows a duress profile by its own transport key, only for what a duress profile sends" {
+    Str dir = fresh_dir();
+    _ = filesystem.create_dir(dir);
+    List(Int) dev = rep(2, 32);
+    HpkeKeyPairG(Secret(UInt(8))) dk = hpkeg_derive_keypair(16, random_secret(32));
+    HpkeKeyPairG(Secret(UInt(8))) tk = hpkeg_derive_keypair(16, random_secret(32));
+    HpkeKeyPairG(Secret(UInt(8))) cos = hpkeg_derive_keypair(16, random_secret(32));
+    Cosigner c = cosigner_with(dir, dev, dk.pk, random_secret(32));
+    List(Int) sub = sw_public(random_secret(32));
+    _ = on_duress_key(c, dev, sub.concat(tk.pk));
+    expect(duress_keys_of(c).len()).toEqual(1);
+    expect(duress_transports_of(c).len()).toEqual(1);
+    expect(known_of(c).len()).toEqual(2);
+    expect(peer_key(c, dev, dk.pk)).toBeTrue();
+    expect(peer_key(c, dev, tk.pk)).toBeFalse();
+    // Envelopes from the device open under either key; the cosigner learns which.
+    Local me = Local {.party = c.cfg.party, .cg = 0, .hpke_sk = cos.sk};
+    List(Secret(UInt(8))) fresh = [];
+    List(Int) by_dev = envelope_encode(seal(dev, dk.sk, c.cfg.party, cos.pk, WBeacon(Beacon {.session_id = [], .log_id = [], .epoch = 0, .time = 0, .location = [], .requester = dev, .sig = []}), fresh) else { Envelope {.from = [], .to = [], .enc = [], .ct = []} });
+    List(Int) by_dur = envelope_encode(seal(dev, tk.sk, c.cfg.party, cos.pk, WSign(SignInvite {.session_id = [], .message = [], .epoch = 0, .requester = dev, .kind = 1, .sig = [], .signers = []}), fresh) else { Envelope {.from = [], .to = [], .enc = [], .ct = []} });
+    List(Int) by_other = envelope_encode(seal(dev, hpkeg_derive_keypair(16, random_secret(32)).sk, c.cfg.party, cos.pk, WKitRelease([]), fresh) else { Envelope {.from = [], .to = [], .enc = [], .ct = []} });
+    expect(hex_encode(got_key(open_env(me, known_of(c), by_dev)))).toEqual(hex_encode(dk.pk));
+    expect(hex_encode(got_key(open_env(me, known_of(c), by_dur)))).toEqual(hex_encode(tk.pk));
+    expect(got_key(open_env(me, known_of(c), by_other)).len()).toEqual(0);
+    // Under the duress transport key only what a duress profile sends.
+    expect(duress_packet(WSign(SignInvite {.session_id = [], .message = [], .epoch = 0, .requester = dev, .kind = 1, .sig = [], .signers = []}))).toBeTrue();
+    expect(duress_packet(WDuressKey(sub))).toBeFalse();
+    expect(duress_packet(WKitRelease([]))).toBeFalse();
+    expect(duress_packet(WSignEvent([]))).toBeFalse();
+    // The device's own key is never taken as a duress transport key, and a
+    // 65-byte registration (a device before the update) drops it.
+    _ = on_duress_key(c, dev, sub.concat(dk.pk));
+    expect(duress_transports_of(c).len()).toEqual(0);
+    _ = on_duress_key(c, dev, sub.concat(tk.pk));
+    expect(duress_transports_of(c).len()).toEqual(1);
+    _ = on_duress_key(c, dev, sub);
+    expect(duress_transports_of(c).len()).toEqual(0);
+    expect(duress_keys_of(c).len()).toEqual(1);
+}

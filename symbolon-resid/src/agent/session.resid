@@ -21,8 +21,11 @@ pub type Local = { List(Int) party; Int cg; List(Secret(UInt(8))) hpke_sk; };
 // A party behind the relay: its id, CGGMP id and HPKE public key.
 pub type Remote = { List(Int) party; Int cg; List(Int) hpke_pub; };
 
-// A Packet value received: who sent it, and whose mailbox it came from.
-pub type Got = { List(Int) from; List(Int) to; Packet w; };
+// A Packet value received: who sent it, whose mailbox it came from, and
+// the sender's HPKE key that authenticated it (one of the keys `known`
+// lists for the sender: the cosigner knows a device by its transport key
+// and, for its duress profile, by the duress transport key, SPEC 14.2).
+pub type Got = { List(Int) from; List(Int) to; Packet w; List(Int) key; };
 
 // The mailbox of one local party: where reading resumes.
 pub type Cursor = { List(Int) party; Int next; };
@@ -46,7 +49,10 @@ pub Option(Remote) remote_by_party(List(Remote) rs, List(Int) p, Int i) {
 
 // What a drain read, and where the next one resumes: the index after the
 // last envelope it read, so one that arrives meanwhile is read next time.
-pub type Drained = { List(Got) got; Cursor cur; Int unknown; };   // unknown: envelopes from senders not in `known`
+// unknown: envelopes from senders not in `known`; unopened: from a known
+// sender, but under none of its keys (a party that moved to a new transport
+// key, SPEC 8.1, before the reader learned it).
+pub type Drained = { List(Got) got; Cursor cur; Int unknown; Int unopened; };
 
 // Everything now in `c`'s mailbox, opened with `me`'s key; envelopes from
 // senders not in `known`, or that do not open, are skipped.
@@ -55,14 +61,18 @@ pub type Drained = { List(Got) got; Cursor cur; Int unknown; };   // unknown: en
 pub Drained drain(Endpoint relay, Local me, List(Remote) known, Cursor c, ListBuf(Got) acc) {
     List(Post) none = [];
     Fetched f = relay_read(relay, none, c.party, [c.next]);
-    return drain_open(me, known, f.envs, 0, Cursor {.party = c.party, .next = f.nexts[0]}, acc, 0);
+    return drain_open(me, known, f.envs, 0, Cursor {.party = c.party, .next = f.nexts[0]}, acc, 0, 0);
 }
 
 @requires(declassify)
 @robust_exempt(reason = "declassifies only envelope plaintext that HPKE mode_auth authenticated under this party's key; nothing is disclosed outward")
-Drained drain_open(Local me, List(Remote) known, List(List(Int)) envs, Int i, Cursor c, ListBuf(Got) acc, Int unknown) {
-    if (i >= envs.len()) { return Drained {.got = acc.finish(), .cur = c, .unknown = unknown}; }
-    return drain_open(me, known, envs, i + 1, c, push_open(acc, me, known, envs[i]), unknown + (if (from_unknown(known, envs[i])) { 1 } else { 0 }));
+Drained drain_open(Local me, List(Remote) known, List(List(Int)) envs, Int i, Cursor c, ListBuf(Got) acc, Int unknown, Int unopened) {
+    if (i >= envs.len()) { return Drained {.got = acc.finish(), .cur = c, .unknown = unknown, .unopened = unopened}; }
+    Bool unk = from_unknown(known, envs[i]);
+    Option(Got) og = open_env(me, known, envs[i]);
+    Bool shut = !unk && match og { None => true, Some(_) => false };
+    ListBuf(Got) acc2 = match og { None => acc, Some(g) => acc.push(g) };
+    return drain_open(me, known, envs, i + 1, c, acc2, unknown + (if (unk) { 1 } else { 0 }), unopened + (if (shut) { 1 } else { 0 }));
 }
 
 Bool from_unknown(List(Remote) known, List(Int) b) {
@@ -73,22 +83,40 @@ Bool from_unknown(List(Remote) known, List(Int) b) {
 @requires(declassify)
 @robust_exempt(reason = "declassifies only envelope plaintext that HPKE mode_auth authenticated under this party's key; nothing is disclosed outward")
 ListBuf(Got) push_open(ListBuf(Got) acc, Local me, List(Remote) known, List(Int) b) {
+    Option(Got) og = open_env(me, known, b);
+    return match og { None => acc, Some(g) => acc.push(g) };
+}
+
+@requires(declassify)
+@robust_exempt(reason = "declassifies only envelope plaintext that HPKE mode_auth authenticated under this party's key; nothing is disclosed outward")
+pub Option(Got) open_env(Local me, List(Remote) known, List(Int) b) {
     Option(Envelope) oe = envelope_decode(b);
     return match oe {
-        None => dropped(acc, f"an envelope that does not decode ({b.len()} bytes)"),
+        None => dropped(f"an envelope that does not decode ({b.len()} bytes)"),
         Some(e) => match remote_by_party(known, e.from, 0) {
-            None => dropped(acc, "an envelope from an unknown party"),
-            Some(r) => match open(e, me.party, me.hpke_sk, r.hpke_pub) {
-                None => dropped(acc, f"an envelope that does not open ({b.len()} bytes)"),
-                Some(w) => acc.push(Got {.from = e.from, .to = me.party, .w = w})
-            }
+            None => dropped("an envelope from an unknown party"),
+            Some(_) => open_any(me, known, e, 0, b.len())
         }
+    };
+}
+
+// The envelope opened under the first of the sender's keys in `known` it
+// opens with.
+@requires(declassify)
+@robust_exempt(reason = "declassifies only envelope plaintext that HPKE mode_auth authenticated under this party's key; nothing is disclosed outward")
+Option(Got) open_any(Local me, List(Remote) known, Envelope e, Int i, Int n) {
+    if (i >= known.len()) { return dropped(f"an envelope that does not open ({n} bytes)"); }
+    if (!bytes_eq(known[i].party, e.from)) { return open_any(me, known, e, i + 1, n); }
+    Option(Packet) ow = open(e, me.party, me.hpke_sk, known[i].hpke_pub);
+    return match ow {
+        None => open_any(me, known, e, i + 1, n),
+        Some(w) => Some(Got {.from = e.from, .to = me.party, .w = w, .key = known[i].hpke_pub})
     };
 }
 
 // Skipped envelopes are reported on stderr: a protocol that then waits
 // for them says why.
-ListBuf(Got) dropped(ListBuf(Got) acc, Str why) { eprintln("skipped " + why); return acc; }
+Option(Got) dropped(Str why) { eprintln("skipped " + why); return None; }
 
 @requires(network, clock(readonly), declassify)
 pub Int mailbox_end(Endpoint relay, List(Int) party, Int n) {

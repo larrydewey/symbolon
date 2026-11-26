@@ -1,9 +1,11 @@
 // The duress PIN from the command line (SPEC 9.2, 14).
 //
 // Every device has, whether or not a duress PIN exists:
-//   duress.pub   the duress DK sub-key's public key, registered with the
-//                cosigner (a device without a duress PIN registers a key no
-//                one holds);
+//   duress.pub   the duress DK sub-key's public key and the duress
+//                profile's own transport (HPKE) key, 130 bytes, registered
+//                with the cosigner (a device without a duress PIN registers
+//                keys no one holds; a device before the security update
+//                has only the sub-key, 65 bytes);
 //   dshare       its CGGMP21 configuration for the duress profile, HPKE-
 //                sealed to the duress profile's key by the real profile, which
 //                cannot read it back (random bytes of the same length
@@ -125,5 +127,5 @@ pub List(Int) duress_pub(Str dir) { return get_file(dir + "/duress.pub"); }
 @requires(filesystem, network, declassify, clock(readonly))
 pub Bool send_duress_key(Str dir, Endpoint relay, Local me, Remote cos) {
     List(Int) k = duress_pub(dir);
-    return k.len() == 65 && send_to(relay, me, cos, WDuressKey(k));
+    return (k.len() == 65 || k.len() == 130) && send_to(relay, me, cos, WDuressKey(k));
 }

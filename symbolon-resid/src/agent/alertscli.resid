@@ -51,7 +51,7 @@ import "httpserv.resid";
 // differs, as run_sign_as does).
 @requires(declassify)
 Local local_of(DeviceConfig c, Unlocked u) {
-    return Local {.party = c.party, .cg = 0, .hpke_sk = if (u.kind == 2) { hpkeg_derive_keypair(16, u.duress.share).sk } else { device_hpke(u.real.dek).sk }};
+    return Local {.party = c.party, .cg = 0, .hpke_sk = if (u.kind == 2) { hpkeg_derive_keypair(16, u.duress.share).sk } else { device_transport(c, u.real.dek).sk }};
 }
 
 @requires(device, declassify, network, environment)

@@ -85,7 +85,7 @@ Result(List(List(Secret(UInt(8)))), Str) keys_with(Str dir, Opener o, VerifiedHe
     Result(List(Int), Str) rs = dk_sign(o.c, o.u.real, o.u.st, request_tbs(sid, eval_message(r0), q.epoch, o.c.party, request_eval()));
     List(Int) sig = match rs { Ok(v) => v, Err(_) => [] };
     if (sig.len() != 64) { return Err("the device key did not sign the request"); }
-    Local lm = Local {.party = o.c.party, .cg = 0, .hpke_sk = device_hpke(o.u.real.dek).sk};
+    Local lm = Local {.party = o.c.party, .cg = 0, .hpke_sk = device_transport(o.c, o.u.real.dek).sk};
     Remote cr = Remote {.party = cos.id, .cg = ci, .hpke_pub = cos.hpke_key};
     Int start = mailbox_end(relay, o.c.party, o.c.mbox_next);
     EvalRequest r = EvalRequest {.session_id = sid, .log_id = r0.log_id, .epoch = r0.epoch, .purpose = purpose, .blinded = bs, .event_seq = -1, .requester = r0.requester, .sig = sig};
@@ -230,7 +230,7 @@ Int openings_ask(Str dir, DeviceConfig c, Unlocked u, VerifiedHead vh) {
     List(Int) sig = match rs { Ok(v) => v, Err(_) => [] };
     if (sig.len() != 64) { return dfail("the device key did not sign the request"); }
     Endpoint relay = relay_ep(c);
-    Local lm = Local {.party = c.party, .cg = 0, .hpke_sk = device_hpke(u.real.dek).sk};
+    Local lm = Local {.party = c.party, .cg = 0, .hpke_sk = device_transport(c, u.real.dek).sk};
     Remote cr = Remote {.party = cos.id, .cg = 0, .hpke_pub = cos.hpke_key};
     Int start = mailbox_end(relay, c.party, c.mbox_next);
     if (!send_to(relay, lm, cr, WEvalLog(EvalLogRequest {.session_id = sid, .log_id = c.log_id, .epoch = (Int)q.epoch, .requester = c.party, .sig = sig}))) { return dfail("cannot reach the relay"); }

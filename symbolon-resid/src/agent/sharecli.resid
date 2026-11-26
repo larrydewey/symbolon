@@ -230,7 +230,74 @@ pub Result(Loaded, Str) load_folder(Str dir, Ctx x, Str cid) {
     Roster r = roster_at(dir, x, cid)?;
     Result(Loaded, Str) rl = loaded(dir, x, r, cid);
     _ = match rl { Err(m) => if (gone(m)) { forget(dir, cid) } else { true }, Ok(ld) => keep_key(dir, x, ld) };
+    _ = match rl { Err(_) => true, Ok(ld) => rewrap_due(dir, x, ld) };
     return rl;
+}
+
+// ─── Wraps made again after the security update (D-4, SPEC 19.2) ──
+// A device that moved to its v2 transport key (SPEC 8.1) makes every
+// folder's wraps again, to each member's devices: the wraps it made with
+// v1 no longer authenticate (members check the sender against its key in
+// the log, now v2), and the wraps others made to its v1 key are made to
+// v2. dir/rewrap.todo lists the folders still to do, one id a line; the
+// security update fills it, and a folder leaves it once its wraps are
+// written (when the update gets to it, or the next time this device
+// opens it under the PIN). Never under the duress PIN.
+
+@requires(filesystem)
+pub List(Str) rewrap_todo(Str dir) { return ids_in(str_split(filesystem.read_all(dir + "/rewrap.todo"), "\n"), 0, ListBuf()); }
+
+List(Str) ids_in(List(Str) ls, Int i, ListBuf(Str) acc) {
+    if (i >= ls.len()) { return acc.finish(); }
+    Str t = str_trim(ls[i]);
+    return ids_in(ls, i + 1, if (share_id_ok(t)) { acc.push(t) } else { acc });
+}
+
+@requires(filesystem)
+pub Bool set_rewrap_todo(Str dir, List(Str) ids) { return filesystem.write_all(dir + "/rewrap.todo", lines_of(ids, 0, StrBuf())); }
+
+Str lines_of(List(Str) ids, Int i, StrBuf acc) { return if (i >= ids.len()) { acc.finish() } else { lines_of(ids, i + 1, acc.push(ids[i]).push("\n")) }; }
+
+List(Str) without_id(List(Str) ids, Str id, Int i, ListBuf(Str) acc) {
+    if (i >= ids.len()) { return acc.finish(); }
+    return without_id(ids, id, i + 1, if (ids[i] == id) { acc } else { acc.push(ids[i]) });
+}
+
+Bool has_id(List(Str) ids, Str id, Int i) { return i < ids.len() && (ids[i] == id || has_id(ids, id, i + 1)); }
+
+@requires(filesystem, network, clock(readonly), declassify)
+Bool rewrap_due(Str dir, Ctx x, Loaded ld) {
+    if (x.u.kind != 1) { return true; }
+    Str cid = hex_encode(ld.r.coll_id);
+    List(Str) todo = rewrap_todo(dir);
+    if (!has_id(todo, cid, 0)) { return true; }
+    Str m = put_wraps(x, ld.r.coll_id, ld.r.version, ld.key, people_of(ld.r), 0);
+    return str_len(m) == 0 && set_rewrap_todo(dir, without_id(rewrap_todo(dir), cid, 0, ListBuf()));
+}
+
+// Every folder this device has a wrap in, made again; the number left to do.
+@requires(filesystem, network, clock(readonly), declassify)
+pub Int rewrap_all(Str dir, Ctx x) {
+    List(Str) ids = folder_ids(x.ep, x.c.log_id);
+    _ = set_rewrap_todo(dir, ids);
+    _ = load_each(dir, x, ids, 0);
+    return rewrap_todo(dir).len();
+}
+
+// The folders a wrap at the relay names this person in.
+@requires(network, clock(readonly), declassify)
+pub List(Str) folder_ids(Endpoint ep, List(Int) l) {
+    List(Str) ids = ids_after(blob_list(ep, "wrap-" + hex_encode(l) + "-"), str_len(hex_encode(l)) + 6, 0, ListBuf());
+    return ids;
+}
+
+@requires(filesystem, network, clock(readonly), declassify)
+Int load_each(Str dir, Ctx x, List(Str) ids, Int i) {
+    if (i >= ids.len()) { return 0; }
+    Result(Loaded, Str) rl = load_folder(dir, x, ids[i]);
+    // A folder gone for this person has nothing to make again.
+    _ = match rl { Ok(_) => true, Err(m) => if (gone(m)) { set_rewrap_todo(dir, without_id(rewrap_todo(dir), ids[i], 0, ListBuf())) } else { true } };
+    return load_each(dir, x, ids, i + 1);
 }
 
 @requires(filesystem, network, clock(readonly), declassify)
@@ -410,12 +477,21 @@ pub Result(List(Secret(UInt(8))), Str) unwrap(Ctx x, Roster r, ShareWrap w) {
     if (!member_in(r, w.from_log)) { return Err("the key was wrapped by someone not in the folder"); }
     VerifiedHead fh = head_of(x.c, x.vh, w.from_log)?;
     Party s = need(device_party(fh.head.quorum.parties, w.from_party, 0), "the key was wrapped by a device that is not in its owner's log")?;
+    return unwrap_with(device_open_keys(x.c, x.u.real.dek), 0, share_info(coll_vid(r.coll_id), x.c.log_id, r.version), s.hpke_key, w);
+}
+
+// A folder-key wrap opened with the first of `sks` that opens it (this
+// device's transport keys, the current one first), the sender
+// authenticated by `sender` (HPKE mode_auth).
+@requires(declassify)
+pub Result(List(Secret(UInt(8))), Str) unwrap_with(List(List(Secret(UInt(8)))) sks, Int i, List(Int) info, List(Int) sender, ShareWrap w) {
+    if (i >= sks.len()) { return Err("the key's wrap does not open"); }
     List(Secret(UInt(8))) none = [];
-    HpkeCtxG(Secret(UInt(8))) hc = hpkeg_setup_receiver_full(share_suite(), w.enc, device_hpke(x.u.real.dek).sk, share_info(coll_vid(r.coll_id), x.c.log_id, r.version), none, [], s.hpke_key);
-    if (!hc.ok) { return Err("the key's wrap does not open"); }
+    HpkeCtxG(Secret(UInt(8))) hc = hpkeg_setup_receiver_full(share_suite(), w.enc, sks[i], info, none, [], sender);
+    if (!hc.ok) { return unwrap_with(sks, i + 1, info, sender, w); }
     HpkeOpenedG(Secret(UInt(8))) o = hpkeg_open(hc, [], w.ct);
-    if (!o.ok || o.pt.len() != 32) { return Err("the key's wrap does not open"); }
-    return Ok(o.pt);
+    if (o.ok && o.pt.len() == 32) { return Ok(o.pt); }
+    return unwrap_with(sks, i + 1, info, sender, w);
 }
 
 // The collection's items: accepted only under a head signed by a device
@@ -543,7 +619,7 @@ Result(Roster, Str) signed_roster(Ctx x, List(Int) id, UInt(64) version, Str own
 Option(ShareWrap) wrap_for(Ctx x, List(Int) vid, List(Int) member, UInt(64) version, List(Secret(UInt(8))) key, Party to) {
     List(Secret(UInt(8))) none = [];
     List(Secret(UInt(8))) fresh = [];
-    HpkeSenderG(Secret(UInt(8))) s = hpkeg_setup_sender_full(share_suite(), to.hpke_key, share_info(vid, member, version), none, [], device_hpke(x.u.real.dek).sk, fresh);
+    HpkeSenderG(Secret(UInt(8))) s = hpkeg_setup_sender_full(share_suite(), to.hpke_key, share_info(vid, member, version), none, [], device_transport(x.c, x.u.real.dek).sk, fresh);
     if (!s.ctx.ok) { return None; }
     HpkeSealedG(Secret(UInt(8))) sealed = hpkeg_seal(s.ctx, [], key);
     if (sealed.ct.len() == 0) { return None; }

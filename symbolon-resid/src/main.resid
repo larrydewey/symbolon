@@ -22,7 +22,9 @@
 //   symbolon device register DIR RP [--duress] PIN on stdin; prints a credential ID and public key;
 //                                              --duress puts it in the duress subset
 //   symbolon device sign DIR RP CID MESSAGE    PIN on stdin; prints r || s
-//   symbolon device status DIR
+//   symbolon device status DIR                 "security-update due" while the update below has not run
+//   symbolon device security-update DIR        PIN, then the duress PIN (empty: none), on stdin; the duress
+//                                              profile gets its own transport key, the device a new one (D-4)
 //   symbolon device forget DIR
 //   symbolon device vault login DIR NAME ORIGIN USERNAME     (PIN, password on stdin)
 //   symbolon device rotate DIR NAME BUNDLE REPOSITORY [CHROMIUM] [--share ID]   (PIN on stdin)
@@ -139,6 +141,7 @@ import "agent/relaysrv.resid";
 import "agent/witnesssrv.resid";
 import "agent/scim.resid";
 import "agent/webauthn.resid";
+import "agent/secupdate.resid";
 import "agent/home.resid";
 import "httpserv.resid";
 import "ecdsa.resid";
@@ -383,8 +386,36 @@ Int org_command(Int n) {
     return 2;
 }
 
+// Every device command ends with the security update's reminder while it
+// is due (D-4). It depends on the device directory's files alone, so it
+// reads the same under the PIN, the duress PIN, or none (SPEC 9.2).
 @requires(args, environment, network, filesystem, device, declassify, clock, process, provision)
 Int main() {
+    Int rc = main_cmd();
+    _ = remind();
+    return rc;
+}
+
+@requires(args, filesystem)
+Bool remind() {
+    if (args.get(1) != "device" || args.get(2) == "status" || args.get(2) == "new" || args.get(2) == "link-new") { return false; }
+    Str d = device_dir_arg(3);
+    if (str_len(d) == 0 || !security_update_due(d)) { return false; }
+    eprintln(security_update_reminder(d));
+    return true;
+}
+
+// The first of the arguments 3-5 that is a device directory.
+@requires(args, filesystem)
+Str device_dir_arg(Int i) {
+    if (i > 5 || i >= args.count()) { return ""; }
+    Str a = args.get(i);
+    if (str_len(a) > 0 && filesystem.exists(a + "/config.cbor")) { return a; }
+    return device_dir_arg(i + 1);
+}
+
+@requires(args, environment, network, filesystem, device, declassify, clock, process, provision)
+Int main_cmd() {
     Str a1 = args.get(1);
     Str a2 = args.get(2);
     Int n = args.count();
@@ -427,6 +458,7 @@ Int main() {
     if (a1 == "device" && a2 == "register" && (n == 5 || n == 6)) { return device_register(args.get(3), args.get(4), has_flag("--duress", 5)); }
     if (a1 == "device" && a2 == "sign" && n == 7) { return device_sign(args.get(3), args.get(4), args.get(5), args.get(6)); }
     if (a1 == "device" && a2 == "status" && n == 4) { return device_status(args.get(3)); }
+    if (a1 == "device" && a2 == "security-update" && n == 4) { return device_security_update(args.get(3)); }
     if (a1 == "device" && a2 == "openings" && n == 4) { return device_openings(args.get(3)); }
     if (a1 == "device" && a2 == "protection" && args.get(3) == "enable" && (n == 5 || n == 6)) { return device_protection_enable(args.get(4), if (n == 6) { args.get(5) } else { "" }); }
     if (a1 == "device" && a2 == "forget" && n == 4) { return device_forget(args.get(3)); }

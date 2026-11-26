@@ -1,0 +1,228 @@
+// The security update (D-4; SPEC 9.2, 14.2, 19.2): `symbolon device
+// security-update DIR`, the PIN then the duress PIN (an empty line: this
+// device has none) on standard input.
+//
+// A device made before it has a duress profile whose `share` field is the
+// seed of the device's own (v1) transport key, which opens every folder-key
+// wrap, kit half and enrolment or re-share envelope addressed to the
+// device: whoever is given the duress PIN could read every shared folder.
+// The update, under the PIN only:
+//   1. re-seals the duress profile with a transport key of its own (fresh
+//      random seed in the same field: the blob keeps its size), and
+//      registers it with the cosigner with the duress sub-key (duress.pub,
+//      130 bytes); without a duress PIN, the second blob, the slot and the
+//      registered keys are made again as decoys of the same shape;
+//   2. moves the device to its v2 transport key (from the DEK under a label
+//      the duress profile never had) with a party-key log event (SPEC 8.1),
+//      signed by the DK; others wrap to v2 from then on;
+//   3. makes every shared folder's wraps again (sharecli rewrap_all): the
+//      ones this device made with v1 no longer authenticate, and the ones
+//      others made to v1 are made to v2. What is left is done the next
+//      time this device opens that folder under the PIN.
+// Then `security-update` is written and the reminder stops. Each step can
+// run again: an update cut short is finished by running it again.
+//
+// Under the duress PIN the command fails as a change does under duress
+// (duress_refusal), and the reminder, which depends on that file alone,
+// stays exactly as it is under the PIN.
+
+import "../types.resid";
+import "../core/log.resid";
+import "../core/event.resid";
+import "../duress/duress.resid";
+import "../net/proto.resid";
+import "../net/services.resid";
+import "state.resid";
+import "common.resid";
+import "session.resid";
+import "device.resid";
+import "fidokey.resid";
+import "duresscli.resid";
+import "enroll.resid";
+import "orgcore.resid";
+import "sharecli.resid";
+import "hpkeg.resid";
+import "word.resid";
+import "crypto.resid";
+import "clock.resid";
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+pub Int device_security_update(Str dir) {
+    Option(DeviceConfig) oc = load_config(dir);
+    return match oc {
+        None => dfail("not set up"),
+        Some(c) => update_with(dir, c, read_pin(), read_pin())
+    };
+}
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+pub Int update_with(Str dir, DeviceConfig c, Str pin, Str dpin) {
+    if (!security_update_due(dir)) { println("security update: done already"); return 0; }
+    Unlocked u = unlock_dir(dir, c, pin);
+    if (u.kind == 2) { return dfail(duress_refusal(dir, c)); }
+    if (u.kind != 1) { return dfail("wrong PIN"); }
+    if (str_len(dpin) > 0 && dpin == pin) { return dfail("that is the PIN: give the duress PIN second (an empty line if this device has none)"); }
+    Result(Int, Str) r1 = reseal_duress(dir, c, u, dpin);
+    if (match r1 { Err(_) => true, Ok(_) => false }) { return dfail(match r1 { Err(m) => m, Ok(_) => "" }); }
+    println("security update: the duress profile has its own transport key");
+    Result(DeviceConfig, Str) r2 = move_transport(dir, c, u);
+    return match r2 {
+        Err(m) => dfail(m),
+        Ok(n) => finish_update(dir, n, u, pin)
+    };
+}
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+Int finish_update(Str dir, DeviceConfig c, Unlocked u, Str pin) {
+    println("security update: this device's transport key is new (v2)");
+    Int left = if (c.log_id.len() == 0) { 0 } else { rewrap_with(dir, c, u, pin) };
+    if (!security_update_done(dir)) { return dfail("cannot record the update"); }
+    println(if (left == 0) { "security update: done" } else { f"security update: done; {left} shared folder(s) get new wraps when next opened" });
+    return 0;
+}
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+Int rewrap_with(Str dir, DeviceConfig c, Unlocked u, Str pin) {
+    _ = keep_relay_session(dir, c, u);
+    Result(VerifiedHead, SymbolonError) rv = verified_log_dir(dir, relay_ep(c), c.log_id);
+    return match rv {
+        Err(_) => rewrap_later(dir, c),
+        Ok(vh) => rewrap_all(dir, Ctx {.c = c, .u = u, .vh = vh, .pin = pin, .ep = relay_at(dir, c)})
+    };
+}
+
+// The folders are listed for later when the log cannot be had now.
+@requires(filesystem, network, clock(readonly), declassify)
+Int rewrap_later(Str dir, DeviceConfig c) {
+    List(Str) ids = folder_ids(relay_at(dir, c), c.log_id);
+    _ = set_rewrap_todo(dir, ids);
+    return ids.len();
+}
+
+@requires(filesystem, network, device, declassify, clock, environment)
+Bool keep_relay_session(Str dir, DeviceConfig c, Unlocked u) {
+    if (session_fresh(dir)) { return true; }
+    return match relay_sign_in(dir, c, u) { Ok(_) => true, Err(_) => false };
+}
+
+// ─── 1. The duress profile ──────────────────────────────────────
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+Result(Int, Str) reseal_duress(Str dir, DeviceConfig c, Unlocked u, Str dpin) {
+    List(Secret(UInt(8))) ka = unlock_key_for(c, u.st, true);
+    Bool real_in_a = unlock(ka, read_blob(dir, "a", u.wrap), []).kind == 1;
+    Bool real_in_b = !real_in_a && unlock(ka, read_blob(dir, "b", u.wrap), []).kind == 1;
+    if (!real_in_a && !real_in_b) { return Err("the profile does not open again under the PIN; nothing changed"); }
+    Str other = if (real_in_a) { "b" } else { "a" };
+    if (str_len(dpin) == 0) { return no_duress(dir, c, u, ka, if (real_in_a) { "a" } else { "b" }, other); }
+    List(Secret(UInt(8))) dst = stretch(c, pin_bytes(dpin));
+    List(Secret(UInt(8))) kb = if (c.unprotected) { unlock_key(dst, c.salt) } else { unlock_key_for(c, dst, false) };
+    Unlocked d = unlock(kb, read_blob(dir, other, u.wrap), []);
+    if (d.kind != 2) { return Err("that is not this device's duress PIN (an empty line if it has none); nothing changed"); }
+    DuressFull nd = new_transport(d.duress, random_secret(32));
+    List(Secret(UInt(8))) dp = encode_duress(nd) else { [] };
+    if (dp.len() == 0) { return Err("cannot encode the duress profile"); }
+    List(Int) blob = seal_blob(kb, random_bytes(12), dp);
+    if (unlock(kb, blob, []).kind != 2) { return Err("the duress profile does not open again; nothing changed"); }
+    List(Int) dpub = duress_pub_of(nd.subkey, nd.share);
+    // Registered first: until the cosigner has the new key, the duress
+    // profile as it was still works (it speaks with the device's key).
+    register_keys(dir, c, u, dpub)?;
+    if (!filesystem.write_bytes(dir + "/duress.pub", dpub) || !write_blob(dir, other, blob, u.wrap)) { return Err("cannot write the duress profile"); }
+    return Ok(0);
+}
+
+// The duress profile with a transport key of its own: the seed in the
+// field that held the device's key, everything else as it was.
+pub DuressFull new_transport(DuressFull d, List(Secret(UInt(8))) seed) {
+    return DuressFull {.share = seed, .subkey = d.subkey, .vault_key = d.vault_key, .hpke_priv = d.hpke_priv, .tweaks = d.tweaks};
+}
+
+// Without a duress PIN: whatever the other blob holds becomes a decoy, as
+// on a device made without one, and the real profile stops writing to a
+// duress profile (slot, dshare and subset as decoys).
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+Result(Int, Str) no_duress(Str dir, DeviceConfig c, Unlocked u, List(Secret(UInt(8))) ka, Str mine, Str other) {
+    List(Int) dpub = duress_pub_of(random_secret(32), random_secret(32));
+    register_keys(dir, c, u, dpub)?;
+    RealProfile nr = RealProfile {.share = u.real.share, .cc = u.real.cc, .vault_key = u.real.vault_key, .dek = u.real.dek, .duress_hpke_pub = []};
+    Bool resealed = if (u.real.duress_hpke_pub.len() == 0) { true } else { reseal_real_in(dir, ka, nr, mine, u.wrap) };
+    if (!resealed) { return Err("cannot write the profile"); }
+    List(Int) ds = get_file(dir + "/dshare");
+    Bool ok = filesystem.write_bytes(dir + "/duress.pub", dpub) && write_blob(dir, other, decoy_blob(random_bytes(blob_len())), u.wrap)
+           && update_duress(dir, nr, [], [], false) && (ds.len() == 0 || filesystem.write_bytes(dir + "/dshare", random_bytes(ds.len())));
+    return if (ok) { Ok(0) } else { Err("cannot write the duress files") };
+}
+
+@requires(filesystem, declassify, provision)
+Bool reseal_real_in(Str dir, List(Secret(UInt(8))) ka, RealProfile r, Str which, List(Secret(UInt(8))) w) {
+    List(Secret(UInt(8))) rp = encode_real(r) else { [] };
+    if (rp.len() == 0) { return false; }
+    List(Int) blob = seal_blob(ka, random_bytes(12), rp);
+    return unlock(ka, blob, []).kind == 1 && write_blob(dir, which, blob, w);
+}
+
+// The duress keys to the cosigner, under this device's transport key (the
+// cosigner takes a registration under no other). A device not in a log
+// yet registers at `device init`.
+@requires(filesystem, network, declassify, clock)
+Result(Int, Str) register_keys(Str dir, DeviceConfig c, Unlocked u, List(Int) dpub) {
+    if (c.log_id.len() == 0) { return Ok(0); }
+    VerifiedHead vh = log_or(verified_log_dir(dir, relay_ep(c), c.log_id))?;
+    Remote cos = cos_remote(vh);
+    if (cos.party.len() == 0) { return Err("no cosigner in the quorum"); }
+    Local me = Local {.party = c.party, .cg = 0, .hpke_sk = device_transport(c, u.real.dek).sk};
+    return if (send_to(relay_ep(c), me, cos, WDuressKey(dpub))) { Ok(0) } else { Err("cannot reach the relay; nothing changed") };
+}
+
+// ─── 2. The device's transport key ──────────────────────────────
+
+@requires(filesystem, network, device, declassify, clock, environment)
+Result(DeviceConfig, Str) move_transport(Str dir, DeviceConfig c, Unlocked u) {
+    List(Int) k2 = device_hpke2(u.real.dek).pk;
+    DeviceConfig n = with_transport(c, k2);
+    if (c.log_id.len() == 0) {
+        if (!save_config(dir, n)) { return Err("cannot store the configuration"); }
+        // Not in a log yet: the cosigner's operator pairs with these keys.
+        println(hex_encode(cbor_of_keys(PartyKeys {.party = n.party, .auth_key = n.dk_pub, .hpke_key = n.hpke_pub})));
+        return Ok(n);
+    }
+    VerifiedHead vh = log_or(verified_log(relay_ep(c), c.log_id))?;
+    Party me = party_in(vh.head.quorum.parties, c.party, 0) else { none_party() };
+    if (me.id.len() == 0) { return Err("this device is not in its log's quorum yet"); }
+    if (!bytes_eq(me.hpke_key, k2)) {
+        List(SignedEvent) es = fetch_log(relay_ep(c), c.log_id, 0, []);
+        EventPayload p = EventPayload {.log_id = Some(vh.head.log_id), .sequence = vh.head.sequence + 1, .predecessor_digest = Some(vh.head.digest),
+                                       .suite = 1, .body = PartyKeyBody(c.party, k2), .next_recovery_key_digests = field6_in_force(es, vh.pending, es.len() - 1),
+                                       .advisory_time = (UInt(64))clock_now_seconds()};
+        List(Int) enc = payload_cbor(p) else { [] };
+        if (enc.len() == 0) { return Err("the party-key event does not encode"); }
+        List(Int) sig = dk_sign(c, u.real, u.st, enc)?;
+        VerifiedHead after = prefixed("party-key: ", publish_event(c, p, enc, [EventSig {.signer = c.party, .sig = sig}]))?;
+        Party now = party_in(after.head.quorum.parties, c.party, 0) else { none_party() };
+        if (!bytes_eq(now.hpke_key, k2)) { return Err("the log does not hold the new key"); }
+    }
+    return if (save_config(dir, n)) { Ok(n) } else { Err("cannot store the configuration (the log names the new key: run the update again)") };
+}
+
+Result(VerifiedHead, Str) log_or(Result(VerifiedHead, SymbolonError) r) {
+    Result(VerifiedHead, Str) out = match r { Ok(v) => Ok(v), Err(e) => Err("the log does not verify: " + err_text(e)) };
+    return out;
+}
+
+Result(VerifiedHead, Str) prefixed(Str p, Result(VerifiedHead, Str) r) {
+    Result(VerifiedHead, Str) out = match r { Ok(v) => Ok(v), Err(m) => Err(p + m) };
+    return out;
+}
+
+pub DeviceConfig with_transport(DeviceConfig c, List(Int) k) {
+    return DeviceConfig {.relay_host = c.relay_host, .relay_port = c.relay_port, .ca = c.ca, .witnesses = c.witnesses, .unprotected = c.unprotected,
+        .argon_m_kib = c.argon_m_kib, .argon_t = c.argon_t, .salt = c.salt, .tpm_dk = c.tpm_dk, .tpm_unlock_a = c.tpm_unlock_a, .tpm_unlock_b = c.tpm_unlock_b,
+        .party = c.party, .dk_pub = c.dk_pub, .hpke_pub = k, .log_id = c.log_id, .mbox_next = c.mbox_next, .peers = c.peers};
+}
+
+Option(Party) party_in(List(Party) ps, List(Int) id, Int i) {
+    if (i >= ps.len()) { return None; }
+    if (bytes_eq(ps[i].id, id)) { return Some(ps[i]); }
+    return party_in(ps, id, i + 1);
+}

@@ -32,9 +32,35 @@ pub List(Secret(UInt(8))) hk(List(Secret(UInt(8))) ikm, Str label, Int n) {
     return hkdf256g_expand(hkdf256g_extract(nil, ikm), secret_bytes(utf8(label)), n);
 }
 
-// The device's HPKE key pair, from its DEK (no new profile field).
+// The device's share-transport (HPKE) key pairs, from its DEK (SPEC 9.2).
+// v1 is the key devices made before the security update: its 32-byte seed
+// was also the duress profile's `share` field, so whoever opens the duress
+// profile holds it. v2 comes from a label the duress profile never had;
+// new devices start with it, and `device security-update` moves an older
+// device to it with a party-key log event (SPEC 8.1).
 @requires(declassify)
 pub HpkeKeyPairG(Secret(UInt(8))) device_hpke(List(Secret(UInt(8))) dek) { return hpkeg_derive_keypair(16, hk(dek, "symbolon v1 device hpke", 32)); }
+
+@requires(declassify)
+pub HpkeKeyPairG(Secret(UInt(8))) device_hpke2(List(Secret(UInt(8))) dek) { return hpkeg_derive_keypair(16, hk(dek, "symbolon v2 device hpke", 32)); }
+
+// The key the device's configuration (and its log entry) names: v2 once
+// moved, else v1. Envelopes and wraps this device sends use it.
+@requires(declassify)
+pub HpkeKeyPairG(Secret(UInt(8))) device_transport(DeviceConfig c, List(Secret(UInt(8))) dek) {
+    HpkeKeyPairG(Secret(UInt(8))) k2 = device_hpke2(dek);
+    return if (bytes_eq(c.hpke_pub, k2.pk)) { k2 } else { device_hpke(dek) };
+}
+
+// The keys a wrap made to this device may be addressed to, the current one
+// first: after the move, wraps others made to v1 still open under the PIN
+// until they are made again (SPEC 19.2). Never under the duress PIN.
+@requires(declassify)
+pub List(List(Secret(UInt(8)))) device_open_keys(DeviceConfig c, List(Secret(UInt(8))) dek) {
+    HpkeKeyPairG(Secret(UInt(8))) k2 = device_hpke2(dek);
+    HpkeKeyPairG(Secret(UInt(8))) k1 = device_hpke(dek);
+    return if (bytes_eq(c.hpke_pub, k2.pk)) { [k2.sk, k1.sk] } else { [k1.sk] };
+}
 
 // A software ECDSA key from a 32-byte secret (the unprotected profile's
 // DK, a cosigner's DK, a duress sub-key).

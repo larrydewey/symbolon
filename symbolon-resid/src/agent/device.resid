@@ -198,7 +198,7 @@ pub Int device_new_pins(Str dir, Str host, Int port, Bool unprotected, Bool keys
     Int t = if (fast) { 1 } else { argon_t() };
     DeviceConfig c0 = DeviceConfig {.relay_host = host, .relay_port = port, .ca = ca, .witnesses = [], .unprotected = unprotected, .argon_m_kib = m, .argon_t = t,
         .salt = salt, .tpm_dk = if (keystore && !unprotected) { keystore_profile() } else { dk_handle() }, .tpm_unlock_a = unlock_a_handle(), .tpm_unlock_b = unlock_b_handle(),
-        .party = [], .dk_pub = [], .hpke_pub = device_hpke(dek).pk, .log_id = [], .mbox_next = 0, .peers = []};
+        .party = [], .dk_pub = [], .hpke_pub = device_hpke2(dek).pk, .log_id = [], .mbox_next = 0, .peers = []};
     List(Secret(UInt(8))) st = stretch(c0, pin_bytes(pin));
     List(Secret(UInt(8))) dst = if (str_len(dpin) > 0) { stretch(c0, pin_bytes(dpin)) } else { random_secret(32) };
     Result(List(Int), Str) dk = make_dk(c0, dek, st);
@@ -246,9 +246,12 @@ Int finish_new(Str dir, DeviceConfig c0, List(Int) dk_pub, List(Secret(UInt(8)))
     HpkeKeyPairG(Secret(UInt(8))) dh = hpkeg_derive_keypair(16, random_secret(32));
     RealProfile real = RealProfile {.share = random_secret(32), .cc = random_secret(32), .vault_key = random_secret(32), .dek = dek,
                                     .duress_hpke_pub = if (has_duress) { dh.pk } else { [] }};
-    // The duress profile's 32-byte share field holds the device's HPKE key
-    // material: under duress the device speaks as itself.
-    DuressFull dur = DuressFull {.share = hk(dek, "symbolon v1 device hpke", 32), .subkey = random_secret(32), .vault_key = random_secret(32), .hpke_priv = dh.sk, .tweaks = []};
+    // The duress profile's 32-byte share field holds the seed of its own
+    // transport (HPKE) key, registered with the cosigner with the sub-key
+    // (SPEC 9.2, 14.2). It never holds the device's: that key opens the
+    // folder-key wraps, kit halves and enrolment and re-share envelopes
+    // addressed to the device (D-4).
+    DuressFull dur = DuressFull {.share = random_secret(32), .subkey = random_secret(32), .vault_key = random_secret(32), .hpke_priv = dh.sk, .tweaks = []};
     List(Secret(UInt(8))) rp = encode_real(real) else { [] };
     List(Secret(UInt(8))) dp = encode_duress(dur) else { [] };
     List(Int) blob_real = seal_blob(ka, random_bytes(12), rp);
@@ -256,15 +259,43 @@ Int finish_new(Str dir, DeviceConfig c0, List(Int) dk_pub, List(Secret(UInt(8)))
     List(Int) slot = if (has_duress) { seal_slot(dh.pk, 0, dur, random_secret(32)) else { [] } } else { decoy_slot(random_bytes(slot_len())) };
     // Which file holds the real profile is random and not recorded.
     Bool real_first = (random_bytes(1)[0] & 1) == 0;
-    // The duress sub-key's public key; a device without a duress PIN has one
-    // too, for a key no one holds.
-    List(Int) dpub = sw_public(if (has_duress) { dur.subkey } else { random_secret(32) });
+    // The duress sub-key's public key and the duress transport key's; a
+    // device without a duress PIN has both too, for keys no one holds.
+    List(Int) dpub = duress_pub_of(if (has_duress) { dur.subkey } else { random_secret(32) }, if (has_duress) { dur.share } else { random_secret(32) });
     Bool ok = filesystem.write_bytes(dir + "/duress.pub", dpub) && filesystem.write_bytes(dir + "/blob_a", if (real_first) { blob_real } else { blob_dur })
            && filesystem.write_bytes(dir + "/blob_b", if (real_first) { blob_dur } else { blob_real })
-           && filesystem.write_bytes(dir + "/slot", slot) && save_config(dir, c);
+           && filesystem.write_bytes(dir + "/slot", slot) && save_config(dir, c) && security_update_done(dir);
     if (!ok) { return dfail("cannot write the profile"); }
     println(hex_encode(cbor_of_keys(PartyKeys {.party = c.party, .auth_key = c.dk_pub, .hpke_key = c.hpke_pub})));
     return 0;
+}
+
+// duress.pub (SPEC 14.2): the duress DK sub-key's public key (65) and the
+// duress profile's transport key (65), from their secrets.
+@requires(declassify)
+pub List(Int) duress_pub_of(List(Secret(UInt(8))) subkey, List(Secret(UInt(8))) transport_seed) {
+    return sw_public(subkey).concat(hpkeg_derive_keypair(16, transport_seed).pk);
+}
+
+// ─── The security update (D-4, SPEC 9.2) ────────────────────────
+// A device made before it has a duress profile holding the device's v1
+// transport key; `device security-update` (secupdate.resid) re-seals the
+// duress profile with a transport key of its own and moves the device to
+// its v2 key. The file `security-update` records that it ran (a device
+// made since writes it at once). Whether it is due depends on that file
+// alone, never on a PIN: the reminder looks the same under the PIN, the
+// duress PIN, or none.
+
+pub Str security_update_file(Str dir) { return dir + "/security-update"; }
+
+@requires(filesystem)
+pub Bool security_update_due(Str dir) { return filesystem.exists(dir + "/config.cbor") && !filesystem.exists(security_update_file(dir)); }
+
+@requires(filesystem)
+pub Bool security_update_done(Str dir) { return filesystem.write_all(security_update_file(dir), "transport-v2 duress-transport\n"); }
+
+pub Str security_update_reminder(Str dir) {
+    return "Finish the security update: run `symbolon device security-update " + dir + "` (it asks for the PIN, then the duress PIN). Until then a duress PIN gives access to your shared folders.";
 }
 
 DeviceConfig with_identity(DeviceConfig c, List(Int) dk_pub) {
@@ -334,7 +365,7 @@ Int init_unlocked(Str dir, DeviceConfig c, PartyKeys cos, InitArgs a, Str pin) {
     PartyKeys kp = PartyKeys {.party = recovery_key_digest(kit.sign_pub), .auth_key = kit.sign_pub, .hpke_key = kit.hpke_pub};
     List(PartyKeys) parties = [me, kp, cos];
     List(Int) sid = random_bytes(32);
-    Local dev = Local {.party = me.party, .cg = 1, .hpke_sk = device_hpke(u.real.dek).sk};
+    Local dev = Local {.party = me.party, .cg = 1, .hpke_sk = device_transport(c, u.real.dek).sk};
     Local kitl = Local {.party = kp.party, .cg = 2, .hpke_sk = secret_bytes(kit.hpke_priv)};
     Remote cr = Remote {.party = cos.party, .cg = 3, .hpke_pub = cos.hpke_key};
     Endpoint relay = relay_ep(c);
@@ -368,7 +399,7 @@ List(WitnessRef) witness_refs(List(WitnessEp) ws, Int i, List(WitnessRef) acc) {
 @requires(filesystem, network, device, declassify, clock, environment)
 Int after_keygen(Str dir, DeviceConfig c, Unlocked u, KitKeys kit, List(PartyKeys) parties, Remote cr, InitArgs a, Run(KgState) r, Str pin, List(Int) seed, List(Int) sid) {
     if (str_len(r.fail) > 0) { return dfail("keygen: " + r.fail); }
-    KvInit kv = kv_inception(relay_ep(c), Local {.party = c.party, .cg = 1, .hpke_sk = device_hpke(u.real.dek).sk}, cr, sid, mailbox_end(relay_ep(c), c.party, c.mbox_next));
+    KvInit kv = kv_inception(relay_ep(c), Local {.party = c.party, .cg = 1, .hpke_sk = device_transport(c, u.real.dek).sk}, cr, sid, mailbox_end(relay_ep(c), c.party, c.mbox_next));
     if (str_len(kv.why) > 0) { return dfail(kv.why); }
     CgConfig none = CgConfig {.id = 0, .threshold = 0, .ecdsa = [], .elgamal = [], .p = [], .q = [], .rid = [], .chain_key = [], .public = []};
     CgConfig mine = kg_result(r.seats[0].st) else { none };
@@ -417,7 +448,7 @@ KvInit kv_inception(Endpoint relay, Local dev, Remote cr, List(Int) sid, Int sta
 Int sign_inception_event(Str dir, DeviceConfig c, Unlocked u, KitKeys kit, List(PartyKeys) parties, Remote cr, InitArgs a,
                          CgConfig mine, CgConfig kitc, Quorum q, EventPayload e0, List(Int) enc, Str pin, List(Int) seed, KvInit kv) {
     Endpoint relay = relay_ep(c);
-    Local dev = Local {.party = c.party, .cg = 1, .hpke_sk = device_hpke(u.real.dek).sk};
+    Local dev = Local {.party = c.party, .cg = 1, .hpke_sk = device_transport(c, u.real.dek).sk};
     Int start = mailbox_end(relay, c.party, c.mbox_next);
     if (!send_to(relay, dev, cr, WSignEvent(enc))) { return dfail("cannot reach the relay"); }
     List(Int) csig = wait_event_sig(relay, dev, cr, Cursor {.party = c.party, .next = start}, clock_now_seconds());
@@ -520,7 +551,7 @@ Int publish(Str dir, DeviceConfig c, Unlocked u, KitKeys kit, List(PartyKeys) pa
     Wrapped wa = offline_wrap(kit.hpke_pub, l, 1, parties[1].party, half_bytes(halves.a, halves.ka), random_bytes(32)) else { Wrapped {.enc = [], .ct = []} };
     Wrapped wb = offline_wrap(cr.hpke_pub, l, 1, cr.party, half_bytes(halves.b, halves.kb), random_bytes(32)) else { Wrapped {.enc = [], .ct = []} };
     List(Int) secrets = kit_secrets_seal(secret_bytes(kk), l, 1, u.real.cc, u.real.vault_key);
-    Local dev = Local {.party = c.party, .cg = 1, .hpke_sk = device_hpke(u.real.dek).sk};
+    Local dev = Local {.party = c.party, .cg = 1, .hpke_sk = device_transport(c, u.real.dek).sk};
     Bool ok = blob_put(relay, "kit-" + hex_encode(l) + "-a", cbor_of_blob(WrappedBlob {.enc = wa.enc, .ct = wa.ct}))
            && blob_put(relay, "kit-" + hex_encode(l) + "-secrets", secrets)
            && send_to(relay, dev, cr, WKitHalf(WrappedBlob {.enc = wb.enc, .ct = wb.ct}))
@@ -683,7 +714,7 @@ Result(List(Int), Str) run_sign(Str dir, DeviceConfig c, Unlocked u, CgConfig x,
     List(List(Int)) signers = [c.party, cos.id];
     Result(List(Int), Str) rs = dk_sign(c, u.real, u.st, request_tbs(sid, m, q.epoch, c.party, request_sign()));
     List(Int) rsig = match rs { Ok(s) => s, Err(_) => [] };
-    return run_sign_core(dir, c, device_hpke(u.real.dek).sk, x, vh, tau, m, sid, rsig);
+    return run_sign_core(dir, c, device_transport(c, u.real.dek).sk, x, vh, tau, m, sid, rsig);
 }
 
 // The session itself, given the HPKE key the device's envelopes use and
@@ -738,6 +769,7 @@ Result(List(Int), Str) finish_sign(Str dir, DeviceConfig c, Quorum q, List(UInt(
 @requires(filesystem, network, clock(readonly), declassify)
 pub Int device_status(Str dir) {
     Option(DeviceConfig) oc = load_config(dir);
+    if (security_update_due(dir)) { println("security-update due"); eprintln(security_update_reminder(dir)); }
     return match oc {
         None => dfail("not set up"),
         Some(c) => status_of(c)
