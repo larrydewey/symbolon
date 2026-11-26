@@ -34,7 +34,8 @@ pub List(Str) epoch_secret_files(Str dir, Int e) {
 @requires(filesystem)
 pub Bool prune_old_epochs(Str dir, Int e) {
     if (filesystem.read_bytes(dir + "/cg-" + f"{e}" + ".cfg").len() == 0) { return false; }
-    return wipe_below(dir, e - 1);
+    Bool wiped = wipe_below(dir, e - 1);
+    return wiped;
 }
 
 @requires(filesystem)
