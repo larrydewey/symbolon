@@ -163,8 +163,12 @@ String? callerOf(int port) {
   return null;
 }
 
-/// Whether [exe] is one of the browsers the extension runs in.
-bool isBrowserExe(String exe) => RegExp(r'(chromium|chrome|brave|firefox|msedge|vivaldi|opera)[^/]*$').hasMatch(exe);
+/// Whether [exe] is one of the browsers the extension runs in: its file
+/// name is the browser's (with a "-browser", "-bin", "-esr"... suffix, and
+/// " (deleted)" when the browser was updated while running), not merely
+/// one containing it, such as notfirefox or evil-chrome. It only decides
+/// the warning: any program can be named firefox.
+bool isBrowserExe(String exe) => RegExp(r'/(chromium|chrome|brave|firefox|msedge|vivaldi|opera)(-[a-z]+)?( \(deleted\))?$').hasMatch(exe);
 
 Future<void> runFillConsent(String path) async {
   WidgetsFlutterBinding.ensureInitialized();

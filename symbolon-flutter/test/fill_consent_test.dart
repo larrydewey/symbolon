@@ -243,5 +243,13 @@ void main() {
     expect(isBrowserExe('/opt/google/chrome/chrome'), isTrue);
     expect(isBrowserExe('/usr/bin/python3'), isFalse);
     expect(isBrowserExe('/home/u/chromium-fake/evil'), isFalse);
+    expect(isBrowserExe('/usr/lib/chromium-browser/chromium-browser'), isTrue);
+    expect(isBrowserExe('/opt/vivaldi/vivaldi-bin'), isTrue);
+    expect(isBrowserExe('/opt/google/chrome/chrome (deleted)'), isTrue);
+    // A name that only contains a browser's is not one.
+    expect(isBrowserExe('/home/u/notfirefox'), isFalse);
+    expect(isBrowserExe('/tmp/evil-chrome'), isFalse);
+    expect(isBrowserExe('/tmp/x/firefox.py'), isFalse);
+    expect(isBrowserExe('/tmp/chrome_helper'), isFalse);
   });
 }
