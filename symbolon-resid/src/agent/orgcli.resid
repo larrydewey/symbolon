@@ -848,7 +848,7 @@ Result(Str, Str) sync_one(Str dir, OrgCtx o, List(Str) wraps, Str cid) {
     Opened op = opened_with(dir, o.x, cid, true)?;
     List(Secret(UInt(8))) key = random_secret(32);
     List(Item) items = reseal(ld.key, key, op.p.vid, op.st.items, 0, ListBuf())?;
-    Opened next = Opened {.c = op.c, .u = op.u, .vh = op.vh, .st = op.st, .pin = op.pin, .p = Place {.share = cid, .vk = key, .vid = op.p.vid}, .ep = op.ep};
+    Opened next = Opened {.c = op.c, .u = op.u, .vh = op.vh, .st = op.st, .pin = op.pin, .p = Place {.share = cid, .vk = key, .vid = op.p.vid}, .ep = op.ep, .writers = []};
     if (publish_items(dir, next, items) != 0) { return Err("the server refused the items sealed again"); }
     UInt(64) v = ld.r.version + (UInt(64))1;
     GroupFolder nf = sign_gfolder(o.x, ld.r.coll_id, v, f.org_id, f.groups, key, ld.name, false)?;

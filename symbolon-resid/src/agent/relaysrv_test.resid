@@ -181,11 +181,13 @@ test "a log's records are written only by a signed-in device of that log" {
     expect(refused(may_write(s, "whatever-1", [1], twho(a)))).toBeTrue();
     expect(refused(may_write(s, "vault-" + la + "x", [1], twho(a)))).toBeTrue();
     // over HTTP: anonymous 401, someone else's session 403, the log's own 200
+    // (a card: a vault takes only a vault state, R3D-2)
     RelayCfg g = cfg_of(s, "");
-    expect(relay_serve_handle(g, treq("PUT", "/blob/" + names[0], "", [7])).status).toEqual(401);
-    expect(relay_serve_handle(g, treq("PUT", "/blob/" + names[0], tsession(s, b, 0), [7])).status).toEqual(403);
-    expect(relay_serve_handle(g, treq("PUT", "/blob/" + names[0], tsession(s, a, 0), [7])).status).toEqual(200);
-    expect(st_bytes(s, "blob/" + names[0])).toEqual([7]);
+    expect(relay_serve_handle(g, treq("PUT", "/blob/" + names[4], "", [7])).status).toEqual(401);
+    expect(relay_serve_handle(g, treq("PUT", "/blob/" + names[4], tsession(s, b, 0), [7])).status).toEqual(403);
+    expect(relay_serve_handle(g, treq("PUT", "/blob/" + names[4], tsession(s, a, 0), [7])).status).toEqual(200);
+    expect(st_bytes(s, "blob/" + names[4])).toEqual([7]);
+    expect(relay_serve_handle(g, treq("PUT", "/blob/" + names[0], tsession(s, a, 0), [7])).status).toEqual(400);
 }
 
 // S-3: a household folder's roster is its owner's; its items and wraps
@@ -1043,4 +1045,43 @@ test "the relay judges a claim at witness time, five minutes on included, not by
 Str http_body_text_of(List(Int) b) {
     Str t = http_text(b, 0, b.len());
     return t;
+}
+
+// ─── Vault and folder states (R3D-2) ────────────────────────────
+
+List(Int) vrep(Int b, Int n) { return if (n <= 0) { [] } else { [b].concat(vrep(b, n - 1)) }; }
+
+List(Int) vstate(UInt(64) v, Int tag) {
+    VaultState st = VaultState {.head = VaultHead {.vault_id = vrep(1, 32), .version = v, .merkle_root = vrep(tag, 32), .log_id = vrep(2, 32),
+                                                   .log_sequence = 1, .suite = 1, .signer = vrep(3, 32), .sig = []}, .items = []};
+    return match to_cbor(st) { Ok(b) => b, Err(_) => [] };
+}
+
+@requires(filesystem, network, clock(readonly), declassify)
+test "a vault or folder state is stored only above the version stored" {
+    Store s = tmp_store();
+    Str n = "vault-" + hex_encode(vrep(2, 32));
+    expect(versioned_blob(n)).toBeTrue();
+    expect(versioned_blob("coll-" + hex_encode(vrep(4, 16)))).toBeTrue();
+    expect(versioned_blob("card-" + hex_encode(vrep(2, 32)))).toBeFalse();
+    expect(versioned_put(s, n, vstate(1, 10), 1000).status).toEqual(200);
+    expect(versioned_put(s, n, vstate(2, 11), 1000).status).toEqual(200);
+    // Another device that read version 1 writes its own version 2: before,
+    // it replaced the first device's version 2 (which then saw a fork).
+    expect(versioned_put(s, n, vstate(2, 12), 1000).status).toEqual(409);
+    expect(versioned_put(s, n, vstate(1, 12), 1000).status).toEqual(409);
+    expect(hex_encode(st_bytes(s, "blob/" + n))).toEqual(hex_encode(vstate(2, 11)));
+    // what is not a state is not stored
+    expect(versioned_put(s, n, [1], 1000).status).toEqual(400);
+    expect(versioned_put(s, n, [], 1000).status).toEqual(400);
+    // two writers of version 3 at once: the lock gives it to one
+    _ = st_put_new(s, "blobv/" + n + "-3", utf8("1000"));
+    expect(versioned_put(s, n, vstate(3, 13), 1030).status).toEqual(409);
+    // a lock whose writer stopped before storing is taken over after a minute
+    expect(versioned_put(s, n, vstate(3, 13), 1061).status).toEqual(200);
+    expect(versioned_put(s, n, vstate(4, 14), 1062).status).toEqual(200);
+    // a folder's items: the same
+    Str c = "coll-" + hex_encode(vrep(4, 16));
+    expect(versioned_put(s, c, vstate(5, 15), 1000).status).toEqual(200);
+    expect(versioned_put(s, c, vstate(5, 16), 1000).status).toEqual(409);
 }

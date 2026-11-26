@@ -64,6 +64,7 @@ import "../browser/json.resid";
 import "crypto.resid";
 import "ecdsa.resid";
 import "cose.resid";
+import "cbor.resid";
 import "httpserv.resid";
 import "clock.resid";
 
@@ -1049,10 +1050,59 @@ HttpReply handle(RelayCfg g, Store root, HttpRequest r) {
         if (why == alerts_full()) { return http_reply_text(429, "text/plain", why); }
         if (str_len(why) > 0) { return http_reply_text(denied, "text/plain", why); }
         if (r.body.len() > max_body()) { return http_reply_status(413); }
+        if (versioned_blob(name)) { return versioned_put(root, name, r.body, clock_now_seconds()); }
         return stored_reply(root, name, r.body);
     }
     return http_reply_status(404);
 }
+
+// A vault ("vault-<log>") or a folder's items ("coll-<cid>") is a signed
+// state with a version (SPEC 18.4). The relay took any write of one, so
+// when two devices changed it at once from version N, the later write
+// replaced the earlier N+1 and the earlier device then saw a fork (R3D-2).
+// Now a state is stored only above the version stored (409 otherwise),
+// and of two writers at the same version only one gets it (a lock per
+// version, "blobv/<name>-<version>", written once; one older than a
+// minute whose state never landed is taken over). The writer that gets
+// 409 reads the state again, makes its change on it and writes again.
+// The relay reads only the head's version, which is not sealed; it does
+// not check the signature (the devices do), so a device of the log or one
+// of the folder's people can still write a state the others refuse.
+pub Bool versioned_blob(Str name) {
+    return (str_starts_with(name, "vault-") && str_len(log_named(name)) > 0) || (str_starts_with(name, "coll-") && str_len(folder_of(name)) > 0);
+}
+
+// The version of the vault state in `b`; -1 when `b` is not one.
+pub Int head_version_of(List(Int) b) {
+    if (b.len() == 0 || b.len() > max_body() || !cbor_well_formed(b, 24)) { return -1; }
+    Result(VaultState, SerialError) r = from_cbor(b);
+    Int v = match r { Ok(st) => (Int)st.head.version, Err(_) => -1 };
+    return if (v < 0) { -1 } else { v };
+}
+
+pub Str stale_state_text() { return "a newer state is stored: read it, make the change on it, and write again"; }
+
+@requires(filesystem, network, clock(readonly), declassify)
+pub HttpReply versioned_put(Store root, Str name, List(Int) body, Int now) {
+    Int nv = head_version_of(body);
+    if (nv < 1) { return http_reply_text(400, "text/plain", "not a vault state"); }
+    List(Int) prev = stored(root, name);
+    Int ov = if (prev.len() == 0) { 0 } else { head_version_of(prev) };
+    if (nv <= ov) { return http_reply_text(409, "text/plain", stale_state_text()); }
+    Str lk = "blobv/" + name + f"-{nv}";
+    Int got = st_put_new(root, lk, utf8(f"{now}"));
+    if (got < 0) { return http_reply_status(500); }
+    if (got == 0) {
+        Int at = int_or_none(str_trim(st_read_text(root, lk)));
+        if (at < 0 || at + 60 > now) { return http_reply_text(409, "text/plain", stale_state_text()); }
+        if (!st_text(root, lk, f"{now}")) { return http_reply_status(500); }
+    }
+    if (!st_put(root, "blob/" + name, body)) { return http_reply_status(500); }
+    _ = if (ov > 0) { st_delete(root, "blobv/" + name + f"-{ov}") } else { true };
+    return http_reply_status(200);
+}
+
+Int int_or_none(Str s) { return if (str_len(s) > 0 && str_len(s) < 19 && dec_ok(s, 0)) { str_parse_int(s) } else { -1 }; }
 
 // Names that are a history, or a request or answer that stands until it
 // is cleared: an alert, a governance version, an audit event, an answer

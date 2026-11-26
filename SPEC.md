@@ -1786,6 +1786,19 @@ change) and is refused with an error that says so, until a higher version
 arrives. KDF parameters are never read
 from storage.
 
+An honest relay keeps two writers from making such a fork (R3D-2): it
+stores a `vault-` or `coll-` state only when its head's version (field 2,
+which it reads without any key) is above the version stored, and of two
+writes of the same version only one (a lock per version, written once;
+one left by a writer that stopped is taken over after a minute); it
+answers 409 otherwise and takes nothing that is not a vault state. A
+device answered 409 reads the place again, accepted as any read is, makes
+its change again on what it finds (the items it removed or wrote replace
+the other device's; every other item of the other device's state stays)
+and writes the next version, a few times at most. A re-key, a deletion and
+a re-anchoring are not merged into another change: they fail and are run
+again.
+
 After a kit recovery (Section 13.2) every device of the recovered quorum is
 new, so no current device signed the head. The recovered device accepts,
 once, the head under the quorum in force before the `recover` event,

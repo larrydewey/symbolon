@@ -544,7 +544,8 @@ pub Result(Opened, Str) opened_with(Str dir, Ctx x, Str cid, Bool any) {
     VaultState st = fetch_coll(dir, x, ld.r, cid, any)?;
     _ = if (is_group_roster(ld.r) && org_forbids(dir, "offline")) { false } else { keep_place_copy(place_local(dir, cid), ld.key, st) };
     _ = filesystem.write_all(place_local(dir, cid) + ".seen", f"{clock_now_seconds()}");
-    return Ok(Opened {.c = x.c, .u = x.u, .vh = x.vh, .st = st, .pin = x.pin, .p = Place {.share = cid, .vk = ld.key, .vid = coll_vid(ld.r.coll_id)}, .ep = x.ep});
+    return Ok(Opened {.c = x.c, .u = x.u, .vh = x.vh, .st = st, .pin = x.pin, .p = Place {.share = cid, .vk = ld.key, .vid = coll_vid(ld.r.coll_id)}, .ep = x.ep,
+                      .writers = if (any) { [] } else { people_of(ld.r) }});
 }
 
 // The place `share` names: the own vault for "", else that collection.
@@ -556,7 +557,7 @@ pub Result(Opened, Str) open_place(Str dir, Str share) { return if (str_len(shar
 Result(Opened, Str) place_in(Str dir, Ctx x, Str share) {
     if (str_len(share) > 0) { return opened_in(dir, x, share); }
     VaultState st = fetch_vault(dir, x.c, x.vh)?;
-    return Ok(Opened {.c = x.c, .u = x.u, .vh = x.vh, .st = st, .pin = x.pin, .p = own_place(x.c, x.u), .ep = x.ep});
+    return Ok(Opened {.c = x.c, .u = x.u, .vh = x.vh, .st = st, .pin = x.pin, .p = own_place(x.c, x.u), .ep = x.ep, .writers = [x.c.log_id]});
 }
 
 // The place again after this device changed it, with the key it has now
@@ -910,7 +911,7 @@ Result(Int, Str) remove_in(Str dir, Ctx x, Str cid, List(Int) l) {
     if (member_at(ld.r.members, l, 0) < 0) { return Err("not in the folder"); }
     List(Secret(UInt(8))) key = random_secret(32);
     List(Item) items = reseal(ld.key, key, o.p.vid, o.st.items, 0, ListBuf())?;
-    Opened next = Opened {.c = o.c, .u = o.u, .vh = o.vh, .st = o.st, .pin = o.pin, .p = Place {.share = cid, .vk = key, .vid = o.p.vid}, .ep = o.ep};
+    Opened next = Opened {.c = o.c, .u = o.u, .vh = o.vh, .st = o.st, .pin = o.pin, .p = Place {.share = cid, .vk = key, .vid = o.p.vid}, .ep = o.ep, .writers = []};
     if (publish_items(dir, next, items) != 0) { return Ok(1); }
     Int r = change_members(dir, x, ld, without_member(ld.r.members, l, 0, ListBuf()), key, [l])?;
     _ = blob_put(x.ep, leave_blob(cid, l), []);
@@ -962,7 +963,8 @@ Result(Int, Str) delete_share(Str dir, Str cid) {
     Opened o = opened_in(dir, x, cid)?;
     Loaded ld = load_folder(dir, x, cid)?;
     if (!bytes_eq(ld.r.owner, x.c.log_id)) { return Err("only the folder's owner deletes it"); }
-    if (publish_items(dir, o, []) != 0) { return Ok(1); }
+    // A deletion is not merged into a change made meanwhile (writers []).
+    if (publish_items(dir, Opened {.c = o.c, .u = o.u, .vh = o.vh, .st = o.st, .pin = o.pin, .p = o.p, .ep = o.ep, .writers = []}, []) != 0) { return Ok(1); }
     UInt(64) v = ld.r.version + (UInt(64))1;
     Roster r = signed_roster(x, ld.r.coll_id, v, ld.r.owner_label, [], ld.key, ld.name, true)?;
     if (!clear_wraps(x, r.coll_id, v, people_of(ld.r), 0)) { return Err("the relay refused a key wrap"); }

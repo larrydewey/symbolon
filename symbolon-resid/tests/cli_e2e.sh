@@ -158,20 +158,24 @@ grep -q 'not for this relying party' "$W/otherrp.log" || fail "other RP: $(cat "
 # The vault (SPEC 18): put, get, overwrite, list; tampering and rollback at
 # the relay are refused.
 LOG=$(awk '/^log / {print $2}' "$W/init.log")
-# The vault as the relay stores it, through the relay itself (so this
-# works whatever the relay's store, RELAY_STORE); written back with the
-# device's own relay session, standing for a relay that tampers.
+# The vault as the relay stores it, read through the relay itself; written
+# back into the relay's file store, standing for a relay that tampers (the
+# relay itself takes a vault state only above the version it holds, so
+# a stale or same-version state cannot be written through it).
 RURL="$([ -n "${TLS:-}" ] && echo https || echo http)://127.0.0.1:$RP/blob/vault-$LOG"
 getb() { curl -sS ${TLS:+--cacert "$W/ca.pem"} -o "$1" "$RURL"; }
-putb() { curl -sS ${TLS:+--cacert "$W/ca.pem"} -H "Authorization: Bearer $(cut -d' ' -f1 "$W/dev/relay.token")" -X PUT --data-binary @"$1" "$RURL" > /dev/null; }
+putb() { cp "$1" "$W/relay/blob/vault-$LOG"; }
 printf '2468\nhunter2\n' | run 300 "$BIN" device vault put "$W/dev" mail > "$W/v1.log" 2>&1 || fail "vault put"
 getb "$W/vault.v1"
 printf '2468\nc0rrect-horse\n' | run 300 "$BIN" device vault put "$W/dev" mail > "$W/v2.log" 2>&1 || fail "vault overwrite"
 printf '2468\ns3cret\n' | run 300 "$BIN" device vault put "$W/dev" bank > "$W/v3.log" 2>&1 || fail "vault put 2"
 grep -q 'vault version 3, 2 items' "$W/v3.log" || fail "vault versions: $(cat "$W/v3.log")"
+# Through the relay, a state not above the stored version is refused (R3D-2).
+[ "$(curl -sS ${TLS:+--cacert "$W/ca.pem"} -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $(cut -d' ' -f1 "$W/dev/relay.token")" -X PUT --data-binary @"$W/vault.v1" "$RURL")" = 409 ] || fail "the relay took an older vault state"
 [ "$(printf '2468\n' | run 300 "$BIN" device vault get "$W/dev" mail 2>&1)" = "c0rrect-horse" ] || fail "vault get"
 [ "$(printf '2468\n' | run 300 "$BIN" device vault list "$W/dev" 2>&1 | sort | tr '\n' ' ')" = "bank mail " ] || fail "vault list"
 [ "$(printf '2468\n' | run 300 "$BIN" device vault list "$W/dev" --kinds 2>&1 | sort | tr '\n' ' ')" = "secret bank secret mail " ] || fail "vault list --kinds"
+if [ -z "${RELAY_STORE:-}" ]; then
 getb "$W/vault.good"
 cp "$W/vault.good" "$W/vault.bad"
 python3 - "$W/vault.bad" <<'PY'
@@ -189,6 +193,9 @@ printf '2468\n' | run 300 "$BIN" device vault get "$W/dev" mail > "$W/vr.log" 2>
 grep -q 'local copy: .*backwards' "$W/vr.log" && grep -q '^c0rrect-horse$' "$W/vr.log" || fail "rollback: $(cat "$W/vr.log")"
 putb "$W/vault.good"
 echo "vault: put/get/list, tampering and rollback refused (reads use the device's verified copy)"
+else
+echo "vault: put/get/list (tampering and rollback need the file store: RELAY_STORE is set)"
+fi
 # Typed items (SPEC 18.2): set, list --long, show, delete; bad input refused.
 hx() { printf '%s' "$1" | od -An -tx1 | tr -d ' \n'; }
 printf '2468\nnumber %s\nexpiry %s\ncvv %s\n' "$(hx 4111111111111111)" "$(hx 12/30)" "$(hx 123)" | run 300 "$BIN" device vault set "$W/dev" "my visa" card > "$W/card.log" 2>&1 || fail "vault set card: $(cat "$W/card.log")"

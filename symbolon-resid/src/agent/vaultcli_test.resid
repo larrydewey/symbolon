@@ -299,3 +299,41 @@ test "subset.enc is the same size whatever the subset holds" {
     expect(hex_encode(subset_records(two))).toEqual(hex_encode(two));
     expect(subset_records(subset_plain([])).len()).toEqual(0);
 }
+
+// ─── Two devices writing at once (R3D-2) ────────────────────────
+
+@requires(declassify)
+Item named(Str name, Str secret) {
+    return item_seal(vk(), vault_id_of(log_id()), item_id_of(vk(), name), 1, "password", [FieldPlain {.name = "name", .value = secret_bytes(utf8(name))},
+        FieldPlain {.name = "secret", .value = secret_bytes(utf8(secret))}], false, None) else {
+        Item {.id = [], .version = 0, .kind = "", .fields = {}, .in_duress_subset = false, .handling_policy = None} };
+}
+
+Str ids_of(List(Item) xs, Int i, Str acc) { return if (i >= xs.len()) { acc } else { ids_of(xs, i + 1, acc + hex_encode(xs[i].id) + ";") }; }
+
+Bool holds(List(Item) xs, Item it) { return match item_by_id(xs, it.id, 0) { None => false, Some(x) => hex_encode(item_cbor(x)) == hex_encode(item_cbor(it)) }; }
+
+@requires(declassify)
+test "a change made again on what another device stored meanwhile keeps both" {
+    Item a = named("a", "1");
+    Item b = named("b", "1");
+    Item c = named("c", "1");
+    Item b2 = named("b", "2");
+    Item d = named("d", "1");
+    Item c3 = named("c", "3");
+    Item e = named("e", "1");
+    List(Item) base = [a, b, c];
+    // this device: changes b, removes a, adds d
+    List(Item) mine = [b2, c, d];
+    // the other device, meanwhile: changes c, adds e
+    List(Item) theirs = [a, b, c3, e];
+    List(Item) m = merged_items(base, mine, theirs);
+    expect(m.len()).toEqual(4);
+    expect(holds(m, b2)).toBeTrue();
+    expect(holds(m, d)).toBeTrue();
+    expect(holds(m, c3)).toBeTrue();
+    expect(holds(m, e)).toBeTrue();
+    expect(holds(m, a)).toBeFalse();
+    // nothing changed meanwhile: the change as it was
+    expect(ids_of(merged_items(base, mine, base), 0, "")).toEqual(ids_of([c, b2, d], 0, ""));
+}

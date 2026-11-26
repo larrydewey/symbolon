@@ -134,7 +134,12 @@ pub Result(VaultState, Str) note_accepted(Str local, VaultState v) {
 }
 
 // `ep`: the relay with this device's session (orgcore relay_at).
-pub type Opened = { DeviceConfig c; Unlocked u; VerifiedHead vh; VaultState st; Str pin; Place p; Endpoint ep; };
+// `writers`: the logs whose devices may sign this place's head, for
+// reading it again when the relay refuses a write as stale (R3D-2): the
+// own log for the own vault, the folder's people for a folder; [] when a
+// change must not be merged into another (a re-key, a deletion, a
+// re-anchoring): such a change fails at a stale write and is run again.
+pub type Opened = { DeviceConfig c; Unlocked u; VerifiedHead vh; VaultState st; Str pin; Place p; Endpoint ep; List(List(Int)) writers; };
 
 @requires(filesystem, network, device, declassify, clock, provision, environment)
 pub Result(Opened, Str) open_vault(Str dir) {
@@ -150,7 +155,7 @@ pub Result(Opened, Str) open_vault(Str dir) {
     Result(VerifiedHead, SymbolonError) rv = region_log(pl);
     return match rv {
         Err(e) => Err(err_text(e)),
-        Ok(vh) => match vault_from(dir, c, vh, region_blob(pb)) { Err(m) => Err(m), Ok(st) => Ok(Opened {.c = c, .u = u, .vh = vh, .st = st, .pin = pin, .p = own_place(c, u), .ep = relay_ep(c)}) }
+        Ok(vh) => match vault_from(dir, c, vh, region_blob(pb)) { Err(m) => Err(m), Ok(st) => Ok(Opened {.c = c, .u = u, .vh = vh, .st = st, .pin = pin, .p = own_place(c, u), .ep = relay_ep(c), .writers = [c.log_id]}) }
     };
 }
 
@@ -212,8 +217,84 @@ Int put_item(Str dir, Opened o, Str name, Str secret) {
     };
 }
 
+// Publishes `items` as the next state of the place. When another device
+// wrote the place since it was read, the relay refuses the write as stale
+// (409, R3D-2): the device reads the place again (accepted as any read
+// is), makes the same change on what it finds (merged_items) and writes
+// again, at most publish_tries() times. Before, the relay took the later
+// write over the earlier one and the device whose change was dropped saw
+// a fork.
 @requires(filesystem, network, device, declassify, clock, environment)
-pub Int publish_items(Str dir, Opened o, List(Item) items) {
+pub Int publish_items(Str dir, Opened o, List(Item) items) { return publish_merged(dir, o, o.st.items, items, items, publish_tries()); }
+
+pub Int publish_tries() { return 4; }
+
+pub Str stale_text() { return "the place changed on another device while this change was saved; nothing was lost: run the command again"; }
+
+@requires(filesystem, network, device, declassify, clock, environment)
+Int publish_merged(Str dir, Opened o, List(Item) base, List(Item) mine, List(Item) items, Int tries) {
+    Int rc = publish_once(dir, o, items);
+    if (rc != 409) { return rc; }
+    if (o.writers.len() == 0 || tries <= 1) { return dfail(stale_text()); }
+    Result(VaultState, Str) rt = reread_place(dir, o);
+    return match rt {
+        Err(m) => dfail(m),
+        Ok(t) => publish_merged(dir, Opened {.c = o.c, .u = o.u, .vh = o.vh, .st = t, .pin = o.pin, .p = o.p, .ep = o.ep, .writers = o.writers},
+                                base, mine, merged_items(base, mine, t.items), tries - 1)
+    };
+}
+
+// The change from `base` to `mine`, made on `theirs`: the items of
+// `theirs` this change neither removed nor wrote, then every item this
+// change added or altered (it wins over another device's change to the
+// same item; a removal wins over another device's change to that item).
+pub List(Item) merged_items(List(Item) base, List(Item) mine, List(Item) theirs) {
+    List(Item) changed = items_changed(mine, base, 0, ListBuf());
+    return items_untouched(theirs, base, mine, changed, 0, ListBuf()).concat(changed);
+}
+
+List(Item) items_changed(List(Item) mine, List(Item) base, Int i, ListBuf(Item) acc) {
+    if (i >= mine.len()) { return acc.finish(); }
+    Option(Item) was = item_by_id(base, mine[i].id, 0);
+    Bool same = match was { None => false, Some(b) => bytes_eq(item_cbor(b), item_cbor(mine[i])) };
+    return items_changed(mine, base, i + 1, if (same) { acc } else { acc.push(mine[i]) });
+}
+
+List(Item) items_untouched(List(Item) theirs, List(Item) base, List(Item) mine, List(Item) changed, Int i, ListBuf(Item) acc) {
+    if (i >= theirs.len()) { return acc.finish(); }
+    List(Int) id = theirs[i].id;
+    Bool removed = has_item(base, id) && !has_item(mine, id);
+    Bool drop = removed || has_item(changed, id);
+    return items_untouched(theirs, base, mine, changed, i + 1, if (drop) { acc } else { acc.push(theirs[i]) });
+}
+
+Bool has_item(List(Item) xs, List(Int) id) { return match item_by_id(xs, id, 0) { None => false, Some(_) => true }; }
+
+// The place as the relay holds it now, accepted as a read accepts it:
+// signed by a device of one of `o.writers`, never older than (nor a fork
+// of) what this device accepted.
+@requires(filesystem, network, clock(readonly), declassify)
+Result(VaultState, Str) reread_place(Str dir, Opened o) {
+    Option(List(Int)) b = blob_get(o.ep, place_blob(o.c, o.p.share));
+    if (str_len(o.p.share) == 0) { return vault_from(dir, o.c, o.vh, b); }
+    Option(VaultState) os = match b { None => None, Some(x) => state_of(x) };
+    if (match os { None => true, Some(_) => false }) { return Err("the folder's items do not decode"); }
+    VaultState st = os else { empty_state(o.p.vid, o.c.log_id) };
+    if (!log_in(o.writers, st.head.log_id, 0)) { return Err(stale_text()); }
+    Result(VerifiedHead, SymbolonError) rh = if (bytes_eq(st.head.log_id, o.c.log_id)) { Ok(o.vh) } else { verified_log(relay_ep(o.c), st.head.log_id) };
+    Seen seen = seen_at(place_local(dir, o.p.share));
+    return match rh {
+        Err(e) => Err(err_text(e)),
+        Ok(sh) => match vault_accept_seen(st, o.p.vid, sh.head, (UInt(64))seen.version, seen.root) { Err(e) => Err(err_text(e)), Ok(v) => note_accepted(place_local(dir, o.p.share), v) }
+    };
+}
+
+Bool log_in(List(List(Int)) ls, List(Int) l, Int i) { return i < ls.len() && (bytes_eq(ls[i], l) || log_in(ls, l, i + 1)); }
+
+// One write of `items` as the next state after o.st: 0, 409 when the
+// relay holds a newer state, else 1 (said on standard error).
+@requires(filesystem, network, device, declassify, clock, environment)
+Int publish_once(Str dir, Opened o, List(Item) items) {
     VaultHead h0 = VaultHead {.vault_id = o.p.vid, .version = o.st.head.version + 1, .merkle_root = merkle_root(items), .log_id = o.c.log_id,
                               .log_sequence = o.vh.head.sequence, .suite = 1, .signer = o.c.party, .sig = []};
     Result(List(Int), Str) rs = dk_sign(o.c, o.u.real, o.u.st, head_tbs(h0));
@@ -232,7 +313,9 @@ Int store_vault(Str dir, Opened o, VaultState st) {
     // Writes need a signed-in device (SPEC 29.4); a context that has no
     // session yet signs in here.
     Endpoint ep = if (str_len(o.ep.token) > 0) { o.ep } else { relay_session(dir, o.c, o.u) };
-    if (!blob_put(ep, place_blob(o.c, o.p.share), cbor_of_vault(st))) { return dfail(vault_refused_text()); }
+    Int put = http_call_ep(ep, "PUT", "/blob/" + place_blob(o.c, o.p.share), cbor_of_vault(st)).status;
+    if (put == 409) { return 409; }
+    if (put != 200) { return dfail(vault_refused_text()); }
     _ = filesystem.write_all(place_local(dir, o.p.share) + ".version", seen_record(st));
     _ = keep_place_copy(place_local(dir, o.p.share), o.p.vk, st);
     println(f"vault version {st.head.version}, {st.items.len()} items");
@@ -506,6 +589,6 @@ pub Int vault_reanchor(Str dir, DeviceConfig c, Unlocked u, VerifiedHead vh, Quo
     Result(VaultState, SymbolonError) ok = vault_accept(st, vault_id_of(c.log_id), before, 0);
     return match ok {
         Err(e) => dfail("the vault does not verify under the quorum before the recovery: " + err_text(e)),
-        Ok(v) => publish_items(dir, Opened {.c = c, .u = u, .vh = vh, .st = v, .pin = pin, .p = own_place(c, u), .ep = relay_ep(c)}, v.items)
+        Ok(v) => publish_items(dir, Opened {.c = c, .u = u, .vh = vh, .st = v, .pin = pin, .p = own_place(c, u), .ep = relay_ep(c), .writers = []}, v.items)
     };
 }

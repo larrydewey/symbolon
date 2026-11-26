@@ -90,7 +90,7 @@ Int wa_make_replacing(Str dir, DeviceConfig c, Unlocked u, Str rp, VerifiedHead 
     Result(VaultState, Str) rs = fetch_vault(dir, c, vh);
     return match rs {
         Err(m) => dfail(m),
-        Ok(st) => wa_replace_checked(dir, Opened {.c = c, .u = u, .vh = vh, .st = st, .pin = pin, .p = own_place(c, u), .ep = relay_ep(c)}, rp, uv, in_subset, old)
+        Ok(st) => wa_replace_checked(dir, Opened {.c = c, .u = u, .vh = vh, .st = st, .pin = pin, .p = own_place(c, u), .ep = relay_ep(c), .writers = [c.log_id]}, rp, uv, in_subset, old)
     };
 }
 
