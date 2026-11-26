@@ -910,7 +910,12 @@ Result(Int, Str) remove_in(Str dir, Ctx x, Str cid, List(Int) l) {
     if (!bytes_eq(ld.r.owner, x.c.log_id)) { return Err("only the folder's owner removes people"); }
     if (member_at(ld.r.members, l, 0) < 0) { return Err("not in the folder"); }
     List(Secret(UInt(8))) key = random_secret(32);
-    List(Item) items = reseal(ld.key, key, o.p.vid, o.st.items, 0, ListBuf())?;
+    // An item this device cannot open (saved by a newer Symbolon, or
+    // malformed: a member can write either) is dropped, not resealed, so
+    // that no member can keep themselves in by writing one.
+    Resealed rs = reseal_dropping(ld.key, key, o.p.vid, o.st.items, 0, ListBuf(), 0)?;
+    if (rs.dropped > 0) { eprintln(f"device: warning: {rs.dropped} item(s) of this folder did not open here (saved by a newer Symbolon, or damaged) and were dropped from it"); }
+    List(Item) items = rs.items;
     Opened next = Opened {.c = o.c, .u = o.u, .vh = o.vh, .st = o.st, .pin = o.pin, .p = Place {.share = cid, .vk = key, .vid = o.p.vid}, .ep = o.ep, .writers = []};
     if (publish_items(dir, next, items) != 0) { return Ok(1); }
     Int r = change_members(dir, x, ld, without_member(ld.r.members, l, 0, ListBuf()), key, [l])?;
@@ -936,6 +941,30 @@ pub Result(List(Item), Str) reseal(List(Secret(UInt(8))) old, List(Secret(UInt(8
         Ok(it) => reseal(old, key, vid, items, i + 1, acc.push(it))
     };
 }
+
+// As reseal, for removing someone: an item that does not open under the
+// old key is left out and counted, instead of stopping the removal.
+pub type Resealed = { List(Item) items; Int dropped; };
+
+@requires(declassify)
+pub Result(Resealed, Str) reseal_dropping(List(Secret(UInt(8))) old, List(Secret(UInt(8))) key, List(Int) vid, List(Item) items, Int i, ListBuf(Item) acc, Int dropped) {
+    if (i >= items.len()) { return Ok(Resealed {.items = acc.finish(), .dropped = dropped}); }
+    Result(List(FieldPlain), SymbolonError) rf = item_open(old, vid, items[i]);
+    return match rf {
+        Err(_) => reseal_dropping(old, key, vid, items, i + 1, acc, dropped + 1),
+        Ok(fs) => resealed_one(old, key, vid, items, i, acc, dropped, sealed_again(key, vid, fs))
+    };
+}
+
+@requires(declassify)
+Result(Resealed, Str) resealed_one(List(Secret(UInt(8))) old, List(Secret(UInt(8))) key, List(Int) vid, List(Item) items, Int i, ListBuf(Item) acc, Int dropped, Result(Item, Str) r) {
+    return match r {
+        Err(m) => fail_resealed(acc, m),
+        Ok(it) => reseal_dropping(old, key, vid, items, i + 1, acc.push(it), dropped)
+    };
+}
+
+Result(Resealed, Str) fail_resealed(ListBuf(Item) acc, Str m) { acc.discard(); return Err(m); }
 
 @requires(declassify)
 Result(Item, Str) sealed_again(List(Secret(UInt(8))) key, List(Int) vid, List(FieldPlain) fs) {

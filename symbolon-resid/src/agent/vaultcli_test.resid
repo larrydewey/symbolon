@@ -236,6 +236,49 @@ test "an item a newer agent wrote opens to the update message and survives a re-
     expect(hex_encode(item_cbor(item_by_id(s4.items, nw.id, 0) else { mail }))).toEqual(hex_encode(before));
 }
 
+// R3D-8: a member cannot keep themselves in a shared folder by writing an
+// item the owner's device cannot open: removing them drops that item, with
+// a warning, and reseals the rest under the new key.
+Int dropped_of(Result(Resealed, Str) r) { return match r { Ok(x) => x.dropped, Err(_) => -1 }; }
+Int kept_of(Result(Resealed, Str) r) { return match r { Ok(x) => x.items.len(), Err(_) => -1 }; }
+
+@requires(declassify)
+test "removing someone drops an item that does not open here instead of failing" {
+    List(Secret(UInt(8))) nk = secret_bytes(rep(6, 32));
+    List(Int) vid = vault_id_of(log_id());
+    List(Item) mixed = items().concat([newer_item()]);
+    // reseal, as before, stops at it; reseal_dropping goes on without it.
+    expect(match reseal(vk(), nk, vid, mixed, 0, ListBuf()) { Ok(_) => false, Err(_) => true }).toBeTrue();
+    Result(Resealed, Str) r = reseal_dropping(vk(), nk, vid, mixed, 0, ListBuf(), 0);
+    expect(dropped_of(r)).toEqual(1);
+    expect(kept_of(r)).toEqual(items().len());
+    Resealed x = r else { Resealed {.items = [], .dropped = 0} };
+    expect(match item_open(nk, vid, x.items[0]) { Ok(_) => true, Err(_) => false }).toBeTrue();
+    expect(dropped_of(reseal_dropping(vk(), nk, vid, items(), 0, ListBuf(), 0))).toEqual(0);
+}
+
+// R3D-9: a duress read writes the real copy back through a new file and a
+// rename, as a real read writes it, so a read cut short never leaves the
+// real copy half written.
+@requires(filesystem, declassify)
+test "a duress read writes the copy back whole, through a renamed new file" {
+    Option(List(Int)) b3 = Some(served_bytes(state_at(items(), 3)));
+    Str d1 = fresh_dir();
+    expect(err_of(view_for(d1, config(), as_real(), Ok(vhead()), b3))).toEqual("ok");
+    List(Int) c3 = get_file(d1 + "/vault.cache");
+    // The new file's name taken by a directory: the write cannot go
+    // through it, and the copy is left whole.
+    _ = filesystem.create_dir(d1 + "/vault.cache.new");
+    expect(touch_copy(d1 + "/vault", state_at(items(), 3))).toBeFalse();
+    expect(hex_encode(get_file(d1 + "/vault.cache"))).toEqual(hex_encode(c3));
+    Str d2 = fresh_dir();
+    expect(err_of(view_for(d2, config(), as_real(), Ok(vhead()), b3))).toEqual("ok");
+    List(Int) c4 = get_file(d2 + "/vault.cache");
+    expect(touch_copy(d2 + "/vault", state_at(items(), 3))).toBeTrue();
+    expect(hex_encode(get_file(d2 + "/vault.cache"))).toEqual(hex_encode(c4));
+    expect(filesystem.exists(d2 + "/vault.cache.new")).toBeFalse();
+}
+
 // ─── Forks (R2A-2, SPEC 18.4) ───────────────────────────────────
 
 @requires(declassify)

@@ -354,7 +354,18 @@ pub Bool keep_copy(Str dir, List(Secret(UInt(8))) vk, VaultState st) { return ke
 @requires(filesystem, declassify)
 pub Bool keep_place_copy(Str local, List(Secret(UInt(8))) vk, VaultState st) {
     List(Int) b = cbor_of_vault(st);
-    return filesystem.write_bytes(local + ".cache", b) && filesystem.write_bytes(local + ".tag", cache_tag(vk, b));
+    return put_copy_file(local + ".cache", b) && put_copy_file(local + ".tag", cache_tag(vk, b));
+}
+
+// A copy's file written whole: a new file renamed over the old one, so a
+// write cut short leaves the old one as it was. The real read and the
+// duress one (touch_copy) write the same way (SPEC 14.2 item 3).
+@requires(filesystem)
+pub Bool put_copy_file(Str f, List(Int) b) {
+    Str tmp = f + ".new";
+    if (filesystem.write_bytes(tmp, b) && filesystem.rename(tmp, f)) { return true; }
+    _ = filesystem.remove(tmp);
+    return false;
 }
 
 @requires(filesystem, declassify)
@@ -431,9 +442,9 @@ Result(View, Str) duress_online(Str dir, View v, VaultState st) {
 @requires(filesystem)
 pub Bool touch_copy(Str local, VaultState st) {
     List(Int) have = get_file(local + ".cache");
-    if (have.len() == 0) { return filesystem.write_bytes(local + ".cache", cbor_of_vault(st)) && filesystem.write_bytes(local + ".tag", random_bytes(32)); }
+    if (have.len() == 0) { return put_copy_file(local + ".cache", cbor_of_vault(st)) && put_copy_file(local + ".tag", random_bytes(32)); }
     List(Int) tag = get_file(local + ".tag");
-    return filesystem.write_bytes(local + ".cache", have) && filesystem.write_bytes(local + ".tag", tag);
+    return put_copy_file(local + ".cache", have) && put_copy_file(local + ".tag", tag);
 }
 
 VaultState no_items(VaultState st) { return VaultState {.head = st.head, .items = []}; }
