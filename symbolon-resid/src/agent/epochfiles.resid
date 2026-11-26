@@ -7,7 +7,9 @@
 // remapping). A secure overwrite-then-unlink belongs in Resid.
 
 import "../types.resid";
+import "../core/log.resid";
 import "../threshold/threshold.resid";
+import "crypto.resid";
 
 List(Int) zeros(Int n, List(Int) acc) { return if (n <= 0) { acc } else { zeros(n - 1, acc.concat([0])) }; }
 
@@ -19,23 +21,179 @@ pub Bool wipe_file(Str path) {
     return filesystem.remove(path) || !filesystem.exists(path);
 }
 
-// The cosigner's secret files of epoch `e`: its configuration (share and
-// Paillier key), its kit contribution b and its half of the kit's material.
+// The cosigner's secret files of epoch `e`, once that epoch is its own
+// (promoted, below): its configuration (share and Paillier key), its kit
+// contribution b and its half of the kit's material, its share of the
+// vault OPRF key and the kit's part of it (b_v), and what it kept of the
+// re-share that made the epoch. Epoch 1's kit half is kit-half.cbor.
 pub List(Str) epoch_secret_files(Str dir, Int e) {
     Str s = f"{e}";
-    return [dir + "/cg-" + s + ".cfg", dir + "/kit-b-" + s, dir + "/kit-half-" + s + ".raw"];
+    List(Str) fs = [dir + "/cg-" + s + ".cfg", dir + "/kit-b-" + s, dir + "/kit-half-" + s + ".raw", dir + "/kv-" + s, dir + "/kitv-b-" + s,
+                    dir + "/kvpend-" + s, dir + "/reshare-" + s + ".invite", dir + "/reshare-" + s + ".tag"];
+    return if (e == 1) { fs.concat([dir + "/kit-half.cbor"]) } else { fs };
 }
 
 // Once the verified log is at epoch `e` and this party holds its
 // configuration of `e` (cg-<e>.cfg, not empty), every older epoch's secret
 // files go. Until then they stay: after a recovery the log is at an epoch
 // nobody holds shares of yet, and the cosigner still deals from the one
-// before it. True when nothing older is left.
+// before it. cg-<e>.cfg is only ever a promoted re-share's (below), so a
+// re-share that never reached the log cannot set this off. True when
+// nothing older is left.
 @requires(filesystem)
 pub Bool prune_old_epochs(Str dir, Int e) {
     if (filesystem.read_bytes(dir + "/cg-" + f"{e}" + ".cfg").len() == 0) { return false; }
     Bool wiped = wipe_below(dir, e - 1);
     return wiped;
+}
+
+// The newest epoch this party holds a configuration of (cg-<e>.cfg, not
+// empty), 0 for none.
+@requires(filesystem)
+pub Int held_epoch(Str dir) {
+    Int e = top_cfg(dir, filesystem.list_dir(dir), 0, 0);
+    return e;
+}
+
+@requires(filesystem)
+Int top_cfg(Str dir, List(Str) names, Int i, Int best) {
+    if (i >= names.len()) { return best; }
+    Str n = names[i];
+    Str mid = if (str_starts_with(n, "cg-") && str_ends_with(n, ".cfg") && str_len(n) > 7) { str_slice(n, 3, str_len(n) - 4) } else { "" };
+    Int e = if (str_len(mid) > 0 && str_is_int(mid)) { str_parse_int(mid) } else { 0 };
+    Bool better = e > best && filesystem.read_bytes(dir + "/" + n).len() > 0;
+    return top_cfg(dir, names, i + 1, if (better) { e } else { best });
+}
+
+// ─── A re-share's outcome, pending until the log holds it ───────
+//
+// What a re-share to epoch e gives this party is kept under names of that
+// epoch and the re-share's transcript digest, pending-<e>-<hex of the
+// digest's first 8 bytes>.<what>: cfg (the new configuration), kitb (its
+// kit contribution b), kb (k_b, from the device that asked), kv (its vault
+// OPRF share, b_v and the commitments), transcript, parties, invite. They
+// become epoch e's (cg-<e>.cfg, kit-b-<e>, kit-half-<e>.raw, kv-<e>,
+// kitv-b-<e>) only when the verified log holds a reshare event of epoch e
+// with that transcript digest and party set; a pending set of an epoch the
+// log reached otherwise (a recovery), or passed, is wiped. A re-share that
+// is never published (a device ran it with this party and kept the event
+// to itself) so never replaces, prunes or releases anything.
+
+pub Str pending_tag(Int e, List(Int) digest) {
+    Str h = if (digest.len() >= 8) { hex_encode(digest[0..8]) } else { hex_encode(digest) };
+    return f"{e}-" + h;
+}
+
+pub Str pending_file(Str dir, Str tag, Str what) { return dir + "/pending-" + tag + "." + what; }
+
+// The epoch a tag names, 0 for none.
+pub Int tag_epoch(Str tag) {
+    List(Str) ps = str_split(tag, "-");
+    Int e = if (ps.len() == 2 && str_is_int(ps[0])) { str_parse_int(ps[0]) } else { 0 };
+    return e;
+}
+
+pub List(Int) party_ids(List(Party) ps, Int i, List(Int) acc) {
+    if (i >= ps.len()) { return acc; }
+    return party_ids(ps, i + 1, acc.concat(ps[i].id));
+}
+
+// Promotes or discards every pending set in `dir` against the verified
+// events `es`, whose head is at epoch `log_epoch`; `me` is this party.
+// The number of sets promoted.
+@requires(filesystem)
+pub Int promote_reshares(Str dir, List(SignedEvent) es, Int log_epoch, List(Int) me) {
+    Int n = promote_names(dir, filesystem.list_dir(dir), 0, es, log_epoch, me, 0);
+    return n;
+}
+
+@requires(filesystem)
+Int promote_names(Str dir, List(Str) names, Int i, List(SignedEvent) es, Int log_epoch, List(Int) me, Int n) {
+    if (i >= names.len()) { return n; }
+    Str nm = names[i];
+    Bool is_set = str_starts_with(nm, "pending-") && str_ends_with(nm, ".transcript") && str_len(nm) > 19;
+    Str tag = if (is_set) { str_slice(nm, 8, str_len(nm) - 11) } else { "" };
+    Int got = if (str_len(tag) > 0 && tag_epoch(tag) > 0) { promote_one(dir, tag, es, log_epoch, me) } else { 0 };
+    return promote_names(dir, names, i + 1, es, log_epoch, me, n + got);
+}
+
+@requires(filesystem)
+Int promote_one(Str dir, Str tag, List(SignedEvent) es, Int log_epoch, List(Int) me) {
+    Int e = tag_epoch(tag);
+    List(Int) digest = filesystem.read_bytes(pending_file(dir, tag, "transcript"));
+    List(Int) ids = filesystem.read_bytes(pending_file(dir, tag, "parties"));
+    Option(Quorum) found = reshare_of(es, e, digest, ids, 0);
+    Bool stale = e <= log_epoch;
+    Int r = match found {
+        Some(nq) => if (promote_set(dir, tag, e, nq, me)) { 1 } else { 0 },
+        None => if (stale && discard_set(dir, tag)) { 0 } else { 0 }
+    };
+    return r;
+}
+
+// The reshare event of epoch `e` with that transcript digest and party set.
+Option(Quorum) reshare_of(List(SignedEvent) es, Int e, List(Int) digest, List(Int) ids, Int i) {
+    if (i >= es.len()) { return None; }
+    EventBody b = es[i].payload.body;
+    Option(Quorum) hit = match b {
+        ReshareBody(q) => if ((Int)q.epoch == e && digest.len() > 0 && q.transcript_digest == digest && party_ids(q.parties, 0, []) == ids) { Some(q) } else { None },
+        _ => None
+    };
+    if (match hit { Some(_) => true, None => false }) { return hit; }
+    return reshare_of(es, e, digest, ids, i + 1);
+}
+
+@requires(filesystem)
+Bool move_file(Str from, Str to) {
+    if (!filesystem.exists(from)) { return true; }
+    Bool ok = filesystem.rename(from, to);
+    return ok;
+}
+
+@requires(filesystem)
+Bool promote_set(Str dir, Str tag, Int e, Quorum nq, List(Int) me) {
+    Str s = f"{e}";
+    List(Int) kitb = filesystem.read_bytes(pending_file(dir, tag, "kitb"));
+    List(Int) kb = filesystem.read_bytes(pending_file(dir, tag, "kb"));
+    Str half = dir + "/kit-half-" + s + ".raw";
+    Bool ok = move_file(pending_file(dir, tag, "cfg"), dir + "/cg-" + s + ".cfg")
+        && move_file(pending_file(dir, tag, "kitb"), dir + "/kit-b-" + s)
+        && (kitb.len() != 32 || kb.len() != 32 || filesystem.exists(half) || filesystem.write_secret(half, kitb.concat(kb)))
+        && promote_kv(dir, tag, s, nq, me)
+        && move_file(pending_file(dir, tag, "invite"), dir + "/reshare-" + s + ".invite")
+        && filesystem.write_all(dir + "/reshare-" + s + ".tag", tag);
+    if (!ok) { return false; }
+    Bool gone = discard_set(dir, tag);
+    return gone;
+}
+
+// The vault OPRF share dealt in that re-share, when the event names the
+// same commitments: kv-<e> (index || share) and kitv-b-<e> (b_v).
+@requires(filesystem)
+Bool promote_kv(Str dir, Str tag, Str s, Quorum nq, List(Int) me) {
+    List(Int) p = filesystem.read_bytes(pending_file(dir, tag, "kv"));
+    if (nq.kv_commits.len() == 0 || p.len() < 64) { return true; }
+    if (!(p[64..p.len()] == ef_flat(nq.kv_commits, 0, []))) { return true; }
+    Int id = ef_index1(nq.parties, me, 0);
+    if (id < 1) { return true; }
+    return filesystem.write_secret(dir + "/kv-" + s, [(id >> 8) & 255, id & 255].concat(p[0..32]))
+        && (p[32..64] == zeros(32, []) || filesystem.write_secret(dir + "/kitv-b-" + s, p[32..64]));
+}
+
+List(Int) ef_flat(List(List(Int)) xs, Int i, List(Int) acc) { return if (i >= xs.len()) { acc } else { ef_flat(xs, i + 1, acc.concat(xs[i])) }; }
+
+Int ef_index1(List(Party) ps, List(Int) p, Int i) {
+    if (i >= ps.len()) { return 0; }
+    if (ps[i].id == p) { return i + 1; }
+    return ef_index1(ps, p, i + 1);
+}
+
+// Wipes a pending set; true when it is gone.
+@requires(filesystem)
+pub Bool discard_set(Str dir, Str tag) {
+    Bool ok = wipe_all([pending_file(dir, tag, "cfg"), pending_file(dir, tag, "kitb"), pending_file(dir, tag, "kb"), pending_file(dir, tag, "kv"),
+                        pending_file(dir, tag, "parties"), pending_file(dir, tag, "invite"), pending_file(dir, tag, "transcript")], 0);
+    return ok;
 }
 
 @requires(filesystem)

@@ -12,6 +12,9 @@ import "common.resid";
 import "serials.resid";
 import "device.resid";
 import "cosignerd.resid";
+import "epochfiles.resid";
+import "cggmp_store.resid";
+import "../recovery/recovery.resid";
 import "crypto.resid";
 import "ecdsa.resid";
 import "cbor.resid";
@@ -64,23 +67,160 @@ test "the cosigner refuses a log below the head it has seen, or another one at t
     expect(verdict(head_seen(c, view_at(5, 1)))).toEqual("refused");
 }
 
+// ─── A re-share's outcome is held apart until the log has it ───
+
+Party pt(Int n, UInt(8) kind) {
+    return Party {.id = rep(n, 32), .kind = kind, .auth_key = [], .hpke_key = [], .label = "p", .attestation = NoAttestation};
+}
+
+// The device 4 (requester), this cosigner (1) and the kit 6.
+List(Party) three() { return [pt(4, party_kind_device()), pt(1, party_kind_cosigner()), pt(6, party_kind_kit())]; }
+
+ReshareInvite invite_to(Int epoch, Int sid) {
+    return ReshareInvite {.session_id = rep(sid, 32), .log_id = rep(7, 32), .new_parties = three(), .dealers = [1, 2], .receivers = [1, 2], .offline = [3], .degree = 1,
+                          .epoch = epoch, .requester = rep(4, 32), .sig = []};
+}
+
+CgConfig cfg_of(Int id) {
+    return CgConfig {.id = id, .threshold = 2, .ecdsa = [(UInt(64))id], .elgamal = [], .p = [], .q = [], .rid = [], .chain_key = [], .public = []};
+}
+
+Quorum q_of(Int epoch, List(Int) digest, List(List(Int)) kv) {
+    return Quorum {.parties = three(), .t = 2, .root_pubkey = [], .epoch = (UInt(32))epoch, .transcript_digest = digest, .kv_commits = kv};
+}
+
+SignedEvent ev(Int seq, EventBody b) {
+    return SignedEvent {.payload = EventPayload {.log_id = None, .sequence = (UInt(64))seq, .predecessor_digest = None, .suite = 1, .body = b,
+                                                 .next_recovery_key_digests = [], .advisory_time = 0},
+                        .encoded = [seq], .sigs = [], .cosigs = []};
+}
+
+SignedEvent inception() { return ev(0, InceptionBody(q_of(1, rep(1, 32), []), no_policy())); }
+
+@requires(filesystem)
+Str dealt_from(Cosigner c, Quorum head, List(SignedEvent) es) {
+    Option(Dealing) od = dealing_cfg(c, head, es);
+    return match od { None => "none", Some(x) => f"{x.cfg.id}" };
+}
+
+@requires(filesystem, declassify)
+Str half_key(Cosigner c) {
+    Option(Half) h = my_half(c);
+    return match h { None => "none", Some(x) => hex_encode(x.key) };
+}
+
+@requires(filesystem)
+Int pending_left(Str d, List(Str) names, Int i, Int n) {
+    if (i >= names.len()) { return n; }
+    return pending_left(d, names, i + 1, if (str_starts_with(names[i], "pending-")) { n + 1 } else { n });
+}
+
+// The cosigner at epoch 1 (its key generation's configuration, and the
+// inception's kit half).
+@requires(filesystem, declassify)
+Cosigner at_epoch1() {
+    Str d = fresh_dir();
+    _ = filesystem.write_secret(d + "/cg-1.cfg", cg_cfg_encode(cfg_of(1)));
+    _ = filesystem.write_secret(d + "/kit-half.cbor", [1, 2, 3]);
+    return cosigner_in(d);
+}
+
 @requires(filesystem, declassify)
 test "the kit's key half is taken only from the device that asked for the re-share, and once" {
-    Str d = fresh_dir();
-    Cosigner c = cosigner_in(d);
-    ReshareInvite inv = ReshareInvite {.session_id = rep(3, 32), .log_id = rep(7, 32), .new_parties = [], .dealers = [], .receivers = [], .offline = [], .degree = 1,
-                                       .epoch = 2, .requester = rep(4, 32), .sig = []};
-    expect(filesystem.write_all(d + "/pending.epoch", "2")).toBeTrue();
-    expect(filesystem.write_bytes(d + "/kit-b-2", rep(5, 32))).toBeTrue();
-    expect(filesystem.write_bytes(d + "/pending-2.invite", match to_cbor(inv) { Ok(b) => b, Err(_) => [] })).toBeTrue();
+    Cosigner c = at_epoch1();
+    Str d = c.dir;
+    expect(keep_reshare(d, invite_to(2, 3), Some(cfg_of(2)), rep(5, 32), rep(10, 32))).toBeTrue();
+    Str kb = pending_file(d, pending_tag(2, rep(10, 32)), "kb");
     // Another party's k_b: not kept.
-    _ = on_kit_key(c, rep(6, 32), rep(8, 32));
-    expect(filesystem.exists(d + "/kit-half-2.raw")).toBeFalse();
+    _ = kit_key_kept(c, rep(6, 32), rep(8, 32));
+    expect(filesystem.exists(kb)).toBeFalse();
     // The requester's: kept; a second one does not replace it.
-    _ = on_kit_key(c, rep(4, 32), rep(9, 32));
-    expect(hex_encode(filesystem.read_bytes(d + "/kit-half-2.raw"))).toEqual(hex_encode(rep(5, 32).concat(rep(9, 32))));
-    _ = on_kit_key(c, rep(4, 32), rep(10, 32));
-    expect(hex_encode(filesystem.read_bytes(d + "/kit-half-2.raw"))).toEqual(hex_encode(rep(5, 32).concat(rep(9, 32))));
+    _ = kit_key_kept(c, rep(4, 32), rep(9, 32));
+    expect(hex_encode(filesystem.read_bytes(kb))).toEqual(hex_encode(rep(9, 32)));
+    _ = kit_key_kept(c, rep(4, 32), rep(10, 32));
+    expect(hex_encode(filesystem.read_bytes(kb))).toEqual(hex_encode(rep(9, 32)));
+}
+
+@requires(filesystem, declassify)
+test "a re-share that never reached the log is never dealt from, never prunes, and goes once a recovery takes its epoch" {
+    Cosigner c = at_epoch1();
+    Str d = c.dir;
+    // A device runs a re-share to epoch 2 with the cosigner, and sends its
+    // k_b, but publishes no reshare event.
+    expect(keep_reshare(d, invite_to(2, 3), Some(cfg_of(2)), rep(5, 32), rep(10, 32))).toBeTrue();
+    _ = kit_key_kept(c, rep(4, 32), rep(9, 32));
+    // The log moves to epoch 2 by a recovery instead.
+    List(SignedEvent) es = [inception(), ev(1, RotateRecoveryBody)];
+    expect(promote_reshares(d, es, 2, c.cfg.party)).toEqual(0);
+    expect(filesystem.exists(d + "/cg-2.cfg")).toBeFalse();
+    expect(held_epoch(d)).toEqual(1);
+    // Epoch 1 is still dealt from and nothing of it is pruned.
+    expect(prune_old_epochs(d, 2)).toBeFalse();
+    expect(filesystem.exists(d + "/cg-1.cfg")).toBeTrue();
+    expect(filesystem.exists(d + "/kit-half.cbor")).toBeTrue();
+    expect(dealt_from(c, q_of(2, rep(77, 32), []), es)).toEqual("1");
+    // The pending set is wiped.
+    expect(pending_left(d, filesystem.list_dir(d), 0, 0)).toEqual(0);
+}
+
+@requires(filesystem, declassify)
+test "a kit half from a re-share that never reached the log is not the one released" {
+    Cosigner c = at_epoch1();
+    Str d = c.dir;
+    // A published re-share to epoch 2: k_b 9.
+    List(Int) t2 = rep(20, 32);
+    expect(keep_reshare(d, invite_to(2, 3), Some(cfg_of(2)), rep(5, 32), t2)).toBeTrue();
+    _ = kit_key_kept(c, rep(4, 32), rep(9, 32));
+    List(SignedEvent) es = [inception(), ev(1, ReshareBody(q_of(2, t2, [])))];
+    expect(promote_reshares(d, es, 2, c.cfg.party)).toEqual(1);
+    expect(half_key(c)).toEqual(hex_encode(rep(9, 32)));
+    // A stolen device runs a re-share to epoch 3 it never publishes, and
+    // sends a k_b of its own.
+    expect(keep_reshare(d, invite_to(3, 4), Some(cfg_of(3)), rep(15, 32), rep(30, 32))).toBeTrue();
+    _ = kit_key_kept(c, rep(4, 32), rep(11, 32));
+    expect(half_key(c)).toEqual(hex_encode(rep(9, 32)));
+    // A recovery makes epoch 3: the half released is still epoch 2's.
+    expect(promote_reshares(d, es.concat([ev(2, RotateRecoveryBody)]), 3, c.cfg.party)).toEqual(0);
+    expect(half_key(c)).toEqual(hex_encode(rep(9, 32)));
+    expect(filesystem.exists(d + "/kit-half-3.raw")).toBeFalse();
+}
+
+@requires(filesystem, declassify)
+test "a re-share's outcome becomes its epoch's when the log holds its reshare event" {
+    Cosigner c = at_epoch1();
+    Str d = c.dir;
+    List(Int) t2 = rep(20, 32);
+    expect(keep_reshare(d, invite_to(2, 3), Some(cfg_of(2)), rep(5, 32), t2)).toBeTrue();
+    Str tag = pending_tag(2, t2);
+    // The vault OPRF share dealt with it: share 7, b_v 8, one commitment.
+    expect(filesystem.write_secret(pending_file(d, tag, "kv"), rep(7, 32).concat(rep(8, 32)).concat(rep(9, 65)))).toBeTrue();
+    // Not yet in the log: still pending.
+    expect(promote_reshares(d, [inception()], 1, c.cfg.party)).toEqual(0);
+    expect(held_epoch(d)).toEqual(1);
+    expect(filesystem.exists(pending_file(d, tag, "cfg"))).toBeTrue();
+    // The kit key arrives before the cosigner sees the event: kept pending.
+    _ = kit_key_kept(c, rep(4, 32), rep(12, 32));
+    expect(filesystem.exists(d + "/kit-half-2.raw")).toBeFalse();
+    // Its event: promoted.
+    List(SignedEvent) es = [inception(), ev(1, ReshareBody(q_of(2, t2, [rep(9, 65)])))];
+    expect(promote_reshares(d, es, 2, c.cfg.party)).toEqual(1);
+    expect(held_epoch(d)).toEqual(2);
+    expect(dealt_from(c, q_of(2, t2, []), es)).toEqual("2");
+    expect(hex_encode(filesystem.read_bytes(d + "/kit-half-2.raw"))).toEqual(hex_encode(rep(5, 32).concat(rep(12, 32))));
+    expect(half_key(c)).toEqual(hex_encode(rep(12, 32)));
+    expect(hex_encode(filesystem.read_bytes(d + "/kv-2"))).toEqual(hex_encode([0, 2].concat(rep(7, 32))));
+    expect(hex_encode(kv_kit_half(c))).toEqual(hex_encode(rep(8, 32)));
+    expect(pending_left(d, filesystem.list_dir(d), 0, 0)).toEqual(0);
+    // Now epoch 1 goes.
+    expect(prune_old_epochs(d, 2)).toBeTrue();
+    expect(filesystem.exists(d + "/cg-1.cfg")).toBeFalse();
+    expect(filesystem.exists(d + "/kit-half.cbor")).toBeFalse();
+    // A kit key after the promotion (the requester's, once) is the epoch's.
+    _ = wipe_file(d + "/kit-half-2.raw");
+    _ = kit_key_kept(c, rep(6, 32), rep(13, 32));
+    expect(filesystem.exists(d + "/kit-half-2.raw")).toBeFalse();
+    _ = kit_key_kept(c, rep(4, 32), rep(13, 32));
+    expect(half_key(c)).toEqual(hex_encode(rep(13, 32)));
 }
 
 List(Int) raw(List(Int) enc, Int cos) {

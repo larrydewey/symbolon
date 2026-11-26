@@ -51,6 +51,26 @@ test "old epochs' shares are removed once the log's epoch is held, and not befor
     expect(prune_old_epochs(d, 3)).toBeFalse();
 }
 
+@requires(filesystem, declassify)
+test "old epochs' vault OPRF shares and the inception's kit half go with the rest" {
+    Str d = tmp_dir();
+    List(Str) names = ["kv-1", "kitv-b-1", "kvpend-1", "kit-half.cbor", "reshare-1.invite", "cg-2.cfg", "kv-2", "kitv-b-2", "kit-half-2.raw"];
+    _ = put(d + "/kv-1");
+    _ = put(d + "/kitv-b-1");
+    _ = put(d + "/kvpend-1");
+    _ = put(d + "/kit-half.cbor");
+    _ = put(d + "/reshare-1.invite");
+    _ = put(d + "/kv-2");
+    _ = put(d + "/kitv-b-2");
+    _ = put(d + "/kit-half-2.raw");
+    // Epoch 2 not held: nothing goes.
+    expect(prune_old_epochs(d, 2)).toBeFalse();
+    expect(present(d, names, 0, "")).toEqual("kv-1 kitv-b-1 kvpend-1 kit-half.cbor reshare-1.invite kv-2 kitv-b-2 kit-half-2.raw ");
+    _ = put(d + "/cg-2.cfg");
+    expect(prune_old_epochs(d, 2)).toBeTrue();
+    expect(present(d, names, 0, "")).toEqual("cg-2.cfg kv-2 kitv-b-2 kit-half-2.raw ");
+}
+
 Party party_of(Int n, UInt(8) kind) {
     return Party {.id = [n, n, n, n, n, n, n, n, n, n, n, n, n, n, n, n, n, n, n, n, n, n, n, n, n, n, n, n, n, n, n, n], .kind = kind, .auth_key = [], .hpke_key = [], .label = "p", .attestation = NoAttestation};
 }

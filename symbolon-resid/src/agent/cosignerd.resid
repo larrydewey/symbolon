@@ -10,6 +10,8 @@
 // layer 8 open: held as public types; with kit-b-<epoch> and
 // kit-half-<epoch>.raw, overwritten and removed once the verified log is at
 // a later epoch it holds a configuration of, epochfiles.resid),
+// pending-<epoch>-<digest>.* and pending.tag (a re-share's outcome, held
+// apart until the verified log holds its reshare event, epochfiles.resid),
 // aborts.bin (the abort book, SPEC 6.2),
 // state.cbor (the policy state: verified head, sessions, records),
 // kit-half.cbor (its half of the kit's material).
@@ -380,7 +382,7 @@ Option(CgConfig) my_cg(Cosigner c) { return cg_at(c, 1); }
 pub type Dealing = { CgConfig cfg; Quorum old_q; };
 
 @requires(filesystem)
-Option(Dealing) dealing_cfg(Cosigner c, Quorum q, List(SignedEvent) es) {
+pub Option(Dealing) dealing_cfg(Cosigner c, Quorum q, List(SignedEvent) es) {
     Option(CgConfig) cur = cg_at(c, (Int)q.epoch);
     Option(Quorum) made = quorum_of_epoch(es, q.epoch, 0, None);
     Option(Quorum) before = if (q.epoch > 0) { quorum_of_epoch(es, q.epoch - 1, 0, None) } else { None };
@@ -442,12 +444,12 @@ Cosigner sign_inception(Cosigner c, List(Int) from, EventPayload p, List(Int) en
     if (!ok) { return cos_fail(c, "not the inception of this key"); }
     EventBody bq = p.body;
     List(List(Int)) kvc = match bq { InceptionBody(q, _) => q.kv_commits, _ => [] };
-    if (!kv_pending_matches(c, 1, kvc)) { return cos_fail(c, "the inception's vault OPRF key is not the one dealt"); }
+    if (!kv_pending_matches(c.dir + "/kvpend-1", kvc)) { return cos_fail(c, "the inception's vault OPRF key is not the one dealt"); }
     List(Int) sig = sw_sign(cos_dk(c.root), encoded);
     Option(Remote) r = remote_by_party(remotes_of(c.cfg.peers, 0, []), from, 0);
     _ = match r { None => false, Some(rr) => send_to(relay_of(c.cfg), me_of(c), rr, WEventSig(sig)) };
     println("cosigner: signed the inception event " + hex_encode(sha256_bytes(encoded)));
-    _ = kv_promote(c, 1, kvc);
+    _ = kv_promote_inception(c, kvc);
     return Cosigner {.dir = c.dir, .cfg = with_log(c.cfg, sha256_bytes(encoded), c.cfg.mbox_next), .root = c.root};
 }
 
@@ -761,6 +763,9 @@ Cosigner reshare_decide(Cosigner c, List(Int) from, ReshareInvite inv, VerifiedH
     CosignerState st = load_state(c, vh);
     Quorum q = vh.head.quorum;
     if (!bytes_eq(from, inv.requester) || inv.epoch != (Int)q.epoch + 1) { return refuse(c, from, inv.session_id); }
+    // An earlier re-share's outcome becomes an epoch's only when these
+    // verified events hold its reshare event; one the log passed is wiped.
+    _ = promote_reshares(c.dir, es, (Int)q.epoch, c.cfg.party);
     _ = prune_old_epochs(c.dir, (Int)q.epoch);
     CgConfig none = CgConfig {.id = 0, .threshold = 0, .ecdsa = [], .elgamal = [], .p = [], .q = [], .rid = [], .chain_key = [], .public = []};
     Dealing d = dealing_cfg(c, q, es) else { Dealing {.cfg = none, .old_q = q} };
@@ -800,53 +805,67 @@ pub Result(Stepped(RsState), CgFail) rs_adapt(RsState st, List(ThMsg) msgs) {
 
 // The re-share's outcome waits for the reshare event: the new
 // configuration, the transcript and the cosigner's kit contribution b are
-// kept for the new epoch, and become current when the log shows it.
+// kept apart, under the new epoch and the transcript digest (pending.tag
+// names the latest such set), and become the epoch's when the verified
+// log holds that event (epochfiles.resid promote_reshares). Until then
+// nothing dealt from, pruned or released reads them.
 @requires(filesystem)
 Cosigner after_reshare(Cosigner c, ReshareInvite inv, Run(RsState) r) {
     if (str_len(r.fail) > 0) { return cos_fail(c, "re-share: " + r.fail); }
     Option(RsResult) or = rs_result(r.seats[0].st);
     RsResult res = or else { RsResult {.cfg = None, .offline = [], .transcript = []} };
-    Str e = f"{inv.epoch}";
-    Option(CgConfig) ncfg = res.cfg;
-    Bool ok = match ncfg { Some(x) => put_secret_file(c.dir + "/cg-" + e + ".cfg", cg_cfg_encode(x)), None => true }
-        && filesystem.write_bytes(c.dir + "/pending-" + e + ".transcript", res.transcript)
-        && filesystem.write_all(c.dir + "/pending.epoch", e)
-        && (res.offline.len() == 0 || put_secret_file(c.dir + "/kit-b-" + e, bn_to_be(res.offline[0].share, 32)))
-        && filesystem.write_bytes(c.dir + "/pending-" + e + ".parties", ids_of(inv.new_parties, 0, []))
-        && filesystem.write_bytes(c.dir + "/pending-" + e + ".invite", match to_cbor(inv) { Ok(b) => b, Err(_) => [] });
-    if (!ok) { return cos_fail(c, "cannot store the re-share"); }
-    println("cosigner: re-share to epoch " + e + " done");
+    List(Int) b = if (res.offline.len() == 0) { [] } else { bn_to_be(res.offline[0].share, 32) };
+    if (!keep_reshare(c.dir, inv, res.cfg, b, res.transcript)) { return cos_fail(c, "cannot store the re-share"); }
+    println(f"cosigner: re-share to epoch {inv.epoch} done; held until its reshare event is in the log");
     return c;
 }
+
+@requires(filesystem)
+pub Bool keep_reshare(Str dir, ReshareInvite inv, Option(CgConfig) ncfg, List(Int) b, List(Int) transcript) {
+    if (transcript.len() < 8) { return false; }
+    Str tag = pending_tag(inv.epoch, transcript);
+    Bool ok = match ncfg { Some(x) => put_secret_file(pending_file(dir, tag, "cfg"), cg_cfg_encode(x)), None => true }
+        && (b.len() == 0 || put_secret_file(pending_file(dir, tag, "kitb"), b))
+        && filesystem.write_bytes(pending_file(dir, tag, "parties"), ids_of(inv.new_parties, 0, []))
+        && filesystem.write_bytes(pending_file(dir, tag, "invite"), match to_cbor(inv) { Ok(x) => x, Err(_) => [] })
+        && filesystem.write_bytes(pending_file(dir, tag, "transcript"), transcript)
+        && filesystem.write_all(dir + "/pending.tag", tag);
+    return ok;
+}
+
+// The latest re-share taken part in, "" for none.
+@requires(filesystem)
+Str pending_now(Str dir) { return str_trim(filesystem.read_all(dir + "/pending.tag")); }
 
 List(Int) ids_of(List(Party) ps, Int i, List(Int) acc) {
     if (i >= ps.len()) { return acc; }
     return ids_of(ps, i + 1, acc.concat(ps[i].id));
 }
 
-// A reshare event: signed only for the re-share this cosigner took part in
-// (the epoch, the transcript digest and the party set it kept).
+// A reshare event: signed only for the latest re-share this cosigner took
+// part in (the epoch, the transcript digest and the party set it kept).
+// Signing promotes nothing: the outcome becomes the epoch's when the
+// event is in the verified log, which this signature alone does not make.
 @requires(network, filesystem, declassify, clock)
 Cosigner sign_reshare_event(Cosigner c, List(Int) from, EventPayload p, List(Int) encoded) {
-    Str e = str_trim(filesystem.read_all(c.dir + "/pending.epoch"));
+    Str tag = pending_now(c.dir);
     EventBody b = p.body;
     Bool ok = match b {
-        ReshareBody(nq) => str_len(e) > 0 && f"{nq.epoch}" == e
-            && bytes_eq(nq.transcript_digest, get_file(c.dir + "/pending-" + e + ".transcript"))
-            && bytes_eq(ids_of(nq.parties, 0, []), get_file(c.dir + "/pending-" + e + ".parties"))
-            && event_is_invite(nq, invite_of(get_file(c.dir + "/pending-" + e + ".invite")))
+        ReshareBody(nq) => str_len(tag) > 0 && nq.transcript_digest.len() >= 8 && pending_tag((Int)nq.epoch, nq.transcript_digest) == tag
+            && bytes_eq(nq.transcript_digest, get_file(pending_file(c.dir, tag, "transcript")))
+            && bytes_eq(ids_of(nq.parties, 0, []), get_file(pending_file(c.dir, tag, "parties")))
+            && event_is_invite(nq, invite_of(get_file(pending_file(c.dir, tag, "invite"))))
             && opt_is(p.log_id, c.cfg.log_id),
         _ => false
     };
     if (!ok) { return cos_fail(c, "not the reshare event of the re-share taken part in"); }
     EventBody bq = p.body;
     List(List(Int)) kvc = match bq { ReshareBody(nq) => nq.kv_commits, _ => [] };
-    if (!kv_pending_matches(c, str_parse_int(e), kvc)) { return cos_fail(c, "the reshare event's vault OPRF key is not the one dealt"); }
+    if (!kv_pending_matches(pending_file(c.dir, tag, "kv"), kvc)) { return cos_fail(c, "the reshare event's vault OPRF key is not the one dealt"); }
     List(Int) sig = sw_sign(cos_dk(c.root), encoded);
     Option(Remote) r = remote_of_party(c, from);
     _ = match r { None => false, Some(rr) => send_to(relay_of(c.cfg), me_of(c), rr, WEventSig(sig)) };
-    println("cosigner: signed the reshare event to epoch " + e);
-    _ = kv_promote(c, str_parse_int(e), kvc);
+    println(f"cosigner: signed the reshare event to epoch {tag_epoch(tag)}");
     // The new quorum's parties are its peers from now on.
     EventBody b2 = p.body;
     List(PartyKeys) ks = match b2 { ReshareBody(nq) => keys_of_parties(nq.parties, 0, []), _ => c.cfg.peers };
@@ -889,21 +908,49 @@ Option(Remote) remote_of_party(Cosigner c, List(Int) p) {
     };
 }
 
-// k_b for the pending epoch: with b, the cosigner's half of the kit's
+// k_b for the latest re-share: with b, the cosigner's half of the kit's
 // material (SPEC 10.6). Only from the device that asked for that re-share,
 // and once: another party's k_b would replace the kit's material the
-// cosigner releases at a recovery.
-@requires(filesystem)
+// cosigner releases at a recovery. It is kept with the re-share's other
+// pending files, and becomes the epoch's half only with them (the device
+// sends it once the reshare event is published, so the log is read now).
+@requires(network, filesystem, declassify, clock(readonly))
 pub Cosigner on_kit_key(Cosigner c, List(Int) from, List(Int) kb) {
-    Str e = str_trim(filesystem.read_all(c.dir + "/pending.epoch"));
-    List(Int) b = get_file(c.dir + "/kit-b-" + e);
-    if (str_len(e) == 0 || b.len() != 32 || kb.len() != 32) { return cos_fail(c, "a kit key without a pending re-share"); }
-    Option(ReshareInvite) oi = invite_of(get_file(c.dir + "/pending-" + e + ".invite"));
+    Cosigner c1 = kit_key_kept(c, from, kb);
+    Int n = promote_now(c1);
+    if (n > 0) { println("cosigner: the re-share's reshare event is in the log; its epoch is held"); }
+    return c1;
+}
+
+@requires(filesystem)
+pub Cosigner kit_key_kept(Cosigner c, List(Int) from, List(Int) kb) {
+    Str tag = pending_now(c.dir);
+    if (str_len(tag) == 0 || kb.len() != 32) { return cos_fail(c, "a kit key without a pending re-share"); }
+    // Still pending, or promoted already (refresh_peers saw the event
+    // first): the same checks, against the files of that state.
+    Str e = f"{tag_epoch(tag)}";
+    Bool promoted = !filesystem.exists(pending_file(c.dir, tag, "invite")) && str_trim(filesystem.read_all(c.dir + "/reshare-" + e + ".tag")) == tag;
+    Str inv_f = if (promoted) { c.dir + "/reshare-" + e + ".invite" } else { pending_file(c.dir, tag, "invite") };
+    Str b_f = if (promoted) { c.dir + "/kit-b-" + e } else { pending_file(c.dir, tag, "kitb") };
+    Str out = if (promoted) { c.dir + "/kit-half-" + e + ".raw" } else { pending_file(c.dir, tag, "kb") };
+    List(Int) b = get_file(b_f);
+    if (b.len() != 32) { return cos_fail(c, "a kit key without a pending re-share"); }
+    Option(ReshareInvite) oi = invite_of(get_file(inv_f));
     Bool asked = match oi { None => false, Some(inv) => bytes_eq(inv.requester, from) };
     if (!asked) { return cos_fail(c, "a kit key from a party that did not ask for the re-share"); }
-    if (filesystem.exists(c.dir + "/kit-half-" + e + ".raw")) { return cos_fail(c, "a kit key for that epoch is held already"); }
-    _ = put_secret_file(c.dir + "/kit-half-" + e + ".raw", b.concat(kb));
+    if (filesystem.exists(out)) { return cos_fail(c, "a kit key for that epoch is held already"); }
+    _ = put_secret_file(out, if (promoted) { b.concat(kb) } else { kb });
     return c;
+}
+
+// Promotes or discards the pending re-share outcomes against the log as
+// the cosigner verifies it now (cos_view); the number promoted.
+@requires(network, filesystem, declassify, clock(readonly))
+Int promote_now(Cosigner c) {
+    if (c.cfg.log_id.len() == 0) { return 0; }
+    Result(LogView, SymbolonError) rv = cos_view(c);
+    Int n = match rv { Err(_) => 0, Ok(v) => promote_reshares(c.dir, v.events, (Int)v.vh.head.quorum.epoch, c.cfg.party) };
+    return n;
 }
 
 // ─── Peers from the log, and the kit release (SPEC 10.6, 13.4) ──
@@ -917,11 +964,14 @@ pub Cosigner on_kit_key(Cosigner c, List(Int) from, List(Int) kb) {
 @requires(network, filesystem, clock(readonly), declassify)
 Cosigner refresh_peers(Cosigner c) {
     if (c.cfg.log_id.len() == 0) { return c; }
-    Result(VerifiedHead, SymbolonError) rv = cos_log(c);
-    return match rv {
+    Result(LogView, SymbolonError) rv = cos_view(c);
+    // The re-share outcomes this log decides: promoted or wiped.
+    _ = match rv { Err(_) => 0, Ok(v) => promote_reshares(c.dir, v.events, (Int)v.vh.head.quorum.epoch, c.cfg.party) };
+    Cosigner nc = match rv {
         Err(_) => c,
-        Ok(vh) => with_known(c, keys_of_parties(vh.head.quorum.parties, 0, []))
+        Ok(v) => with_known(c, keys_of_parties(v.vh.head.quorum.parties, 0, []))
     };
+    return nc;
 }
 
 Bool same_peer_keys(List(PartyKeys) a, List(PartyKeys) b, Int i) {
@@ -938,12 +988,15 @@ Cosigner with_known(Cosigner c, List(PartyKeys) ps) {
     return Cosigner {.dir = c.dir, .cfg = nc, .root = c.root};
 }
 
-// The cosigner's half b || k_b for the latest epoch it holds one for.
+// The cosigner's half b || k_b of the newest epoch it holds (a promoted
+// re-share's, epochfiles.resid; the inception's kit-half.cbor at epoch 1).
+// None when that epoch's half is missing: an older epoch's half is the
+// kit's old material, and a pending re-share's is no epoch's at all.
 @requires(filesystem, declassify)
-Option(Half) my_half(Cosigner c) {
-    Str e = str_trim(filesystem.read_all(c.dir + "/pending.epoch"));
-    List(Int) raw = if (str_len(e) > 0) { get_file(c.dir + "/kit-half-" + e + ".raw") } else { [] };
-    if (raw.len() == 64) { return half_of(raw); }
+pub Option(Half) my_half(Cosigner c) {
+    Int e = held_epoch(c.dir);
+    List(Int) raw = if (e >= 2) { get_file(c.dir + "/kit-half-" + f"{e}" + ".raw") } else { [] };
+    if (e >= 2) { return if (raw.len() == 64) { half_of(raw) } else { None }; }
     Option(WrappedBlob) ob = blob_of_cbor(get_file(c.dir + "/kit-half.cbor"));
     return match ob {
         None => None,
@@ -1001,21 +1054,23 @@ Cosigner release_sent(Cosigner c, List(Int) from, Wrapped w, VerifiedHead vh) {
 // the key generation), and with every re-share. It answers a device's
 // dealing with its own, to that device and to every other online receiver,
 // and keeps its share, its part for the kit (b_v) and the commitments as
-// pending until it signs the event that names them. Files: kvpend-<e>
-// (share || b_v || commitments, SEC1), then kv-<e> (index || share) and
-// kitv-b-<e> (b_v).
+// pending (share || b_v || commitments, SEC1). At inception: kvpend-1,
+// made kv-1 (index || share) and kitv-b-1 (b_v) when it signs the
+// inception. At a re-share: with the re-share's other pending files
+// (pending-<e>-<digest>.kv), made kv-<e> and kitv-b-<e> only when the
+// verified log holds the reshare event (epochfiles.resid).
 
 @requires(network, filesystem, declassify, clock)
 Cosigner on_kv_deal(Cosigner c, List(Int) from, KvDealMsg m) {
     if (c.cfg.log_id.len() == 0) { return kv_inception_deal(c, from, m); }
-    Str e = str_trim(filesystem.read_all(c.dir + "/pending.epoch"));
-    Option(ReshareInvite) oi = if (str_len(e) == 0) { None } else { invite_of(get_file(c.dir + "/pending-" + e + ".invite")) };
+    Str tag = pending_now(c.dir);
+    Option(ReshareInvite) oi = if (str_len(tag) == 0) { None } else { invite_of(get_file(pending_file(c.dir, tag, "invite"))) };
     Result(VerifiedHead, SymbolonError) rv = cos_log(c);
     return match oi {
         None => cos_fail(c, "a vault OPRF dealing without a pending re-share"),
         Some(inv) => match rv {
             Err(_) => cos_fail(c, "the log does not verify"),
-            Ok(vh) => kv_reshare_deal(c, from, m, inv, vh)
+            Ok(vh) => kv_reshare_deal(c, from, m, inv, vh, pending_file(c.dir, tag, "kv"))
         }
     };
 }
@@ -1036,7 +1091,7 @@ Cosigner kv_inception_deal(Cosigner c, List(Int) from, KvDealMsg m) {
     if (mine < 1 || dev < 1 || n != 3 || !bytes_eq(m.session_id, get_file(c.dir + "/keygen.sid")) || m.dealer != dev) { return cos_fail(c, "a vault OPRF dealing outside an inception"); }
     Int kit = 6 - mine - dev;
     KvDealing d = kv_dealing(KvGenerate, 2, n, [dev, mine], mine);
-    return kv_deal_back(c, m, d, mine, [dev, mine], [], kit, 1, [Remote {.party = from, .cg = dev, .hpke_pub = peer_hpke(c.cfg.peers, from, 0)}]);
+    return kv_deal_back(c, m, d, mine, [dev, mine], [], kit, 1, c.dir + "/kvpend-1", [Remote {.party = from, .cg = dev, .hpke_pub = peer_hpke(c.cfg.peers, from, 0)}]);
 }
 
 List(Int) peer_hpke(List(PartyKeys) ps, List(Int) p, Int i) {
@@ -1049,7 +1104,7 @@ List(Int) peer_hpke(List(PartyKeys) ps, List(Int) p, Int i) {
 // dealers. Re-sharing when the quorum has k_v (the cosigner's newest share
 // at its old index), generating when it does not.
 @requires(network, filesystem, declassify, clock)
-Cosigner kv_reshare_deal(Cosigner c, List(Int) from, KvDealMsg m, ReshareInvite inv, VerifiedHead vh) {
+Cosigner kv_reshare_deal(Cosigner c, List(Int) from, KvDealMsg m, ReshareInvite inv, VerifiedHead vh, Str pend) {
     Quorum q = vh.head.quorum;
     if (!bytes_eq(from, inv.requester) || !bytes_eq(m.session_id, inv.session_id) || inv.dealers.len() != 2 || m.dealer != inv.dealers[0]) {
         return cos_fail(c, "a vault OPRF dealing outside the pending re-share");
@@ -1063,26 +1118,26 @@ Cosigner kv_reshare_deal(Cosigner c, List(Int) from, KvDealMsg m, ReshareInvite 
     KvDealing d = kv_dealing(mode, inv.degree + 1, inv.new_parties.len(), inv.dealers, me_old);
     Int kit = if (inv.offline.len() > 0) { inv.offline[0] } else { 0 };
     List(Remote) to = session_remotes(inv.new_parties, inv.receivers, c.cfg.party, 0, []);
-    return kv_deal_back(c, m, d, me_new, inv.dealers, if (resharing) { kv_from_sec1(q.kv_commits) } else { [] }, kit, inv.epoch, to);
+    return kv_deal_back(c, m, d, me_new, inv.dealers, if (resharing) { kv_from_sec1(q.kv_commits) } else { [] }, kit, inv.epoch, pend, to);
 }
 
 // Checks the device's dealing, keeps the result pending, and sends this
 // cosigner's dealing to `to` (each at its new index).
 @requires(network, filesystem, declassify, clock)
-Cosigner kv_deal_back(Cosigner c, KvDealMsg m, KvDealing d, Int me_new, List(Int) dealers, List(List(Int)) old_commits, Int kit, Int epoch, List(Remote) to) {
+Cosigner kv_deal_back(Cosigner c, KvDealMsg m, KvDealing d, Int me_new, List(Int) dealers, List(List(Int)) old_commits, Int kit, Int epoch, Str pend, List(Remote) to) {
     Int me_dealer = dealers[1];
     Result(KvOut, Str) r = kv_combine(me_new, [KvGot {.from = [], .m = m}], Some(d), me_dealer, old_commits, dealers);
     return match r {
         Err(why) => cos_fail(c, "vault OPRF key: " + why),
-        Ok(o) => kv_pending_then_send(c, o, d, kit, epoch, m.session_id, me_dealer, to)
+        Ok(o) => kv_pending_then_send(c, o, d, kit, epoch, pend, m.session_id, me_dealer, to)
     };
 }
 
 @requires(network, filesystem, declassify, clock)
-Cosigner kv_pending_then_send(Cosigner c, KvOut o, KvDealing d, Int kit, Int epoch, List(Int) sid, Int me_dealer, List(Remote) to) {
+Cosigner kv_pending_then_send(Cosigner c, KvOut o, KvDealing d, Int kit, Int epoch, Str pend, List(Int) sid, Int me_dealer, List(Remote) to) {
     List(Int) bv = if (kit > 0) { part_bytes(d, kit) } else { [] };
     List(Int) rec = reveal(kv_share_bytes(o.share.v)).concat(if (bv.len() == 32) { bv } else { zeros32() }).concat(flat(o.commits, 0, []));
-    if (!put_secret_file(c.dir + "/kvpend-" + f"{epoch}", rec)) { return cos_fail(c, "cannot keep the vault OPRF share"); }
+    if (!put_secret_file(pend, rec)) { return cos_fail(c, "cannot keep the vault OPRF share"); }
     if (!kv_send(relay_of(c.cfg), me_of(c), to, sid, me_dealer, d, 0)) { return cos_fail(c, "cannot send the vault OPRF dealing"); }
     println(f"cosigner: dealt the vault OPRF key for epoch {epoch}");
     return c;
@@ -1094,39 +1149,27 @@ List(Int) flat(List(List(Int)) xs, Int i, List(Int) acc) { return if (i >= xs.le
 
 List(List(Int)) chunks65(List(Int) b, Int i, List(List(Int)) acc) { return if (i + 65 > b.len()) { acc } else { chunks65(b, i + 65, acc.concat([b[i..i + 65]])) }; }
 
-// Whether the event's field 6 is what was dealt for epoch e: both absent,
-// or the same commitments.
+// Whether the event's field 6 is what was dealt (kept in `pend`): both
+// absent, or the same commitments.
 @requires(filesystem)
-Bool kv_pending_matches(Cosigner c, Int e, List(List(Int)) commits) {
-    List(Int) p = get_file(c.dir + "/kvpend-" + f"{e}");
+Bool kv_pending_matches(Str pend, List(List(Int)) commits) {
+    List(Int) p = get_file(pend);
     if (commits.len() == 0) { return true; }
     if (p.len() < 64) { return false; }
     List(List(Int)) mine = chunks65(p, 64, []);
     return mine.len() == commits.len() && flat(mine, 0, []) == flat(commits, 0, []);
 }
 
-// After signing: the pending share and the kit's half become epoch e's.
+// After signing the inception: the pending share and the kit's half become
+// epoch 1's, at the cosigner's key-generation index. (A re-share's become
+// its epoch's when the log holds the reshare event, epochfiles.resid.)
 @requires(filesystem)
-Bool kv_promote(Cosigner c, Int e, List(List(Int)) commits) {
-    List(Int) p = get_file(c.dir + "/kvpend-" + f"{e}");
+Bool kv_promote_inception(Cosigner c, List(List(Int)) commits) {
+    List(Int) p = get_file(c.dir + "/kvpend-1");
     if (commits.len() == 0 || p.len() < 64) { return true; }
-    Int id = kv_index_of(c, e);
-    return put_secret_file(c.dir + "/kv-" + f"{e}", [(id >> 8) & 255, id & 255].concat(p[0..32]))
-        && (p[32..64] == zeros32() || put_secret_file(c.dir + "/kitv-b-" + f"{e}", p[32..64]));
-}
-
-// The cosigner's index at epoch e: its position in that epoch's parties.
-@requires(filesystem)
-Int kv_index_of(Cosigner c, Int e) {
-    List(Int) ids = get_file(c.dir + "/pending-" + f"{e}" + ".parties");
-    Int at = id_at(ids, c.cfg.party, 0);
-    return if (at >= 0) { at + 1 } else { index_of(c.cfg.peers, c.cfg.party, 0) + 1 };
-}
-
-Int id_at(List(Int) ids, List(Int) p, Int i) {
-    if (i * 32 + 32 > ids.len()) { return -1; }
-    if (ids[i * 32..i * 32 + 32] == p) { return i; }
-    return id_at(ids, p, i + 1);
+    Int id = index_of(c.cfg.peers, c.cfg.party, 0) + 1;
+    return put_secret_file(c.dir + "/kv-1", [(id >> 8) & 255, id & 255].concat(p[0..32]))
+        && (p[32..64] == zeros32() || put_secret_file(c.dir + "/kitv-b-1", p[32..64]));
 }
 
 // The newest share held at epoch `e` or before.
@@ -1138,11 +1181,13 @@ Option(KvKept) latest_kv(Cosigner c, Int e) {
     return latest_kv(c, e - 1);
 }
 
-// The kit's half b_v of the newest epoch the cosigner holds one for.
+// The kit's half b_v of the newest epoch the cosigner holds (promoted
+// re-shares only, epochfiles.resid), or the latest before it.
 @requires(filesystem)
-List(Int) kv_kit_half(Cosigner c) {
-    Str e = str_trim(filesystem.read_all(c.dir + "/pending.epoch"));
-    return kit_half_at(c, if (str_len(e) > 0) { str_parse_int(e) } else { 1 });
+pub List(Int) kv_kit_half(Cosigner c) {
+    Int e = held_epoch(c.dir);
+    List(Int) b = kit_half_at(c, if (e > 0) { e } else { 1 });
+    return b;
 }
 
 @requires(filesystem)
