@@ -216,3 +216,26 @@ test "two devices sign, the second one initiating" {
 test "an initiator outside the signers gives no context" {
     expect(session([[12, 201, 97, 213, 187, 45, 176, 173, 225, 34, 33, 242, 136, 32, 83, 104, 116, 216, 241, 101, 151, 3, 58, 6, 128, 109, 190, 241, 109, 170, 205, 19], [50, 193, 193, 90, 151, 15, 15, 97, 64, 114, 44, 3, 216, 218, 213, 216, 65, 78, 192, 235, 134, 75, 38, 20, 123, 65, 36, 8, 70, 62, 65, 149]], [212, 166, 176, 3, 55, 10, 159, 24, 111, 1, 17, 25, 196, 237, 97, 45, 141, 202, 178, 19, 33, 155, 159, 26, 226, 237, 208, 170, 46, 129, 215, 191])).toEqual("no context");
 }
+
+// A peer's signature share sigma_j = k_j m + r chi_j and its abort-2
+// openings (k_j and the Chi MtA plaintexts) together give its key share
+// to the designated party. Once a peer has sent sigma_j, an abort request
+// must get nothing from it.
+Int peer_opened(List(Party3) ps, Int d, Int i) {
+    if (i >= ps.len()) { return -1; }
+    if (ps[i].ctx.self == d) { return peer_opened(ps, d, i + 1); }
+    return match th_step(ps[i].st, [ThAbortReq(d)]) { Ok(s) => s.out.len(), Err(_) => 0 };
+}
+
+@requires(declassify)
+test "a peer that has sent its signature share opens nothing on an abort request" {
+    List(List(Int)) signers = [[12, 201, 97, 213, 187, 45, 176, 173, 225, 34, 33, 242, 136, 32, 83, 104, 116, 216, 241, 101, 151, 3, 58, 6, 128, 109, 190, 241, 109, 170, 205, 19], [50, 193, 193, 90, 151, 15, 15, 97, 64, 114, 44, 3, 216, 218, 213, 216, 65, 78, 192, 235, 134, 75, 38, 20, 123, 65, 36, 8, 70, 62, 65, 149]];
+    List(UInt(64)) tau = tweak_scalar(chain_code(), "login.example.com", [50, 185, 196, 129, 49, 116, 171, 111, 241, 56, 213, 180, 146, 122, 133, 182]);
+    List(Int) sid = [52, 55, 17, 188, 174, 75, 0, 133, 179, 81, 20, 211, 246, 165, 75, 136, 131, 169, 209, 57, 105, 90, 118, 144, 125, 235, 174, 79, 184, 57, 74, 90];
+    List(Party3) ps = start_all(signers, signers[0], tau, sid, 0, ListBuf());
+    expect(ps.len()).toEqual(2);
+    // Five rounds: the peer has sent its S point and sigma (ThPeerSent).
+    Round r = run(ps, starts_out(ps, 0, []), 5);
+    expect(r.fail).toEqual("");
+    expect(peer_opened(r.ps, cg_id_of(quorum(), signers[0], 0), 0)).toEqual(0);
+}

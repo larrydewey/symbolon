@@ -280,18 +280,20 @@ Result(ThStep, CgFail) th_r7(Ps6 s, BlR2 b, List(CgMsg) in) {
     };
 }
 
+// A failed S check ends the session unidentified. Abort 2 is not asked
+// for: the peers have already sent their signature shares, and a peer's
+// sigma_j with its abort-2 openings (k_j and its Chi MtA plaintexts) would
+// give the designated party chi_j and from it the peer's key share. CGGMP21
+// opens abort 2 only for a presignature that never signed. The failure
+// counts as unidentified (SPEC 6.2).
 Result(ThStep, CgFail) th_start_abort(Ps6 s, BlR2 b, CgFail e) {
-    if (e.culprits.len() > 0 || e.why != "the S shares do not add up to the public key") { return Err(e); }
-    PsAb2 a = bl_abort2(s, b.role)?;
-    return Ok(ThStep {.state = ThAwaitAbort(a, b), .out = [ThAbortReq(b.role.designated)]});
+    return Err(e);
 }
 
-// A peer that has sent its share answers the designated party's abort
-// request with its openings (to that party only), and is then done.
+// A peer that has sent its share is done. It answers no abort request,
+// for the reason above, whoever asks.
 Result(ThStep, CgFail) th_peer_after(Ps6 s, BlR2 b, List(ThMsg) in) {
-    if (!abort_asked(in, b.role.designated, 0)) { return Ok(ThStep {.state = ThClosed, .out = []}); }
-    PsAb2 a = bl_abort2(s, b.role)?;
-    return Ok(ThStep {.state = ThClosed, .out = wrap_cg(a.out, 0, ListBuf())});
+    return Ok(ThStep {.state = ThClosed, .out = []});
 }
 
 // The ECDSA signature r || s (64 bytes) of a finished session.
