@@ -43,10 +43,14 @@ class MainActivity : FlutterFragmentActivity() {
 
     override fun onCreate(savedInstanceState: android.os.Bundle?) {
         if (savedInstanceState == null) pendingPage = pageFor(intent)
-        super.onCreate(savedInstanceState)
         // The recent-apps screen keeps a picture of the app as it was left,
-        // taken before the app locks: Android 13+ shows a blank one instead.
-        // Screenshots inside the app still work.
+        // taken before the app locks (an open vault item, a password shown).
+        // Android 13+ shows a blank one instead, and screenshots inside the
+        // app still work. Before 13 that cannot be turned off alone, so the
+        // window is FLAG_SECURE there: no recents picture, and no
+        // screenshots or screen recording either.
+        if (Build.VERSION.SDK_INT < 33) window.addFlags(android.view.WindowManager.LayoutParams.FLAG_SECURE)
+        super.onCreate(savedInstanceState)
         if (Build.VERSION.SDK_INT >= 33) setRecentsScreenshotEnabled(false)
     }
 

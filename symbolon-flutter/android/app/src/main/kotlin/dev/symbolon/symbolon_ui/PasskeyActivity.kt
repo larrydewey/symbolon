@@ -38,6 +38,16 @@ class PasskeyActivity : FlutterFragmentActivity() {
 
     override fun getDartEntrypointFunctionName() = "passkeyMain"
 
+    // As the fill screen (AutofillActivity, SPEC 22.6 item 4): no
+    // screenshots or screen recording of the site, account and PIN, other
+    // apps' overlays hidden, and no touch taken while anything covers it.
+    override fun onCreate(savedInstanceState: android.os.Bundle?) {
+        window.addFlags(android.view.WindowManager.LayoutParams.FLAG_SECURE)
+        window.setHideOverlayWindows(true)   // API 31; this activity is 34+
+        super.onCreate(savedInstanceState)
+        window.decorView.filterTouchesWhenObscured = true
+    }
+
     override fun onResume() {
         super.onResume()
         KeystoreServer.inFront(this)
