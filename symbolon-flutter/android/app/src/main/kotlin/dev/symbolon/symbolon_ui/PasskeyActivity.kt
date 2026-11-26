@@ -110,10 +110,12 @@ class PasskeyActivity : FlutterFragmentActivity() {
             given = opt.clientDataHash
         }
         val (origin, browser) = originOf(info)
-        // A browser supplies the hash of its own client data; for an app,
-        // the client data is formed here.
+        // A privileged browser supplies the hash of its own client data (it
+        // names the page's origin in it). Any other caller's hash is ignored:
+        // an app could otherwise have a passkey sign client data claiming any
+        // site's origin. For an app, the client data is formed here.
         var clientData: String? = null
-        val hash = given ?: run {
+        val hash = (if (browser) given else null) ?: run {
             val cd = JSONObject()
                 .put("type", if (create) "webauthn.create" else "webauthn.get")
                 .put("challenge", JSONObject(json).getString("challenge"))
@@ -129,6 +131,9 @@ class PasskeyActivity : FlutterFragmentActivity() {
             "origin" to origin,
             "browser" to browser,
             "callingPackage" to info.packageName,
+            // The app's signing certificates (hex SHA-256), for its Digital
+            // Asset Links with the relying party (SPEC 22.6 item 3).
+            "callingCerts" to info.signingInfo.apkContentsSigners.map { c -> sha256(c.toByteArray()).joinToString("") { "%02x".format(it) } },
             "clientDataHash" to hash.joinToString("") { "%02x".format(it) },
             "clientDataJSON" to clientData,
             "rp" to intent.getStringExtra("rp"),

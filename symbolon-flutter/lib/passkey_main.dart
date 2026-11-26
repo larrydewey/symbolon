@@ -5,9 +5,11 @@
 // agent make or use the passkey with the cosigner.
 
 import 'package:material_ui/material_ui.dart';
+import 'dart:io';
 import 'package:flutter/services.dart';
 
 import 'brand.dart';
+import 'applinks.dart';
 import 'biometric.dart';
 import 'cli.dart';
 import 'main.dart' show loadSettings;
@@ -86,6 +88,15 @@ class _PasskeyPageState extends State<PasskeyPage> {
   void initState() {
     super.initState();
     problem = _check();
+    if (problem == null && origin.startsWith('android:')) {
+      // An app: only with the relying party's Digital Asset Links naming it.
+      final certs = [for (final c in (rq['callingCerts'] as List? ?? const [])) '$c'];
+      final links = AppLinks(File('${widget.settings.file.parent.path}/applinks.json'));
+      problem = 'Checking that $rpId lets ${rq['callingPackage']} use its passkeys…';
+      appMayUse(rpId, '${rq['callingPackage'] ?? ''}', certs, links.linked).then((ok) {
+        if (mounted) setState(() => problem = ok ? null : '$rpId does not let the app ${rq['callingPackage']} use its passkeys (its Digital Asset Links do not name the app).');
+      });
+    }
     Bio.state().then((b) {
       if (mounted) setState(() => bio = b);
     });
@@ -102,7 +113,7 @@ class _PasskeyPageState extends State<PasskeyPage> {
 
   String? _check() {
     if (rq.isEmpty) return 'The request could not be read.';
-    if (!originMayUse(origin, rpId)) return 'The page at $origin may not use passkeys of $rpId.';
+    if (!origin.startsWith('android:') && !originMayUse(origin, rpId)) return 'The page at $origin may not use passkeys of $rpId.';
     if (create) {
       final c = cr!;
       if (!c.es256) return '$rpId does not accept the kind of passkey Symbolon makes (ES256).';
@@ -122,7 +133,7 @@ class _PasskeyPageState extends State<PasskeyPage> {
   Future<void> cancel() => widget.channel.invokeMethod('cancel');
 
   Future<void> go() async {
-    if (pin.text.isEmpty || busy) return;
+    if (pin.text.isEmpty || busy || problem != null) return;
     setState(() {
       busy = true;
       error = null;

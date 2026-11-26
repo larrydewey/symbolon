@@ -41,7 +41,8 @@ void main() {
     expect(originMayUse('https://evilexample.com', 'example.com'), isFalse);
     expect(originMayUse('http://example.com', 'example.com'), isFalse);
     expect(originMayUse('http://localhost', 'localhost'), isTrue);
-    expect(originMayUse('android:apk-key-hash:abc', 'example.com'), isTrue);
+    // An app's identity alone is not enough: its Digital Asset Links decide (appMayUse).
+    expect(originMayUse('android:apk-key-hash:abc', 'example.com'), isFalse);
   });
 
   test('responses carry the agent output in base64url', () {
@@ -173,20 +174,38 @@ void main() {
       expect(cancelled, 1);
     });
 
-    testWidgets('signing in uses the chosen passkey with the client data hash and returns the user handle', (t) async {
+    testWidgets('an app the site does not name in its asset links gets no passkey', (t) async {
       settings.credentials = [const Credential('example.com', 'cc', '04dd', userName: 'alice', userHandle: '0707')];
       await show(t, {
         'kind': 'get',
         'origin': 'android:apk-key-hash:abc',
         'browser': false,
-        'callingPackage': 'com.example.app',
+        'callingPackage': 'com.evil.app',
+        'callingCerts': ['ab' * 32],
+        'clientDataHash': '11' * 32,
+        'requestJson': '{}',
+        'rp': 'example.com',
+        'cid': 'cc',
+      });
+      await settle(t);
+      expect(find.byKey(const Key('pk-problem')), findsOneWidget);
+      expect(find.byKey(const Key('pk-pin')), findsNothing);
+    });
+
+    testWidgets('signing in uses the chosen passkey with the client data hash and returns the user handle', (t) async {
+      settings.credentials = [const Credential('example.com', 'cc', '04dd', userName: 'alice', userHandle: '0707')];
+      await show(t, {
+        'kind': 'get',
+        'origin': 'https://example.com',
+        'browser': true,
+        'callingPackage': 'com.android.chrome',
         'clientDataHash': '11' * 32,
         'clientDataJSON': '{"type":"webauthn.get"}',
         'requestJson': '{}',
         'rp': 'example.com',
         'cid': 'cc',
       });
-      expect(find.text('the app com.example.app'), findsOneWidget);
+      expect(find.text('https://example.com'), findsOneWidget);
       await t.enterText(find.byKey(const Key('pk-pin')), '2468');
       await t.tap(find.byKey(const Key('pk-go')));
       await t.pump();
@@ -198,5 +217,13 @@ void main() {
       final args = (await t.runAsync(() => agent.argsLog.readAsString()))!;
       expect(args, contains('device webauthn assert ${agent.dir.path}/dev example.com cc ${'11' * 32} --uv'));
     });
+  });
+
+  test("an app uses a site's passkeys only when the site's asset links name it", () async {
+    Future<bool> linked(String host, String pkg, List<String> certs) async => host == 'bank.example' && pkg == 'com.bank' && certs.contains('ab');
+    expect(await appMayUse('bank.example', 'com.bank', ['ab'], linked), isTrue);
+    expect(await appMayUse('bank.example', 'com.evil', ['cd'], linked), isFalse);
+    expect(await appMayUse('other.example', 'com.bank', ['ab'], linked), isFalse);
+    expect(await appMayUse('bank.example', 'com.bank', [], linked), isFalse);
   });
 }

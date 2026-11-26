@@ -50,14 +50,23 @@ String hostOf(String origin) => Uri.tryParse(origin)?.host ?? '';
 
 /// Whether a page at [origin] may use passkeys of [rpId]: its host is the
 /// RP ID or under it, over HTTPS (or localhost). An app's origin
-/// (android:apk-key-hash:…) is left to the site, which checks it against
-/// its Digital Asset Links.
+/// (android:apk-key-hash:…) is never enough by itself: the RP's Digital
+/// Asset Links must list the app ([appMayUse]), or any installed app could
+/// sign in to any site with the person's passkey.
 bool originMayUse(String origin, String rpId) {
-  if (origin.startsWith('android:')) return true;
+  if (origin.startsWith('android:')) return false;
   final u = Uri.tryParse(origin);
   if (u == null) return false;
   if (u.scheme != 'https' && !(u.scheme == 'http' && u.host == 'localhost')) return false;
   return u.host == rpId || u.host.endsWith('.$rpId');
+}
+
+/// Whether the app [pkg], signed by one of [certs], may use passkeys of
+/// [rpId]: https://RPID/.well-known/assetlinks.json lists it with
+/// `delegate_permission/common.get_login_creds` ([linked] looks it up).
+Future<bool> appMayUse(String rpId, String pkg, List<String> certs, Future<bool> Function(String host, String pkg, List<String> certs) linked) async {
+  if (rpId.isEmpty || pkg.isEmpty || certs.isEmpty) return false;
+  return linked(rpId, pkg, certs);
 }
 
 /// The client data in a response: the app's own when it formed it, else a
