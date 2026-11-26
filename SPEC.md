@@ -822,7 +822,13 @@ element). Each signer adds its MtA output to its `χ` share, so the `χ`
 shares sum to `k(x + τ)`. The `S` points, whose sum is `P`, the signature
 shares, and the abort-2 openings (which would let a co-signer solve for
 `τG`) go to the designated party only, and only it checks `Σ S = P` and
-names a culprit. This is Symbolon's addition to CGGMP21, not part of the
+names a culprit. Because a co-signer cannot check `Σ S` itself, it sends
+only its `S` point first; the designated party checks the sum and sends
+each co-signer a verdict, and the co-signer answers it once: its signature
+share on "ok", its abort-2 openings on "abort", never both (its signature
+share next to its openings would give away its key share). A co-signer
+keeps the session's state in memory only, and never answers a second
+verdict for one presignature. This is Symbolon's addition to CGGMP21, not part of the
 paper; it needs its own review (C-01). Because the tweak
 is additive and unhardened, **a credential's private key, if ever
 assembled, together with `cc`, would reveal `x`.** Therefore:
