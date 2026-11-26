@@ -67,6 +67,30 @@ void main() {
     app.session.lock();
   });
 
+  testWidgets('under the duress PIN an added key shows in the list, which is asked for with the PIN', (t) async {
+    t.view.devicePixelRatio = 2;
+    t.view.physicalSize = const Size(460, 1000) * 2;
+    addTearDown(t.view.reset);
+    final app = App(settings);
+    await t.pumpWidget(MaterialApp(home: SecurityKeysPage(app: app)));
+    await settle(t);
+    await t.tap(find.byKey(const Key('key-add')));
+    await t.pumpAndSettle();
+    await t.enterText(find.byKey(const Key('key-name')), 'yubi');
+    await t.tap(find.byKey(const Key('key-name-ok')));
+    await t.pumpAndSettle();
+    await t.enterText(find.byKey(const Key('secret-field')), '1357');
+    await t.tap(find.byKey(const Key('secret-ok')));
+    await t.pump();
+    await settle(t);
+    // The agent acted the add; the list, asked with the same PIN, shows it.
+    expect(find.byKey(const Key('key-yubi')), findsOneWidget);
+    final args = (await t.runAsync(() => agent.argsLog.readAsString()))!;
+    expect(args, contains('device key list ${agent.dir.path}/dev --pin'));
+    expect(File('${agent.dir.path}/keys').existsSync(), isFalse);
+    app.session.lock();
+  });
+
   testWidgets('fills can be set to need a security key (SPEC 22.7), with the PIN', (t) async {
     t.view.devicePixelRatio = 2;
     t.view.physicalSize = const Size(460, 1000) * 2;

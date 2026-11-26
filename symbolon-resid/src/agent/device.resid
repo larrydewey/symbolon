@@ -871,15 +871,76 @@ pub Int device_pin(Str dir) {
     DeviceConfig c = oc else { with_identity(load_config(dir) else { DeviceConfig {.relay_host = "", .relay_port = 0, .ca = "", .witnesses = [], .unprotected = true, .argon_m_kib = 0, .argon_t = 0, .salt = [], .tpm_dk = 0, .tpm_unlock_a = 0, .tpm_unlock_b = 0, .party = [], .dk_pub = [], .hpke_pub = [], .log_id = [], .mbox_next = 0, .peers = []} }, []) };
     Str pin = read_pin();
     Str npin = read_pin();
+    Int r = device_pin_with(dir, c, pin, npin);
+    return r;
+}
+
+// `device pin` with the PINs read. Under the duress PIN (SPEC 14.2) the
+// change is acted, not made: the same checks, stretches, unlocks and
+// writes as a real change, and "PIN changed", but every file holds what
+// it held (the duress profile sealed again unchanged): see duress_pin_act.
+@requires(filesystem, device, declassify, provision, network, environment, clock)
+pub Int device_pin_with(Str dir, DeviceConfig c, Str pin, Str npin) {
     Int need = org_min_pin(dir);
     if (str_len(npin) < 4 || str_len(npin) < need) { return dfail(f"a PIN of at least {if (need > 4) { need } else { 4 }} characters"); }
     if (npin == pin) { return dfail("the new PIN is the PIN"); }
     Unlocked u = unlock_dir(dir, c, pin);
-    if (u.kind != 1) { return dfail("wrong PIN"); }
-    if (unlock_dir(dir, c, npin).kind == 2) { return dfail("the new PIN must differ from the duress PIN"); }
+    if (u.kind != 1 && u.kind != 2) { return dfail("wrong PIN"); }
+    // A new PIN that opens the duress profile is refused without naming
+    // it, so that whoever reads the screen does not learn that the other
+    // PIN exists. (Under the duress PIN the same unlock is made, and its
+    // answer is not used: refusing a new PIN that opens the real profile
+    // would tell the real PIN.)
+    Int nk = unlock_dir(dir, c, npin).kind;
+    if (u.kind == 1 && nk == 2) { return dfail("this PIN cannot be used; choose another"); }
     List(Secret(UInt(8))) st = stretch(c, pin_bytes(pin));
     List(Secret(UInt(8))) nst = stretch(c, pin_bytes(npin));
+    if (u.kind == 2) { Int d = duress_pin_act(dir, c, u, st, nst); return d; }
     return if (c.unprotected || on_keystore(c)) { reseal_real(dir, c, u, st, nst) } else { tpm_new_auth(dir, c, st, nst) };
+}
+
+// A PIN change under the duress PIN: the work of reseal_real (the old
+// unlock key, which file, a profile sealed under the new PIN's key and
+// checked, one profile file written) or of tpm_new_auth (two authValue
+// changes in the TPM, the configuration written), with nothing that
+// lasts. The duress profile's own blob is sealed again, the same
+// plaintext under its own key and a fresh IV, so the file changes as a
+// real change's does; when that does not check, its old bytes are written
+// back. Residual: the new PIN does not open the device afterwards, and in
+// TPM mode the configuration keeps its key handles (a real change moves
+// them).
+@requires(filesystem, device, declassify, provision, network, environment)
+Int duress_pin_act(Str dir, DeviceConfig c, Unlocked u, List(Secret(UInt(8))) st, List(Secret(UInt(8))) nst) {
+    if (!c.unprotected && !on_keystore(c)) {
+        _ = change_auth(c.tpm_unlock_b, srk_handle(), st, st);
+        _ = change_auth(c.tpm_unlock_b, srk_handle(), st, st);
+        if (!save_config(dir, c)) { return dfail("cannot store the configuration (the keys at the new handles are made)"); }
+        println("PIN changed");
+        return 0;
+    }
+    List(Secret(UInt(8))) k = unlock_key_for(c, st, false);
+    List(Int) a = read_blob(dir, "a", u.wrap);
+    List(Int) b = read_blob(dir, "b", u.wrap);
+    Bool in_a = unlock(k, a, []).kind == 2;
+    List(Int) old = if (in_a) { a } else { b };
+    List(Int) again = reseal_same(k, old);
+    _ = reseal_same(unlock_key_for(c, nst, false), old);
+    Bool ok = again.len() == old.len() && unlock(k, again, []).kind == 2;
+    if (!write_blob(dir, if (in_a) { "a" } else { "b" }, if (ok) { again } else { old }, u.wrap)) { return dfail("cannot write the profile"); }
+    println("PIN changed");
+    return 0;
+}
+
+// A profile blob (SPEC 9.2: iv || AES-256-GCM(key, iv, profile, aad))
+// sealed again under the same key and a fresh IV, its plaintext as it was;
+// [] when it does not open under `key`.
+@requires(declassify)
+List(Int) reseal_same(List(Secret(UInt(8))) key, List(Int) blob) {
+    if (blob.len() < 28 || key.len() != 32) { return []; }
+    List(Int) aad = utf8("symbolon v1 profile blob");
+    Option(List(Secret(UInt(8)))) p = aes_gcmg_decrypt(key, blob[0..12], blob[12..blob.len()], aad);
+    List(Int) iv = random_bytes(12);
+    return match p { None => [], Some(x) => iv.concat(reveal(aes_gcmg_seal(key, iv, x, aad))) };
 }
 
 // The organization's minimum PIN length the device last verified, or 0.

@@ -660,6 +660,9 @@ touched, besides the PIN, before a device opens its profiles
   and the duress profile behaves as in Section 9.2.
 - **Removal** needs the PIN and any enrolled key. Removing the last key
   unseals the profiles and returns the device to the PIN alone.
+- **Listing.** `device key list DIR` prints the names in `security-keys`;
+  with `--pin` (the PIN on standard input) it prints the list as that PIN
+  sees it, which differs only under the duress PIN (Section 14.2).
 - **Transport.** USB keys over CTAPHID, through Resid's isolated device
   host (`lib/dev/fido.resid`): the host writes only to a hidraw node whose
   report descriptor declares the FIDO usage page, and waits up to 45 s for
@@ -1070,6 +1073,40 @@ Unlocking with the duress PIN:
    signature or a re-share;
 3. otherwise behaves like a normal unlock, with identical timing,
    interface and network pattern.
+
+**Changes to the device, acted.** Under the duress PIN, adding or
+removing a security key (9.4) and changing the PIN (`device pin`) appear
+to succeed and print what a real change prints, but change nothing that
+lasts:
+
+- They make the same checks, PIN stretches, unlocks, touches of the key
+  and file writes as a real change. Every file is written with what it
+  held: `security-keys` with its own content, the profile files re-sealed
+  with their own plaintext (a fresh IV: the bytes change, as a real
+  change's do), the configuration unchanged. In TPM mode a PIN change asks
+  the TPM for two authValue changes of the duress unlock key to the same
+  value, whose results are dropped.
+- A key change acted under the duress PIN is remembered in
+  `security-keys.view`: the names added and the real names removed, padded
+  to 2048 bytes and sealed (AES-256-GCM) under
+  `HKDF(unlock_key_duress, "symbolon v1 duress key view")`, so the file is
+  always 2076 bytes. `key list --pin` under the duress PIN shows the real
+  list with those changes; under the real PIN the file does not open and
+  the real list is shown. A real add or remove writes the file too, with
+  random bytes of the same size (ending any acted view), so its presence,
+  size and time say nothing.
+- The real PIN is never told apart: a new PIN that opens the real
+  profile, chosen under the duress PIN, is "taken" like any other; under
+  the real PIN, a new PIN that opens the duress profile is refused with
+  "this PIN cannot be used; choose another", which does not name it.
+
+Residual risk: the new PIN of an acted change does not open the device
+afterwards; a key acted in is not asked for at the next unlock, and one
+acted away still is; `security-keys` (names, credential IDs) is readable
+without a PIN and lists the real keys; in TPM mode an acted PIN change
+leaves the key handles in the configuration where they were (a real one
+moves them); the app shows the duress list while it holds the PIN, and
+the file's list once it no longer does.
 
 ### 14.3 Containment
 

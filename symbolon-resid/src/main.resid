@@ -440,6 +440,7 @@ Int main_cmd() {
     if (a1 == "device" && a2 == "link-add" && n >= 5) { return link_add(args.get(3), args.get(4), flag_arg("--primes", 1, 5)); }
     if (a1 == "device" && a2 == "key" && args.get(3) == "add" && n == 6) { return key_add(args.get(4), args.get(5)); }
     if (a1 == "device" && a2 == "key" && args.get(3) == "list" && n == 5) { return key_list(args.get(4)); }
+    if (a1 == "device" && a2 == "key" && args.get(3) == "list" && n == 6 && args.get(5) == "--pin") { return key_list_pin(args.get(4)); }
     if (a1 == "device" && a2 == "key" && args.get(3) == "remove" && n == 6) { return key_remove(args.get(4), args.get(5)); }
     if (a1 == "device" && a2 == "key" && args.get(3) == "fills" && n == 6) { return key_fills(args.get(4), args.get(5)); }
     if (a1 == "browser" && a2 == "host") { return browser_host([args.get(3), args.get(4)]); }

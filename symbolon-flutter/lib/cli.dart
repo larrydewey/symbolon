@@ -444,8 +444,12 @@ class SymbolonCli {
 
   // ─── Security keys (SPEC 9.4) ───────────────────────────────────────
 
-  /// "NAME-HEX" per enrolled key (no PIN).
-  Future<CliResult> keyList(String dir) => run(['device', 'key', 'list', dir], timeout: const Duration(minutes: 1));
+  /// "NAME-HEX" per enrolled key. With [pin], the list as that PIN sees
+  /// it: under the duress PIN, with the changes made under it (which are
+  /// acted, never made: SPEC 14.2); without, the device's key file.
+  Future<CliResult> keyList(String dir, {String? pin}) => pin == null
+      ? run(['device', 'key', 'list', dir], timeout: const Duration(minutes: 1))
+      : run(['device', 'key', 'list', dir, '--pin'], input: [pin], timeout: const Duration(minutes: 2));
 
   /// Enrolls the present key (two touches).
   Future<CliResult> keyAdd(String dir, String name, String pin) => run(['device', 'key', 'add', dir, name], input: [pin], timeout: const Duration(minutes: 3));

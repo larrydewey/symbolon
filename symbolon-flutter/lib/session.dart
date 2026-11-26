@@ -19,6 +19,9 @@ class PinSession extends ChangeNotifier {
 
   bool get unlocked => _pin != null;
 
+  /// The PIN held now, without asking; null when none is.
+  String? get held => _pin;
+
   void _arm() {
     _timer?.cancel();
     if (keepMinutes == 0) {

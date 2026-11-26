@@ -27,8 +27,11 @@ class _SecurityKeysPageState extends State<SecurityKeysPage> {
     load();
   }
 
-  Future<void> load() async {
-    final r = await app.cli.keyList(app.dir);
+  // With the PIN the session holds (or the one an add or remove just used),
+  // so that the list is the one that PIN sees (under the duress PIN, its
+  // acted changes: SPEC 14.2).
+  Future<void> load({String? pin}) async {
+    final r = await app.cli.keyList(app.dir, pin: pin ?? app.session.held);
     final policy = File('${app.dir}/fill-policy');
     final need = await policy.exists() && (await policy.readAsString()).startsWith('keys');
     if (!mounted) return;
@@ -66,13 +69,17 @@ class _SecurityKeysPageState extends State<SecurityKeysPage> {
     final n = await askName();
     if (n == null || n.isEmpty || !mounted) return;
     if (names?.contains(n) ?? false) return toast(context, 'A key named $n is already enrolled');
-    final r = await app.withPin(context, (p) => runTask(context, 'Adding $n', () => app.cli.keyAdd(app.dir, n, p),
-        detail: 'Plug the key in and touch it when it blinks: twice${(names?.isNotEmpty ?? false) ? ', after a key you already enrolled' : ''}.', usually: 'under a minute'));
+    String? used;
+    final r = await app.withPin(context, (p) {
+      used = p;
+      return runTask(context, 'Adding $n', () => app.cli.keyAdd(app.dir, n, p),
+          detail: 'Plug the key in and touch it when it blinks: twice${(names?.isNotEmpty ?? false) ? ', after a key you already enrolled' : ''}.', usually: 'under a minute');
+    });
     if (r == null || !mounted) return;
     if (!r.ok) return toast(context, friendlyError(r));
     app.session.lock();      // the next action asks again, with the key
     toast(context, '$n added. From now on this device opens only with an enrolled key present.');
-    await load();
+    await load(pin: used);
   }
 
   Future<void> remove(String n) async {
@@ -89,10 +96,14 @@ class _SecurityKeysPageState extends State<SecurityKeysPage> {
       ),
     );
     if (ok != true || !mounted) return;
-    final r = await app.withPin(context, (p) => runTask(context, 'Removing $n', () => app.cli.keyRemove(app.dir, n, p), detail: 'Touch any enrolled key.', usually: 'a few seconds'));
+    String? used;
+    final r = await app.withPin(context, (p) {
+      used = p;
+      return runTask(context, 'Removing $n', () => app.cli.keyRemove(app.dir, n, p), detail: 'Touch any enrolled key.', usually: 'a few seconds');
+    });
     if (r == null || !mounted) return;
     if (!r.ok) return toast(context, friendlyError(r));
-    await load();
+    await load(pin: used);
   }
 
   @override
