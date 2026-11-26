@@ -320,13 +320,13 @@ Int notices(OrgCtx o, List(Str) names, Int i) {
         None => 0,
         Some(q) => match escrow_of(blob_get(o.x.ep, escrow_blob(q.org_id, hex_encode(q.coll_id))) else { [] }) {
             None => 0,
-            Some(e) => if (bytes_eq(e.owner, o.x.c.log_id)) { notice(q, o.st.gov.recovery.delay_sec) } else { 0 }
+            Some(e) => if (bytes_eq(e.owner, o.x.c.log_id)) { notice(q, recovery_opens(q.time, match request_received(o, hex_encode(q.coll_id)) { Ok(t) => t, Err(_) => 0 }, o.st.gov.recovery.delay_sec)) } else { 0 }
         }
     };
     return notices(o, names, i + 1);
 }
 
-Int notice(OrgRecoveryRequest q, Int delay) { println("recovery-request " + hex_encode(q.coll_id) + " " + hex_encode(q.requester) + f" {q.time + delay}"); return 0; }
+Int notice(OrgRecoveryRequest q, Int opens) { println("recovery-request " + hex_encode(q.coll_id) + " " + hex_encode(q.requester) + f" {opens}"); return 0; }
 
 @requires(filesystem, network, clock(readonly), declassify)
 pub Int org_members(Str dir) { return done(members(dir)); }
@@ -1014,6 +1014,20 @@ Result(OrgRecoveryRequest, Str) verified_request(OrgCtx o, Str cid) {
     return Ok(q);
 }
 
+// When the relay took the request: its receipt ("recat-", written once by
+// the relay, which refuses a request whose own time is not its clock's).
+// The request's time is the requester's word; the delay runs from the
+// later of the two, so a requester cannot date a request back.
+@requires(network, clock(readonly), declassify)
+Result(Int, Str) request_received(OrgCtx o, Str cid) {
+    List(Int) qb = blob_get(o.x.ep, recreq_blob(o.st.org.org_id, cid)) else { [] };
+    Option(List(Int)) rb = blob_get(o.x.ep, recat_blob(o.st.org.org_id, cid, qb));
+    List(Int) b = rb else { [] };
+    Str t = str_trim(http_text(b, 0, b.len()));
+    Int got = str_parse_int(t);
+    return if (qb.len() > 0 && str_len(t) > 0 && got > 0) { Ok(got) } else { Err("the relay has no record of when it took the request") };
+}
+
 // A wrapped secret for this device: id `id`, version `v`, wrapped by `from`.
 @requires(network, clock(readonly), declassify)
 Result(List(Secret(UInt(8))), Str) unwrapped(Ctx x, List(Int) id, UInt(64) v, List(Int) from) {
@@ -1030,8 +1044,10 @@ Result(Int, Str) rec_approve(Str dir, Str cid) {
     Int me = rec_admin_only(o)?;
     OrgRecovery rec = o.st.gov.recovery;
     OrgRecoveryRequest q = verified_request(o, cid)?;
+    Int got = request_received(o, cid)?;
+    Int opens = recovery_opens(q.time, got, rec.delay_sec);
     Int now = witness_now(o.x.vh.head.policy.witnesses, o.x.c.ca, random_bytes(32));
-    if (now < q.time + rec.delay_sec) { return Err(f"the request opens at {q.time + rec.delay_sec} (witness time now {now})"); }
+    if (now < opens) { return Err(f"the request opens at {opens} (witness time now {now})"); }
     List(Secret(UInt(8))) share = unwrapped(o.x, rec_share_id(o.st.org.org_id, rec.since, me), rec.since, rec.owner)?;
     Str m = put_wraps(o.x, rec_part_id(q.coll_id, o.x.c.log_id, q.time), (UInt(64))q.time, share, [q.requester], 0);
     if (str_len(m) > 0) { return Err(m); }
@@ -1250,8 +1266,13 @@ Result(Int, Str) console_key(Str dir, Str code) {
     Int ok = admin_only(o)?;
     HttpOut r = http_call_ep(o.x.ep, "GET", "/console/" + hex_encode(o.st.org.org_id) + "/pending", []);
     if (r.status != 200) { return Err(f"the relay's console did not answer ({r.status})"); }
-    List(Str) p = pending_with(str_split(http_text(r.body, 0, r.body.len()), "\n"), code, 0);
-    if (p.len() != 4) { return Err("no passkey with this code is waiting at the console"); }
+    List(List(Str)) ps = pending_matching(str_split(http_text(r.body, 0, r.body.len()), "\n"), code, 0, ListBuf());
+    if (ps.len() == 0) { return Err("no passkey with this code is waiting at the console"); }
+    if (ps.len() > 1) { return Err("more than one passkey has this code: have them register again"); }
+    List(Str) p = ps[0];
+    // The person at the console sees the same fingerprint for the passkey
+    // they registered; the code alone names the credential, not its key.
+    println("passkey " + key_fingerprint(cose_hex_decode(p[2])));
     OrgConsoleKey k0 = OrgConsoleKey {.org_id = o.st.org.org_id, .cred_id = cose_hex_decode(p[1]), .public_key = cose_hex_decode(p[2]), .rp_id = p[3], .log_id = o.x.c.log_id,
                                       .log_sequence = o.x.vh.head.sequence, .signer = o.x.c.party, .sig = []};
     List(Int) sig = dk_sign(o.x.c, o.x.u.real, o.x.u.st, conkey_tbs(k0))?;
@@ -1259,12 +1280,6 @@ Result(Int, Str) console_key(Str dir, Str code) {
     _ = audit(dir, o.x, k0.org_id, "member", hex_encode(sha256_bytes(k0.cred_id)[0..16]), "console passkey approved");
     println("approved " + code);
     return Ok(0);
-}
-
-List(Str) pending_with(List(Str) lines, Str code, Int i) {
-    if (i >= lines.len()) { return []; }
-    List(Str) p = str_split(lines[i], " ");
-    return if (p.len() == 4 && p[0] == code) { p } else { pending_with(lines, code, i + 1) };
 }
 
 @requires(filesystem, network, clock(readonly), declassify)
@@ -1294,7 +1309,7 @@ Result(Int, Str) approve(Str dir, Str id) {
     HttpOut r = http_call_ep(o.x.ep, "GET", "/console/" + org + "/changes", []);
     if (r.status != 200) { return Err(f"the relay's console did not answer ({r.status})"); }
     List(Str) p = change_with(str_split(http_text(r.body, 0, r.body.len()), "\n"), id, 0);
-    if (p.len() != 8) { return Err("no such change"); }
+    if (p.len() != 8 && p.len() != 9) { return Err("no such change"); }
     if (p[6] != "pending") { return Err("the change is " + p[6]); }
     println("change " + p[1] + " " + unhex_s(p[2]) + " " + unhex_s(p[3]) + " " + unhex_s(p[4]) + " queued by " + str_slice(p[5], 0, 12));
     Result(Str, Str) res = run_change(dir, o, p[1], unhex_s(p[2]), unhex_s(p[3]), unhex_s(p[4]));
@@ -1309,7 +1324,7 @@ Int say_ok(Str t) { println(t); return 0; }
 List(Str) change_with(List(Str) lines, Str id, Int i) {
     if (i >= lines.len()) { return []; }
     List(Str) p = str_split(lines[i], " ");
-    return if (p.len() == 8 && p[0] == id) { p } else { change_with(lines, id, i + 1) };
+    return if ((p.len() == 8 || p.len() == 9) && p[0] == id) { p } else { change_with(lines, id, i + 1) };
 }
 
 @requires(filesystem, network, device, declassify, clock, provision, environment)
