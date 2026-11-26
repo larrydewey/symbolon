@@ -180,37 +180,72 @@ Bool cache_from(Str cd, List(List(Int)) rs, Int i) {
 // a log only grows, and every event, kept or new, is verified again here,
 // so the copy saves round trips, not checks. A relay that serves fewer
 // events than the copy holds cannot roll the log back. If the copy and the
-// relay's events do not verify together, the whole log is fetched again.
+// relay's events do not verify together, the whole log is fetched again,
+// and taken only if it holds every kept event, unchanged, at its sequence,
+// and verifies (SPEC 8.4): a shorter log or one that differs from the copy
+// is a fork or a rollback, refused, never a reason to forget what was seen.
 @requires(filesystem, network, clock(readonly), declassify)
 pub Result(VerifiedHead, SymbolonError) verified_log_dir(Str dir, Endpoint relay, List(Int) l) {
+    Result(LogView, SymbolonError) r = log_view_dir(dir, relay, l, "");
+    return match r { Ok(v) => Ok(v.vh), Err(e) => Err(e) };
+}
+
+// A verified head with the events it was verified from (one fetch: the
+// events are those the head describes).
+pub type LogView = { VerifiedHead vh; List(SignedEvent) events; };
+
+// As verified_log_dir, with the events; the witnesses reached at `here`
+// when it is set (verified_log_at).
+@requires(filesystem, network, clock(readonly), declassify)
+pub Result(LogView, SymbolonError) log_view_dir(Str dir, Endpoint relay, List(Int) l, Str here) {
     Str cd = dir + "/logcache/" + hex_encode(l);
     List(List(Int)) kept = cached_raw(cd, 0, []);
     // The witnesses the kept log names are asked while the rest of the log
     // is fetched; their answer is used only if the log still names them.
     List(WitnessRef) ws0 = policy_of_e0(events_of_raw(kept, 0, [])).witnesses;
+    List(WitnessRef) ask0 = witnesses_at(ws0, here);
     List(Int) nonce = random_bytes(32);
-    Result(Int, RegionError) early = spawn (network, clock(readonly), declassify) { return if (ws0.len() == 0) { 0 } else { witness_now(ws0, relay.ca, nonce) }; };
+    Result(Int, RegionError) early = spawn (network, clock(readonly), declassify) { return if (ask0.len() == 0) { 0 } else { witness_now(ask0, relay.ca, nonce) }; };
     Fetched got = fetch_raw(relay, l, (UInt(64))kept.len(), kept);
     List(List(Int)) all = got.evs;
     Int now0 = match early { Ok(t) => t, Err(_) => 0 };
     // The kept copy alone proves nothing current: unless the relay said
     // where the log ends, it is as if the log could not be fetched.
     if (!got.ended) { return Err(ErrInvalidLog("no log at the relay")); }
-    Result(VerifiedHead, SymbolonError) r = verified_events_now(l, events_of_raw(all, 0, []), relay.ca, ws0, now0);
+    List(SignedEvent) es = events_of_raw(all, 0, []);
+    Result(VerifiedHead, SymbolonError) r = verified_events_now(l, es, relay.ca, ws0, now0, here);
     if (match r { Ok(_) => true, Err(_) => false }) {
         _ = filesystem.create_dir(dir + "/logcache");
         _ = filesystem.create_dir(cd);
         _ = cache_from(cd, all, kept.len());
-        return r;
+        return view_of(r, es);
     }
-    if (kept.len() == 0) { return r; }
+    if (kept.len() == 0) { return view_of(r, es); }
     Fetched fr = fetch_raw(relay, l, (UInt(64))0, []);
     List(List(Int)) fresh = fr.evs;
     if (!fr.ended) { return Err(ErrInvalidLog("no log at the relay")); }
-    Result(VerifiedHead, SymbolonError) r2 = verified_events(l, events_of_raw(fresh, 0, []), relay.ca, "");
+    if (!extends_kept(kept, fresh, 0)) { return Err(ErrInvalidLog("the relay's log does not extend the events already verified: a fork or a rollback (SPEC 8.4)")); }
+    List(SignedEvent) fes = events_of_raw(fresh, 0, []);
+    Result(VerifiedHead, SymbolonError) r2 = verified_events(l, fes, relay.ca, here);
     if (match r2 { Ok(_) => true, Err(_) => false }) { _ = cache_from(cd, fresh, 0); }
-    return r2;
+    return view_of(r2, fes);
 }
+
+Result(LogView, SymbolonError) view_of(Result(VerifiedHead, SymbolonError) r, List(SignedEvent) es) {
+    return match r { Ok(vh) => Ok(LogView {.vh = vh, .events = es}), Err(e) => Err(e) };
+}
+
+// Whether `fresh` holds every event of `kept`, the same signed bytes at the
+// same sequence (their signatures and co-signatures may differ).
+pub Bool extends_kept(List(List(Int)) kept, List(List(Int)) fresh, Int i) {
+    if (i >= kept.len()) { return true; }
+    if (i >= fresh.len()) { return false; }
+    List(Int) a = encoded_of(kept[i]);
+    List(Int) b = encoded_of(fresh[i]);
+    return a.len() > 0 && bytes_eq(a, b) && extends_kept(kept, fresh, i + 1);
+}
+
+List(Int) encoded_of(List(Int) raw) { return match event_of_cbor(raw) { Some(se) => se.encoded, None => [] }; }
 
 // The median witness time of the last event: the `now` a freshly fetched
 // log is verified at.
@@ -251,13 +286,13 @@ Bool same_witnesses(List(WitnessRef) a, List(WitnessRef) b, Int i) {
 // witnesses `ws0`: used when the log's policy still names exactly those
 // witnesses and they answered, else the witnesses are asked now.
 @requires(network, clock(readonly), declassify)
-Result(VerifiedHead, SymbolonError) verified_events_now(List(Int) l, List(SignedEvent) es, Str ca, List(WitnessRef) ws0, Int now0) {
+Result(VerifiedHead, SymbolonError) verified_events_now(List(Int) l, List(SignedEvent) es, Str ca, List(WitnessRef) ws0, Int now0, Str here) {
     if (es.len() == 0) { return Err(ErrInvalidLog("no log at the relay")); }
     Int t = last_time(es, policy_of_e0(es));
     Result(VerifiedHead, SymbolonError) v0 = il_verify(l, es, t, lambda(p) { false });
     return match v0 {
         Err(e) => Err(e),
-        Ok(vh) => il_verify(l, es, at_least(if (now0 > 0 && same_witnesses(vh.head.policy.witnesses, ws0, 0)) { now0 } else { witness_now(vh.head.policy.witnesses, ca, random_bytes(32)) }, t), lambda(p) { false })
+        Ok(vh) => il_verify(l, es, at_least(if (now0 > 0 && same_witnesses(vh.head.policy.witnesses, ws0, 0)) { now0 } else { witness_now(witnesses_at(vh.head.policy.witnesses, here), ca, random_bytes(32)) }, t), lambda(p) { false })
     };
 }
 

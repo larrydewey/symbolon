@@ -482,7 +482,12 @@ verifies the whole log, kept and new events alike, as above: the copy
 saves round trips, never checks. A relay that serves fewer events than the
 copy holds cannot roll the log back. If the kept and new events do not
 verify together, the agent fetches the whole log again and keeps that copy
-only if it verifies. While the rest of the log is fetched, the agent asks
+only if it holds every kept event, the same signed bytes at the same
+sequence, and verifies; a log that is shorter than the copy or differs
+from it is a fork or a rollback and is refused. The cosigner acts on a log
+(a kit release, a signature, a re-share, a duress beacon or end) only when
+its head is not below the highest head it has recorded. While the rest of
+the log is fetched, the agent asks
 the witnesses that the kept log names for the current witness time, all at
 once. It uses their answer only if the verified log still names exactly
 those witnesses; otherwise it asks the log's witnesses again.
@@ -2019,8 +2024,7 @@ whose digest is the log id, signed by every party of its quorum. So only
 the holders of a log's keys can take its next sequence, and a device's
 veto of a pending recovery is co-signable until the delay has run by the
 witness's clock. The relay likewise stores an event only as the verified
-next event of the log it holds.
-Agents and the cosigner MUST require a
+next event of the log it holds. Agents and the cosigner MUST require a
 majority of the policy's witnesses on `recover`, delayed and `reshare`
 events and on heads they release material against, and SHOULD require
 them on all heads. A policy MUST name at least three witnesses run by
