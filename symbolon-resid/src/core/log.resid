@@ -170,11 +170,17 @@ Bool policy_ok(Policy p, Quorum q) {
     if (p.recovery_delay_sec < 86400) { return false; }
     if (witness_keys_distinct(p.witnesses, 0) < 3) { return false; }
     if ((Int)p.guardian_threshold > p.guardians.len()) { return false; }
+    // Field 8 (SPEC 20.3): at most one sequencing relay, with a valid key.
+    if (p.sequencer.len() > 1) { return false; }
+    if (p.sequencer.len() == 1 && (!key_ok(p.sequencer[0].key) || str_len(p.sequencer[0].url) > 260)) { return false; }
     return true;
 }
 
-// SPEC 8.2: a policy that shortens the delay or thins guardians or witnesses.
+// SPEC 8.2: a policy that shortens the delay or thins guardians or
+// witnesses, or drops the sequencing relay (SPEC 20.3: without one, any
+// single key holder can freeze the log again).
 Bool weakens(Policy old, Policy new) {
+    if (old.sequencer.len() > 0 && new.sequencer.len() == 0) { return true; }
     if (new.recovery_delay_sec < old.recovery_delay_sec) { return true; }
     if (new.guardians.len() < old.guardians.len()) { return true; }
     if (new.guardian_threshold < old.guardian_threshold) { return true; }
@@ -246,6 +252,54 @@ Bool signed_by_any(List(EventSig) sigs, List(Party) ps, List(Int) msg, Int i) {
 // ============================================================================
 // Witness co-signatures and witness time (SPEC 8.3, A-07)
 // ============================================================================
+
+// ============================================================================
+// The sequencing relay's claim (SPEC 20.3, R2W-2)
+// ============================================================================
+
+// What the relay named in policy[8] signs when it reserves sequence `n` of
+// log `l` for the event whose digest is `d`, at its time `t`: once per
+// (l, n), never for a second digest. `name` is the relay's name as the
+// policy records it.
+pub List(Int) claim_message(Str name, List(Int) l, Int n, List(Int) d, Int t) {
+    List(Int) m = cbe_uint(t, cbe_bytes(d, cbe_uint(n, cbe_bytes(l, cbe_text(name, cbe_text("symbolon v1 relay claim", cbe_array(6, [])))))));
+    return m;
+}
+
+// A relay's claim: its time and r || s over claim_message.
+pub type RelayClaim = { Int time; List(Int) sig; };
+
+// CBOR [time, r || s].
+pub List(Int) claim_cbor(RelayClaim c) {
+    List(Int) b = cbe_bytes(c.sig, cbe_uint(c.time, cbe_array(2, [])));
+    return b;
+}
+
+// The relay's record of its claim: CBOR [bstr event, [time, r || s]].
+pub List(Int) claim_record_cbor(List(Int) event, RelayClaim c) {
+    List(Int) b = cbe_bytes(event, cbe_array(2, [])).concat(claim_cbor(c));
+    return b;
+}
+
+// Whether `c` is the claim of the sequencer `sq` (policy[8]) on (l, n, d).
+pub Bool claim_ok(WitnessRef sq, List(Int) l, Int n, List(Int) d, RelayClaim c) {
+    if (c.sig.len() != 64 || c.time < 0) { return false; }
+    Bool ok = sig_ok(sq.key, claim_message(sq.url, l, n, d, c.time), c.sig);
+    return ok;
+}
+
+// Why a witness may not co-sign event `n` (digest `d`) of log `l` whose
+// policy before it names the sequencers `sqs` (none or one), with the
+// claim `c` the request carried; "" when it may. A log whose policy names
+// no sequencer (one made before policy[8]) needs no claim; at sequence 0
+// none is needed either, as E0's digest is the log id.
+pub Str claim_problem(List(WitnessRef) sqs, List(Int) l, Int n, List(Int) d, Option(RelayClaim) c) {
+    if (sqs.len() == 0 || n == 0) { return ""; }
+    return match c {
+        None => "no claim from the log's relay for this sequence (SPEC 20.3)",
+        Some(x) => if (claim_ok(sqs[0], l, n, d, x)) { "" } else { "the relay claim is not the log's relay's claim on this event (SPEC 20.3)" }
+    };
+}
 
 pub List(Int) witness_message(List(Int) l, UInt(64) seq, List(Int) d) {
     List(Int) a = cbe_array(4, []);
@@ -817,15 +871,40 @@ pub Result(VerifiedHead, SymbolonError) il_verify(List(Int) l, List(SignedEvent)
 // by every agent ("witness time went backwards") while the witness holds
 // the sequence (R2W-3).
 pub Result(Int, SymbolonError) il_check_next(List(Int) l, List(SignedEvent) before, SignedEvent e, Int now, Bool closure(EventPayload) approvals_ok) {
+    NextOk n = il_next(l, before, e, now, approvals_ok)?;
+    return Ok(n.time);
+}
+
+// il_check_next's answer with the sequencing relay (policy[8]) whose claim
+// the event needs (SPEC 20.3): the one the policy names after event n-1,
+// as the log stands at that event's own witness time (so every witness
+// and the relay read the same one, whatever their clocks; a delayed change
+// of relay applies from the event after the first one witnessed once its
+// delay has run). None at sequence 0. `witnesses`: those whose
+// co-signatures the event needs (the same policy's).
+pub type NextOk = { Int time; List(WitnessRef) sequencer; List(WitnessRef) witnesses; };
+
+pub Result(NextOk, SymbolonError) il_next(List(Int) l, List(SignedEvent) before, SignedEvent e, Int now, Bool closure(EventPayload) approvals_ok) {
     if (before.len() == 0) {
         LogState s = start_at(e, l, true, now)?;
-        return Ok(now);
+        return Ok(NextOk {.time = now, .sequencer = [], .witnesses = []});
     }
     LogState s0 = start(before[0], l)?;
     LogState s1 = run(s0, before, l, approvals_ok, 1)?;
     Int t = if (now > s1.last_time) { now } else { s1.last_time };
     LogState s2 = step_at(s1, e, l, t, approvals_ok)?;
-    return Ok(t);
+    return Ok(NextOk {.time = t, .sequencer = s1.policy.sequencer, .witnesses = s1.policy.witnesses});
+}
+
+// The sequencing relay named by the policy of the verified log `before`
+// (as il_next reads it for the event after it); [] when it names none or
+// does not verify.
+pub List(WitnessRef) il_sequencer(List(Int) l, List(SignedEvent) before) {
+    if (before.len() == 0) { return []; }
+    return match start(before[0], l) {
+        Err(_) => [],
+        Ok(a) => match run(a, before, l, lambda(x) { false }, 1) { Err(_) => [], Ok(s1) => s1.policy.sequencer }
+    };
 }
 
 // The parties proposed and not yet re-shared in, as il_verify's state holds

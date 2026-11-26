@@ -37,7 +37,7 @@ Policy policy(UInt(64) delay) {
     return Policy {
         .device_sigs_for_authority = 2, .recovery_delay_sec = delay, .guardians = [],
         .guardian_threshold = 0, .witnesses = [WitnessRef {.url = "w1", .key = pubk(7)}, WitnessRef {.url = "w2", .key = pubk(8)}, WitnessRef {.url = "w3", .key = pubk(11)}],
-        .duress_window_sec = 3600, .cosigner_policy = NoCosignerPolicy };
+        .duress_window_sec = 3600, .sequencer = [], .cosigner_policy = NoCosignerPolicy };
 }
 
 List(Int) enc(Int tag) { return [tag, 1, 2, 3, 4, 5, 6, 7]; }
@@ -237,7 +237,7 @@ Policy two_witness_policy() {
         .device_sigs_for_authority = p.device_sigs_for_authority, .recovery_delay_sec = p.recovery_delay_sec,
         .guardians = [], .guardian_threshold = 0,
         .witnesses = [WitnessRef {.url = "w1", .key = pubk(7)}, WitnessRef {.url = "w2", .key = pubk(8)}],
-        .duress_window_sec = 3600, .cosigner_policy = NoCosignerPolicy };
+        .duress_window_sec = 3600, .sequencer = [], .cosigner_policy = NoCosignerPolicy };
 }
 
 test "a policy naming fewer than three witnesses is refused (SPEC 20.3)" {
@@ -543,4 +543,79 @@ test "a party-key event encodes as [11, party-id, COSE_Key] and decodes back" {
     List(Int) b = payload_cbor(p) else { [] };
     expect(b.len() > 0).toBeTrue();
     expect(is_key_body(payload_decode(b), id32(2), pubk(20))).toBeTrue();
+}
+
+// ─── The sequencing relay, policy field 8 (SPEC 20.3, R2W-2) ────
+
+Policy policy_seq(List(WitnessRef) sq) {
+    Policy p = policy(86400);
+    return Policy {.device_sigs_for_authority = p.device_sigs_for_authority, .recovery_delay_sec = p.recovery_delay_sec, .guardians = p.guardians,
+                   .guardian_threshold = p.guardian_threshold, .witnesses = p.witnesses, .duress_window_sec = p.duress_window_sec,
+                   .sequencer = sq, .cosigner_policy = p.cosigner_policy};
+}
+
+Int sequencers_of(Result(VerifiedHead, SymbolonError) r) { return match r { Ok(v) => v.head.policy.sequencer.len(), Err(_) => -1 }; }
+
+Int next_sequencers(Result(NextOk, SymbolonError) r) { return match r { Ok(n) => n.sequencer.len(), Err(_) => -1 }; }
+
+test "a policy names at most one sequencing relay, and dropping it is a weakening" {
+    List(Int) l = log_id();
+    List(WitnessRef) one = [WitnessRef {.url = "relay:1", .key = pubk(30)}];
+    SignedEvent add = next(1, 1, enc(0), SetPolicyBody(policy_seq(one)), [2, 3], 2000);
+    Result(VerifiedHead, SymbolonError) r = il_verify(l, [e0([2, 3]), add], 2000, lambda(x) { false });
+    expect(pending_n(r)).toEqual(0);
+    expect(sequencers_of(r)).toEqual(1);
+    // Two relays, or one whose key is not a point: refused.
+    SignedEvent two = next(1, 1, enc(0), SetPolicyBody(policy_seq(one.concat([WitnessRef {.url = "relay:2", .key = pubk(31)}]))), [2, 3], 2000);
+    expect(ok(il_verify(l, [e0([2, 3]), two], 2000, lambda(x) { false }))).toBeFalse();
+    SignedEvent badkey = next(1, 1, enc(0), SetPolicyBody(policy_seq([WitnessRef {.url = "relay:1", .key = [4, 1, 2]}])), [2, 3], 2000);
+    expect(ok(il_verify(l, [e0([2, 3]), badkey], 2000, lambda(x) { false }))).toBeFalse();
+    // Dropping the relay is delayed even with two signatures.
+    SignedEvent drop = next(2, 2, enc(1), SetPolicyBody(policy(86400)), [2, 3], 3000);
+    Result(VerifiedHead, SymbolonError) d = il_verify(l, [e0([2, 3]), add, drop], 3000, lambda(x) { false });
+    expect(pending_n(d)).toEqual(1);
+    expect(sequencers_of(d)).toEqual(1);
+    // The relay whose claim the next event needs: none after E0 (whose
+    // policy names none), the one named once the set-policy is in force.
+    SignedEvent rot = next(3, 2, enc(1), RotateRecoveryBody, [2, 3], 0);
+    expect(next_sequencers(il_next(l, [e0([2, 3])], bare(next(1, 1, enc(0), RotateRecoveryBody, [2, 3], 0)), 2000, lambda(x) { false }))).toEqual(0);
+    expect(next_sequencers(il_next(l, [e0([2, 3]), add], bare(rot), 3000, lambda(x) { false }))).toEqual(1);
+}
+
+test "a claim is the named relay's signature on exactly (log, sequence, digest)" {
+    List(Int) l = log_id();
+    WitnessRef sq = WitnessRef {.url = "relay:1", .key = pubk(30)};
+    List(Int) d = id32(5);
+    RelayClaim c = RelayClaim {.time = 1000, .sig = sign(30, claim_message("relay:1", l, 3, d, 1000))};
+    expect(claim_problem([sq], l, 3, d, Some(c))).toEqual("");
+    expect(str_len(claim_problem([sq], l, 3, d, None)) > 0).toBeTrue();
+    expect(str_len(claim_problem([sq], l, 3, id32(6), Some(c))) > 0).toBeTrue();
+    expect(str_len(claim_problem([sq], l, 4, d, Some(c))) > 0).toBeTrue();
+    expect(str_len(claim_problem([sq], id32(1), 3, d, Some(c))) > 0).toBeTrue();
+    expect(str_len(claim_problem([WitnessRef {.url = "relay:1", .key = pubk(31)}], l, 3, d, Some(c))) > 0).toBeTrue();
+    expect(str_len(claim_problem([sq], l, 3, d, Some(RelayClaim {.time = 1001, .sig = c.sig}))) > 0).toBeTrue();
+    // No relay named, or E0: no claim needed.
+    expect(claim_problem([], l, 3, d, None)).toEqual("");
+    expect(claim_problem([sq], l, 0, d, None)).toEqual("");
+}
+
+test "policy field 8 is written only when a relay is named, and reads back" {
+    List(WitnessRef) one = [WitnessRef {.url = "relay:1", .key = pubk(30)}];
+    EventPayload withp = EventPayload {.log_id = Some(log_id()), .sequence = 1, .predecessor_digest = Some(id32(1)), .suite = 1,
+                                      .body = SetPolicyBody(policy_seq(one)), .next_recovery_key_digests = [id32(50)], .advisory_time = 0};
+    EventPayload without = EventPayload {.log_id = Some(log_id()), .sequence = 1, .predecessor_digest = Some(id32(1)), .suite = 1,
+                                         .body = SetPolicyBody(policy(86400)), .next_recovery_key_digests = [id32(50)], .advisory_time = 0};
+    List(Int) a = payload_cbor(withp) else { [] };
+    List(Int) b = payload_cbor(without) else { [] };
+    expect(a.len() > b.len()).toBeTrue();
+    EventPayload pa = payload_decode(a) else { without };
+    EventBody ba = pa.body;
+    expect(match ba { SetPolicyBody(p) => p.sequencer.len() == 1 && hex_encode(p.sequencer[0].key) == hex_encode(pubk(30)) && p.sequencer[0].url == "relay:1", _ => false }).toBeTrue();
+    EventPayload pb = payload_decode(b) else { withp };
+    EventBody bb = pb.body;
+    expect(match bb { SetPolicyBody(p) => p.sequencer.len() == 0, _ => false }).toBeTrue();
+    // Two relays do not encode.
+    EventPayload two = EventPayload {.log_id = Some(log_id()), .sequence = 1, .predecessor_digest = Some(id32(1)), .suite = 1,
+                                     .body = SetPolicyBody(policy_seq(one.concat(one))), .next_recovery_key_digests = [id32(50)], .advisory_time = 0};
+    expect(match payload_cbor(two) { Some(_) => true, None => false }).toBeFalse();
 }

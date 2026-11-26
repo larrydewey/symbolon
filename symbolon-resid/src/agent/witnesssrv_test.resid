@@ -29,7 +29,7 @@ Party dev_party(Int n) {
 Policy policy_with(List(Int) wpub) {
     return Policy {.device_sigs_for_authority = 2, .recovery_delay_sec = 86400, .guardians = [], .guardian_threshold = 0,
                    .witnesses = [WitnessRef {.url = "w1", .key = wpub}, WitnessRef {.url = "w2", .key = pubk(8)}, WitnessRef {.url = "w3", .key = pubk(11)}],
-                   .duress_window_sec = 3600, .cosigner_policy = NoCosignerPolicy};
+                   .duress_window_sec = 3600, .sequencer = [], .cosigner_policy = NoCosignerPolicy};
 }
 
 List(EventSig) sigs(List(Int) who, List(Int) msg, Int i, List(EventSig) acc) {
@@ -240,4 +240,120 @@ test "a witness answers how far it co-signed a log, signed for the nonce (R2W-5)
     List(Str) names = filesystem.list_dir(root + "/seen/" + hex_encode(l));
     expect(names.len()).toEqual(2);
     expect(witness_handle(root, wpriv, 0, post("/head", nonce)).status).toEqual(400);
+}
+
+// ─── The relay as the log's sequencer (SPEC 20.3, R2W-2) ────────
+// A log whose policy names a sequencing relay (key 30, "relay:1"); the
+// three witnesses are keys 7, 8 and 11, each over its own directory.
+
+WitnessRef relay_ref() { return WitnessRef {.url = "relay:1", .key = pubk(30)}; }
+
+EventPayload e0_seq() {
+    Quorum q = Quorum {.parties = [dev_party(2), dev_party(3)], .t = 2, .root_pubkey = pubk(9), .epoch = 0, .transcript_digest = id32(99), .kv_commits = []};
+    Policy p = Policy {.device_sigs_for_authority = 2, .recovery_delay_sec = 86400, .guardians = [], .guardian_threshold = 0,
+                       .witnesses = [WitnessRef {.url = "w1", .key = pubk(7)}, WitnessRef {.url = "w2", .key = pubk(8)}, WitnessRef {.url = "w3", .key = pubk(11)}],
+                       .duress_window_sec = 3600, .sequencer = [relay_ref()], .cosigner_policy = NoCosignerPolicy};
+    return EventPayload {.log_id = None, .sequence = 0, .predecessor_digest = None, .suite = 1, .body = InceptionBody(q, p),
+                         .next_recovery_key_digests = [sha256_bytes(pubk(20))], .advisory_time = 0};
+}
+
+// Relay key `k`'s claim under `name` on (l, n, d).
+RelayClaim claim_by(Int k, Str name, List(Int) l, Int n, List(Int) d) {
+    return RelayClaim {.time = 1000, .sig = sign(k, claim_message(name, l, n, d, 1000))};
+}
+
+@requires(filesystem, clock(readonly), declassify)
+HttpReply ask_claimed(Str root, Int wk, List(Int) l, List(StoredEvent) shown, Option(RelayClaim) c) {
+    return witness_handle(root, secret_bytes(priv(wk)), 0, post("/cosign", cosign_request_claimed(l, raws(shown, 0, []), c)));
+}
+
+// E0 with the co-signatures of witnesses 7 and 8.
+StoredEvent e0_done(StoredEvent e0, List(Int) l) {
+    List(Int) d = dig(e0);
+    return with_cosigs(e0, [WitnessCosignature {.log_id = l, .sequence = 0, .digest = d, .witness_key = pubk(7), .signature = sign(7, witness_message(l, 0, d)), .witness_time = 1000},
+                            WitnessCosignature {.log_id = l, .sequence = 0, .digest = d, .witness_key = pubk(8), .signature = sign(8, witness_message(l, 0, d)), .witness_time = 1000}]);
+}
+
+@requires(filesystem, clock(readonly), declassify)
+Option(WitnessHead) head_of(Str root, Int wk, List(Int) l) {
+    List(Int) nonce = random_bytes(32);
+    return head_answer(witness_handle(root, secret_bytes(priv(wk)), 0, post("/head", nonce.concat(l))).body, pubk(wk), l, nonce);
+}
+
+Int seq_of(Option(WitnessHead) o) { return match o { Some(h) => h.seq, None => -1 }; }
+
+@requires(filesystem, clock(readonly), declassify)
+test "a witness co-signs the next event of a sequenced log only with the log's relay's claim on it" {
+    Str root = fresh_root();
+    StoredEvent e0 = ev(e0_seq(), [2, 3]);
+    List(Int) l = dig(e0);
+    // E0 needs no claim (its digest is the log id).
+    expect(ask_claimed(root, 7, l, [e0], None).status).toEqual(200);
+    StoredEvent e0c = e0_done(e0, l);
+    StoredEvent r1 = ev(after(l, 1, e0, kit_recover(4), [id32(51)]), [20]);
+    StoredEvent r1x = ev(after(l, 1, e0, kit_recover(5), [id32(51)]), [20]);
+    // No claim; the relay's claim on another event; a claim by a key the
+    // policy does not name; the right key under another name; the right
+    // claim for another sequence: refused, and the sequence stays free.
+    expect(ask_claimed(root, 7, l, [e0c, r1], None).status).toEqual(403);
+    expect(ask_claimed(root, 7, l, [e0c, r1], Some(claim_by(30, "relay:1", l, 1, dig(r1x)))).status).toEqual(403);
+    expect(ask_claimed(root, 7, l, [e0c, r1], Some(claim_by(31, "relay:1", l, 1, dig(r1)))).status).toEqual(403);
+    expect(ask_claimed(root, 7, l, [e0c, r1], Some(claim_by(30, "relay:2", l, 1, dig(r1)))).status).toEqual(403);
+    expect(ask_claimed(root, 7, l, [e0c, r1], Some(claim_by(30, "relay:1", l, 2, dig(r1)))).status).toEqual(403);
+    expect(seq_of(head_of(root, 7, l))).toEqual(0);
+    // With the claim: co-signed.
+    RelayClaim c1 = claim_by(30, "relay:1", l, 1, dig(r1));
+    HttpReply a1 = ask_claimed(root, 7, l, [e0c, r1], Some(c1));
+    expect(answer_verifies(a1, pubk(7), l, 1, r1)).toBeTrue();
+    // Another event there, even with a (second) claim of the relay: 409,
+    // with the digest and the claim this witness holds at 1.
+    HttpReply a2 = ask_claimed(root, 7, l, [e0c, r1x], Some(claim_by(30, "relay:1", l, 1, dig(r1x))));
+    expect(a2.status).toEqual(409);
+    Held h = held_of(a2.body) else { Held {.digest = [], .claim = None} };
+    RelayClaim hc = h.claim else { RelayClaim {.time = 0, .sig = []} };
+    expect(hex_encode(h.digest)).toEqual(hex_encode(dig(r1)));
+    expect(hex_encode(claim_cbor(hc))).toEqual(hex_encode(claim_cbor(c1)));
+    // A log whose policy names no relay is co-signed without a claim, as
+    // before (a log made before policy field 8).
+    StoredEvent o0 = ev(e0_payload(pubk(7)), [2, 3]);
+    List(Int) ol = dig(o0);
+    StoredEvent o1 = ev(after(ol, 1, o0, kit_recover(4), [id32(51)]), [20]);
+    expect(ask_claimed(root, 7, ol, [e0_done(o0, ol), o1], None).status).toEqual(200);
+}
+
+@requires(filesystem, clock(readonly), declassify)
+test "a key holder cannot split a sequenced log's next sequence among the witnesses (R2W-2)" {
+    Str w1 = fresh_root();
+    Str w2 = fresh_root();
+    Str w3 = fresh_root();
+    StoredEvent e0 = ev(e0_seq(), [2, 3]);
+    List(Int) l = dig(e0);
+    StoredEvent e0c = e0_done(e0, l);
+    // The kit's key signs three different valid recovers at 1. The relay
+    // claims the first it is sent, once; the holder shows each witness
+    // another of them, with that claim or with none.
+    StoredEvent ra = ev(after(l, 1, e0, kit_recover(4), [id32(51)]), [20]);
+    StoredEvent rb = ev(after(l, 1, e0, kit_recover(5), [id32(51)]), [20]);
+    StoredEvent rc = ev(after(l, 1, e0, kit_recover(6), [id32(51)]), [20]);
+    RelayClaim ca = claim_by(30, "relay:1", l, 1, dig(ra));
+    expect(ask_claimed(w1, 7, l, [e0c, ra], Some(ca)).status).toEqual(200);
+    expect(ask_claimed(w2, 8, l, [e0c, rb], Some(ca)).status).toEqual(403);
+    expect(ask_claimed(w3, 11, l, [e0c, rc], None).status).toEqual(403);
+    // So the log is not frozen at 1: witnesses 2 and 3 are still free,
+    // and the claimed event gets its majority.
+    List(Option(WitnessHead)) hs = [head_of(w1, 7, l), head_of(w2, 8, l), head_of(w3, 11, l)];
+    expect(freeze_problem(hs, 3, 1)).toEqual("");
+    expect(ask_claimed(w2, 8, l, [e0c, ra], Some(ca)).status).toEqual(200);
+    expect(ask_claimed(w3, 11, l, [e0c, ra], Some(ca)).status).toEqual(200);
+    // A relay that claims a second event at 1 is caught: the witness that
+    // holds the first answers it with the relay's other claim, two claims
+    // under one key at one sequence.
+    RelayClaim cb = claim_by(30, "relay:1", l, 1, dig(rb));
+    HttpReply x = ask_claimed(w1, 7, l, [e0c, rb], Some(cb));
+    expect(x.status).toEqual(409);
+    Held held = held_of(x.body) else { Held {.digest = [], .claim = None} };
+    CosignOut o = CosignOut {.cosig = None, .other = held.digest, .other_claim = held.claim};
+    expect(str_len(equivocation_in(relay_ref(), l, 1, dig(rb), cb, [o], 0)) > 0).toBeTrue();
+    // An honest relay's single claim is no such proof.
+    expect(equivocation_in(relay_ref(), l, 1, dig(ra), ca, [o], 0)).toEqual("");
 }

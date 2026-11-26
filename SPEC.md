@@ -169,6 +169,10 @@ P-256 base point, `q` its order.
 
 - **A1 Malicious sync service.** Reads, drops, reorders, replays, forks
   and fabricates what it stores or relays; substitutes keys; equivocates.
+  As the log's sequencer (Section 20.3) it can stall a log by claiming
+  nothing, but not fork it or split a sequence: it signs one claim per
+  `(log, seq)`, and a second claim of it at one sequence is proof of its
+  equivocation.
 - **A2 Phisher.** Controls origins and page content the principal visits.
 - **A3 Network adversary.** Outside the TLS sessions the agent verifies.
 - **A4 Endpoint malware without kernel control** on one or more devices.
@@ -203,7 +207,10 @@ P-256 base point, `q` its order.
   device's share is revoked by the next re-share.
 - Denial of service by the sync service or the cosigner is detected, not
   prevented; the quorum is sized so that one unavailable party does not
-  block signing (Section 10.2).
+  block signing (Section 10.2). A relay that sequences a log (Section
+  20.3) can stall that log's events, not the credentials' signing; moving
+  the log to another relay is a `set-policy` the current relay must claim
+  (Section 20.4).
 
 ---
 
@@ -389,7 +396,10 @@ policy = {
   5 => [* witness-ref],
   6 => uint,                                 ; duress window, seconds
   7 => cosigner-policy / null,
+  ? 8 => relay-ref,                          ; the relay that sequences the log (20.3)
 }
+
+relay-ref       = { 1 => tstr, 2 => pubkey } ; the relay's name and claim key
 
 cosigner-policy = {
   1 => uint,                                 ; max signatures per device per hour
@@ -450,7 +460,8 @@ recover-body = [
   only after the recovery delay, during which every other device is
   notified and may veto, exactly as for `recover` (A-04).
 - A `set-policy` that weakens recovery protection (shorter delay, fewer
-  guardians, lower guardian threshold, fewer witnesses) is always delayed.
+  guardians, lower guardian threshold, fewer witnesses, or no sequencing
+  relay where there was one) is always delayed.
 - `reshare`: signatures from every party that took part in the re-share
   (Section 11.3), at least `t` of the old quorum.
 - `recover`: Section 13. `veto`: Section 13.4.
@@ -2217,6 +2228,61 @@ events and on heads they release material against, and SHOULD require
 them on all heads. A policy MUST name at least three witnesses run by
 independent operators.
 
+**The relay as sequencer (R2W-2).** A policy names at most one relay
+that sequences the log (field 8: its name and claim key). Before a device
+asks the witnesses to co-sign event `n >= 1`, it reserves `(log, n)` at
+that relay: `POST /claim/<log>/<n>` with the event. The relay checks the
+event is valid as the next event of the log it stores (as a witness does,
+at its own clock) and still valid five minutes later (so that an event
+whose validity runs out, a veto at the end of its window or a party's
+event as a recovery's delay runs, does not hold a sequence the witnesses
+would then refuse it at), stores the first such claim write-once and answers
+CBOR `[event, [time, sig]]`, `sig` by its claim key over `["symbolon v1
+relay claim", name, log, n, H(event), time]` (`name` as field 8 gives
+it). Having claimed, the relay itself carries the event, with its claim,
+to the witnesses the policy before it names and stores it as the log's
+next event once a majority co-signs. A later request for the same `(log,
+n)` with another event gets 409 and the same record. The claim key is drawn once and kept in the relay's
+store (`GET /claim-key` serves it), shared by the relay's processes. A
+witness co-signs event `n >= 1` of a log whose policy names a sequencing
+relay only with that relay's claim on exactly that `(log, n, digest)`, the
+claim the last item of the co-sign request, `CBOR [log, E0, ..., En,
+[time, sig]]`; without it, with a claim on another digest, sequence or log,
+or under another key or name, it refuses (403) and the sequence stays
+free. The relay named is the one in force after event `n-1` at that
+event's own witness time, so every witness reads the same one whatever
+its clock. `E0` needs no claim: its digest is the log id. A witness keeps
+the claim beside what it co-signed and answers a second digest at that
+sequence with 409 and CBOR `[digest, claim]`, what it holds.
+
+So a holder of one key cannot show different events to different
+witnesses: the relay claims one of them, and only that one is
+co-signable. A malicious relay can stall the log (claim nothing, or claim
+an event and serve it to no one) but cannot split a sequence unless it
+signs two claims at one `(log, n)`, which are its two signatures over two
+digests: a device whose claimed event a witness refuses, holding another
+event under a claim of the same relay, reports "relay equivocation" with
+both claims as the proof. A device that the relay answers with another
+event's claim carries that event, which is valid and claimed, to the
+witnesses and the relay itself (when the relay could not reach the
+witnesses when it claimed), so that a key holder who claims a sequence
+and stops cannot stall the log either, and reports which event
+took the sequence (an authority event of one device, or a recovery, is
+delayed and can be vetoed).
+
+`device init` pins its relay's claim key in `E0`'s policy, under the name
+the device reaches the relay at. A log whose policy names no sequencing
+relay (one made before field 8) is co-signed without a claim, as before,
+and stays exposed to the freeze of Section 20.4 until a `set-policy`
+names one: `symbolon device sequence DIR` makes it (signed by that device
+alone, it is delayed, and may be vetoed, when the policy asks for more
+devices; naming a relay never weakens a policy). A `set-policy` that drops
+the sequencing relay weakens the policy (Section 8.2). Moving a log to
+another relay is a `set-policy` naming the new relay, claimed by the old
+one; a relay that refuses to claim it, or is gone, keeps the log where it
+is (a stall: the relay is already what stores the log, the kit's
+material and the recovery requests).
+
 A witness co-signs with the witness time at which it checked the event:
 its own clock, but never earlier than the last event's witness time, so a
 witness whose clock runs behind does not co-sign a time that every agent
@@ -2250,11 +2316,18 @@ majority, counting every witness that did not answer or co-signed nothing
 there as free, it reports "log frozen at sequence n" as a possible attack
 instead of a generic failure.
 
-**Residual (open).** The alarm detects the freeze; nothing in this version
-undoes it. A frozen log stays frozen, and recovering from it (for example
-with the relay as a sequencer whose signed claim on `(log, seq, digest)`
-the witnesses require) needs a protocol change not made here. Excluding
-removed parties from signing rules (Section 8.3) narrows who can cause it.
+With a sequencing relay (Section 20.3) this cannot happen: a witness
+co-signs at `n` only the event the relay claimed there, so at most one
+event per sequence is co-signable, and it gets its majority once the
+witnesses are asked. The freeze needs the relay to sign two claims at one
+sequence, which the device detects and reports with both claims; the
+freeze alarm stays for that case and for logs without a sequencing relay.
+
+**Residual.** A log whose policy names no sequencing relay (made before
+policy field 8) can still be frozen until a `set-policy` names one; a log
+frozen before that stays frozen. Excluding removed parties from signing
+rules (Section 8.3) narrows who can cause it. A relay that claims nothing
+stalls the log (Section 3.3).
 
 ### 20.5 Symbolon Home
 

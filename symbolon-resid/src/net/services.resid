@@ -21,8 +21,12 @@
 // digest for the same (log, seq) is refused (409), the first is re-signed
 // on request; an event that is not valid there is refused (403).
 //
-//   POST /cosign               CBOR [log, E0, ..., En]; answers CBOR [time, r || s]
-//                              over ["symbolon v1 witness", log, n, H(En)]
+//   POST /cosign               CBOR [log, E0, ..., En, ? claim]; answers CBOR [time, r || s]
+//                              over ["symbolon v1 witness", log, n, H(En)]; claim, CBOR
+//                              [time, r || s], is the log's relay's claim on (log, n, H(En))
+//                              (agent/relaysrv.resid POST /claim), needed when the log's
+//                              policy names a sequencing relay (field 8, SPEC 20.3); a 409
+//                              answers CBOR [digest, claim or an empty bstr] held there
 //   POST /time                 a 32-byte nonce; answers CBOR [time, r || s] over
 //                              ["symbolon v1 witness time", nonce, time]: the witness
 //                              time devices and the cosigner measure delays by (SPEC 13.4)
@@ -31,6 +35,7 @@
 // [a-z0-9._-], at most 128 characters.
 
 import "../core/log.resid";
+import "../core/event_decode.resid";
 import "httpserv.resid";
 import "cose.resid";
 import "cosesig.resid";
@@ -141,7 +146,15 @@ HttpReply file_reply(Str f) {
 // log verifies and En is valid as its next event under the signing rules
 // in force, at the witness's time.
 pub List(Int) cosign_request(List(Int) l, List(List(Int)) events) {
-    return cosign_items(events, 0, cbe_bytes(l, cbe_array(events.len() + 1, [])));
+    List(Int) b = cosign_request_claimed(l, events, None);
+    return b;
+}
+
+// With the relay's claim on the last event (SPEC 20.3), as the last item.
+pub List(Int) cosign_request_claimed(List(Int) l, List(List(Int)) events, Option(RelayClaim) c) {
+    Int extra = match c { None => 0, Some(_) => 1 };
+    List(Int) a = cosign_items(events, 0, cbe_bytes(l, cbe_array(events.len() + 1 + extra, [])));
+    return match c { None => a, Some(x) => a.concat(claim_cbor(x)) };
 }
 
 List(Int) cosign_items(List(List(Int)) es, Int i, List(Int) acc) {
@@ -537,9 +550,31 @@ Str text_of_body(List(Int) b, Int i, StrBuf acc) {
 // `d`, as cosign_request takes it.
 @requires(network, clock(readonly), declassify)
 pub Option(WitnessCosignature) cosign_from(Endpoint e, List(Int) wkey, List(Int) l, UInt(64) seq, List(Int) d, List(List(Int)) events) {
-    HttpOut o = http_call_ep(e, "POST", "/cosign", cosign_request(l, events));
-    if (o.status != 200) { return None; }
-    List(Int) b = o.body;
+    CosignOut o = cosign_try(e, wkey, l, seq, d, events, None);
+    return o.cosig;
+}
+
+// A witness's answer to a co-sign request with the relay's claim `c`:
+// its co-signature, or, when it refused because it holds another digest
+// at the sequence (409), that digest and the relay claim it co-signed it
+// with (`other` empty when it gave none).
+pub type CosignOut = { Option(WitnessCosignature) cosig; List(Int) other; Option(RelayClaim) other_claim; };
+
+@requires(network, clock(readonly), declassify)
+pub CosignOut cosign_try(Endpoint e, List(Int) wkey, List(Int) l, UInt(64) seq, List(Int) d, List(List(Int)) events, Option(RelayClaim) c) {
+    HttpOut o = http_call_ep(e, "POST", "/cosign", cosign_request_claimed(l, events, c));
+    if (o.status == 409) {
+        Option(Held) h = held_of(o.body);
+        return match h {
+            None => CosignOut {.cosig = None, .other = [], .other_claim = None},
+            Some(x) => CosignOut {.cosig = None, .other = x.digest, .other_claim = x.claim}
+        };
+    }
+    Option(WitnessCosignature) w = if (o.status == 200) { cosig_of(o.body, wkey, l, seq, d) } else { None };
+    return CosignOut {.cosig = w, .other = [], .other_claim = None};
+}
+
+Option(WitnessCosignature) cosig_of(List(Int) b, List(Int) wkey, List(Int) l, UInt(64) seq, List(Int) d) {
     // [uint time, bytes(64)]
     if (b.len() < 3 || b[0] != 130) { return None; }
     Int ib = b[1];
@@ -551,6 +586,51 @@ pub Option(WitnessCosignature) cosign_from(Endpoint e, List(Int) wkey, List(Int)
     List(Int) sig = b[4 + n..b.len()];
     if (!ecdsa_verify_raw(P256, Sha256, wkey, witness_message(l, seq, d), sig)) { return None; }
     return Some(WitnessCosignature {.log_id = l, .sequence = seq, .digest = d, .witness_key = wkey, .signature = sig, .witness_time = (UInt(64))t});
+}
+
+// ─── The sequencing relay (SPEC 20.3, agent/relaysrv.resid) ─────
+
+// Proof that the log's relay `sq` equivocated (SPEC 20.4): it claimed `d`
+// at `n` of log `l` for this device (`mine`, checked by the caller) and a
+// witness (`outs`, the witnesses' answers) holds another digest there
+// under a claim of the same relay: two signatures of the relay over two
+// events at one sequence. "" when there is no such pair.
+pub Str equivocation_in(WitnessRef sq, List(Int) l, Int n, List(Int) d, RelayClaim mine, List(CosignOut) outs, Int i) {
+    if (i >= outs.len()) { return ""; }
+    CosignOut o = outs[i];
+    RelayClaim theirs = o.other_claim else { RelayClaim {.time = -1, .sig = []} };
+    Bool two = o.other.len() == 32 && !bytes_eq(o.other, d) && theirs.time >= 0 && claim_ok(sq, l, n, o.other, theirs);
+    if (!two) { return equivocation_in(sq, l, n, d, mine, outs, i + 1); }
+    return f"relay equivocation: the log's relay {sq.url} claimed sequence {n} for two events, "
+        + f"{hex_encode(d)} (claim {hex_encode(claim_cbor(mine))}) and {hex_encode(o.other)} (claim {hex_encode(claim_cbor(theirs))}); "
+        + "keep both as proof and move the log to another relay (SPEC 20.4)";
+}
+
+// The relay's claim key (GET /claim-key, hex); [] when it serves none.
+@requires(network, clock(readonly), declassify)
+pub List(Int) claim_key_get(Endpoint e) {
+    HttpOut o = http_call_ep(e, "GET", "/claim-key", []);
+    if (o.status != 200) { return []; }
+    List(Int) k = cose_hex_decode(str_trim(text_of_body(o.body, 0, StrBuf())));
+    return if (k.len() == 65 && ec_public_ok(P256, k)) { k } else { [] };
+}
+
+// The relay's answer to POST /claim/<log>/<n> with an event (as the relay
+// stores it, without co-signatures): 200 with its claim on that event,
+// 409 with the event it claimed there before and that claim (`event` and
+// `claim` from CBOR [event, [time, r || s]]), or another status (a relay
+// that does not sequence: 404) with neither.
+pub type ClaimOut = { Int status; List(Int) event; Option(RelayClaim) claim; };
+
+@requires(network, clock(readonly), declassify)
+pub ClaimOut claim_post(Endpoint e, List(Int) l, UInt(64) n, List(Int) stored_event) {
+    HttpOut o = http_call_ep(e, "POST", "/claim/" + hex_encode(l) + "/" + f"{n}", stored_event);
+    Bool answered = o.status == 200 || o.status == 409;
+    Option(ClaimRecord) r = if (answered) { claim_record_of(o.body) } else { None };
+    return match r {
+        None => ClaimOut {.status = if (answered) { 502 } else { o.status }, .event = [], .claim = None},
+        Some(x) => ClaimOut {.status = o.status, .event = x.event, .claim = Some(x.claim)}
+    };
 }
 
 // A witness's current time, checked under its key and bound to `nonce`.

@@ -28,7 +28,7 @@ Party dev_party(Int n) {
 Policy policy_with(List(Int) wpub) {
     return Policy {.device_sigs_for_authority = 2, .recovery_delay_sec = 86400, .guardians = [], .guardian_threshold = 0,
                    .witnesses = [WitnessRef {.url = "w1", .key = wpub}, WitnessRef {.url = "w2", .key = pubk(8)}, WitnessRef {.url = "w3", .key = pubk(11)}],
-                   .duress_window_sec = 3600, .cosigner_policy = NoCosignerPolicy};
+                   .duress_window_sec = 3600, .sequencer = [], .cosigner_policy = NoCosignerPolicy};
 }
 
 List(EventSig) sigs(List(Int) who, List(Int) msg, Int i, List(EventSig) acc) {

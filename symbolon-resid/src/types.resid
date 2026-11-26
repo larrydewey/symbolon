@@ -81,6 +81,11 @@ type Policy = {
     List(WitnessRef) witnesses;
     UInt(64) duress_window_sec;
     CosignerPolicy cosigner_policy;
+    // policy[8] (SPEC 20.3): the relay that sequences the log, its name
+    // and claim key; at most one. A witness co-signs event n >= 1 only
+    // with this relay's signed claim on (log, n, digest). Empty: no
+    // sequencer (a log made before it; the field is then left out).
+    List(WitnessRef) sequencer;         //@ default
 };
 
 // A recovery's payload (SPEC 13.2).

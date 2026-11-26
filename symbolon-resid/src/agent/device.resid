@@ -411,9 +411,13 @@ Int after_keygen(Str dir, DeviceConfig c, Unlocked u, KitKeys kit, List(PartyKey
                        .t = 2, .root_pubkey = x, .epoch = 1, .transcript_digest = sha256_bytes(utf8("cmp/keygen")), .kv_commits = kv.out.commits};
     // The evaluation limit (policy field 3) with the vault OPRF key: a
     // cosigner that cannot deal k_v predates both.
+    // The relay sequences the log (policy field 8, SPEC 20.3): its claim
+    // key, pinned here, under the name this device reaches it at.
+    List(Int) ck = claim_key_get(relay_ep(c));
+    if (ck.len() == 0) { return dfail("the relay serves no claim key (GET /claim-key): it cannot sequence the log (SPEC 20.3)"); }
     Policy pol = Policy {.device_sigs_for_authority = 1, .recovery_delay_sec = 259200, .guardians = [], .guardian_threshold = 0,
                          .witnesses = witness_refs(a.witnesses, 0, []), .duress_window_sec = 3600,
-                         .cosigner_policy = if (kv.on) { CosignerLimits(Limits {.sign = 60, .eval = 60}) } else { CosignerLimit(60) }};
+                         .sequencer = [WitnessRef {.url = c.relay_host + f":{c.relay_port}", .key = ck}], .cosigner_policy = if (kv.on) { CosignerLimits(Limits {.sign = 60, .eval = 60}) } else { CosignerLimit(60) }};
     EventPayload e0 = EventPayload {.log_id = None, .sequence = 0, .predecessor_digest = None, .suite = 1, .body = InceptionBody(q, pol),
                                     .next_recovery_key_digests = [recovery_key_digest(kit.sign_pub)], .advisory_time = (UInt(64))clock_now_seconds()};
     List(Int) enc = payload_cbor(e0) else { [] };

@@ -282,11 +282,11 @@ Decode(CosignerPolicy, F) = derive_cosigner_policy_decode;
 
 // ── Policy (line 76)
 /// The serialized field names of `Policy`, in declaration order.
-pub List(Str) derive_policy_names() { return ["device_sigs_for_authority", "recovery_delay_sec", "guardians", "guardian_threshold", "witnesses", "duress_window_sec", "cosigner_policy"]; }
+pub List(Str) derive_policy_names() { return ["device_sigs_for_authority", "recovery_delay_sec", "guardians", "guardian_threshold", "witnesses", "duress_window_sec", "cosigner_policy", "sequencer"]; }
 /// Encodes a `Policy` through the encoder `s`.
 @needs(Encoder(F))
 pub Result(F, SerialError) derive_policy_encode(Policy v, F s) {
-    Int n = 7;
+    Int n = 8;
     F s0 = write_struct_begin(s, "Policy", n)?;
     F s1 = write_named(s0, "device_sigs_for_authority", v.device_sigs_for_authority)?;
     F s2 = write_named(s1, "recovery_delay_sec", v.recovery_delay_sec)?;
@@ -295,36 +295,38 @@ pub Result(F, SerialError) derive_policy_encode(Policy v, F s) {
     F s5 = write_named(s4, "witnesses", v.witnesses)?;
     F s6 = write_named(s5, "duress_window_sec", v.duress_window_sec)?;
     F s7 = write_named(s6, "cosigner_policy", v.cosigner_policy)?;
-    return write_struct_end(s7);
+    F s8 = write_named(s7, "sequencer", v.sequencer)?;
+    return write_struct_end(s8);
 }
 Encode(Policy, F) = derive_policy_encode;
 /// Decodes a `Policy` from the decoder `s`, with the input left over.
 @needs(Decoder(F))
 pub Result(Parsed(Policy, F), SerialError) derive_policy_decode(F s) {
     F s0 = read_struct_begin(s, "Policy", derive_policy_names())?;
-    return derive_policy_fields(s0, None, None, None, None, None, None, None);
+    return derive_policy_fields(s0, None, None, None, None, None, None, None, None);
 }
 @needs(Decoder(F))
-Result(Parsed(Policy, F), SerialError) derive_policy_fields(F s, Option(UInt(8)) f_device_sigs_for_authority, Option(UInt(64)) f_recovery_delay_sec, Option(List(List(Int))) f_guardians, Option(UInt(8)) f_guardian_threshold, Option(List(WitnessRef)) f_witnesses, Option(UInt(64)) f_duress_window_sec, Option(CosignerPolicy) f_cosigner_policy) {
+Result(Parsed(Policy, F), SerialError) derive_policy_fields(F s, Option(UInt(8)) f_device_sigs_for_authority, Option(UInt(64)) f_recovery_delay_sec, Option(List(List(Int))) f_guardians, Option(UInt(8)) f_guardian_threshold, Option(List(WitnessRef)) f_witnesses, Option(UInt(64)) f_duress_window_sec, Option(CosignerPolicy) f_cosigner_policy, Option(List(WitnessRef)) f_sequencer) {
     Parsed(FieldKey, F) k = read_field(s, derive_policy_names())?;
     FieldKey key = k.value;
     return match key {
-        KnownField(i) => derive_policy_field(k.rest, i, f_device_sigs_for_authority, f_recovery_delay_sec, f_guardians, f_guardian_threshold, f_witnesses, f_duress_window_sec, f_cosigner_policy),
-        UnknownField(name) => derive_policy_fields(skip_unknown(k.rest, name, derive_policy_names(), false)?, f_device_sigs_for_authority, f_recovery_delay_sec, f_guardians, f_guardian_threshold, f_witnesses, f_duress_window_sec, f_cosigner_policy),
-        EndOfFields => derive_policy_done(k.rest, f_device_sigs_for_authority, f_recovery_delay_sec, f_guardians, f_guardian_threshold, f_witnesses, f_duress_window_sec, f_cosigner_policy)
+        KnownField(i) => derive_policy_field(k.rest, i, f_device_sigs_for_authority, f_recovery_delay_sec, f_guardians, f_guardian_threshold, f_witnesses, f_duress_window_sec, f_cosigner_policy, f_sequencer),
+        UnknownField(name) => derive_policy_fields(skip_unknown(k.rest, name, derive_policy_names(), false)?, f_device_sigs_for_authority, f_recovery_delay_sec, f_guardians, f_guardian_threshold, f_witnesses, f_duress_window_sec, f_cosigner_policy, f_sequencer),
+        EndOfFields => derive_policy_done(k.rest, f_device_sigs_for_authority, f_recovery_delay_sec, f_guardians, f_guardian_threshold, f_witnesses, f_duress_window_sec, f_cosigner_policy, f_sequencer)
     };
 }
 @needs(Decoder(F))
-Result(Parsed(Policy, F), SerialError) derive_policy_field(F s, Int i, Option(UInt(8)) f_device_sigs_for_authority, Option(UInt(64)) f_recovery_delay_sec, Option(List(List(Int))) f_guardians, Option(UInt(8)) f_guardian_threshold, Option(List(WitnessRef)) f_witnesses, Option(UInt(64)) f_duress_window_sec, Option(CosignerPolicy) f_cosigner_policy) {
-    if (i == 0) { Parsed(Option(UInt(8)), F) p = read_slot(s, f_device_sigs_for_authority, "device_sigs_for_authority")?; return derive_policy_fields(p.rest, p.value, f_recovery_delay_sec, f_guardians, f_guardian_threshold, f_witnesses, f_duress_window_sec, f_cosigner_policy); }
-    if (i == 1) { Parsed(Option(UInt(64)), F) p = read_slot(s, f_recovery_delay_sec, "recovery_delay_sec")?; return derive_policy_fields(p.rest, f_device_sigs_for_authority, p.value, f_guardians, f_guardian_threshold, f_witnesses, f_duress_window_sec, f_cosigner_policy); }
-    if (i == 2) { Parsed(Option(List(List(Int))), F) p = read_slot(s, f_guardians, "guardians")?; return derive_policy_fields(p.rest, f_device_sigs_for_authority, f_recovery_delay_sec, p.value, f_guardian_threshold, f_witnesses, f_duress_window_sec, f_cosigner_policy); }
-    if (i == 3) { Parsed(Option(UInt(8)), F) p = read_slot(s, f_guardian_threshold, "guardian_threshold")?; return derive_policy_fields(p.rest, f_device_sigs_for_authority, f_recovery_delay_sec, f_guardians, p.value, f_witnesses, f_duress_window_sec, f_cosigner_policy); }
-    if (i == 4) { Parsed(Option(List(WitnessRef)), F) p = read_slot(s, f_witnesses, "witnesses")?; return derive_policy_fields(p.rest, f_device_sigs_for_authority, f_recovery_delay_sec, f_guardians, f_guardian_threshold, p.value, f_duress_window_sec, f_cosigner_policy); }
-    if (i == 5) { Parsed(Option(UInt(64)), F) p = read_slot(s, f_duress_window_sec, "duress_window_sec")?; return derive_policy_fields(p.rest, f_device_sigs_for_authority, f_recovery_delay_sec, f_guardians, f_guardian_threshold, f_witnesses, p.value, f_cosigner_policy); }
-    Parsed(Option(CosignerPolicy), F) p = read_slot(s, f_cosigner_policy, "cosigner_policy")?; return derive_policy_fields(p.rest, f_device_sigs_for_authority, f_recovery_delay_sec, f_guardians, f_guardian_threshold, f_witnesses, f_duress_window_sec, p.value);
+Result(Parsed(Policy, F), SerialError) derive_policy_field(F s, Int i, Option(UInt(8)) f_device_sigs_for_authority, Option(UInt(64)) f_recovery_delay_sec, Option(List(List(Int))) f_guardians, Option(UInt(8)) f_guardian_threshold, Option(List(WitnessRef)) f_witnesses, Option(UInt(64)) f_duress_window_sec, Option(CosignerPolicy) f_cosigner_policy, Option(List(WitnessRef)) f_sequencer) {
+    if (i == 0) { Parsed(Option(UInt(8)), F) p = read_slot(s, f_device_sigs_for_authority, "device_sigs_for_authority")?; return derive_policy_fields(p.rest, p.value, f_recovery_delay_sec, f_guardians, f_guardian_threshold, f_witnesses, f_duress_window_sec, f_cosigner_policy, f_sequencer); }
+    if (i == 1) { Parsed(Option(UInt(64)), F) p = read_slot(s, f_recovery_delay_sec, "recovery_delay_sec")?; return derive_policy_fields(p.rest, f_device_sigs_for_authority, p.value, f_guardians, f_guardian_threshold, f_witnesses, f_duress_window_sec, f_cosigner_policy, f_sequencer); }
+    if (i == 2) { Parsed(Option(List(List(Int))), F) p = read_slot(s, f_guardians, "guardians")?; return derive_policy_fields(p.rest, f_device_sigs_for_authority, f_recovery_delay_sec, p.value, f_guardian_threshold, f_witnesses, f_duress_window_sec, f_cosigner_policy, f_sequencer); }
+    if (i == 3) { Parsed(Option(UInt(8)), F) p = read_slot(s, f_guardian_threshold, "guardian_threshold")?; return derive_policy_fields(p.rest, f_device_sigs_for_authority, f_recovery_delay_sec, f_guardians, p.value, f_witnesses, f_duress_window_sec, f_cosigner_policy, f_sequencer); }
+    if (i == 4) { Parsed(Option(List(WitnessRef)), F) p = read_slot(s, f_witnesses, "witnesses")?; return derive_policy_fields(p.rest, f_device_sigs_for_authority, f_recovery_delay_sec, f_guardians, f_guardian_threshold, p.value, f_duress_window_sec, f_cosigner_policy, f_sequencer); }
+    if (i == 5) { Parsed(Option(UInt(64)), F) p = read_slot(s, f_duress_window_sec, "duress_window_sec")?; return derive_policy_fields(p.rest, f_device_sigs_for_authority, f_recovery_delay_sec, f_guardians, f_guardian_threshold, f_witnesses, p.value, f_cosigner_policy, f_sequencer); }
+    if (i == 6) { Parsed(Option(CosignerPolicy), F) p = read_slot(s, f_cosigner_policy, "cosigner_policy")?; return derive_policy_fields(p.rest, f_device_sigs_for_authority, f_recovery_delay_sec, f_guardians, f_guardian_threshold, f_witnesses, f_duress_window_sec, p.value, f_sequencer); }
+    Parsed(Option(List(WitnessRef)), F) p = read_slot(s, f_sequencer, "sequencer")?; return derive_policy_fields(p.rest, f_device_sigs_for_authority, f_recovery_delay_sec, f_guardians, f_guardian_threshold, f_witnesses, f_duress_window_sec, f_cosigner_policy, p.value);
 }
-Result(Parsed(Policy, F), SerialError) derive_policy_done(F s, Option(UInt(8)) f_device_sigs_for_authority, Option(UInt(64)) f_recovery_delay_sec, Option(List(List(Int))) f_guardians, Option(UInt(8)) f_guardian_threshold, Option(List(WitnessRef)) f_witnesses, Option(UInt(64)) f_duress_window_sec, Option(CosignerPolicy) f_cosigner_policy) {
+Result(Parsed(Policy, F), SerialError) derive_policy_done(F s, Option(UInt(8)) f_device_sigs_for_authority, Option(UInt(64)) f_recovery_delay_sec, Option(List(List(Int))) f_guardians, Option(UInt(8)) f_guardian_threshold, Option(List(WitnessRef)) f_witnesses, Option(UInt(64)) f_duress_window_sec, Option(CosignerPolicy) f_cosigner_policy, Option(List(WitnessRef)) f_sequencer) {
     UInt(8) d_device_sigs_for_authority = require(f_device_sigs_for_authority, "device_sigs_for_authority")?;
     UInt(64) d_recovery_delay_sec = require(f_recovery_delay_sec, "recovery_delay_sec")?;
     List(List(Int)) d_guardians = require(f_guardians, "guardians")?;
@@ -332,7 +334,9 @@ Result(Parsed(Policy, F), SerialError) derive_policy_done(F s, Option(UInt(8)) f
     List(WitnessRef) d_witnesses = require(f_witnesses, "witnesses")?;
     UInt(64) d_duress_window_sec = require(f_duress_window_sec, "duress_window_sec")?;
     CosignerPolicy d_cosigner_policy = require(f_cosigner_policy, "cosigner_policy")?;
-    return parsed(Policy {.device_sigs_for_authority = d_device_sigs_for_authority, .recovery_delay_sec = d_recovery_delay_sec, .guardians = d_guardians, .guardian_threshold = d_guardian_threshold, .witnesses = d_witnesses, .duress_window_sec = d_duress_window_sec, .cosigner_policy = d_cosigner_policy}, s);
+    List(WitnessRef) d_sequencer_absent = [];
+    List(WitnessRef) d_sequencer = or_default(f_sequencer, d_sequencer_absent);
+    return parsed(Policy {.device_sigs_for_authority = d_device_sigs_for_authority, .recovery_delay_sec = d_recovery_delay_sec, .guardians = d_guardians, .guardian_threshold = d_guardian_threshold, .witnesses = d_witnesses, .duress_window_sec = d_duress_window_sec, .cosigner_policy = d_cosigner_policy, .sequencer = d_sequencer}, s);
 }
 Decode(Policy, F) = derive_policy_decode;
 

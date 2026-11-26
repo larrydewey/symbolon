@@ -78,13 +78,19 @@ List(Int) cosigner_policy_cbor(CosignerPolicy c, List(Int) acc) {
 }
 
 pub Option(List(Int)) policy_cbor(Policy p, List(Int) acc) {
-    List(Int) a = cbe_uint(p.device_sigs_for_authority, cbe_uint(1, cbe_map(7, acc)));
+    // Field 8 (the sequencing relay, SPEC 20.3) only when there is one.
+    Int n = if (p.sequencer.len() > 0) { 8 } else { 7 };
+    List(Int) a = cbe_uint(p.device_sigs_for_authority, cbe_uint(1, cbe_map(n, acc)));
     List(Int) b = cbe_uint((Int)p.recovery_delay_sec, cbe_uint(2, a));
     List(Int) c = bytes_list(p.guardians, 0, cbe_array(p.guardians.len(), cbe_uint(3, b)));
     List(Int) d = cbe_uint(p.guardian_threshold, cbe_uint(4, c));
     List(Int) e = witnesses_cbor(p.witnesses, 0, cbe_array(p.witnesses.len(), cbe_uint(5, d)))?;
     List(Int) f = cbe_uint((Int)p.duress_window_sec, cbe_uint(6, e));
-    return Some(cosigner_policy_cbor(p.cosigner_policy, cbe_uint(7, f)));
+    List(Int) g = cosigner_policy_cbor(p.cosigner_policy, cbe_uint(7, f));
+    if (p.sequencer.len() == 0) { return Some(g); }
+    // One witness-ref-shaped map: { 1 => name, 2 => claim key }.
+    if (p.sequencer.len() != 1) { return None; }
+    return witnesses_cbor(p.sequencer, 0, cbe_uint(8, g));
 }
 
 // The guardian approvals are COSE_Sign1 encodings, written in place as CBOR

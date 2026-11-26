@@ -2,12 +2,17 @@
 // `symbolon witness serve` (main.resid). The client side, and the wire
 // format, are in net/services.resid (cosign_request, cosign_from, time_from).
 //
-//   POST /cosign   CBOR [log id, E0, ..., En] (cosign_request): the whole log
-//                  before En, with its co-signatures, then En. Answers CBOR
-//                  [time, r || s] over witness_message(log, n, H(En)); 409
-//                  when the witness co-signed another digest at (log, n) or
-//                  at a sequence of the log shown; 403 when En is not valid
-//                  as the next event of that log; 400 when it does not parse.
+//   POST /cosign   CBOR [log id, E0, ..., En, ? claim] (cosign_request): the
+//                  whole log before En, with its co-signatures, then En,
+//                  then the log's relay's claim on En, CBOR [time, r || s]
+//                  (needed for n >= 1 when the policy names a sequencing
+//                  relay, field 8). Answers CBOR [time, r || s] over
+//                  witness_message(log, n, H(En)); 409 when the witness
+//                  co-signed another digest at (log, n) (with CBOR [digest,
+//                  claim or h''], what it holds there) or at a sequence of
+//                  the log shown; 403 when En is not valid as the next event
+//                  of that log or lacks the relay's claim on it; 400 when it
+//                  does not parse.
 //   POST /time     a 32-byte nonce; answers CBOR [time, r || s] over
 //                  ["symbolon v1 witness time", nonce, time] (SPEC 13.4)
 //   POST /head     a 32-byte nonce || a 32-byte log id; answers CBOR
@@ -39,7 +44,8 @@
 // approvals are not accepted, as the agents do not accept them yet
 // (agent/common.resid verified_events).
 //
-// Files: seen/<log>/<seq>, the digest the witness co-signed there (32
+// Files: seen/<log>/c<seq>, the relay's claim it co-signed with (SPEC
+// 20.3); seen/<log>/<seq>, the digest the witness co-signed there (32
 // bytes) and its answer; written once (to a temporary file, then renamed
 // into place, so a write cut short never holds a sequence), never changed. A request re-verifies
 // the log it carries: an agent does the same on every fetch (SPEC 8.4), and
@@ -114,31 +120,51 @@ Bool decimal(Str s, Int i) {
     return c >= 48 && c <= 57 && decimal(s, i + 1);
 }
 
-type CoReq = { List(Int) l; List(SignedEvent) before; SignedEvent e; };
+type CoReq = { List(Int) l; List(SignedEvent) before; SignedEvent e; Option(RelayClaim) claim; };
 
-// [bstr(32) log id, bstr event, ...], at least one event, nothing after.
+// [bstr(32) log id, bstr event, ..., ? claim], at least one event, nothing
+// after; claim = [uint time, bstr(64) r || s], the relay's claim on the
+// last event (SPEC 20.3), an array where every other item is a byte string.
 Option(CoReq) parse_cosign(List(Int) b) {
     Rd h = rd(b, 0);
-    if (h.major != 4 || h.val < 2 || h.val > max_cosign_events() + 1) { return None; }
-    Option(List(List(Int))) items = byte_strings(b, h.next, h.val, []);
+    if (h.major != 4 || h.val < 2 || h.val > max_cosign_events() + 2) { return None; }
+    Option(Items) items = byte_strings(b, h.next, h.val, []);
     return match items {
         None => None,
-        Some(xs) => if (xs[0].len() != 32) { None } else { coreq_of(xs[0], events_of(xs, 1, [])) }
+        Some(xs) => coreq_items(xs)
     };
 }
 
-Option(CoReq) coreq_of(List(Int) l, Option(List(SignedEvent)) oes) {
+type Items = { List(List(Int)) xs; Option(RelayClaim) claim; };
+
+Option(CoReq) coreq_items(Items it) {
+    List(List(Int)) xs = it.xs;
+    if (xs.len() < 2 || xs.len() > max_cosign_events() + 1 || xs[0].len() != 32) { return None; }
+    return coreq_of(xs[0], events_of(xs, 1, []), it.claim);
+}
+
+Option(CoReq) coreq_of(List(Int) l, Option(List(SignedEvent)) oes, Option(RelayClaim) c) {
     return match oes {
         None => None,
-        Some(es) => Some(CoReq {.l = l, .before = es[0..es.len() - 1], .e = es[es.len() - 1]})
+        Some(es) => Some(CoReq {.l = l, .before = es[0..es.len() - 1], .e = es[es.len() - 1], .claim = c})
     };
 }
 
-Option(List(List(Int))) byte_strings(List(Int) b, Int p, Int n, List(List(Int)) acc) {
-    if (n == 0) { return if (p == b.len()) { Some(acc) } else { None }; }
+Option(Items) byte_strings(List(Int) b, Int p, Int n, List(List(Int)) acc) {
+    if (n == 0) { return if (p == b.len()) { Some(Items {.xs = acc, .claim = None}) } else { None }; }
     Rd h = rd(b, p);
+    if (n == 1 && h.major == 4) { return claim_last(b, p, acc); }
     if (h.major != 2 || h.next + h.val > b.len()) { return None; }
     return byte_strings(b, h.next + h.val, n - 1, acc.concat([b[h.next..h.next + h.val]]));
+}
+
+// The trailing claim, the request's last item.
+Option(Items) claim_last(List(Int) b, Int p, List(List(Int)) acc) {
+    Option(ClaimAt) c = claim_at(b, p);
+    return match c {
+        None => None,
+        Some(x) => if (x.next == b.len()) { Some(Items {.xs = acc, .claim = Some(x.claim)}) } else { None }
+    };
 }
 
 Option(List(SignedEvent)) events_of(List(List(Int)) xs, Int i, List(SignedEvent) acc) {
@@ -157,7 +183,7 @@ HttpReply witness_sign(Str root, List(Secret(UInt(8))) wpriv, Int offset, CoReq 
     Str f = dir + "/" + f"{seq}";
     if (filesystem.exists(f)) {
         List(Int) held = filesystem.read_bytes(f);
-        if (held.len() <= 32 || !bytes_eq(held[0..32], d)) { return http_reply_status(409); }
+        if (held.len() <= 32 || !bytes_eq(held[0..32], d)) { return refused_seq(dir, seq, held); }
         return http_reply_bytes(200, "application/cbor", held[32..held.len()]);
     }
     // The log shown must be the one this witness co-signed, where it did.
@@ -165,19 +191,57 @@ HttpReply witness_sign(Str root, List(Secret(UInt(8))) wpriv, Int offset, CoReq 
     Int t = clock_now_seconds() + offset;
     // The time the event was checked at, never earlier than the last
     // event's (il_check_next), is the time signed (R2W-3).
-    Result(Int, SymbolonError) ok = il_check_next(q.l, q.before, q.e, t, lambda(p) { false });
+    Result(NextOk, SymbolonError) ok = il_next(q.l, q.before, q.e, t, lambda(p) { false });
     return match ok {
         Err(e) => http_reply_text(403, "text/plain", match e { ErrInvalidLog(why) => why, _ => "refused" }),
-        Ok(at) => witness_store(f, dir, wpriv, q.l, seq, d, at)
+        Ok(at) => witness_claimed(f, dir, wpriv, q, seq, d, at)
     };
 }
 
+// Only the event the log's relay claimed at this sequence (SPEC 20.3,
+// R2W-2): a holder of one key who shows different valid events to
+// different witnesses gets a claim for one of them at most, so the others
+// are refused here and the sequence cannot be split so that none reaches
+// a majority. The claim is kept beside what was co-signed, as evidence
+// should the relay ever claim another event at the same sequence.
 @requires(filesystem, declassify)
-HttpReply witness_store(Str f, Str dir, List(Secret(UInt(8))) wpriv, List(Int) l, UInt(64) seq, List(Int) d, Int t) {
+HttpReply witness_claimed(Str f, Str dir, List(Secret(UInt(8))) wpriv, CoReq q, UInt(64) seq, List(Int) d, NextOk at) {
+    Str why = claim_problem(at.sequencer, q.l, (Int)seq, d, q.claim);
+    if (str_len(why) > 0) { return http_reply_text(403, "text/plain", why); }
+    Option(RelayClaim) qc = q.claim;
+    List(Int) ck = match qc { None => [], Some(c) => claim_cbor(c) };
+    return witness_store(f, dir, wpriv, q.l, seq, d, at.time, if (at.sequencer.len() > 0) { ck } else { [] });
+}
+
+// 409 for a second digest at a sequence: CBOR [digest, claim] (claim an
+// empty byte string when the witness co-signed without one), what this
+// witness holds there. With a relay claim on another event than the one a
+// device holds the relay's claim for, the device has two claims by the
+// relay at one sequence: proof that the relay equivocated.
+@requires(filesystem)
+HttpReply refused_seq(Str dir, UInt(64) seq, List(Int) held) {
+    if (held.len() < 32) { return http_reply_status(409); }
+    Str cf = dir + "/c" + f"{seq}";
+    List(Int) c = if (filesystem.exists(cf)) { filesystem.read_bytes(cf) } else { [] };
+    List(Int) tail = if (c.len() > 0) { c } else { cbe_bytes([], []) };
+    return http_reply_bytes(409, "application/cbor", cbe_bytes(held[0..32], cbe_array(2, [])).concat(tail));
+}
+
+@requires(filesystem, declassify)
+HttpReply witness_store(Str f, Str dir, List(Secret(UInt(8))) wpriv, List(Int) l, UInt(64) seq, List(Int) d, Int t, List(Int) claim) {
     List(Int) sig = ecdsag_sign_raw(P256, Sha256, wpriv, witness_message(l, seq, d));
     List(Int) answer = cbe_bytes(sig, cbe_uint(t, cbe_array(2, [])));
     _ = filesystem.create_dir(str_slice(dir, 0, str_len(dir) - 65));
     _ = filesystem.create_dir(dir);
+    // The claim first ("c<seq>", not a sequence name): once the sequence
+    // is held, its claim is there to show.
+    if (claim.len() > 0 && !filesystem.exists(dir + "/c" + f"{seq}")) {
+        Str ctmp = dir + "/.c" + f"{seq}" + ".tmp-" + hex_encode(random_bytes(8));
+        if (!filesystem.write_bytes(ctmp, claim) || !filesystem.rename(ctmp, dir + "/c" + f"{seq}")) {
+            _ = filesystem.remove(ctmp);
+            return http_reply_status(500);
+        }
+    }
     // Whole or not at all (R2W-8): a torn seen/ file would hold the
     // sequence with no answer to give.
     Str tmp = dir + "/." + f"{seq}" + ".tmp-" + hex_encode(random_bytes(8));

@@ -68,21 +68,168 @@ EventPayload next_event(VerifiedHead vh, EventBody b, List(List(Int)) digests) {
 // An event signed by `sigs`, witnessed and published; then the log again.
 // The witnesses are shown the log before the event, as the relay holds it:
 // they verify it, and the event as its next one, before they co-sign.
+// First the relay claims the sequence for the event (SPEC 20.3, R2W-2): a
+// log whose policy names a sequencing relay is co-signed only with that
+// relay's claim. A relay that does not sequence (404) gives none: the
+// witnesses then co-sign as before for a log whose policy names no relay,
+// and refuse for one that does.
 @requires(network, clock(readonly), declassify)
 pub Result(VerifiedHead, Str) publish_event(DeviceConfig c, EventPayload p, List(Int) enc, List(EventSig) sigs) {
     List(List(Int)) before = log_raw(relay_ep(c), c.log_id);
     Int have = before.len();
     if (have != (Int)p.sequence) { return Err(f"the relay's log has {have} events, not the {p.sequence} this event follows"); }
-    List(List(Int)) shown = before.concat([cbor_of_event(StoredEvent {.encoded = enc, .sigs = sigs, .cosigs = []})]);
-    List(WitnessCosignature) cs = cosigs_for(c.witnesses, c.ca, c.log_id, p.sequence, sha256_bytes(enc), shown, 0, []);
+    List(Int) bare = cbor_of_event(StoredEvent {.encoded = enc, .sigs = sigs, .cosigs = []});
+    List(Int) d = sha256_bytes(enc);
+    ClaimOut co = claim_post(relay_ep(c), c.log_id, p.sequence, bare);
+    if (co.status == 409) { return Err(claimed_by_other(c, before, p.sequence, co)); }
+    Option(RelayClaim) cl = if (co.status == 200) { co.claim } else { None };
+    List(CosignOut) outs = cosign_all(c.witnesses, c.ca, c.log_id, p.sequence, d, before.concat([bare]), cl, 0, []);
+    List(WitnessCosignature) cs = cosigs_in(outs, 0, []);
     if (cs.len() * 2 <= c.witnesses.len() || cs.len() < 2) {
+        // The relay's two claims at one sequence, when the witnesses hold
+        // another event under a claim of the same relay.
+        Str eq = equivocation(c, before, p.sequence, d, cl, outs);
+        if (str_len(eq) > 0) { return Err(eq); }
         // The freeze alarm (SPEC 20.4): witnesses that co-signed different
         // events at this sequence, so none can get a majority there.
         Str frozen = freeze_check(c.witnesses, c.ca, c.log_id, p.sequence);
-        return Err(if (str_len(frozen) > 0) { frozen } else { "too few witnesses co-signed" });
+        Str none = if (co.status == 200) { "" } else { f" (the relay gave no claim on the event: {co.status})" };
+        return Err(if (str_len(frozen) > 0) { frozen } else { "too few witnesses co-signed" + none });
     }
-    if (!log_put(relay_ep(c), c.log_id, p.sequence, cbor_of_event(StoredEvent {.encoded = enc, .sigs = sigs, .cosigs = cs}))) { return Err("the relay refused the event"); }
+    Bool put = log_put(relay_ep(c), c.log_id, p.sequence, cbor_of_event(StoredEvent {.encoded = enc, .sigs = sigs, .cosigs = cs}));
+    // The relay may have stored it already (it carries what it claims to
+    // the witnesses itself, agent/relaysrv.resid claim_complete).
+    if (!put && !relay_holds(relay_ep(c), c.log_id, p.sequence, d)) { return Err("the relay refused the event"); }
     return match verified_log(relay_ep(c), c.log_id) { Ok(v) => Ok(v), Err(e) => Err("the log does not verify: " + err_text(e)) };
+}
+
+// Each witness's answer to a co-sign request with the relay's claim.
+@requires(network, clock(readonly), declassify)
+List(CosignOut) cosign_all(List(WitnessEp) ws, Str ca, List(Int) l, UInt(64) seq, List(Int) d, List(List(Int)) events, Option(RelayClaim) cl, Int i, List(CosignOut) acc) {
+    if (i >= ws.len()) { return acc; }
+    CosignOut o = cosign_try(Endpoint {.host = ws[i].host, .port = ws[i].port, .ca = ca, .token = ""}, ws[i].key, l, seq, d, events, cl);
+    return cosign_all(ws, ca, l, seq, d, events, cl, i + 1, acc.concat([o]));
+}
+
+List(WitnessCosignature) cosigs_in(List(CosignOut) os, Int i, List(WitnessCosignature) acc) {
+    if (i >= os.len()) { return acc; }
+    Option(WitnessCosignature) w = os[i].cosig;
+    return cosigs_in(os, i + 1, match w { None => acc, Some(x) => acc.concat([x]) });
+}
+
+// Whether the relay's log holds the event with digest `d` at `seq` (the
+// log is verified after, as always).
+@requires(network, clock(readonly), declassify)
+Bool relay_holds(Endpoint relay, List(Int) l, UInt(64) seq, List(Int) d) {
+    HttpOut o = log_get_out(relay, l, seq);
+    if (o.status != 200) { return false; }
+    Option(StoredEvent) se = event_of_cbor(o.body);
+    return match se { None => false, Some(x) => bytes_eq(sha256_bytes(x.encoded), d) };
+}
+
+// The relay claimed sequence `n` for another event. That event is valid
+// there (the relay checked it, the witnesses check it again) and anyone
+// may carry it, with its claim, to the witnesses: this device does, and
+// stores it, so that a key holder who claims a sequence and never
+// finishes cannot stall the log. Then it reports which event took the
+// sequence; one this principal did not make is pending at worst (a
+// single key's authority event or recovery is delayed) and can be vetoed.
+@requires(network, clock(readonly), declassify)
+Str claimed_by_other(DeviceConfig c, List(List(Int)) before, UInt(64) n, ClaimOut co) {
+    Option(StoredEvent) se = event_of_cbor(co.event);
+    List(Int) od = match se { None => [], Some(x) => sha256_bytes(x.encoded) };
+    if (od.len() == 0) { return f"the relay claimed sequence {n} of the log for another event it does not show"; }
+    List(CosignOut) outs = cosign_all(c.witnesses, c.ca, c.log_id, n, od, before.concat([co.event]), co.claim, 0, []);
+    List(WitnessCosignature) cs = cosigs_in(outs, 0, []);
+    StoredEvent x = se else { StoredEvent {.encoded = [], .sigs = [], .cosigs = []} };
+    Bool done = cs.len() * 2 > c.witnesses.len() && cs.len() >= 2
+        && (log_put(relay_ep(c), c.log_id, n, cbor_of_event(StoredEvent {.encoded = x.encoded, .sigs = x.sigs, .cosigs = cs})) || relay_holds(relay_ep(c), c.log_id, n, od));
+    Str what = f"sequence {n} of the log is claimed at the relay by another event (digest {hex_encode(od)})";
+    return what + if (done) { ", now witnessed and stored: check it (device status) and try again" } else { ", not witnessed yet" };
+}
+
+// ─── `device sequence DIR [HOST:PORT]` (SPEC 20.3) ───────────────
+// Names a relay as the log's sequencer (policy field 8): the relay at
+// HOST:PORT, or this device's own. For a log made before field 8 this is
+// the transition: until the set-policy is in force any single key holder
+// can freeze the log, as before. Signed by this device only, it is
+// delayed (and may be vetoed) when the policy wants more devices; adding
+// a relay never weakens the policy, so with enough devices it is
+// immediate. Moving a log to another relay is the same event, claimed by
+// the relay the policy names now: run it while this device still uses
+// that relay, then point the devices at the new one, which takes the log
+// event by event (POST /log verifies each).
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+pub Int device_sequence(Str dir, Str at) {
+    Option(DeviceConfig) oc = load_config(dir);
+    return match oc {
+        None => dfail("not set up"),
+        Some(c) => sequence_with(dir, c, at, read_pin())
+    };
+}
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+Int sequence_with(Str dir, DeviceConfig c, Str at, Str pin) {
+    Unlocked u = unlock_dir(dir, c, pin);
+    if (u.kind == 2) { return dfail(duress_refusal(dir, c)); }
+    if (u.kind != 1) { return dfail("wrong PIN"); }
+    Str name = if (str_len(at) > 0) { at } else { c.relay_host + f":{c.relay_port}" };
+    List(Str) hp = str_split(name, ":");
+    if (hp.len() != 2 || str_len(hp[0]) == 0 || str_parse_int(hp[1]) < 1 || str_parse_int(hp[1]) > 65535) { return dfail("give the relay as HOST:PORT"); }
+    List(Int) ck = claim_key_get(Endpoint {.host = hp[0], .port = str_parse_int(hp[1]), .ca = c.ca, .token = ""});
+    if (ck.len() == 0) { return dfail("that relay serves no claim key (GET /claim-key)"); }
+    Result(VerifiedHead, SymbolonError) rv = verified_log(relay_ep(c), c.log_id);
+    return match rv {
+        Err(e) => dfail(err_text(e)),
+        Ok(vh) => sequence_set(c, u, vh, WitnessRef {.url = name, .key = ck})
+    };
+}
+
+@requires(filesystem, network, device, declassify, clock, environment)
+Int sequence_set(DeviceConfig c, Unlocked u, VerifiedHead vh, WitnessRef sq) {
+    Policy p0 = vh.head.policy;
+    if (p0.sequencer.len() == 1 && bytes_eq(p0.sequencer[0].key, sq.key) && p0.sequencer[0].url == sq.url) {
+        println("the log's policy names that relay already");
+        return 0;
+    }
+    // A policy from before a second device was enrolled may ask for one
+    // device signature: the new one asks for the floor (SPEC 8.2), or
+    // it would not be valid.
+    Int floor = if (count_devices(vh.head.quorum.parties, 0, 0) >= 2) { 2 } else { 1 };
+    UInt(8) dsigs = if ((Int)p0.device_sigs_for_authority < floor) { (UInt(8))floor } else { p0.device_sigs_for_authority };
+    Policy np = Policy {.device_sigs_for_authority = dsigs, .recovery_delay_sec = p0.recovery_delay_sec, .guardians = p0.guardians,
+                        .guardian_threshold = p0.guardian_threshold, .witnesses = p0.witnesses, .duress_window_sec = p0.duress_window_sec,
+                        .sequencer = [sq], .cosigner_policy = p0.cosigner_policy};
+    List(SignedEvent) es = fetch_log(relay_ep(c), c.log_id, 0, []);
+    EventPayload p = next_event(vh, SetPolicyBody(np), field6_in_force(es, vh.pending, es.len() - 1));
+    List(Int) enc = payload_cbor(p) else { [] };
+    if (enc.len() == 0) { return dfail("the policy does not encode"); }
+    Result(List(Int), Str) s = dk_sign(c, u.real, u.st, enc);
+    return match s {
+        Err(m) => dfail(m),
+        Ok(sig) => match publish_event(c, p, enc, [EventSig {.signer = c.party, .sig = sig}]) {
+            Err(m) => dfail("set-policy: " + m),
+            Ok(vh2) => sequence_done(sq, vh2)
+        }
+    };
+}
+
+Int sequence_done(WitnessRef sq, VerifiedHead vh) {
+    Bool now = vh.head.policy.sequencer.len() == 1 && bytes_eq(vh.head.policy.sequencer[0].key, sq.key);
+    println("relay " + sq.url + " " + hex_encode(sq.key) + if (now) { " sequences the log now" } else { f" sequences the log once the set-policy's delay has run ({vh.pending.len()} pending)" });
+    return 0;
+}
+
+// Proof that the log's relay equivocated (SPEC 20.4): it claimed `d` at
+// `n` for this device (`cl`) and a witness holds another digest there
+// under a claim of the same relay. "" when there is no such pair.
+Str equivocation(DeviceConfig c, List(List(Int)) before, UInt(64) n, List(Int) d, Option(RelayClaim) cl, List(CosignOut) outs) {
+    RelayClaim mine = cl else { RelayClaim {.time = -1, .sig = []} };
+    if (mine.time < 0) { return ""; }
+    List(WitnessRef) sq = il_sequencer(c.log_id, events_of_raw(before, 0, []));
+    if (sq.len() == 0 || !claim_ok(sq[0], c.log_id, (Int)n, d, mine)) { return ""; }
+    Str why = equivocation_in(sq[0], c.log_id, (Int)n, d, mine, outs, 0);
+    return why;
 }
 
 // ─── `device protection enable DIR [PRIMES]` (SPEC 18.10.1) ─────

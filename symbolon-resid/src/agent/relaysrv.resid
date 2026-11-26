@@ -19,6 +19,16 @@
 //                              answers "TOKEN UNTIL", a bearer token for seven days, good
 //                              while PARTY stays a device of LOG
 //   GET  /healthz              "ok"
+//   GET  /claim-key            the relay's claim key, hex (SEC1): what a log's policy
+//                              names as its sequencing relay (field 8, SPEC 20.3)
+//   POST /claim/<log>/<n>      an event (as stored, co-signatures not read) valid as
+//                              the next event of the log stored here: the relay
+//                              reserves sequence n for it, once, and answers CBOR
+//                              [event, [time, r || s]], its claim over ["symbolon v1
+//                              relay claim", name, log, n, H(event), time]; 409 with
+//                              the same record for the event it claimed there before
+//                              when this is another; 403 when the event is not valid
+//                              there or the log's policy names another relay
 //   GET  /directory/<org>      the company directory (scim.resid) for an owner's or
 //                              administrator's device; 404 when there is none
 //   /scim/v2/...               the directory's SCIM 2.0 service (scim.resid)
@@ -34,6 +44,7 @@
 
 import "../types.resid";
 import "../core/log.resid";
+import "../core/event_decode.resid";
 import "../net/services.resid";
 import "../net/store.resid";
 import "state.resid";
@@ -989,6 +1000,8 @@ HttpReply handle(RelayCfg g, Store root, HttpRequest r) {
     Str kind = seg_at(p, 1);
     if (p.len() == 3 && kind == "directory" && r.method == "GET") { return directory_reply(root, p[2], who_of(g, root, r)); }
     if (kind == "mbox" || kind == "log") { return plain(root, r, p); }
+    if (r.path == "/claim-key" && r.method == "GET") { return claim_key_reply(root); }
+    if (kind == "claim" && r.method == "POST" && p.len() == 4) { return claim_reply(g.ca, root, p[2], p[3], r.body); }
     if (p.len() != 3 || (kind != "blob" && kind != "list") || !blob_ok(p[2], 0)) { return http_reply_status(404); }
     Who w = who_of(g, root, r);
     Str name = p[2];
@@ -1105,6 +1118,165 @@ Bool next_event_ok(Store root, Str who, Int seq, List(Int) body) {
         None => false,
         Some(e) => log_next_ok(l, log_dir(root, l, (UInt(64))0, []), e, seq)
     };
+}
+
+// ─── The relay as the log's sequencer (SPEC 20.3, R2W-2) ─────────
+// Witnesses co-sign one digest per (log, n) and never another, so a
+// holder of one key that can sign a valid next event (a device, a removed
+// device until the next re-share, the kit) could show different events to
+// different witnesses so that none gets a majority: the log frozen for
+// good. A log whose policy names this relay (field 8, with this relay's
+// claim key) takes event n only with this relay's claim on it, and the
+// relay claims each (log, n) once (write-once, st_put_new): every witness
+// then co-signs the same event there or none. A relay can stall a log (by
+// claiming nothing) but not split it; two claims of it at one sequence
+// are its signatures over two digests, the proof that it equivocated.
+//
+// The claim key is drawn once and kept in the store, "auth/claim-key" (32
+// bytes), shared by every relay process on the store like the challenge
+// key: whoever reads the store can claim for this relay.
+
+@requires(filesystem, network, clock(readonly), declassify)
+List(Int) claim_priv(Store root) {
+    Str k = "auth/claim-key";
+    List(Int) b = st_bytes(root, k);
+    if (b.len() == 32) { return b; }
+    List(Int) fresh = ec_generate(P256);
+    if (fresh.len() != 32) { return []; }
+    _ = st_put_new(root, k, fresh);
+    List(Int) b2 = st_bytes(root, k);
+    return if (b2.len() == 32) { b2 } else { [] };
+}
+
+@requires(filesystem, network, clock(readonly), declassify)
+HttpReply claim_key_reply(Store root) {
+    List(Int) k = claim_priv(root);
+    return if (k.len() == 32) { http_reply_text(200, "text/plain", hex_encode(ec_public_key(P256, k))) } else { http_reply_status(500) };
+}
+
+@requires(filesystem, network, clock(readonly), declassify)
+HttpReply claim_reply(Str ca, Store root, Str who, Str n, List(Int) body) {
+    if (!hex_len(who, 64) || !dec_ok(n, 0) || str_parse_int(n) < 1) { return http_reply_status(404); }
+    if (body.len() > max_body()) { return http_reply_status(413); }
+    Int seq = str_parse_int(n);
+    Option(StoredEvent) se = event_of_cbor(body);
+    Option(SignedEvent) oe = match se { None => None, Some(x) => signed_of(x) };
+    return match oe {
+        None => http_reply_status(400),
+        Some(e) => claim_event(ca, root, cose_hex_decode(who), seq, e, body)
+    };
+}
+
+// The record held for (l, seq), if any: 200 when it is this event's, 409
+// (with it) when another's.
+HttpReply claim_held(List(Int) rec, List(Int) d) {
+    Option(ClaimRecord) cr = claim_record_of(rec);
+    return match cr {
+        None => http_reply_status(500),
+        Some(x) => http_reply_bytes(if (bytes_eq(claimed_digest(x.event), d)) { 200 } else { 409 }, "application/cbor", rec)
+    };
+}
+
+List(Int) claimed_digest(List(Int) stored) {
+    Option(StoredEvent) se = event_of_cbor(stored);
+    return match se { None => [], Some(x) => sha256_bytes(x.encoded) };
+}
+
+@requires(filesystem, network, clock(readonly), declassify)
+HttpReply claim_event(Str ca, Store root, List(Int) l, Int seq, SignedEvent e, List(Int) body) {
+    if ((Int)e.payload.sequence != seq) { return http_reply_status(400); }
+    List(Int) d = sha256_bytes(e.encoded);
+    Str k = "claim/" + hex_encode(l) + "/" + f"{seq}";
+    Option(List(Int)) had = st_get(root, k);
+    if (match had { None => false, Some(_) => true }) { return claim_held(had else { [] }, d); }
+    List(SignedEvent) all = log_dir(root, l, (UInt(64))0, []);
+    if (all.len() < seq) { return http_reply_text(403, "text/plain", "the log before this sequence is not here"); }
+    // Valid as the next event of the log stored here, at this relay's
+    // clock (as a witness checks it at its own): only a holder of the
+    // log's keys can take a sequence. And still valid claim_margin_secs()
+    // from now: an event whose validity runs out (a veto at the end of
+    // its window, a party's event as a recovery's delay runs) must not
+    // hold a sequence the witnesses would then refuse it at.
+    Int now = clock_now_seconds();
+    Result(NextOk, SymbolonError) ok = il_next(l, all[0..seq], e, now, lambda(x) { false });
+    Result(NextOk, SymbolonError) later = il_next(l, all[0..seq], e, now + claim_margin_secs(), lambda(x) { false });
+    Str why = match later { Ok(_) => "", Err(w) => match w { ErrInvalidLog(m) => m + " (in " + f"{claim_margin_secs()}" + " seconds)", _ => "refused" } };
+    return match ok {
+        Err(w) => http_reply_text(403, "text/plain", match w { ErrInvalidLog(m) => m, _ => "refused" }),
+        Ok(nx) => if (str_len(why) > 0) { http_reply_text(403, "text/plain", why) } else { claim_new(ca, root, k, l, seq, d, nx, stored_bare(e, body)) }
+    };
+}
+
+pub Int claim_margin_secs() { return 300; }
+
+// The event as it was sent, without co-signatures (which the claim does not
+// cover and which it does not need).
+List(Int) stored_bare(SignedEvent e, List(Int) body) {
+    Option(StoredEvent) se = event_of_cbor(body);
+    return match se { None => body, Some(x) => cbor_of_event(StoredEvent {.encoded = x.encoded, .sigs = x.sigs, .cosigs = []}) };
+}
+
+@requires(filesystem, network, clock(readonly), declassify)
+HttpReply claim_new(Str ca, Store root, Str k, List(Int) l, Int seq, List(Int) d, NextOk nx, List(Int) ev) {
+    List(WitnessRef) sq = nx.sequencer;
+    List(Int) priv = claim_priv(root);
+    if (priv.len() != 32) { return http_reply_status(500); }
+    List(Int) mine = ec_public_key(P256, priv);
+    // A log whose policy names another relay is that relay's to sequence;
+    // one that names none (made before policy field 8) gets a claim
+    // nobody requires, under no name.
+    if (sq.len() > 0 && !bytes_eq(sq[0].key, mine)) { return http_reply_text(403, "text/plain", "the log's policy names another relay as its sequencer"); }
+    Str name = if (sq.len() > 0) { sq[0].url } else { "" };
+    Int t = clock_now_seconds();
+    RelayClaim c = RelayClaim {.time = t, .sig = ecdsa_sign_raw(P256, Sha256, priv, claim_message(name, l, seq, d, t))};
+    List(Int) rec = claim_record_cbor(ev, c);
+    Int w = st_put_new(root, k, rec);
+    if (w == 1) {
+        // The relay carries the claimed event to the witnesses itself, at
+        // once: a key holder who claims a sequence and never asks the
+        // witnesses cannot leave it held (if the witnesses cannot be
+        // reached now, any device that is answered with this claim
+        // carries the event later).
+        _ = claim_complete(ca, root, l, seq, d, nx.witnesses, ev, c);
+        return http_reply_bytes(200, "application/cbor", rec);
+    }
+    if (w < 0) { return http_reply_status(500); }
+    // Another request claimed it first: that one stands.
+    return claim_held(st_bytes(root, k), d);
+}
+
+// The claimed event at `seq`, co-signed by a majority of `ws` (the
+// policy's witnesses before it) and stored as the log's next event; false
+// when the witnesses did not co-sign it (yet) or it was stored already.
+@requires(filesystem, network, clock(readonly), declassify)
+Bool claim_complete(Str ca, Store root, List(Int) l, Int seq, List(Int) d, List(WitnessRef) ws, List(Int) ev, RelayClaim c) {
+    if (ws.len() == 0) { return false; }
+    List(List(Int)) shown = raw_events(root, l, 0, seq, []).concat([ev]);
+    if (shown.len() != seq + 1) { return false; }
+    List(WitnessCosignature) cs = claim_cosigs(ws, ca, l, seq, d, shown, c, 0, []);
+    if (cs.len() * 2 <= ws.len()) { return false; }
+    Option(StoredEvent) se = event_of_cbor(ev);
+    StoredEvent x = se else { StoredEvent {.encoded = [], .sigs = [], .cosigs = []} };
+    List(Int) full = cbor_of_event(StoredEvent {.encoded = x.encoded, .sigs = x.sigs, .cosigs = cs});
+    if (!next_event_ok(root, hex_encode(l), seq, full)) { return false; }
+    return st_put_new(root, "log/" + hex_encode(l) + "/" + f"{seq}", full) == 1;
+}
+
+// The stored events of `l` from `i` to before `n`, as stored.
+@requires(filesystem, network, clock(readonly), declassify)
+List(List(Int)) raw_events(Store root, List(Int) l, Int i, Int n, List(List(Int)) acc) {
+    if (i >= n) { return acc; }
+    List(Int) b = st_bytes(root, "log/" + hex_encode(l) + "/" + f"{i}");
+    if (b.len() == 0) { return acc; }
+    return raw_events(root, l, i + 1, n, acc.concat([b]));
+}
+
+@requires(network, clock(readonly), declassify)
+List(WitnessCosignature) claim_cosigs(List(WitnessRef) ws, Str ca, List(Int) l, Int seq, List(Int) d, List(List(Int)) shown, RelayClaim c, Int i, List(WitnessCosignature) acc) {
+    if (i >= ws.len()) { return acc; }
+    Option(Endpoint) oe = endpoint_of_url(ws[i].url, ca);
+    Option(WitnessCosignature) w = match oe { None => None, Some(e) => cosign_try(e, ws[i].key, l, (UInt(64))seq, d, shown, Some(c)).cosig };
+    return claim_cosigs(ws, ca, l, seq, d, shown, c, i + 1, match w { None => acc, Some(x) => acc.concat([x]) });
 }
 
 // A mailbox message is one HPKE envelope of one Packet (net/proto.resid).
