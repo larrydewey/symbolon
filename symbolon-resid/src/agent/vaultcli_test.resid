@@ -1,6 +1,6 @@
-// The own vault on the device (src/agent/vaultcli.resid): what a device
-// accepts from the relay over time, and what the duress PIN shows. The
-// other modules the duress PIN changes are imported so they are checked.
+// The own vault on the device (src/agent/vaultcli.resid) and the duress
+// subset file (duresscli.resid): what a device accepts from the relay over
+// time, what the duress PIN shows, and that subset.enc tells nothing.
 // Files go to target/test-vaultcli/ (a fresh directory per test).
 
 import "../types.resid";
@@ -9,6 +9,7 @@ import "../duress/duress.resid";
 import "state.resid";
 import "common.resid";
 import "device.resid";
+import "duresscli.resid";
 import "vaultcli.resid";
 import "alertscli.resid";
 import "home.resid";
@@ -148,4 +149,24 @@ test "under the duress PIN the vault reads as the empty subset, never as a wrong
     // A change under the duress PIN fails as an unreachable relay does.
     expect(duress_change(Ok(vhead()))).toEqual(unreachable_text());
     expect(duress_change(off)).toEqual(unreachable_text());
+}
+
+// ─── subset.enc (D-6) ───────────────────────────────────────────
+
+@requires(filesystem, declassify)
+test "subset.enc is the same size whatever the subset holds" {
+    Str dir = fresh_dir();
+    RealProfile real = as_real().real;
+    expect(update_duress(dir, real, rep(1, 32), rep(2, 32), false)).toBeTrue();
+    Int empty = get_file(dir + "/subset.enc").len();
+    expect(update_duress(dir, real, rep(3, 32), rep(4, 32), true)).toBeTrue();
+    expect(get_file(dir + "/subset.enc").len()).toEqual(empty);
+    expect(update_duress(dir, real, rep(5, 32), rep(6, 32), true)).toBeTrue();
+    expect(get_file(dir + "/subset.enc").len()).toEqual(empty);
+    expect(empty).toEqual(12 + 1 + 64 * max_subset() + 16);
+    // The records come back, in either format.
+    List(Int) two = rep(3, 32).concat(rep(4, 32)).concat(rep(5, 32)).concat(rep(6, 32));
+    expect(hex_encode(subset_records(subset_plain(two)))).toEqual(hex_encode(two));
+    expect(hex_encode(subset_records(two))).toEqual(hex_encode(two));
+    expect(subset_records(subset_plain([])).len()).toEqual(0);
 }

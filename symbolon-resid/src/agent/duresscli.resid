@@ -56,12 +56,35 @@ pub Option(CgConfig) load_dshare(Str dir, List(Secret(UInt(8))) hpke_priv) {
 
 List(Int) subset_aad() { return utf8("symbolon v1 duress subset"); }
 
+// subset.enc's plaintext: the number of credentials (one byte), their
+// (cid 32 | tau 32) records, and zeros up to max_subset() records, so the
+// file is the same size whatever is in the subset, and on a device with no
+// duress PIN. (An earlier format held only the records, which told anyone
+// who can read the directory how many credentials are in the subset, and
+// that there is a duress PIN when there are any.)
+pub Int subset_plain_len() { return 1 + 64 * max_subset(); }
+
+List(Int) zero_bytes(Int n, ListBuf(Int) acc) { return if (n <= 0) { acc.finish() } else { zero_bytes(n - 1, acc.push(0)) }; }
+
+pub List(Int) subset_plain(List(Int) records) {
+    return [records.len() / 64].concat(records).concat(zero_bytes(subset_plain_len() - 1 - records.len(), ListBuf()));
+}
+
+// The records of a subset.enc plaintext, either format.
+pub List(Int) subset_records(List(Int) p) {
+    if (p.len() == subset_plain_len()) {
+        Int n = p[0];
+        return if (n > max_subset()) { [] } else { p[1..1 + 64 * n] };
+    }
+    return if (p.len() % 64 == 0) { p } else { [] };
+}
+
 @requires(filesystem, declassify)
 List(Int) load_subset(Str dir, List(Secret(UInt(8))) dek) {
     List(Int) b = get_file(dir + "/subset.enc");
     if (b.len() < 28) { return []; }
     Option(List(Secret(UInt(8)))) pt = aes_gcmg_decrypt(dek, b[0..12], b[12..b.len()], subset_aad());
-    return match pt { None => [], Some(p) => reveal(p) };
+    return match pt { None => [], Some(p) => subset_records(reveal(p)) };
 }
 
 List(SubsetTweak) tweaks_of(List(Int) b, Int i, List(SubsetTweak) acc) {
@@ -76,9 +99,11 @@ List(SubsetTweak) tweaks_of(List(Int) b, Int i, List(SubsetTweak) acc) {
 @requires(filesystem, declassify)
 pub Bool update_duress(Str dir, RealProfile real, List(Int) cid, List(Int) tau32, Bool add) {
     List(Int) old = load_subset(dir, real.dek);
+    // A full subset takes no more (the duress profile holds max_subset()).
+    if (add && (cid.len() != 32 || tau32.len() != 32 || old.len() + 64 > 64 * max_subset())) { return false; }
     List(Int) all = if (add) { old.concat(cid).concat(tau32) } else { old };
     List(Int) iv = random_bytes(12);
-    Bool saved = put_secret_file(dir + "/subset.enc", iv.concat(reveal(aes_gcmg_seal(real.dek, iv, secret_bytes(all), subset_aad()))));
+    Bool saved = put_secret_file(dir + "/subset.enc", iv.concat(reveal(aes_gcmg_seal(real.dek, iv, secret_bytes(subset_plain(all)), subset_aad()))));
     List(Int) slot = if (real.duress_hpke_pub.len() == 65) {
         seal_slot(real.duress_hpke_pub, 0, DuressFull {.share = zeros32(), .subkey = zeros32(), .vault_key = zeros32(), .hpke_priv = zeros32(), .tweaks = tweaks_of(all, 0, [])}, random_secret(32)) else { [] }
     } else { decoy_slot(random_bytes(slot_len())) };
