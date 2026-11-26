@@ -1,0 +1,108 @@
+// Files sealed at rest on a Symbolon Home box (SPEC 20.5, R3U-3).
+//
+// A box that is sealed has one 32-byte box key, itself sealed to the box's
+// TPM or to a passphrase (home.resid). `home serve` unseals it into a
+// directory in memory (tmpfs) and nowhere else; the cosigner and witness
+// keys on the box's disk are AES-256-GCM under it:
+//
+//   "SYMBSEAL" || IV (12) || AES-256-GCM(box key, IV, plaintext,
+//                                        "symbolon v1 home sealed file")
+//
+// A cosigner directory on a sealed box holds `box-seal.path`, naming the
+// box key's file in memory. While it is there, every secret file the
+// cosigner writes (put_secret_file) is sealed, and one it cannot seal (the
+// key is not in memory) is not written at all; get_file opens sealed files
+// and returns other files as they are. A copy of the disk, or a backup of
+// the data folder, holds sealed files and the box key sealed, never the
+// box key itself.
+
+import "aesgcm.resid";
+import "crypto.resid";
+
+pub List(Int) seal_magic() { return [83, 89, 77, 66, 83, 69, 65, 76]; }   // "SYMBSEAL"
+pub Str seal_ptr_name() { return "box-seal.path"; }
+// "symbolon v1 home sealed file"
+List(Int) seal_aad() { return [115, 121, 109, 98, 111, 108, 111, 110, 32, 118, 49, 32, 104, 111, 109, 101, 32, 115, 101, 97, 108, 101, 100, 32, 102, 105, 108, 101]; }
+
+pub Bool is_sealed(List(Int) b) { return b.len() >= 36 && b[0..8] == seal_magic(); }
+
+// `pt` sealed under `key` (32 bytes), or [] for a bad key.
+pub List(Int) seal_bytes(List(Int) key, List(Int) pt) {
+    if (key.len() != 32) { return []; }
+    List(Int) iv = random_bytes(12);
+    List(Int) ct = aes_gcm_seal(key, iv, pt, seal_aad());
+    return if (ct.len() < 16) { [] } else { seal_magic().concat(iv).concat(ct) };
+}
+
+// The plaintext of a sealed `b`, None when it is not sealed or the key is
+// not the one it was sealed under.
+pub Option(List(Int)) unseal_bytes(List(Int) key, List(Int) b) {
+    if (key.len() != 32 || !is_sealed(b)) { return None; }
+    return aes_gcm_decrypt(key, b[8..20], b[20..b.len()], seal_aad());
+}
+
+// The directory part of a path ("" for none).
+pub Str seal_dir_of(Str path) {
+    Int i = seal_last_slash(path, str_len(path) - 1);
+    return if (i < 0) { "." } else { str_slice(path, 0, i) };
+}
+
+Int seal_last_slash(Str s, Int i) {
+    if (i < 0) { return -1; }
+    return if (str_slice(s, i, i + 1) == "/") { i } else { seal_last_slash(s, i - 1) };
+}
+
+// Whether `dir` is sealed (its box-seal.path is there), and the box key
+// when the file it names holds one ([] when it does not: the box is not
+// serving, so nothing is written and nothing sealed opens).
+pub type SealAt = { Bool on; List(Int) key; };
+
+@requires(filesystem)
+pub SealAt seal_at(Str dir) {
+    Str ptr = dir + "/" + seal_ptr_name();
+    if (!filesystem.exists(ptr)) { return SealAt {.on = false, .key = []}; }
+    Str kf = str_trim(filesystem.read_all(ptr));
+    List(Int) k = if (str_len(kf) == 0) { [] } else { filesystem.read_bytes(kf) };
+    return SealAt {.on = true, .key = if (k.len() == 32) { k } else { [] }};
+}
+
+// A secret file: sealed when its directory is, mode 0600 either way.
+@requires(filesystem)
+pub Bool seal_put(Str path, List(Int) b) {
+    SealAt s = seal_at(seal_dir_of(path));
+    if (!s.on) { return filesystem.write_secret(path, b); }
+    List(Int) sealed = seal_bytes(s.key, b);
+    return sealed.len() > 0 && filesystem.write_secret(path, sealed);
+}
+
+// A file's contents, opened when it is sealed ([] when it cannot be).
+@requires(filesystem)
+pub List(Int) seal_get(Str path) {
+    List(Int) b = filesystem.read_bytes(path);
+    if (!is_sealed(b)) { return b; }
+    SealAt s = seal_at(seal_dir_of(path));
+    // Outside a sealed directory every file is read as it is (a device's
+    // files, whatever their first bytes).
+    if (!s.on) { return b; }
+    return match unseal_bytes(s.key, b) { Some(p) => p, None => [] };
+}
+
+// ─── Memory only ────────────────────────────────────────────────
+
+// Whether `dir` lies on a file system kept in memory (tmpfs, ramfs), by
+// `mounts` (the text of /proc/self/mounts): the longest mount point that
+// holds it decides.
+pub Bool in_memory_fs(Str dir, Str mounts) {
+    return mem_mount(dir, str_split(mounts, "\n"), 0, -1, false);
+}
+
+Bool mem_mount(Str dir, List(Str) ls, Int i, Int best, Bool mem) {
+    if (i >= ls.len()) { return best >= 0 && mem; }
+    List(Str) f = str_split(str_trim(ls[i]), " ");
+    if (f.len() < 3) { return mem_mount(dir, ls, i + 1, best, mem); }
+    Str mp = f[1];
+    Int n = str_len(mp);
+    Bool holds = mp == "/" || dir == mp || (str_len(dir) > n && str_slice(dir, 0, n) == mp && str_slice(dir, n, n + 1) == "/");
+    Bool better = holds && n >= best;
+    return mem_mount(dir, ls, i + 1, if (better) { n } else { best }, if (better) { f[2] == "tmpfs" || f[2] == "ramfs" } else { mem });
+}

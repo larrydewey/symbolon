@@ -17,6 +17,7 @@ import "word.resid";
 import "ecdsa.resid";
 import "crypto.resid";
 import "cbor.resid";
+import "boxseal.resid";
 
 pub List(Int) ints(List(UInt(8)) b) { return ints_at(b, 0, ListBuf()); }
 List(Int) ints_at(List(UInt(8)) b, Int i, ListBuf(Int) acc) {
@@ -76,11 +77,14 @@ pub List(Int) party_of_key(List(Int) auth_key) { return sha256_bytes(auth_key); 
 
 // ─── Files ───────────────────────────────────────────────────────
 
+// Mode 0600; on a sealed Symbolon Home box, sealed under the box key in
+// memory, and opened again by get_file (boxseal.resid). Elsewhere a plain
+// write and read.
 @requires(filesystem)
-pub Bool put_secret_file(Str path, List(Int) b) { return filesystem.write_secret(path, b); }
+pub Bool put_secret_file(Str path, List(Int) b) { return seal_put(path, b); }
 
 @requires(filesystem)
-pub List(Int) get_file(Str path) { return filesystem.read_bytes(path); }
+pub List(Int) get_file(Str path) { return seal_get(path); }
 
 pub List(Int) cbor_of_device(DeviceConfig c) { return match to_cbor(c) { Ok(b) => b, Err(_) => [] }; }
 pub Option(DeviceConfig) device_of_cbor(List(Int) b) {

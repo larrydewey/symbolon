@@ -10,6 +10,7 @@ import "../types.resid";
 import "../core/log.resid";
 import "../threshold/threshold.resid";
 import "crypto.resid";
+import "boxseal.resid";
 
 List(Int) zeros(Int n, List(Int) acc) { return if (n <= 0) { acc } else { zeros(n - 1, acc.concat([0])) }; }
 
@@ -153,12 +154,12 @@ Bool move_file(Str from, Str to) {
 @requires(filesystem)
 Bool promote_set(Str dir, Str tag, Int e, Quorum nq, List(Int) me) {
     Str s = f"{e}";
-    List(Int) kitb = filesystem.read_bytes(pending_file(dir, tag, "kitb"));
-    List(Int) kb = filesystem.read_bytes(pending_file(dir, tag, "kb"));
+    List(Int) kitb = seal_get(pending_file(dir, tag, "kitb"));
+    List(Int) kb = seal_get(pending_file(dir, tag, "kb"));
     Str half = dir + "/kit-half-" + s + ".raw";
     Bool ok = move_file(pending_file(dir, tag, "cfg"), dir + "/cg-" + s + ".cfg")
         && move_file(pending_file(dir, tag, "kitb"), dir + "/kit-b-" + s)
-        && (kitb.len() != 32 || kb.len() != 32 || filesystem.exists(half) || filesystem.write_secret(half, kitb.concat(kb)))
+        && (kitb.len() != 32 || kb.len() != 32 || filesystem.exists(half) || seal_put(half, kitb.concat(kb)))
         && promote_kv(dir, tag, s, nq, me)
         && move_file(pending_file(dir, tag, "invite"), dir + "/reshare-" + s + ".invite")
         && filesystem.write_all(dir + "/reshare-" + s + ".tag", tag);
@@ -171,13 +172,13 @@ Bool promote_set(Str dir, Str tag, Int e, Quorum nq, List(Int) me) {
 // same commitments: kv-<e> (index || share) and kitv-b-<e> (b_v).
 @requires(filesystem)
 Bool promote_kv(Str dir, Str tag, Str s, Quorum nq, List(Int) me) {
-    List(Int) p = filesystem.read_bytes(pending_file(dir, tag, "kv"));
+    List(Int) p = seal_get(pending_file(dir, tag, "kv"));
     if (nq.kv_commits.len() == 0 || p.len() < 64) { return true; }
     if (!(p[64..p.len()] == ef_flat(nq.kv_commits, 0, []))) { return true; }
     Int id = ef_index1(nq.parties, me, 0);
     if (id < 1) { return true; }
-    return filesystem.write_secret(dir + "/kv-" + s, [(id >> 8) & 255, id & 255].concat(p[0..32]))
-        && (p[32..64] == zeros(32, []) || filesystem.write_secret(dir + "/kitv-b-" + s, p[32..64]));
+    return seal_put(dir + "/kv-" + s, [(id >> 8) & 255, id & 255].concat(p[0..32]))
+        && (p[32..64] == zeros(32, []) || seal_put(dir + "/kitv-b-" + s, p[32..64]));
 }
 
 List(Int) ef_flat(List(List(Int)) xs, Int i, List(Int) acc) { return if (i >= xs.len()) { acc } else { ef_flat(xs, i + 1, acc.concat(xs[i])) }; }
