@@ -88,10 +88,16 @@
 //       refused under "keys" with no key enrolled, and a key's touch signs over the request.
 //   symbolon browser host [ORIGIN...]          the browser extension's native messaging host (SPEC 22.5);
 //                                              SYMBOLON_CONSENT is the consent window (the app)
-//   symbolon home init DIR HOST [HOST...] [--ports BASE] [--bind ADDR]   Symbolon Home: the box's CA, certificates, witnesses
-//   symbolon home invite DIR NAME              a cosigner for NAME; prints the pairing link (QR)
+//   symbolon home init DIR HOST [HOST...] --witness H:P:KEY --witness H:P:KEY [--witness-ca FILE] [--ports BASE] [--bind ADDR]
+//            [--seal tpm|passphrase] [--passphrase-file FILE]   Symbolon Home: the box's CA, certificates and witness,
+//                                              keys sealed to the TPM or a passphrase; two witnesses outside the box
+//   symbolon home secure DIR [--witness H:P:KEY ...] [seal flags]   an existing box: seals its keys, moves new people's witnesses off it
+//   symbolon home status DIR                   JSON: sealed, witness majority off the box, the reminder
+//   symbolon home witness-cert DIR HOST OUTDIR a TLS certificate under the box's CA for a witness outside it
+//   symbolon home invite DIR NAME              a one-time code (a day) for NAME; prints the pairing link (QR)
 //   symbolon device pin DIR                    PIN and the new PIN on stdin; changes the PIN
-//   symbolon home serve DIR                    pairing, relay, three witnesses and every cosigner
+//   symbolon home serve DIR [--passphrase-file FILE] [--run DIR]   pairing, relay, the box's witness and every cosigner
+//                                              (keys unsealed into DIR, a tmpfs, default /dev/shm)
 //   symbolon device webauthn register DIR RP_ID [--uv] [--duress]          PIN on stdin; adds authenticator-data
 //                                              and attestation-object (fmt none) to what register prints
 //                                              --replaces CID: it replaces that imported (Synced) passkey
@@ -341,7 +347,16 @@ List(Str) arg_list(Int i, Int e, ListBuf(Str) acc) {
     return arg_list(i + 1, e, acc.push(args.get(i)));
 }
 
-Str bind_or_all(Str b) { return if (str_len(b) == 0) { "0.0.0.0" } else { b }; }
+// Every value of a flag that may repeat (`--witness A --witness B`).
+@requires(args)
+List(Str) flag_args(Str f, Int i, ListBuf(Str) acc) {
+    if (i + 1 >= args.count()) { return acc.finish(); }
+    return if (args.get(i) == f) { flag_args(f, i + 2, acc.push(args.get(i + 1))) } else { flag_args(f, i + 1, acc) };
+}
+
+// How `home init` and `home secure` seal the box's keys (home.resid).
+@requires(args)
+SealOpts seal_opts(Int i) { return SealOpts {.mode = flag_arg("--seal", 1, i), .pass_file = flag_arg("--passphrase-file", 1, i), .fast = has_flag("--fast-kdf", i)}; }
 
 Str bind_or(Str b) { return if (str_len(b) == 0) { "127.0.0.1" } else { b }; }
 
@@ -421,7 +436,14 @@ Int main_cmd() {
     Str a1 = args.get(1);
     Str a2 = args.get(2);
     Int n = args.count();
-    if (a1 == "home" && a2 == "init" && n >= 5) { Int hp = positional(4); return home_init(args.get(3), arg_list(4, hp, ListBuf()), if (str_len(flag_arg("--ports", 1, hp)) > 0) { str_parse_int(flag_arg("--ports", 1, hp)) } else { home_default_base() }, bind_or_all(flag_arg("--bind", 1, hp))); }
+    if (a1 == "home" && a2 == "init" && n >= 5) {
+        Int hp = positional(4);
+        return home_init(args.get(3), arg_list(4, hp, ListBuf()), if (str_len(flag_arg("--ports", 1, hp)) > 0) { str_parse_int(flag_arg("--ports", 1, hp)) } else { home_default_base() },
+                         flag_arg("--bind", 1, hp), flag_args("--witness", hp, ListBuf()), flag_arg("--witness-ca", 1, hp), seal_opts(hp));
+    }
+    if (a1 == "home" && a2 == "secure" && n >= 4) { return home_secure(args.get(3), flag_args("--witness", 4, ListBuf()), flag_arg("--witness-ca", 1, 4), seal_opts(4)); }
+    if (a1 == "home" && a2 == "status" && n == 4) { return home_status_cmd(args.get(3)); }
+    if (a1 == "home" && a2 == "witness-cert" && n >= 6) { return home_witness_cert(args.get(3), args.get(4), args.get(5), flag_arg("--passphrase-file", 1, 6)); }
     if (a1 == "home" && a2 == "invite" && n == 5) { return home_invite(args.get(3), args.get(4)); }
     if (a1 == "device" && a2 == "pin" && n == 4) { return device_pin(args.get(3)); }
     // Started by the browser (native messaging); its own arguments follow.
@@ -446,9 +468,9 @@ Int main_cmd() {
     if (a1 == "device" && a2 == "key" && args.get(3) == "remove" && n == 6) { return key_remove(args.get(4), args.get(5)); }
     if (a1 == "device" && a2 == "key" && args.get(3) == "fills" && n == 6) { return key_fills(args.get(4), args.get(5)); }
     if (a1 == "browser" && a2 == "host") { return browser_host([args.get(3), args.get(4)]); }
-    if (a1 == "home" && a2 == "serve" && n == 4) { return home_serve(args.get(3), args.get(0)); }
-    if (a1 == "home" && a2 == "pair-serve" && n == 4) { return home_pair_serve(args.get(3), args.get(0)); }
-    if (a1 == "home" && a2 == "pair-child" && n == 5) { return home_pair_child(args.get(3), str_parse_int(args.get(4))); }
+    if (a1 == "home" && a2 == "serve" && n >= 4) { return home_serve(args.get(3), args.get(0), flag_arg("--passphrase-file", 1, 4), flag_arg("--run", 1, 4)); }
+    if (a1 == "home" && a2 == "pair-serve" && n == 5) { return home_pair_serve(args.get(3), args.get(4), args.get(0)); }
+    if (a1 == "home" && a2 == "pair-child" && n == 6) { return home_pair_child(args.get(3), str_parse_int(args.get(4)), args.get(5)); }
     if (a1 == "cosigner" && a2 == "new" && positional(3) == 6) { return cosignerd_new(args.get(3), args.get(4), str_parse_int(args.get(5)), ca_text()); }
     if (a1 == "cosigner" && a2 == "pair" && n == 5) { return cosignerd_pair(args.get(3), args.get(4)); }
     if (a1 == "cosigner" && a2 == "serve" && (n == 4 || n == 5)) { return cosignerd_serve(args.get(3), if (n == 5) { args.get(4) } else { "" }, args.get(0)); }

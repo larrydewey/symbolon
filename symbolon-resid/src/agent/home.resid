@@ -1,44 +1,77 @@
-// Symbolon Home: one box (a NAS, a small computer) that runs everything a
-// household's devices need -- the relay, the witnesses and a cosigner for
-// each person -- with its own small certificate authority, and pairs a
-// new phone through a one-time invite shown as a QR code.
+// Symbolon Home: one box (a NAS, a small computer) that runs what a
+// household's devices need -- the relay, one of the witnesses and a
+// cosigner for each person -- with its own small certificate authority,
+// and pairs a new phone through a one-time invite shown as a QR code.
 //
-//   symbolon home init DIR HOST [HOST...] [--ports BASE] [--bind ADDR]
+//   symbolon home init DIR HOST [HOST...] --witness H:P:KEY --witness H:P:KEY
+//                 [--witness-ca FILE] [--ports BASE] [--bind ADDR]
+//                 [--seal tpm|passphrase] [--passphrase-file FILE] [--fast-kdf]
 //       the box's keys and certificates, for the names or addresses its
-//       devices reach it at (a LAN address, a WireGuard or Tailscale one);
-//       --bind: listen on ADDR only (default 0.0.0.0, every interface)
+//       devices reach it at (a LAN address, a WireGuard or Tailscale one).
+//       --bind: the address to listen on (default: the first HOST, when it
+//       is an IPv4 address; in a container, 0.0.0.0 and publish the ports
+//       on one address only). --witness: a witness outside the box (a
+//       household computer running `symbolon witness serve`, or a hosted
+//       one), at least two: the box runs one witness, so it is never a
+//       majority of the three (SPEC 20.5). --witness-ca: the CA of a hosted
+//       witness's certificate, trusted beside the box's.
+//   symbolon home secure DIR [--witness H:P:KEY ...] [--witness-ca FILE] [seal flags]
+//       an existing box: seals its keys, and names the witnesses outside it
+//       that people invited from now on get.
+//   symbolon home status DIR
+//       JSON: whether the keys are sealed and the witnesses outside the box
+//       a majority; the reminder while they are not.
+//   symbolon home witness-cert DIR HOST OUTDIR [--passphrase-file FILE]
+//       a TLS certificate under the box's CA for a household computer that
+//       runs a witness (OUTDIR/server.pem, OUTDIR/server.key).
 //   symbolon home invite DIR NAME
-//       a cosigner for NAME and a one-time code; prints the pairing link
-//       symbolon://pair?h=HOST&p=PORT&c=CODE&f=CERT-SHA256 (the QR content)
-//   symbolon home serve DIR
-//       runs it all (ports BASE..BASE+4: pairing, relay, three witnesses)
+//       a one-time code for NAME (a day); prints the pairing link
+//       symbolon://pair?h=HOST&p=PORT&c=CODE&f=CERT-SHA256 (the QR content).
+//       `home serve` makes NAME's cosigner within ten seconds.
+//   symbolon home serve DIR [--passphrase-file FILE] [--run DIR]
+//       runs it all (ports BASE..BASE+4: pairing, relay, the box's witness;
+//       a box set up before the witnesses moved runs three).
+//
+// Sealing (R3U-3): the cosigners' keys, the witnesses' keys, the CA's and
+// the server certificate's are sealed on the disk under one box key
+// (boxseal.resid), and the box key is sealed to the box's TPM or, without
+// one, to a passphrase (Argon2id). `home serve` unseals the box key into a
+// directory in memory (tmpfs) at start; nothing on the disk opens without
+// the TPM or the passphrase, so a copy of the disk or of the data folder,
+// even with a person's paper recovery sheet, does not sign.
 //
 // Pairing (port BASE, HTTPS; the phone pins the box's server certificate by
 // the fingerprint in the link on its first connection, so the code never
 // travels over a connection it has not checked, and takes the CA from the
 // setup for the agent):
-//   GET  /setup?c=CODE  the relay, NAME's cosigner keys, the witnesses and
-//                       the CA certificate (JSON)
-//   POST /pair?c=CODE   body: the new device's keys (device new); pins the
-//                       device at NAME's cosigner and spends the code
-//
-// Interim: the box runs its witnesses itself, so it vouches for its own
-// log; SPEC 20.3 wants independent ones (public logs are planned).
+//   GET  /setup?c=CODE    the relay, NAME's cosigner keys, the witnesses,
+//                         the CA certificate and a pair token (JSON); the
+//                         code's first use spends it (O_EXCL), so the setup
+//                         is given out once
+//   POST /pair?c=CODE&t=TOKEN   body: the new device's keys (device new);
+//                         pins the device at NAME's cosigner, once, and only
+//                         for the device that fetched the setup
 
 import "../types.resid";
+import "../duress/duress.resid";
 import "state.resid";
 import "common.resid";
 import "cosignerd.resid";
+import "boxseal.resid";
 import "crypto.resid";
 import "cose.resid";
 import "ecdsa.resid";
+import "aesgcm.resid";
 import "x509gen.resid";
 import "httpserv.resid";
 import "tlskey.resid";
 import "tlswire.resid";
+import "dev/tpm.resid";
+import "dev/tpm_wire.resid";
 
 pub Int home_default_base() { return 47100; }
-Int invite_secs() { return 7 * 86400; }
+// An invite lives a day: the link is a bearer secret (SPEC 20.5).
+pub Int invite_secs() { return 86400; }
 
 pub type HomeCfg = { Int base; List(Str) hosts; Str bind; };
 
@@ -55,6 +88,9 @@ List(Str) rest_of(List(Str) ls, Int i, ListBuf(Str) acc) {
     Str l = str_trim(ls[i]);
     return rest_of(ls, i + 1, if (str_len(l) == 0) { acc } else { acc.push(l) });
 }
+
+@requires(filesystem)
+List(Str) file_lines(Str path) { return rest_of(str_split(filesystem.read_all(path), "\n"), 0, ListBuf()); }
 
 // An IPv4 address as 4 octets, or [] for a name.
 pub List(Int) ipv4_of(Str h) {
@@ -99,18 +135,424 @@ pub Str local_of(Str bind) { return if (bind == "0.0.0.0" || str_len(bind) == 0)
 
 List(Str) with_local(List(Str) hosts, Str local) { return if (hosts.contains(local)) { hosts } else { hosts.concat([local]) }; }
 
+// The address `home init` listens on (R3U-5): --bind when given, else the
+// first host when it is an IPv4 address; "" when neither (a name: the box
+// cannot tell which of its addresses that is).
+pub Str bind_for(Str flag, List(Str) hosts) {
+    if (str_len(flag) > 0) { return flag; }
+    return if (hosts.len() > 0 && ipv4_of(hosts[0]).len() == 4) { hosts[0] } else { "" };
+}
+
 // A P-256 key drawn until it is in range.
 List(Int) fresh_key() { return ec_generate(P256); }
+
+// ─── Witnesses outside the box (SPEC 20.5) ──────────────────────
+
+// The box runs `on_box` of `total` witnesses: it must be fewer than a
+// majority, so the box alone can never co-sign an event or a head.
+pub Bool box_minority(Int on_box, Int total) { return on_box * 2 < total; }
+
+// What is wrong with a witness HOST:PORT:KEY (KEY: its P-256 public key,
+// uncompressed, hex) given as outside the box, or "".
+pub Str witness_problem(Str w, List(Str) box_hosts) {
+    List(Str) p = str_split(w, ":");
+    if (p.len() != 3) { return w + ": a witness is HOST:PORT:KEY"; }
+    Int port = str_parse_int(p[1]);
+    if (!digits(p[1], 0) || port < 1 || port > 65535) { return w + ": not a port"; }
+    List(Int) k = cose_hex_decode(p[2]);
+    if (k.len() != 65 || k[0] != 4 || str_len(p[2]) != 130) { return w + ": the key is not a P-256 public key (130 hex digits, `symbolon witness keygen` prints it)"; }
+    Str h = str_to_lower(p[0]);
+    if (str_len(h) == 0 || h == "localhost" || str_starts_with(h, "127.") || h == "0.0.0.0" || lower_all(box_hosts, 0, ListBuf()).contains(h)) {
+        return w + ": that is this box; a witness outside it runs on another machine";
+    }
+    return "";
+}
+
+List(Str) lower_all(List(Str) xs, Int i, ListBuf(Str) acc) {
+    if (i >= xs.len()) { return acc.finish(); }
+    return lower_all(xs, i + 1, acc.push(str_to_lower(xs[i])));
+}
+
+Str key_of_witness(Str w) { List(Str) p = str_split(w, ":"); return if (p.len() == 3) { str_to_lower(p[2]) } else { "" }; }
+
+// The witnesses outside the box, checked: each one well formed and not
+// on the box, no key twice, and the box (`on_box` witnesses of its own)
+// a minority of them all. "" when they will do.
+pub Str witnesses_problem(List(Str) ws, List(Str) box_hosts, List(Str) box_keys, Int on_box) {
+    Str one = first_problem(ws, box_hosts, 0);
+    if (str_len(one) > 0) { return one; }
+    if (!distinct_keys(ws, 0, lower_all(box_keys, 0, ListBuf()))) { return "two witnesses have the same key, or one has the key of the box's own witness"; }
+    if (!box_minority(on_box, on_box + ws.len())) {
+        Int need = on_box + 1;
+        return f"the box runs {on_box} witness(es), so it would be a majority: name at least {need} witnesses outside it (--witness HOST:PORT:KEY)";
+    }
+    return "";
+}
+
+Str first_problem(List(Str) ws, List(Str) box_hosts, Int i) {
+    if (i >= ws.len()) { return ""; }
+    Str p = witness_problem(ws[i], box_hosts);
+    return if (str_len(p) > 0) { p } else { first_problem(ws, box_hosts, i + 1) };
+}
+
+Bool distinct_keys(List(Str) ws, Int i, List(Str) seen) {
+    if (i >= ws.len()) { return true; }
+    Str k = key_of_witness(ws[i]);
+    return !seen.contains(k) && distinct_keys(ws, i + 1, seen.concat([k]));
+}
+
+// ─── The box key (sealed to the TPM or a passphrase) ────────────
+
+// seal/box.key:
+//   "SYMBOXK1" || 1 || m_kib (4, big-endian) || t (1) || salt (16) || IV (12) || AES-256-GCM(kek, box key)
+//       kek = Argon2id(passphrase, salt, m_kib, t), 32 bytes
+//   "SYMBOXK1" || 2 || handle (4) || salt (32) || IV (12) || AES-256-GCM(kek, box key)
+//       kek = HMAC-SHA-256 by the TPM-held key at `handle` of the salt
+// both with AAD "symbolon v1 home box key" || kind.
+List(Int) boxkey_magic() { return [83, 89, 77, 66, 79, 88, 75, 49]; }
+pub Int kind_passphrase() { return 1; }
+pub Int kind_tpm() { return 2; }
+List(Int) boxkey_aad(Int kind) { return str_to_bytes("symbolon v1 home box key").concat([kind]); }
+Int home_tpm_handle() { return 0x81000120; }
+Int home_srk_handle() { return 0x81000110; }
+pub Int box_argon_m_kib() { return argon_m_kib(); }
+pub Int box_argon_t() { return argon_t(); }
+pub Int min_passphrase() { return 12; }
+
+List(Int) be32(Int v) { return [(v >> 24) & 255, (v >> 16) & 255, (v >> 8) & 255, v & 255]; }
+Int from_be32(List(Int) b, Int i) { return (b[i] << 24) | (b[i + 1] << 16) | (b[i + 2] << 8) | b[i + 3]; }
+
+@requires(declassify)
+List(Int) pass_kek(Str pass, List(Int) salt, Int m, Int t) { return reveal(pin_stretch(secret_bytes(str_to_bytes(pass)), salt, m, t)); }
+
+// The box key `k` sealed to `pass`.
+@requires(declassify)
+pub List(Int) box_key_seal_pass(List(Int) k, Str pass, Int m, Int t) {
+    List(Int) salt = random_bytes(16);
+    List(Int) iv = random_bytes(12);
+    List(Int) ct = aes_gcm_seal(pass_kek(pass, salt, m, t), iv, k, boxkey_aad(kind_passphrase()));
+    return boxkey_magic().concat([kind_passphrase()]).concat(be32(m)).concat([t]).concat(salt).concat(iv).concat(ct);
+}
+
+pub Int box_key_kind(List(Int) b) { return if (b.len() > 9 && b[0..8] == boxkey_magic()) { b[8] } else { 0 }; }
+
+// The box key, when `pass` is the passphrase it was sealed to.
+@requires(declassify)
+pub Option(List(Int)) box_key_open_pass(List(Int) b, Str pass) {
+    if (box_key_kind(b) != kind_passphrase() || b.len() != 90) { return None; }
+    Int m = from_be32(b, 9);
+    Int t = b[13];
+    if (m < 8 || m > 4194304 || t < 1 || t > 16) { return None; }
+    return aes_gcm_decrypt(pass_kek(pass, b[14..30], m, t), b[30..42], b[42..90], boxkey_aad(kind_passphrase()));
+}
+
+List(UInt(8)) u8_of(List(Int) b, Int i, ListBuf(UInt(8)) acc) {
+    if (i >= b.len()) { return acc.finish(); }
+    return u8_of(b, i + 1, acc.push((UInt(8))(b[i] & 255)));
+}
+
+// The TPM's HMAC of `salt` under the box's TPM key, or [].
+@requires(device, declassify)
+List(Int) tpm_kek(Int handle, List(Int) salt) {
+    List(Secret(UInt(8))) none = [];
+    Result(List(Secret(UInt(8))), TpmError) r = tpm_hmac(handle, none, u8_of(salt, 0, ListBuf()));
+    return match r { Ok(h) => reveal(h), Err(_) => [] };
+}
+
+// Whether the TPM holds the box's HMAC key, made now when it does not. A
+// key the TPM makes never leaves it; one already there (this box set up
+// again) is used as it is.
+@requires(device, declassify)
+pub Bool tpm_box_key_ready() {
+    Result(List(Int), TpmError) r = tpm_handles(home_tpm_handle(), 1);
+    Bool have = match r { Ok(hs) => hs.contains(home_tpm_handle()), Err(_) => false };
+    if (have) { return true; }
+    if (match r { Ok(_) => false, Err(_) => true }) { return false; }
+    _ = tpm_srk_setup(home_srk_handle());
+    List(Secret(UInt(8))) none = [];
+    return match tpm_create(home_srk_handle(), tpm_hmac_key_template(), none) {
+        Err(_) => false,
+        Ok(b) => match tpm_persist(home_srk_handle(), b, home_tpm_handle()) { Ok(_) => true, Err(_) => false }
+    };
+}
+
+@requires(device, declassify)
+pub List(Int) box_key_seal_tpm(List(Int) k) {
+    List(Int) salt = random_bytes(32);
+    List(Int) kek = tpm_kek(home_tpm_handle(), salt);
+    if (kek.len() != 32) { return []; }
+    List(Int) iv = random_bytes(12);
+    return boxkey_magic().concat([kind_tpm()]).concat(be32(home_tpm_handle())).concat(salt).concat(iv).concat(aes_gcm_seal(kek, iv, k, boxkey_aad(kind_tpm())));
+}
+
+@requires(device, declassify)
+pub Option(List(Int)) box_key_open_tpm(List(Int) b) {
+    if (box_key_kind(b) != kind_tpm() || b.len() != 105) { return None; }
+    List(Int) kek = tpm_kek(from_be32(b, 9), b[13..45]);
+    if (kek.len() != 32) { return None; }
+    return aes_gcm_decrypt(kek, b[45..57], b[57..105], boxkey_aad(kind_tpm()));
+}
+
+// How a box seals its key: `mode` "tpm", "passphrase" or "" (the TPM when
+// the box has one); the passphrase from `pass_file` (or
+// SYMBOLON_HOME_PASSPHRASE_FILE, or the Docker secret
+// /run/secrets/symbolon_home_passphrase), else typed on standard input;
+// `fast`: tests' Argon2id parameters.
+pub type SealOpts = { Str mode; Str pass_file; Bool fast; };
+
+pub Str docker_secret() { return "/run/secrets/symbolon_home_passphrase"; }
+
+@requires(filesystem, environment)
+Str pass_file_of(Str flag) {
+    if (str_len(flag) > 0) { return flag; }
+    Str e = environment.get("SYMBOLON_HOME_PASSPHRASE_FILE");
+    if (str_len(e) > 0) { return e; }
+    // The Docker secret, when the operator mounted one with a passphrase
+    // in it (compose mounts an empty one on a box with a TPM).
+    return if (str_len(str_trim(filesystem.read_all(docker_secret()))) > 0) { docker_secret() } else { "" };
+}
+
+Str chomp(Str l) {
+    Int n = str_len(l);
+    if (n > 0 && (str_slice(l, n - 1, n) == "\n" || str_slice(l, n - 1, n) == "\r")) { return chomp(str_slice(l, 0, n - 1)); }
+    return l;
+}
+
+// The passphrase, "" when there is none or (typed twice, `twice`) the two
+// differ.
+@requires(filesystem, environment)
+Str passphrase(Str flag, Bool twice) {
+    Str f = pass_file_of(flag);
+    if (str_len(f) > 0) { return chomp(filesystem.read_all(f)); }
+    eprintln("home: the box's passphrase (it unseals the keys at every start; keep it off this box's disk and its backups):");
+    Str a = chomp(resid_read_line());
+    if (!twice) { return a; }
+    eprintln("home: the passphrase again:");
+    Str b = chomp(resid_read_line());
+    return if (a == b) { a } else { "" };
+}
+
+// A new box key `k`, sealed as `o` says, or [] (said why).
+@requires(filesystem, environment, device, declassify)
+List(Int) seal_new_box_key(List(Int) k, SealOpts o) {
+    if (o.mode != "" && o.mode != "tpm" && o.mode != "passphrase") { eprintln("home: --seal is tpm or passphrase"); return []; }
+    Bool tpm = o.mode == "tpm" || (o.mode == "" && tpm_box_key_ready());
+    if (tpm) {
+        List(Int) b = if (o.mode == "tpm" && !tpm_box_key_ready()) { [] } else { box_key_seal_tpm(k) };
+        if (b.len() == 0) { eprintln("home: the TPM did not take the box key (is /dev/tpmrm0 there and writable?); --seal passphrase seals it to a passphrase instead"); }
+        return b;
+    }
+    Str p = passphrase(o.pass_file, true);
+    if (str_len(p) < min_passphrase()) { eprintln(f"home: a passphrase of at least {min_passphrase()} characters (five random words are better), the same twice"); return []; }
+    eprintln("home: no TPM: the keys are sealed to the passphrase (Argon2id)");
+    return box_key_seal_pass(k, p, if (o.fast) { 64 } else { box_argon_m_kib() }, if (o.fast) { 1 } else { box_argon_t() });
+}
+
+pub Str box_key_file(Str dir) { return dir + "/seal/box.key"; }
+
+@requires(filesystem)
+pub Bool home_sealed(Str dir) { return box_key_kind(filesystem.read_bytes(box_key_file(dir))) != 0; }
+
+// The box key, unsealed by the TPM or the passphrase, or [] (said why).
+@requires(filesystem, environment, device, declassify)
+pub List(Int) open_box_key(Str dir, Str pass_flag) {
+    List(Int) b = filesystem.read_bytes(box_key_file(dir));
+    Int kind = box_key_kind(b);
+    if (kind == kind_tpm()) {
+        Option(List(Int)) k = box_key_open_tpm(b);
+        return match k { Some(x) => x, None => fail_key("home: the TPM does not unseal the box's keys (another machine's disk, or the TPM was cleared)") };
+    }
+    if (kind != kind_passphrase()) { return fail_key("home: the box's keys are not sealed (home secure)"); }
+    Str p = passphrase(pass_flag, false);
+    Option(List(Int)) k = box_key_open_pass(b, p);
+    return match k { Some(x) => x, None => fail_key("home: wrong passphrase: the box's keys stay sealed") };
+}
+
+List(Int) fail_key(Str m) { eprintln(m); return []; }
+
+// A file of the box sealed under `k` where it lies (an empty or missing
+// file, or one sealed already, stays as it is).
+@requires(filesystem)
+pub Bool seal_in_place(Str path, List(Int) k) {
+    List(Int) b = filesystem.read_bytes(path);
+    if (b.len() == 0 || is_sealed(b)) { return true; }
+    List(Int) s = seal_bytes(k, b);
+    return s.len() > 0 && filesystem.write_secret(path, s);
+}
+
+// A box file's contents: opened under `k` when sealed, else as it is.
+@requires(filesystem)
+pub List(Int) box_file(Str path, List(Int) k) {
+    List(Int) b = filesystem.read_bytes(path);
+    if (!is_sealed(b)) { return b; }
+    return match unseal_bytes(k, b) { Some(p) => p, None => [] };
+}
+
+// The secret files of a cosigner's directory (cosignerd.resid,
+// epochfiles.resid): its root key, its shares and the kit's halves, the
+// vault OPRF shares, the duress keys, and a re-share's pending ones.
+pub Bool cos_secret_name(Str n) {
+    return n == "root" || n == "duress-keys" || n == "duress-transport"
+        || (str_starts_with(n, "cg-") && str_ends_with(n, ".cfg")) || str_starts_with(n, "kit-b-") || str_starts_with(n, "kit-half")
+        || str_starts_with(n, "kv-") || str_starts_with(n, "kitv-b-") || str_starts_with(n, "kvpend-")
+        || (str_starts_with(n, "pending-") && (str_ends_with(n, ".cfg") || str_ends_with(n, ".kitb") || str_ends_with(n, ".kb") || str_ends_with(n, ".kv")));
+}
+
+@requires(filesystem)
+Bool seal_cos_dir(Str cos, List(Str) names, Int i, List(Int) k) {
+    if (i >= names.len()) { return true; }
+    Bool ok = !cos_secret_name(names[i]) || seal_in_place(cos + "/" + names[i], k);
+    return ok && seal_cos_dir(cos, names, i + 1, k);
+}
+
+@requires(filesystem)
+Bool seal_people(Str dir, List(Str) people, Int i, List(Int) k) {
+    if (i >= people.len()) { return true; }
+    Str cos = dir + "/people/" + people[i] + "/cos";
+    return seal_cos_dir(cos, filesystem.list_dir(cos), 0, k) && seal_people(dir, people, i + 1, k);
+}
+
+// Every key of the box sealed under `k`: the CA's, the server
+// certificate's, the witnesses', and each cosigner's secret files.
+@requires(filesystem)
+pub Bool seal_box_files(Str dir, List(Int) k) {
+    return seal_in_place(dir + "/tls/ca.key", k) && seal_in_place(dir + "/tls/server.key", k)
+        && seal_in_place(dir + "/w1.key", k) && seal_in_place(dir + "/w2.key", k) && seal_in_place(dir + "/w3.key", k)
+        && seal_people(dir, filesystem.list_dir(dir + "/people"), 0, k);
+}
+
+// ─── What the box's devices are told ────────────────────────────
+
+// The box's own witnesses a person invited now gets: w1 alone once
+// witnesses outside the box are named (witnesses.txt), else (a box set up
+// before them) w1, w2 and w3.
+@requires(filesystem)
+pub List(Int) box_witness_ids(Str dir) {
+    if (filesystem.exists(dir + "/witnesses.txt")) { return [1]; }
+    return present_witnesses(dir, 1, []);
+}
+
+@requires(filesystem)
+List(Int) present_witnesses(Str dir, Int i, List(Int) acc) {
+    if (i > 3) { return acc; }
+    return present_witnesses(dir, i + 1, if (filesystem.exists(dir + f"/w{i}.pub")) { acc.concat([i]) } else { acc });
+}
+
+@requires(filesystem)
+pub List(Str) offbox_witnesses(Str dir) { return file_lines(dir + "/witnesses.txt"); }
+
+@requires(filesystem)
+List(Str) box_keys(Str dir, Int i, List(Str) acc) {
+    if (i > 3) { return acc; }
+    Str k = str_to_lower(str_trim(filesystem.read_all(dir + f"/w{i}.pub")));
+    return box_keys(dir, i + 1, if (str_len(k) > 0) { acc.concat([k]) } else { acc });
+}
+
+@requires(filesystem)
+List(Str) box_witness_list(Str dir, Str host, Int base, List(Int) ids, Int i, List(Str) acc) {
+    if (i >= ids.len()) { return acc; }
+    Int n = ids[i];
+    return box_witness_list(dir, host, base, ids, i + 1, acc.concat([host + f":{base + 1 + n}:" + str_trim(filesystem.read_all(dir + f"/w{n}.pub"))]));
+}
+
+// The witnesses a person invited now gets: the box's, then those outside it.
+@requires(filesystem)
+pub List(Str) witness_list(Str dir, HomeCfg c) { return box_witness_list(dir, c.hosts[0], c.base, box_witness_ids(dir), 0, []).concat(offbox_witnesses(dir)); }
+
+// The trust anchors the box's devices, relay and cosigners use for TLS:
+// the box's CA, and a hosted witness's CA when one was given.
+@requires(filesystem)
+pub Str trust_file(Str dir) { return if (filesystem.exists(dir + "/tls/trust.pem")) { dir + "/tls/trust.pem" } else { dir + "/tls/ca.pem" }; }
+
+// The witnesses recorded for a person (when their cosigner was made).
+@requires(filesystem)
+List(Str) person_witnesses(Str dir, Str name) { return file_lines(dir + "/people/" + name + "/witnesses"); }
+
+Int count_in(List(Str) ws, List(Str) keys, Int i, Int n) {
+    if (i >= ws.len()) { return n; }
+    return count_in(ws, keys, i + 1, if (keys.contains(key_of_witness(ws[i]))) { n + 1 } else { n });
+}
+
+// People whose identities rest on witnesses the box holds a majority of:
+// every person set up before the witnesses moved (no record, or a record
+// of the box's own). Moving an identity's witnesses takes a set-policy
+// from that person's device.
+@requires(filesystem)
+List(Str) on_box_people(Str dir, List(Str) names, List(Str) bkeys, Int i, List(Str) acc) {
+    if (i >= names.len()) { return acc; }
+    Str n = names[i];
+    List(Str) ws = person_witnesses(dir, n);
+    Bool made = filesystem.exists(dir + "/people/" + n + "/keys");
+    Bool on_box = made && (ws.len() == 0 || !box_minority(count_in(ws, bkeys, 0, 0), ws.len()));
+    return on_box_people(dir, names, bkeys, i + 1, if (on_box) { acc.concat([n]) } else { acc });
+}
+
+pub type HomeStatus = { Bool sealed; Int on_box; Int off_box; List(Str) people_on_box; };
+
+@requires(filesystem)
+pub HomeStatus home_status(Str dir) {
+    return HomeStatus {.sealed = home_sealed(dir), .on_box = box_witness_ids(dir).len(), .off_box = offbox_witnesses(dir).len(),
+                       .people_on_box = on_box_people(dir, filesystem.list_dir(dir + "/people"), box_keys(dir, 1, []), 0, [])};
+}
+
+pub Bool status_secure(HomeStatus s) { return s.sealed && box_minority(s.on_box, s.on_box + s.off_box) && s.people_on_box.len() == 0; }
+
+// The reminder while the box is not secured, "" once it is (R3U-3).
+pub Str status_reminder(HomeStatus s) {
+    if (status_secure(s)) { return ""; }
+    Str a = if (s.sealed) { "" } else { " The cosigner and witness keys are not sealed: a copy of this box's disk or of its data folder, with a person's recovery sheet, can sign as that person." };
+    Str b = if (box_minority(s.on_box, s.on_box + s.off_box)) { "" } else { " The box runs every witness, so it alone can vouch for an identity's log." };
+    Str fix = if (str_len(a) > 0 || str_len(b) > 0) { " Run `symbolon home secure` (README: Securing an existing box)." } else { "" };
+    Str c = if (s.people_on_box.len() == 0) { "" } else {
+        " Identities made before the witnesses moved still rely on the box's own witnesses: " + str_join(s.people_on_box, ", ") + "; moving them needs a witness change from their own device, which this version cannot make yet."
+    };
+    return "Symbolon Home is not fully secured." + a + b + fix + c;
+}
+
+Str jbool(Bool b) { return if (b) { "true" } else { "false" }; }
+
+pub Str status_json(HomeStatus s) {
+    return "{\"sealed\": " + jbool(s.sealed) + f", \"box_witnesses\": {s.on_box}, \"offbox_witnesses\": {s.off_box}"
+        + ", \"box_minority\": " + jbool(box_minority(s.on_box, s.on_box + s.off_box))
+        + ", \"people_on_box_witnesses\": [" + jlist(s.people_on_box, 0, StrBuf()) + "]"
+        + ", \"secure\": " + jbool(status_secure(s)) + ", \"reminder\": " + jstr(status_reminder(s)) + "}";
+}
+
+Str jlist(List(Str) xs, Int i, StrBuf acc) {
+    if (i >= xs.len()) { return acc.finish(); }
+    return jlist(xs, i + 1, if (i == 0) { acc.push(jstr(xs[i])) } else { acc.push(", ").push(jstr(xs[i])) });
+}
+
+// `symbolon home status DIR`.
+@requires(filesystem)
+pub Int home_status_cmd(Str dir) {
+    Option(HomeCfg) oc = home_cfg(dir);
+    if (match oc { None => true, Some(_) => false }) { eprintln("home: not set up (home init)"); return 1; }
+    println(status_json(home_status(dir)));
+    return 0;
+}
 
 // ─── home init ──────────────────────────────────────────────────
 
 // The CA lives 20 years and the server certificate 10; the phone pins the
-// CA, so the server certificate can be renewed under it.
-@requires(filesystem, clock(readonly))
-pub Int home_init(Str dir, List(Str) hosts, Int base, Str bind) {
+// server certificate, and the agent trusts the CA.
+@requires(filesystem, clock(readonly), environment, device, declassify)
+pub Int home_init(Str dir, List(Str) hosts, Int base, Str bind_flag, List(Str) witnesses, Str witness_ca, SealOpts so) {
     if (filesystem.exists(dir + "/home.txt")) { eprintln("home: already set up"); return 1; }
     if (hosts.len() == 0) { eprintln("home: name at least one host the devices reach this box at"); return 1; }
+    Str bind = bind_for(bind_flag, hosts);
+    if (str_len(bind) == 0 || (bind != "0.0.0.0" && ipv4_of(bind).len() != 4)) {
+        eprintln("home: --bind ADDR: the IPv4 address to listen on (in a container: 0.0.0.0, and publish the ports on one address only)"); return 1;
+    }
+    Str wp = witnesses_problem(witnesses, hosts, [], 1);
+    if (str_len(wp) > 0) { eprintln("home: " + wp); return 1; }
+    Str wca = if (str_len(witness_ca) == 0) { "" } else { filesystem.read_all(witness_ca) };
+    if (str_len(witness_ca) > 0 && !str_contains(wca, "BEGIN CERTIFICATE")) { eprintln("home: --witness-ca: no certificate in " + witness_ca); return 1; }
+    List(Int) k = random_bytes(32);
+    List(Int) sealed = seal_new_box_key(k, so);
+    if (sealed.len() == 0) { return 1; }
     _ = filesystem.create_dir(dir);
+    _ = filesystem.create_dir(dir + "/seal");
     _ = filesystem.create_dir(dir + "/tls");
     _ = filesystem.create_dir(dir + "/people");
     _ = filesystem.create_dir(dir + "/invites");
@@ -127,24 +569,84 @@ pub Int home_init(Str dir, List(Str) hosts, Int base, Str bind) {
     List(Int) srv_der = x509g_cert(srv, srv_pub, "Symbolon Home CA", ca_priv);
     if (ca_der.len() == 0 || srv_der.len() == 0) { eprintln("home: cannot make the certificates"); return 1; }
     Str ca_pem = x509g_pem("CERTIFICATE", ca_der);
-    Bool ok = filesystem.write_all(dir + "/tls/ca.pem", ca_pem)
-           && filesystem.write_secret(dir + "/tls/ca.key", ca_priv)
+    List(Int) w_priv = fresh_key();
+    Bool ok = filesystem.write_secret(box_key_file(dir), sealed)
+           && filesystem.write_all(dir + "/tls/ca.pem", ca_pem)
+           && filesystem.write_all(dir + "/tls/trust.pem", ca_pem + wca)
+           && filesystem.write_secret(dir + "/tls/ca.key", seal_bytes(k, ca_priv))
            && filesystem.write_all(dir + "/tls/server.pem", x509g_pem("CERTIFICATE", srv_der) + ca_pem)
-           && filesystem.write_secret(dir + "/tls/server.key", str_to_bytes(x509g_pem("EC PRIVATE KEY", x509g_sec1_key(srv_priv, srv_pub))))
-           && make_witnesses(dir, 1)
+           && filesystem.write_secret(dir + "/tls/server.key", seal_bytes(k, str_to_bytes(x509g_pem("EC PRIVATE KEY", x509g_sec1_key(srv_priv, srv_pub)))))
+           && filesystem.write_secret(dir + "/w1.key", seal_bytes(k, w_priv)) && filesystem.write_all(dir + "/w1.pub", hex_encode(ec_public_key(P256, w_priv)))
+           && filesystem.write_all(dir + "/witnesses.txt", lines(witnesses, 0, StrBuf()))
            && filesystem.write_all(dir + "/bind.txt", bind)
            && filesystem.write_all(dir + "/home.txt", f"{base}\n" + lines(hosts, 0, StrBuf()));
     if (!ok) { eprintln("home: cannot write the box's files"); return 1; }
-    println("home ready at " + hosts[0] + f" ports {base}-{base + 4}");
+    println("home ready at " + hosts[0] + f" ports {base}-{base + 4}, listening on " + bind + "; keys sealed" + if (box_key_kind(sealed) == kind_tpm()) { " to the TPM" } else { " to the passphrase" });
     return 0;
 }
 
-@requires(filesystem)
-Bool make_witnesses(Str dir, Int i) {
-    if (i > 3) { return true; }
+// ─── home secure (an existing box) ──────────────────────────────
+
+@requires(filesystem, clock(readonly), environment, device, declassify)
+pub Int home_secure(Str dir, List(Str) witnesses, Str witness_ca, SealOpts so) {
+    Option(HomeCfg) oc = home_cfg(dir);
+    HomeCfg c = oc else { HomeCfg {.base = 0, .hosts = [], .bind = ""} };
+    if (c.hosts.len() == 0) { eprintln("home: not set up (home init)"); return 1; }
+    Bool have_ws = filesystem.exists(dir + "/witnesses.txt");
+    if (witnesses.len() == 0 && !have_ws) {
+        eprintln("home: name the witnesses outside the box, at least two: --witness HOST:PORT:KEY (see README: Witnesses outside the box)"); return 1;
+    }
+    Str wp = if (witnesses.len() == 0) { "" } else { witnesses_problem(witnesses, c.hosts, box_keys(dir, 1, []), 1) };
+    if (str_len(wp) > 0) { eprintln("home: " + wp); return 1; }
+    Str wca = if (str_len(witness_ca) == 0) { "" } else { filesystem.read_all(witness_ca) };
+    if (str_len(witness_ca) > 0 && !str_contains(wca, "BEGIN CERTIFICATE")) { eprintln("home: --witness-ca: no certificate in " + witness_ca); return 1; }
+    // The box key: the one sealed already, or a new one sealed now. It is
+    // written before any file is sealed under it, so a run cut short is
+    // finished by running again.
+    Bool was = home_sealed(dir);
+    List(Int) k = if (was) { open_box_key(dir, so.pass_file) } else { random_bytes(32) };
+    if (k.len() != 32) { return 1; }
+    _ = filesystem.create_dir(dir + "/seal");
+    List(Int) sealed = if (was) { [1] } else { seal_new_box_key(k, so) };
+    if (sealed.len() == 0) { return 1; }
+    if (!was && !filesystem.write_secret(box_key_file(dir), sealed)) { eprintln("home: cannot write the sealed box key"); return 1; }
+    if (!seal_box_files(dir, k)) { eprintln("home: cannot seal every key file; run home secure again"); return 1; }
+    Str trust = filesystem.read_all(trust_file(dir));
+    Bool ok = (witnesses.len() == 0 || filesystem.write_all(dir + "/witnesses.txt", lines(witnesses, 0, StrBuf())))
+           && (str_len(wca) == 0 || filesystem.write_all(dir + "/tls/trust.pem", trust + wca));
+    if (!ok) { eprintln("home: cannot write the witnesses"); return 1; }
+    println("home: keys sealed" + if (was) { " (already)" } else { "" } + f"; people invited from now on get the box's witness and {offbox_witnesses(dir).len()} outside it");
+    Str r = status_reminder(home_status(dir));
+    if (str_len(r) > 0) { eprintln("home: " + r); }
+    return 0;
+}
+
+// `symbolon home witness-cert DIR HOST OUTDIR`: a server certificate (two
+// years) under the box's CA for a witness outside the box, so the
+// household's devices, which trust the box's CA, reach it over TLS.
+@requires(filesystem, clock(readonly), environment, device, declassify)
+pub Int home_witness_cert(Str dir, Str host, Str out, Str pass_flag) {
+    Option(HomeCfg) oc = home_cfg(dir);
+    HomeCfg c = oc else { HomeCfg {.base = 0, .hosts = [], .bind = ""} };
+    if (c.hosts.len() == 0) { eprintln("home: not set up (home init)"); return 1; }
+    if (lower_all(c.hosts, 0, ListBuf()).contains(str_to_lower(host)) || str_len(host) == 0) { eprintln("home: " + host + " is this box; the certificate is for the witness's own machine"); return 1; }
+    List(Int) k = if (home_sealed(dir)) { open_box_key(dir, pass_flag) } else { [] };
+    if (home_sealed(dir) && k.len() != 32) { return 1; }
+    List(Int) ca_priv = box_file(dir + "/tls/ca.key", k);
+    if (ca_priv.len() != 32) { eprintln("home: cannot read the CA's key"); return 1; }
+    Int now = clock_now_seconds();
     List(Int) priv = fresh_key();
-    Bool ok = filesystem.write_secret(dir + f"/w{i}.key", priv) && filesystem.write_all(dir + f"/w{i}.pub", hex_encode(ec_public_key(P256, priv)));
-    return ok && make_witnesses(dir, i + 1);
+    List(Int) pub = ec_public_key(P256, priv);
+    CertSpec s = CertSpec {.cn = "Symbolon Home witness", .serial = random_bytes(16), .not_before = now - 86400, .not_after = now + 2 * 365 * 86400,
+                           .ca = false, .ips = ips_of([host], 0, ListBuf()), .dns = names_of([host], 0, ListBuf())};
+    List(Int) der = x509g_cert(s, pub, "Symbolon Home CA", ca_priv);
+    if (der.len() == 0) { eprintln("home: cannot make the certificate"); return 1; }
+    _ = filesystem.create_dir(out);
+    Bool ok = filesystem.write_all(out + "/server.pem", x509g_pem("CERTIFICATE", der) + filesystem.read_all(dir + "/tls/ca.pem"))
+           && filesystem.write_secret(out + "/server.key", str_to_bytes(x509g_pem("EC PRIVATE KEY", x509g_sec1_key(priv, pub))));
+    if (!ok) { eprintln("home: cannot write " + out); return 1; }
+    println("witness certificate for " + host + " in " + out + " (server.pem, server.key)");
+    return 0;
 }
 
 // SHA-256 of a certificate (DER), base64url without padding.
@@ -177,26 +679,24 @@ Str body_lines(List(Str) ls, Int i, StrBuf acc) {
 
 // ─── home invite ────────────────────────────────────────────────
 
-// A person: their own cosigner (a cosigner serves one identity) and a code
-// that lets one phone fetch the setup and pair, within a week.
-@requires(filesystem, clock(readonly), provision, declassify)
+// A person and a code that lets one phone fetch the setup and pair, within
+// a day. The person's cosigner is made by `home serve` (it holds the box
+// key, so the cosigner's keys are sealed from their first write).
+@requires(filesystem, clock(readonly))
 pub Int home_invite(Str dir, Str name) {
     Option(HomeCfg) oc = home_cfg(dir);
     HomeCfg c = oc else { HomeCfg {.base = 0, .hosts = [], .bind = ""} };
     if (c.hosts.len() == 0) { eprintln("home: not set up (home init)"); return 1; }
     if (!name_ok(name)) { eprintln("home: a name is 1-32 of a-z, 0-9, - and _"); return 1; }
     Str pd = dir + "/people/" + name;
-    if (filesystem.exists(pd + "/cos/cosigner.cbor")) { eprintln("home: " + name + " already has a cosigner; to pair again, start over with a new name"); return 1; }
+    if (filesystem.exists(pd)) { eprintln("home: " + name + " is invited already; to pair again, start over with a new name"); return 1; }
     _ = filesystem.create_dir(pd);
-    // The cosigner runs on the box: it reaches the relay and the witnesses
-    // locally, whatever address the devices use.
-    Str keys = cosigner_make(pd + "/cos", local_of(c.bind), c.base + 1, filesystem.read_all(dir + "/tls/ca.pem"));
-    if (str_len(keys) == 0 || !filesystem.write_all(pd + "/cos/local_host", local_of(c.bind))) { eprintln("home: cannot make the cosigner"); return 1; }
     Str code = b64url(random_bytes(16));
-    if (!filesystem.write_all(pd + "/keys", keys) || !filesystem.write_all(dir + "/invites/" + code, name + f" {clock_now_seconds() + invite_secs()}")) {
-        eprintln("home: cannot write the invite"); return 1;
-    }
+    if (!filesystem.write_all(dir + "/invites/" + code, name + f" {clock_now_seconds() + invite_secs()}")) { eprintln("home: cannot write the invite"); return 1; }
     println("symbolon://pair?h=" + c.hosts[0] + f"&p={c.base}" + "&c=" + code + "&f=" + ca_fingerprint(server_der_of(dir)));
+    eprintln("home: the link works once, for a day; whoever has it can pair as " + name + ", so give it only to them");
+    Str r = status_reminder(home_status(dir));
+    if (str_len(r) > 0) { eprintln("home: " + r); }
     return 0;
 }
 
@@ -219,32 +719,118 @@ Str relay_names_of(List(Str) hosts, Int port, Int i, ListBuf(Str) acc) {
     return relay_names_of(hosts, port, i + 1, acc.push(str_to_lower(hosts[i]) + f":{port}"));
 }
 
+// Where the keys a sealed box serves with live while it runs: a new
+// directory under `base` (default /dev/shm), which must be in memory.
+// The one before it (run.path) is wiped first.
+@requires(filesystem)
+pub Str make_run_dir(Str dir, Str base0) {
+    Str base = if (str_len(base0) == 0) { "/dev/shm" } else { base0 };
+    if (!in_memory_fs(base, filesystem.read_all("/proc/self/mounts"))) {
+        eprintln("home: " + base + " is not a file system in memory (tmpfs): the unsealed keys must not touch a disk; --run DIR names one that is");
+        return "";
+    }
+    _ = wipe_run(str_trim(filesystem.read_all(dir + "/run.path")));
+    Str r = base + "/symbolon-home-" + hex_encode(random_bytes(8));
+    if (!filesystem.create_dir(r) && !filesystem.is_dir(r)) { eprintln("home: cannot make " + r); return ""; }
+    return if (filesystem.write_all(dir + "/run.path", r)) { r } else { "" };
+}
+
+@requires(filesystem)
+Bool wipe_run(Str r) {
+    if (str_len(r) == 0 || !str_contains(r, "/symbolon-home-")) { return true; }
+    return wipe_names(r, ["box.key", "server.key", "w1.key", "w2.key", "w3.key"], 0);
+}
+
+@requires(filesystem)
+Bool wipe_names(Str r, List(Str) ns, Int i) {
+    if (i >= ns.len()) { return true; }
+    Str p = r + "/" + ns[i];
+    _ = if (filesystem.exists(p)) { filesystem.write_secret(p, zeros_n(filesystem.read_bytes(p).len(), ListBuf())) && filesystem.remove(p) } else { true };
+    return wipe_names(r, ns, i + 1);
+}
+
+List(Int) zeros_n(Int n, ListBuf(Int) acc) { return if (n <= 0) { acc.finish() } else { zeros_n(n - 1, acc.push(0)) }; }
+
+// The keys `home serve` hands its servers: on a sealed box, unsealed into
+// the run directory; on a box not sealed yet, the files on the disk.
+pub type ServeKeys = { Str run; Str server_key; List(Str) witness_keys; };
+
+@requires(filesystem)
+ServeKeys unsealed_keys(Str dir, Str run, List(Int) k) {
+    Bool ok = filesystem.write_secret(run + "/box.key", k)
+           && put_unsealed(dir + "/tls/server.key", run + "/server.key", k)
+           && put_unsealed(dir + "/w1.key", run + "/w1.key", k) && put_unsealed(dir + "/w2.key", run + "/w2.key", k) && put_unsealed(dir + "/w3.key", run + "/w3.key", k);
+    if (!ok) { return ServeKeys {.run = "", .server_key = "", .witness_keys = []}; }
+    return ServeKeys {.run = run, .server_key = run + "/server.key", .witness_keys = [run + "/w1.key", run + "/w2.key", run + "/w3.key"]};
+}
+
+@requires(filesystem)
+Bool put_unsealed(Str from, Str to, List(Int) k) {
+    if (!filesystem.exists(from)) { return true; }
+    List(Int) b = box_file(from, k);
+    return b.len() > 0 && filesystem.write_secret(to, b);
+}
+
+// Each cosigner directory names the box key in memory (boxseal.resid).
+@requires(filesystem)
+Bool point_people(Str dir, List(Str) people, Int i, Str keyfile) {
+    if (i >= people.len()) { return true; }
+    Str cos = dir + "/people/" + people[i] + "/cos";
+    Bool ok = !filesystem.is_dir(cos) || filesystem.write_all(cos + "/" + seal_ptr_name(), keyfile);
+    return ok && point_people(dir, people, i + 1, keyfile);
+}
+
 // Each server runs under its own supervisor in a spawn region; a server
 // that stops is started again after a pause. People invited later get
 // their cosigner within ten seconds.
-@requires(filesystem, process, clock)
-pub Int home_serve(Str dir, Str self) {
+@requires(filesystem, process, clock, environment, device, declassify, provision)
+pub Int home_serve(Str dir, Str self, Str pass_flag, Str run_base) {
     Option(HomeCfg) oc = home_cfg(dir);
     HomeCfg c = oc else { HomeCfg {.base = 0, .hosts = [], .bind = ""} };
     if (c.hosts.len() == 0) { eprintln("home: not set up (home init)"); return 1; }
-    Str tls = " --tls " + dir + "/tls/server.pem " + dir + "/tls/server.key --bind " + c.bind;
+    Bool sealed = home_sealed(dir);
+    List(Int) k = if (sealed) { open_box_key(dir, pass_flag) } else { [] };
+    if (sealed && k.len() != 32) { return 1; }
+    Str run = if (sealed) { make_run_dir(dir, run_base) } else { "" };
+    if (sealed && str_len(run) == 0) { return 1; }
+    ServeKeys sk = if (sealed) { unsealed_keys(dir, run, k) } else {
+        ServeKeys {.run = "", .server_key = dir + "/tls/server.key", .witness_keys = [dir + "/w1.key", dir + "/w2.key", dir + "/w3.key"]} };
+    if (str_len(sk.server_key) == 0) { eprintln("home: cannot unseal the keys into " + run); return 1; }
+    Str keyfile = if (sealed) { run + "/box.key" } else { "" };
+    if (sealed && !point_people(dir, filesystem.list_dir(dir + "/people"), 0, keyfile)) { eprintln("home: cannot point the cosigners at the box key"); return 1; }
+    Str tls = " --tls " + dir + "/tls/server.pem " + sk.server_key + " --bind " + c.bind;
     List(Str) cmds = [
-        self + " home pair-serve " + dir,
-        self + " relay serve " + dir + f"/relay {c.base + 1}" + tls + " --ca " + dir + "/tls/ca.pem --console-origin https://" + c.hosts[0] + f":{c.base + 1}" + " --name " + relay_names_of(c.hosts, c.base + 1, 0, ListBuf()),
-        self + " witness serve " + dir + f"/w1 {c.base + 2} " + dir + "/w1.key 0" + tls,
-        self + " witness serve " + dir + f"/w2 {c.base + 3} " + dir + "/w2.key 0" + tls,
-        self + " witness serve " + dir + f"/w3 {c.base + 4} " + dir + "/w3.key 0" + tls
-    ];
-    println("home serving at " + c.hosts[0] + f" ports {c.base}-{c.base + 4}");
-    return run_all(dir, self, cmds, 0, []);
+        self + " home pair-serve " + dir + " " + sk.server_key,
+        self + " relay serve " + dir + f"/relay {c.base + 1}" + tls + " --ca " + trust_file(dir) + " --console-origin https://" + c.hosts[0] + f":{c.base + 1}" + " --name " + relay_names_of(c.hosts, c.base + 1, 0, ListBuf())
+    ].concat(witness_cmds(dir, self, c, sk, tls, 1, []));
+    println("home serving at " + c.hosts[0] + f" ports {c.base}-{c.base + 4}" + if (sealed) { ", keys unsealed in memory only" } else { "" });
+    _ = remind(dir);
+    return run_all(dir, self, cmds, 0, [], c, keyfile);
+}
+
+@requires(filesystem)
+List(Str) witness_cmds(Str dir, Str self, HomeCfg c, ServeKeys sk, Str tls, Int i, List(Str) acc) {
+    if (i > 3) { return acc; }
+    Bool here = filesystem.exists(dir + f"/w{i}.key");
+    Str cmd = self + " witness serve " + dir + f"/w{i} {c.base + 1 + i} " + sk.witness_keys[i - 1] + " 0" + tls;
+    return witness_cmds(dir, self, c, sk, tls, i + 1, if (here) { acc.concat([cmd]) } else { acc });
+}
+
+// The reminder, while the box is not secured (R3U-3), at start and every
+// hour after.
+@requires(filesystem)
+Bool remind(Str dir) {
+    Str r = status_reminder(home_status(dir));
+    if (str_len(r) > 0) { eprintln("home: " + r); }
+    return str_len(r) > 0;
 }
 
 // Starts cmds[i..] concurrently, then watches for new people.
-@requires(filesystem, process, clock)
-Int run_all(Str dir, Str self, List(Str) cmds, Int i, List(Str) started) {
-    if (i >= cmds.len()) { return watch_people(dir, self, started); }
+@requires(filesystem, process, clock, declassify, provision)
+Int run_all(Str dir, Str self, List(Str) cmds, Int i, List(Str) started, HomeCfg c, Str keyfile) {
+    if (i >= cmds.len()) { return watch_people(dir, self, started, c, keyfile, 0); }
     Result(Int, RegionError) r = spawn (process, clock) { return keep_running(cmds[i]); };
-    return run_all(dir, self, cmds, i + 1, started);
+    return run_all(dir, self, cmds, i + 1, started, c, keyfile);
 }
 
 @requires(process, clock)
@@ -254,16 +840,45 @@ Int keep_running(Str cmd) {
     return keep_running(cmd);
 }
 
-@requires(filesystem, process, clock)
-Int watch_people(Str dir, Str self, List(Str) started) {
-    List(Str) fresh = new_people(dir, filesystem.list_dir(dir + "/people"), started, 0, ListBuf());
+@requires(filesystem, process, clock, declassify, provision)
+Int watch_people(Str dir, Str self, List(Str) started, HomeCfg c, Str keyfile, Int tick) {
+    _ = if (tick > 0 && tick % 360 == 0) { remind(dir) } else { false };
+    List(Str) all = filesystem.list_dir(dir + "/people");
+    _ = make_cosigners(dir, all, 0, c, keyfile);
+    List(Str) fresh = new_people(dir, all, started, 0, ListBuf());
     if (fresh.len() == 0) {
         _ = clock_sleep_ms(10000);
-        return watch_people(dir, self, started);
+        return watch_people(dir, self, started, c, keyfile, tick + 1);
     }
     Str cmd = self + " cosigner serve " + dir + "/people/" + fresh[0] + "/cos";
     Result(Int, RegionError) r = spawn (process, clock) { return keep_running(cmd); };
-    return watch_people(dir, self, started.concat([fresh[0]]));
+    return watch_people(dir, self, started.concat([fresh[0]]), c, keyfile, tick);
+}
+
+// A cosigner for each person invited without one yet. The cosigner runs on
+// the box: it reaches the relay and the witnesses locally, whatever
+// address the devices use. On a sealed box its directory names the box key
+// before its root key is written, so that is sealed too.
+@requires(filesystem, declassify, provision)
+Int make_cosigners(Str dir, List(Str) names, Int i, HomeCfg c, Str keyfile) {
+    if (i >= names.len()) { return 0; }
+    Str pd = dir + "/people/" + names[i];
+    Bool want = name_ok(names[i]) && !filesystem.exists(pd + "/keys");
+    _ = if (want) { make_cosigner(dir, pd, c, keyfile) } else { true };
+    return make_cosigners(dir, names, i + 1, c, keyfile);
+}
+
+@requires(filesystem, declassify, provision)
+Bool make_cosigner(Str dir, Str pd, HomeCfg c, Str keyfile) {
+    Str cos = pd + "/cos";
+    _ = filesystem.create_dir(cos);
+    if (str_len(keyfile) > 0 && !filesystem.write_all(cos + "/" + seal_ptr_name(), keyfile)) { return false; }
+    Str keys = cosigner_make(cos, local_of(c.bind), c.base + 1, filesystem.read_all(trust_file(dir)));
+    Bool ok = str_len(keys) > 0 && filesystem.write_all(cos + "/local_host", local_of(c.bind))
+           && filesystem.write_all(pd + "/witnesses", lines(witness_list(dir, c), 0, StrBuf()))
+           && filesystem.write_all(pd + "/keys", keys);
+    if (!ok) { eprintln("home: cannot make the cosigner in " + cos); }
+    return ok;
 }
 
 @requires(filesystem)
@@ -277,14 +892,15 @@ List(Str) new_people(Str dir, List(Str) all, List(Str) started, Int i, ListBuf(S
 
 pub Int home_batch() { return 50; }
 
-// `symbolon home pair-serve DIR` (run by `home serve`).
+// `symbolon home pair-serve DIR KEYFILE` (run by `home serve`; KEYFILE the
+// server certificate's key, in memory on a sealed box).
 @requires(network, filesystem, declassify, provision, clock(readonly), process)
-pub Int home_pair_serve(Str dir, Str self) {
+pub Int home_pair_serve(Str dir, Str keyfile, Str self) {
     Option(HomeCfg) oc = home_cfg(dir);
     HomeCfg c = oc else { HomeCfg {.base = 0, .hosts = [], .bind = ""} };
     Int lfd = http_listen_at(c.bind, c.base);
     if (lfd < 0) { eprintln(f"home: cannot listen on {c.base}"); return 1; }
-    return pair_children(self + " home pair-child " + dir + f" {lfd}");
+    return pair_children(self + " home pair-child " + dir + f" {lfd} " + keyfile);
 }
 
 @requires(process)
@@ -294,10 +910,10 @@ Int pair_children(Str cmd) {
     return pair_children(cmd);
 }
 
-// `symbolon home pair-child DIR FD` (run by `home pair-serve`).
+// `symbolon home pair-child DIR FD KEYFILE` (run by `home pair-serve`).
 @requires(network, filesystem, declassify, provision, clock(readonly))
-pub Int home_pair_child(Str dir, Int lfd) {
-    Option(ServerKey) k = tls_key_load(dir + "/tls/server.key");
+pub Int home_pair_child(Str dir, Int lfd, Str keyfile) {
+    Option(ServerKey) k = tls_key_load(keyfile);
     List(List(Int)) chain = tls_chain_load(dir + "/tls/server.pem");
     return match k {
         None => 2,
@@ -315,10 +931,12 @@ Str query_at(List(Str) ps, Str key, Int i) {
     return if (kv.len() == 2 && kv[0] == key) { kv[1] } else { query_at(ps, key, i + 1) };
 }
 
-// The person an unexpired code is for, or "".
+Bool code_shape(Str code) { return str_len(code) == 22 && b64url_chars(bytes_of(code), 0); }
+
+// The person an unexpired, unpaired code is for, or "".
 @requires(filesystem, clock(readonly))
-Str invite_of(Str dir, Str code) {
-    if (str_len(code) != 22 || !b64url_chars(bytes_of(code), 0)) { return ""; }
+pub Str invite_of(Str dir, Str code) {
+    if (!code_shape(code) || filesystem.exists(dir + "/invites/" + code + ".paired")) { return ""; }
     List(Str) p = str_split(str_trim(filesystem.read_all(dir + "/invites/" + code)), " ");
     if (p.len() != 2 || str_parse_int(p[1]) < clock_now_seconds()) { return ""; }
     return p[0];
@@ -332,31 +950,64 @@ Bool b64url_chars(List(Int) b, Int i) {
 
 Str jstr(Str s) { return "\"" + str_replace(str_replace(str_replace(s, "\\", "\\\\"), "\"", "\\\""), "\n", "\\n") + "\""; }
 
+// Spends `code` for `what` ("setup", "paired"): true for the one caller
+// whose O_EXCL create of invites/CODE.what succeeds, which writes `note`.
 @requires(filesystem)
-Str witnesses_json(Str dir, Str host, Int base, Int i, StrBuf acc) {
-    if (i > 3) { return acc.finish(); }
-    Str w = jstr(host + f":{base + 1 + i}:" + str_trim(filesystem.read_all(dir + f"/w{i}.pub")));
-    return witnesses_json(dir, host, base, i + 1, if (i == 1) { acc.push(w) } else { acc.push(", ").push(w) });
+pub Bool spend(Str dir, Str code, Str what, Str note) {
+    File f = filesystem.create_new(dir + "/invites/" + code + "." + what);
+    if (!filesystem.is_open(f)) { return false; }
+    _ = filesystem.write_handle(f, str_to_bytes(note));
+    _ = filesystem.close(f);
+    return true;
+}
+
+Str token_digest(Str t) { return hex_encode(sha256_bytes(str_to_bytes("symbolon v1 home pair token").concat(str_to_bytes(t)))); }
+
+// The witnesses a person's setup names: those recorded when their
+// cosigner was made (a person made before the record: the box's now,
+// recorded at the first setup).
+@requires(filesystem)
+List(Str) setup_witnesses(Str dir, Str name, HomeCfg c) {
+    List(Str) rec = person_witnesses(dir, name);
+    if (rec.len() > 0) { return rec; }
+    List(Str) now = witness_list(dir, c);
+    _ = filesystem.write_all(dir + "/people/" + name + "/witnesses", lines(now, 0, StrBuf()));
+    return now;
 }
 
 @requires(filesystem, clock(readonly), provision)
-HttpReply pair_handle(Str dir, HttpRequest r) {
-    Str name = invite_of(dir, query_arg(r.query, "c"));
+pub HttpReply pair_handle(Str dir, HttpRequest r) {
+    Str code = query_arg(r.query, "c");
+    Str name = invite_of(dir, code);
     if (str_len(name) == 0) { return http_reply_text(403, "application/json", "{\"error\": \"this invite is not valid (used or expired)\"}"); }
     Option(HomeCfg) oc = home_cfg(dir);
     HomeCfg c = oc else { HomeCfg {.base = 0, .hosts = [], .bind = ""} };
     Str pd = dir + "/people/" + name;
     if (r.method == "GET" && r.path == "/setup") {
+        Str keys = str_trim(filesystem.read_all(pd + "/keys"));
+        if (str_len(keys) == 0) { return http_reply_text(503, "application/json", "{\"error\": \"the box is still making this person's cosigner; try again in a minute\"}"); }
+        // The code's first use spends it: one setup, and one token, per
+        // code (R3U-9).
+        Str tok = b64url(random_bytes(16));
+        if (!spend(dir, code, "setup", token_digest(tok))) { return http_reply_text(403, "application/json", "{\"error\": \"this invite is not valid (used or expired)\"}"); }
+        HomeStatus s = home_status(dir);
         Str host = c.hosts[0];
         return http_reply_text(200, "application/json", "{\"name\": " + jstr(name) + ", \"relay_host\": " + jstr(host) + f", \"relay_port\": {c.base + 1}"
-            + ", \"cosigner_keys\": " + jstr(str_trim(filesystem.read_all(pd + "/keys")))
-            + ", \"witnesses\": [" + witnesses_json(dir, host, c.base, 1, StrBuf()) + "]"
-            + ", \"ca\": " + jstr(filesystem.read_all(dir + "/tls/ca.pem")) + "}");
+            + ", \"cosigner_keys\": " + jstr(keys)
+            + ", \"witnesses\": [" + jlist(setup_witnesses(dir, name, c), 0, StrBuf()) + "]"
+            + ", \"ca\": " + jstr(filesystem.read_all(trust_file(dir)))
+            + ", \"pair_token\": " + jstr(tok)
+            + ", \"secure\": " + jbool(status_secure(s)) + ", \"reminder\": " + jstr(status_reminder(s)) + "}");
     }
     if (r.method == "POST" && r.path == "/pair") {
+        Str t = query_arg(r.query, "t");
+        Str held = str_trim(filesystem.read_all(dir + "/invites/" + code + ".setup"));
+        if (!code_shape(t) || str_len(held) == 0 || token_digest(t) != held) { return http_reply_text(403, "application/json", "{\"error\": \"pair from the device that fetched the setup\"}"); }
         Str keys = str_trim(http_body_text(r));
+        if (match keys_of_cbor(cose_hex_decode(keys)) { None => true, Some(_) => false }) { return http_reply_text(400, "application/json", "{\"error\": \"those are not device keys\"}"); }
+        if (!spend(dir, code, "paired", "")) { return http_reply_text(403, "application/json", "{\"error\": \"this invite is not valid (used or expired)\"}"); }
         if (cosignerd_pair(pd + "/cos", keys) != 0) { return http_reply_text(400, "application/json", "{\"error\": \"those are not device keys\"}"); }
-        _ = filesystem.write_all(dir + "/invites/" + query_arg(r.query, "c"), name + " 0");
+        _ = filesystem.write_all(dir + "/invites/" + code, name + " 0");
         return http_reply_text(200, "application/json", "{\"paired\": true}");
     }
     return http_reply_status(404);

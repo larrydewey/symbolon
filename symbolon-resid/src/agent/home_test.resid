@@ -1,0 +1,262 @@
+// Symbolon Home (agent/home.resid, agent/boxseal.resid): the box's keys
+// sealed at rest (R3U-3), the box never a witness majority (R3U-3), the
+// invite spent on first use (R3U-9), over fresh directories under /tmp.
+
+import "../types.resid";
+import "state.resid";
+import "common.resid";
+import "boxseal.resid";
+import "device.resid";
+import "home.resid";
+import "httpserv.resid";
+import "ecdsa.resid";
+import "crypto.resid";
+
+@requires(filesystem, declassify)
+Str tmp_dir() {
+    Str d = "/tmp/symbolon-home-test-" + hex_encode(random_bytes(8));
+    _ = filesystem.create_dir(d);
+    return d;
+}
+
+List(Int) key32(Int n) { return sha256_bytes([n]); }
+
+// Whether `needle` occurs in `hay`.
+Bool contains_bytes(List(Int) hay, List(Int) needle, Int i) {
+    if (needle.len() == 0) { return true; }
+    if (i + needle.len() > hay.len()) { return false; }
+    return hay[i..i + needle.len()] == needle || contains_bytes(hay, needle, i + 1);
+}
+
+Str wkey(Int n) { return hex_encode(ec_public_key(P256, key32(n))); }
+
+// ─── Sealing ────────────────────────────────────────────────────
+
+test "a sealed file opens only under its key, and holds no byte run of what it seals" {
+    List(Int) k = key32(1);
+    List(Int) secret = key32(2);
+    List(Int) s = seal_bytes(k, secret);
+    expect(is_sealed(s)).toBeTrue();
+    expect(contains_bytes(s, secret[0..8], 0)).toBeFalse();
+    expect(unseal_bytes(k, s)).toEqual(Some(secret));
+    expect(unseal_bytes(key32(3), s)).toEqual(None);
+    // A changed byte, or the box key on the wrong file, is refused.
+    List(Int) t = s[0..30].concat([s[30] ^ 1]).concat(s[31..s.len()]);
+    expect(unseal_bytes(k, t)).toEqual(None);
+    expect(seal_bytes([1, 2, 3], secret)).toEqual([]);
+}
+
+@requires(declassify)
+test "the box key sealed to a passphrase opens with it and not with another" {
+    List(Int) k = key32(7);
+    List(Int) b = box_key_seal_pass(k, "correct horse battery", 64, 1);
+    expect(box_key_kind(b)).toEqual(kind_passphrase());
+    expect(contains_bytes(b, k[0..8], 0)).toBeFalse();
+    expect(box_key_open_pass(b, "correct horse battery")).toEqual(Some(k));
+    expect(box_key_open_pass(b, "correct horse batterY")).toEqual(None);
+    expect(box_key_open_pass(b, "")).toEqual(None);
+    // Not the TPM kind: the passphrase path refuses a TPM-sealed file.
+    expect(box_key_open_pass(b[0..8].concat([kind_tpm()]).concat(b[9..b.len()]), "correct horse battery")).toEqual(None);
+}
+
+@requires(filesystem, declassify)
+test "a cosigner directory that names the box key writes its secrets sealed, and none without the key" {
+    Str d = tmp_dir();
+    Str run = tmp_dir();
+    List(Int) k = key32(9);
+    List(Int) root = key32(10);
+    // Not sealed: a plain 0600 file, as before.
+    expect(seal_put(d + "/root", root)).toBeTrue();
+    expect(filesystem.read_bytes(d + "/root")).toEqual(root);
+    // Sealed: the disk holds no key bytes; get_file opens it.
+    _ = filesystem.write_secret(run + "/box.key", k);
+    _ = filesystem.write_all(d + "/" + seal_ptr_name(), run + "/box.key");
+    expect(put_secret_file(d + "/root", root)).toBeTrue();
+    List(Int) disk = filesystem.read_bytes(d + "/root");
+    expect(is_sealed(disk)).toBeTrue();
+    expect(contains_bytes(disk, root[0..8], 0)).toBeFalse();
+    expect(get_file(d + "/root")).toEqual(root);
+    // A public file is read as it is.
+    _ = filesystem.write_bytes(d + "/cosigner.cbor", [1, 2, 3]);
+    expect(get_file(d + "/cosigner.cbor")).toEqual([1, 2, 3]);
+    // The box key gone from memory (the box stopped): nothing opens, and a
+    // secret is not written in the clear instead.
+    _ = filesystem.write_secret(run + "/box.key", []);
+    expect(get_file(d + "/root")).toEqual([]);
+    expect(put_secret_file(d + "/cg-1.cfg", root)).toBeFalse();
+    expect(filesystem.exists(d + "/cg-1.cfg")).toBeFalse();
+}
+
+@requires(filesystem, declassify)
+test "home secure seals every key file of an existing box in place, and leaves the public ones" {
+    Str d = tmp_dir();
+    _ = filesystem.create_dir(d + "/tls");
+    _ = filesystem.create_dir(d + "/people");
+    _ = filesystem.create_dir(d + "/people/alice");
+    _ = filesystem.create_dir(d + "/people/alice/cos");
+    Str cos = d + "/people/alice/cos";
+    List(Int) k = key32(20);
+    _ = filesystem.write_secret(d + "/w1.key", key32(21));
+    _ = filesystem.write_secret(d + "/w2.key", key32(22));
+    _ = filesystem.write_secret(d + "/tls/ca.key", key32(23));
+    _ = filesystem.write_secret(cos + "/root", key32(24));
+    _ = filesystem.write_secret(cos + "/cg-2.cfg", key32(25));
+    _ = filesystem.write_secret(cos + "/kit-half-2.raw", key32(26));
+    _ = filesystem.write_secret(cos + "/pending-3-ab.kb", key32(27));
+    _ = filesystem.write_bytes(cos + "/cosigner.cbor", [9, 9]);
+    _ = filesystem.write_all(cos + "/pending.tag", "3-ab");
+    expect(seal_box_files(d, k)).toBeTrue();
+    expect(is_sealed(filesystem.read_bytes(d + "/w1.key"))).toBeTrue();
+    expect(is_sealed(filesystem.read_bytes(d + "/w2.key"))).toBeTrue();
+    expect(is_sealed(filesystem.read_bytes(d + "/tls/ca.key"))).toBeTrue();
+    expect(is_sealed(filesystem.read_bytes(cos + "/root"))).toBeTrue();
+    expect(is_sealed(filesystem.read_bytes(cos + "/cg-2.cfg"))).toBeTrue();
+    expect(is_sealed(filesystem.read_bytes(cos + "/kit-half-2.raw"))).toBeTrue();
+    expect(is_sealed(filesystem.read_bytes(cos + "/pending-3-ab.kb"))).toBeTrue();
+    expect(filesystem.read_bytes(cos + "/cosigner.cbor")).toEqual([9, 9]);
+    expect(filesystem.read_all(cos + "/pending.tag")).toEqual("3-ab");
+    expect(box_file(d + "/w1.key", k)).toEqual(key32(21));
+    // Running it again changes nothing (no file sealed twice).
+    List(Int) once = filesystem.read_bytes(cos + "/root");
+    expect(seal_box_files(d, k)).toBeTrue();
+    expect(filesystem.read_bytes(cos + "/root")).toEqual(once);
+}
+
+test "the unsealed keys go only to a directory in memory" {
+    Str m = "rootfs / rootfs rw 0 0\n/dev/sda1 / ext4 rw 0 0\ntmpfs /dev/shm tmpfs rw,nosuid,nodev 0 0\n/dev/sda2 /dev/shm/disk ext4 rw 0 0\noverlay /data overlay rw 0 0\n";
+    expect(in_memory_fs("/dev/shm", m)).toBeTrue();
+    expect(in_memory_fs("/dev/shm/x", m)).toBeTrue();
+    expect(in_memory_fs("/dev/shm/disk/x", m)).toBeFalse();
+    expect(in_memory_fs("/dev/shmx", m)).toBeFalse();
+    expect(in_memory_fs("/data", m)).toBeFalse();
+    expect(in_memory_fs("/tmp", m)).toBeFalse();
+    expect(in_memory_fs("/dev/shm", "")).toBeFalse();
+}
+
+// ─── Witnesses outside the box ──────────────────────────────────
+
+test "home init needs witnesses outside the box that outnumber the box's own" {
+    List(Str) box = ["192.168.1.20", "home.lan"];
+    Str a = "pc.lan:47110:" + wkey(31);
+    Str b = "witness.example.org:443:" + wkey(32);
+    expect(box_minority(1, 3)).toBeTrue();
+    expect(box_minority(2, 3)).toBeFalse();
+    expect(box_minority(3, 3)).toBeFalse();
+    expect(box_minority(2, 5)).toBeTrue();
+    expect(witnesses_problem([a, b], box, [], 1)).toEqual("");
+    // One outside the box: the box's own would be half; none: all of them.
+    expect(str_contains(witnesses_problem([a], box, [], 1), "majority")).toBeTrue();
+    expect(str_contains(witnesses_problem([], box, [], 1), "majority")).toBeTrue();
+    // A legacy box running three needs four outside.
+    expect(str_contains(witnesses_problem([a, b], box, [], 3), "majority")).toBeTrue();
+    // The same witness twice, or the box's own key, counts once.
+    expect(str_len(witnesses_problem([a, "other.lan:47110:" + wkey(31)], box, [], 1)) > 0).toBeTrue();
+    expect(str_len(witnesses_problem([a, b], box, [wkey(32)], 1)) > 0).toBeTrue();
+    // A witness on the box itself is not outside it.
+    expect(str_contains(witnesses_problem([a, "HOME.lan:47103:" + wkey(33)], box, [], 1), "this box")).toBeTrue();
+    expect(str_contains(witnesses_problem([a, "127.0.0.1:47103:" + wkey(33)], box, [], 1), "this box")).toBeTrue();
+    // Malformed.
+    expect(str_len(witness_problem("pc.lan:47110", box)) > 0).toBeTrue();
+    expect(str_len(witness_problem("pc.lan:x:" + wkey(31), box)) > 0).toBeTrue();
+    expect(str_len(witness_problem("pc.lan:47110:abcd", box)) > 0).toBeTrue();
+}
+
+test "home init listens on the first host's address unless told otherwise" {
+    expect(bind_for("", ["192.168.1.20", "10.8.0.1"])).toEqual("192.168.1.20");
+    expect(bind_for("0.0.0.0", ["192.168.1.20"])).toEqual("0.0.0.0");
+    expect(bind_for("", ["home.lan"])).toEqual("");
+}
+
+test "the reminder stays until the keys are sealed, the box is a witness minority, and no identity rests on it" {
+    HomeStatus legacy = HomeStatus {.sealed = false, .on_box = 3, .off_box = 0, .people_on_box = ["alice"]};
+    expect(status_secure(legacy)).toBeFalse();
+    expect(str_contains(status_reminder(legacy), "not sealed")).toBeTrue();
+    expect(str_contains(status_reminder(legacy), "every witness")).toBeTrue();
+    expect(str_contains(status_reminder(legacy), "alice")).toBeTrue();
+    expect(str_contains(status_json(legacy), "\"secure\": false")).toBeTrue();
+    HomeStatus moved = HomeStatus {.sealed = true, .on_box = 1, .off_box = 2, .people_on_box = ["alice"]};
+    expect(status_secure(moved)).toBeFalse();
+    expect(str_contains(status_reminder(moved), "not sealed")).toBeFalse();
+    expect(str_contains(status_reminder(moved), "alice")).toBeTrue();
+    HomeStatus done = HomeStatus {.sealed = true, .on_box = 1, .off_box = 2, .people_on_box = []};
+    expect(status_secure(done)).toBeTrue();
+    expect(status_reminder(done)).toEqual("");
+    expect(str_contains(status_json(done), "\"secure\": true")).toBeTrue();
+}
+
+// ─── The invite (R3U-9) ─────────────────────────────────────────
+
+HttpRequest hreq(Str method, Str path, Str query, List(Int) body) {
+    Map(Str, Str) none = {};
+    return HttpRequest { .method = method, .target = path, .path = path, .query = query, .version = "HTTP/1.1", .headers = none, .body = body, .keep_alive = false, .ok = true, .status = 0 };
+}
+
+Str body_of(HttpReply r) { return http_text(r.body, 0, r.body.len()); }
+
+Str token_in(Str json) {
+    Str at = "\"pair_token\": \"";
+    Int i = str_index_of(json, at, 0);
+    return if (i < 0) { "" } else { str_slice(json, i + str_len(at), i + str_len(at) + 22) };
+}
+
+@requires(filesystem, declassify, clock(readonly))
+Str invited_box() {
+    Str d = tmp_dir();
+    _ = filesystem.create_dir(d + "/people");
+    _ = filesystem.create_dir(d + "/invites");
+    _ = filesystem.create_dir(d + "/tls");
+    _ = filesystem.create_dir(d + "/people/alice");
+    _ = filesystem.create_dir(d + "/people/alice/cos");
+    _ = filesystem.write_all(d + "/home.txt", "47100\n192.168.1.20\n");
+    _ = filesystem.write_all(d + "/w1.pub", wkey(40));
+    _ = filesystem.write_all(d + "/witnesses.txt", "pc.lan:47110:" + wkey(41) + "\nw.example.org:443:" + wkey(42) + "\n");
+    _ = filesystem.write_all(d + "/tls/ca.pem", "-----BEGIN CERTIFICATE-----\n-----END CERTIFICATE-----\n");
+    _ = filesystem.write_all(d + "/people/alice/keys", "a1b2");
+    _ = filesystem.write_bytes(d + "/people/alice/cos/cosigner.cbor", [1]);
+    _ = filesystem.write_all(d + "/invites/AAAAAAAAAAAAAAAAAAAAAA", f"alice {clock_now_seconds() + invite_secs()}");
+    _ = filesystem.write_all(d + "/invites/BBBBBBBBBBBBBBBBBBBBBB", f"alice {clock_now_seconds() - 1}");
+    return d;
+}
+
+Str device_keys() {
+    List(Int) p = ec_public_key(P256, key32(50));
+    return hex_encode(cbor_of_keys(PartyKeys {.party = sha256_bytes(p), .auth_key = p, .hpke_key = p}));
+}
+
+@requires(filesystem, declassify, clock(readonly), provision)
+test "the invite code gives the setup once, and only the device that fetched it pairs, once" {
+    Str d = invited_box();
+    Str c = "c=AAAAAAAAAAAAAAAAAAAAAA";
+    HttpReply s1 = pair_handle(d, hreq("GET", "/setup", c, []));
+    expect(s1.status).toEqual(200);
+    Str j = body_of(s1);
+    Str t = token_in(j);
+    expect(str_len(t)).toEqual(22);
+    // The box's one witness and the two outside it, and the reminder fields.
+    expect(str_contains(j, "192.168.1.20:47102:" + wkey(40))).toBeTrue();
+    expect(str_contains(j, "pc.lan:47110:")).toBeTrue();
+    expect(str_contains(j, "\"secure\": false")).toBeTrue();
+    // The code is spent: a second setup, by anyone, is refused.
+    expect(pair_handle(d, hreq("GET", "/setup", c, [])).status).toEqual(403);
+    // Pairing needs the token the setup gave.
+    expect(pair_handle(d, hreq("POST", "/pair", c, str_to_bytes(device_keys()))).status).toEqual(403);
+    expect(pair_handle(d, hreq("POST", "/pair", c + "&t=CCCCCCCCCCCCCCCCCCCCCC", str_to_bytes(device_keys()))).status).toEqual(403);
+    // Not device keys: refused, and the pairing is not spent by it.
+    expect(pair_handle(d, hreq("POST", "/pair", c + "&t=" + t, str_to_bytes("not keys"))).status).toEqual(400);
+    HttpReply p = pair_handle(d, hreq("POST", "/pair", c + "&t=" + t, str_to_bytes(device_keys())));
+    expect(p.status).toEqual(200);
+    expect(str_trim(filesystem.read_all(d + "/people/alice/cos/pair.keys"))).toEqual(device_keys());
+    expect(pair_handle(d, hreq("POST", "/pair", c + "&t=" + t, str_to_bytes(device_keys()))).status).toEqual(403);
+    // An expired code gets nothing; a wrong one neither.
+    expect(pair_handle(d, hreq("GET", "/setup", "c=BBBBBBBBBBBBBBBBBBBBBB", [])).status).toEqual(403);
+    expect(pair_handle(d, hreq("GET", "/setup", "c=../../etc/passwd", [])).status).toEqual(403);
+    expect(invite_secs()).toEqual(86400);
+}
+
+@requires(filesystem, declassify, clock(readonly))
+test "the code is spent by exactly one of two racing claims" {
+    Str d = invited_box();
+    expect(spend(d, "AAAAAAAAAAAAAAAAAAAAAA", "setup", "x")).toBeTrue();
+    expect(spend(d, "AAAAAAAAAAAAAAAAAAAAAA", "setup", "y")).toBeFalse();
+    expect(filesystem.read_all(d + "/invites/AAAAAAAAAAAAAAAAAAAAAA.setup")).toEqual("x");
+}
