@@ -9,6 +9,7 @@ import 'devices_page.dart';
 import 'hardware_page.dart';
 import 'provider_card.dart';
 import 'recovery_page.dart';
+import 'security_update_page.dart';
 import 'setup_page.dart';
 import 'tutorial_page.dart';
 
@@ -144,6 +145,30 @@ class _HomePageState extends State<HomePage> {
               ]),
             ),
           ),
+          if (s.securityUpdate)
+            Card(
+              key: const Key('security-update'),
+              margin: const EdgeInsets.only(bottom: 16),
+              color: Color.alphaBlend(Colors.orange.withValues(alpha: 0.18), Theme.of(context).colorScheme.surfaceContainerLow),
+              child: Padding(
+                padding: const EdgeInsets.all(16),
+                child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+                  Row(children: [
+                    const Icon(Icons.security_update_good, color: Colors.orange),
+                    const SizedBox(width: 12),
+                    Expanded(child: Text('Finish the security update', style: t.titleMedium)),
+                  ]),
+                  const SizedBox(height: 8),
+                  const Text('This device was set up before an important fix. It takes your PIN and, if you have one, your duress PIN, '
+                      'and a minute.'),
+                  const SizedBox(height: 12),
+                  WideButton('Finish the update', key: const Key('start-security-update'), tonal: true, onPressed: () async {
+                    await Navigator.of(context).push(MaterialPageRoute<void>(builder: (_) => SecurityUpdatePage(app: widget.app)));
+                    refresh();
+                  }),
+                ]),
+              ),
+            ),
           if ((s.pending ?? 0) > 0)
             Card(
               key: const Key('pending-change'),

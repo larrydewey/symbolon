@@ -33,6 +33,15 @@ void main() {
     expect([s.sequence, s.epoch, s.parties, s.threshold, s.pending], [3, 2, 4, 2, 1]);
   });
 
+  test('a device before the security update says so, and the update sends both PINs on standard input', () async {
+    const r = CliResult(0, 'security-update due\nparty ab\nprofile TPM\nlog none (run `symbolon device init`)\n', '');
+    expect(DeviceStatus.parse(r)!.securityUpdate, isTrue);
+    expect(DeviceStatus.parse(const CliResult(0, 'party ab\nprofile TPM\n', ''))!.securityUpdate, isFalse);
+    await cli.securityUpdate('/d', '2468', '1357');
+    expect((await agent.argsLog.readAsString()).trim(), 'device security-update /d');
+    expect(await agent.stdinLog.readAsString(), startsWith('2468\n1357\n'));
+  });
+
   test('a device before inception has no log', () {
     const r = CliResult(0, 'party ab\nprofile UNPROTECTED (no TPM)\nlog none (run `symbolon device init`)\n', '');
     final s = DeviceStatus.parse(r)!;

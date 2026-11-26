@@ -181,6 +181,12 @@ class SymbolonCli {
 
   Future<CliResult> status(String dir) => run(['device', 'status', dir], timeout: const Duration(minutes: 2));
 
+  /// The security update (D-4): the PIN, then the duress PIN ("" when this
+  /// device has none). The duress profile gets a transport key of its own
+  /// and the device a new one, published in the log.
+  Future<CliResult> securityUpdate(String dir, String pin, String duressPin) =>
+      run(['device', 'security-update', dir], input: [pin, duressPin], timeout: const Duration(minutes: 10));
+
   Future<CliResult> register(String dir, String rp, String pin, {bool duress = false}) =>
       run(['device', 'register', dir, rp, if (duress) '--duress'], input: [pin], timeout: const Duration(minutes: 5));
 
@@ -577,8 +583,13 @@ class DeviceStatus {
   final String? log;
   final int? sequence, epoch, parties, threshold, pending;
   final bool protectedItems; // the quorum has a vault OPRF key (SPEC 18.10)
+  /// `device security-update` has not run on this device yet. It depends on
+  /// the device's files alone, never on a PIN, so it shows the same under
+  /// the PIN and the duress PIN (SPEC 9.2).
+  final bool securityUpdate;
   const DeviceStatus(
-      {required this.party, required this.unprotected, this.keystore = false, this.log, this.sequence, this.epoch, this.parties, this.threshold, this.pending, this.protectedItems = false});
+      {required this.party, required this.unprotected, this.keystore = false, this.log, this.sequence, this.epoch, this.parties, this.threshold, this.pending, this.protectedItems = false,
+      this.securityUpdate = false});
 
   static DeviceStatus? parse(CliResult r) {
     final party = r.field('party');
@@ -603,6 +614,7 @@ class DeviceStatus {
       threshold: at('threshold'),
       pending: at('pending'),
       protectedItems: (r.field('protected') ?? '').startsWith('on'),
+      securityUpdate: (r.field('security-update') ?? '').startsWith('due'),
     );
   }
 }
