@@ -447,7 +447,10 @@ pub Result(List(Secret(UInt(8))), Str) unwrap(Ctx x, Roster r, ShareWrap w) {
 @requires(filesystem, network, clock(readonly), declassify)
 pub Result(VaultState, Str) fetch_coll(Str dir, Ctx x, Roster r, Str cid, Bool any) {
     List(Int) vid = coll_vid(r.coll_id);
-    Int seen = kept_version(place_local(dir, cid) + ".version");
+    // The highest version this device saw of the folder, also from its
+    // kept copy (vaultcli seen_version): once it saw one, "no items" is
+    // a relay withholding them.
+    Int seen = seen_version(place_local(dir, cid));
     Option(List(Int)) b = blob_get(x.ep, place_blob(x.c, cid));
     if (match b { None => true, Some(_) => false }) {
         return if (seen == 0) { Ok(empty_state(vid, r.owner)) } else { Err(f"the relay has no items for the folder, but this device accepted version {seen}") };
@@ -458,7 +461,7 @@ pub Result(VaultState, Str) fetch_coll(Str dir, Ctx x, Roster r, Str cid, Bool a
     Result(VaultState, SymbolonError) ra = vault_accept(st, vid, sh.head, (UInt(64))seen);
     return match ra {
         Err(e) => Err(err_text(e)),
-        Ok(v) => accepted(place_local(dir, cid), v)
+        Ok(v) => note_accepted(place_local(dir, cid), v)
     };
 }
 
@@ -466,12 +469,6 @@ pub Result(VaultState, Str) fetch_coll(Str dir, Ctx x, Roster r, Str cid, Bool a
 Bool in_org(Str dir, Ctx x, List(Int) l) {
     Result(OrgState, Str) rs = org_at(dir, x.c, x.vh);
     return match rs { Err(_) => false, Ok(st) => member_index(st.org.members, l, 0) >= 0 };
-}
-
-@requires(filesystem)
-Result(VaultState, Str) accepted(Str local, VaultState v) {
-    _ = filesystem.write_all(local + ".version", f"{v.head.version}");
-    return Ok(v);
 }
 
 @requires(filesystem, network, device, declassify, clock, provision, environment)

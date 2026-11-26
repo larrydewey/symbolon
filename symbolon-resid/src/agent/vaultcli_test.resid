@@ -1,0 +1,95 @@
+// The own vault on the device (src/agent/vaultcli.resid): what a device
+// accepts from the relay over time.
+// Files go to target/test-vaultcli/ (a fresh directory per test).
+
+import "../types.resid";
+import "../vault/vault.resid";
+import "../duress/duress.resid";
+import "state.resid";
+import "common.resid";
+import "device.resid";
+import "vaultcli.resid";
+import "crypto.resid";
+import "ecdsa.resid";
+import "hash.resid";
+import "word.resid";
+
+List(Int) rep(Int b, Int n) { return if (n <= 0) { [] } else { [b].concat(rep(b, n - 1)) }; }
+
+@requires(filesystem)
+Str fresh_dir() {
+    Str d = "target/test-vaultcli/" + hex_encode(random_bytes(8));
+    _ = filesystem.create_dir(d);
+    return d;
+}
+
+List(Int) log_id() { return rep(9, 32); }
+List(Secret(UInt(8))) vk() { return secret_bytes(rep(5, 32)); }
+List(Int) privk(Int n) { return rep(0, 31).concat([n]); }
+List(Int) idn(Int n) { return sha256_bytes([n]); }
+
+DeviceConfig config() {
+    return DeviceConfig {.relay_host = "", .relay_port = 0, .ca = "", .witnesses = [], .unprotected = true, .argon_m_kib = 0, .argon_t = 0, .salt = [],
+        .tpm_dk = 0, .tpm_unlock_a = 0, .tpm_unlock_b = 0, .party = idn(2), .dk_pub = [], .hpke_pub = [], .log_id = log_id(), .mbox_next = 0, .peers = []};
+}
+
+VerifiedHead vhead() {
+    Party a = Party {.id = idn(2), .kind = party_kind_device(), .auth_key = ec_public_key(P256, privk(2)), .hpke_key = [], .label = "a", .attestation = NoAttestation};
+    LogHead h = LogHead {.log_id = log_id(), .sequence = 10, .digest = [],
+        .quorum = Quorum {.parties = [a], .t = 1, .root_pubkey = [], .epoch = 0, .transcript_digest = [], .kv_commits = []},
+        .policy = Policy {.device_sigs_for_authority = 1, .recovery_delay_sec = 86400, .guardians = [], .guardian_threshold = 0, .witnesses = [],
+                          .duress_window_sec = 0, .cosigner_policy = NoCosignerPolicy}};
+    return VerifiedHead {.head = h, .witness_cosigs = [], .pending = []};
+}
+
+@requires(declassify)
+List(Item) items() {
+    List(Int) id = item_id_of(vk(), "mail");
+    Item it = item_seal(vk(), vault_id_of(log_id()), id, 1, "password", [FieldPlain {.name = "name", .value = secret_bytes(utf8("mail"))},
+        FieldPlain {.name = "secret", .value = secret_bytes(utf8("hunter2"))}], false, None) else {
+        Item {.id = [], .version = 0, .kind = "", .fields = {}, .in_duress_subset = false, .handling_policy = None} };
+    return [it];
+}
+
+VaultState state_at(List(Item) its, UInt(64) ver) {
+    VaultHead h0 = VaultHead {.vault_id = vault_id_of(log_id()), .version = ver, .merkle_root = merkle_root(its), .log_id = log_id(),
+                              .log_sequence = 4, .suite = 1, .signer = idn(2), .sig = []};
+    EcSig s = ecdsa_sign_digest(P256, Sha256, privk(2), hash_bytes(Sha256, head_tbs(h0)));
+    return VaultState {.head = VaultHead {.vault_id = h0.vault_id, .version = ver, .merkle_root = h0.merkle_root, .log_id = h0.log_id,
+                                          .log_sequence = 4, .suite = 1, .signer = h0.signer, .sig = ecdsa_raw_of(P256, s)}, .items = its};
+}
+
+// A state as the relay serves it (CBOR), by way of the device's own copy.
+@requires(filesystem, declassify)
+List(Int) served_bytes(VaultState st) {
+    Str local = fresh_dir() + "/enc";
+    _ = keep_place_copy(local, vk(), st);
+    return get_file(local + ".cache");
+}
+
+Bool is_ok(Result(VaultState, Str) r) { return match r { Ok(_) => true, Err(_) => false }; }
+
+// ─── Rollback (A-14) ────────────────────────────────────────────
+
+@requires(filesystem, declassify)
+test "a vault read once is never taken back to an older state or to none" {
+    Str dir = fresh_dir();
+    List(Item) its = items();
+    expect(is_ok(vault_from(dir, config(), vhead(), Some(served_bytes(state_at(its, 3)))))).toBeTrue();
+    // A read-only device: no publish wrote vault.version, the read did.
+    expect(is_ok(vault_from(dir, config(), vhead(), None))).toBeFalse();
+    expect(is_ok(vault_from(dir, config(), vhead(), Some(served_bytes(state_at(its, 2)))))).toBeFalse();
+    expect(is_ok(vault_from(dir, config(), vhead(), Some(served_bytes(state_at([], 2)))))).toBeFalse();
+    expect(is_ok(vault_from(dir, config(), vhead(), Some(served_bytes(state_at(its, 3)))))).toBeTrue();
+    expect(is_ok(vault_from(dir, config(), vhead(), Some(served_bytes(state_at([], 4)))))).toBeTrue();
+}
+
+@requires(filesystem, declassify)
+test "a kept copy counts as seen: the relay cannot answer no vault" {
+    Str dir = fresh_dir();
+    _ = keep_copy(dir, vk(), state_at(items(), 3));
+    expect(is_ok(vault_from(dir, config(), vhead(), None))).toBeFalse();
+    expect(is_ok(vault_from(dir, config(), vhead(), Some(served_bytes(state_at(items(), 2)))))).toBeFalse();
+    // A device that never saw a vault still starts from none.
+    expect(is_ok(vault_from(fresh_dir(), config(), vhead(), None))).toBeTrue();
+}

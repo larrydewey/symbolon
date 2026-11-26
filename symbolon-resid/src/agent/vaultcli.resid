@@ -53,9 +53,6 @@ pub Option(VaultState) state_of(List(Int) b) {
 List(Int) cbor_of_vault(VaultState s) { return match to_cbor(s) { Ok(b) => b, Err(_) => [] }; }
 
 @requires(filesystem)
-Int accepted_version(Str dir) { return kept_version(dir + "/vault.version"); }
-
-@requires(filesystem)
 pub Int kept_version(Str path) {
     Str s = str_trim(filesystem.read_all(path));
     return if (str_len(s) == 0) { 0 } else { str_parse_int(s) };
@@ -67,18 +64,44 @@ pub Int kept_version(Str path) {
 pub Result(VaultState, Str) fetch_vault(Str dir, DeviceConfig c, VerifiedHead vh) { return vault_from(dir, c, vh, blob_get(relay_ep(c), vault_blob(c.log_id))); }
 
 // The vault in `b` (as the relay gave it, perhaps fetched ahead), accepted
-// against the verified log.
+// against the verified log, never older than any version this device saw.
 @requires(filesystem, declassify)
 pub Result(VaultState, Str) vault_from(Str dir, DeviceConfig c, VerifiedHead vh, Option(List(Int)) b) {
     List(Int) vid = vault_id_of(c.log_id);
-    Int seen = accepted_version(dir);
+    Str local = place_local(dir, "");
+    Int seen = seen_version(local);
     return match b {
         None => if (seen == 0) { Ok(empty_state(vid, c.log_id)) } else { Err("the relay has no vault, but this device accepted version " + f"{seen}") },
         Some(x) => match state_of(x) {
             None => Err("the vault does not decode"),
-            Some(st) => match vault_accept(st, vid, vh.head, (UInt(64))seen) { Ok(v) => Ok(v), Err(e) => Err(err_text(e)) }
+            Some(st) => match vault_accept(st, vid, vh.head, (UInt(64))seen) { Ok(v) => note_accepted(local, v), Err(e) => Err(err_text(e)) }
         }
     };
+}
+
+// The highest version of a place this device has seen (A-14): the one it
+// recorded in local.version, or its kept copy's (local.cache) when that is
+// higher. Every state a device accepts, also one it only reads, raises
+// local.version, so a relay cannot roll a read-only device back to an
+// older signed state or answer "no vault" once it showed one. The copy
+// counts too, for a device that kept one before versions were recorded on
+// reading; its tag is not checked here (the key is not at hand): a copy
+// written by someone else can only raise the floor, making the relay's
+// state refused, never accept an older one.
+@requires(filesystem)
+pub Int seen_version(Str local) {
+    Int a = kept_version(local + ".version");
+    Option(VaultState) kc = state_of(get_file(local + ".cache"));
+    Int k = match kc { None => 0, Some(st) => (Int)st.head.version };
+    return if (k > a) { k } else { a };
+}
+
+// After a state is accepted: its version recorded, never lowering it.
+@requires(filesystem)
+pub Result(VaultState, Str) note_accepted(Str local, VaultState v) {
+    Int n = (Int)v.head.version;
+    _ = if (n > kept_version(local + ".version")) { filesystem.write_all(local + ".version", f"{n}") } else { true };
+    return Ok(v);
 }
 
 // `ep`: the relay with this device's session (orgcore relay_at).
