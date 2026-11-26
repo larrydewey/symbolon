@@ -913,7 +913,10 @@ void main() {
     await settle(t);
     await pin(t, '2468');
     await settle(t);
-    expect(agent.argsLog.readAsStringSync(), contains('device org join ${settings.deviceDir} 0123456789abcdef0123456789abcdef ${'a' * 64} fedcba9876543210fedcba9876543210'));
+    // The invite code is a bearer secret: on standard input ("-"), before the PIN, never on the command line.
+    expect(agent.argsLog.readAsStringSync(), contains('device org join ${settings.deviceDir} 0123456789abcdef0123456789abcdef ${'a' * 64} -'));
+    expect(agent.argsLog.readAsStringSync(), isNot(contains('fedcba9876543210fedcba9876543210')));
+    expect(agent.stdinLog.readAsStringSync(), contains('fedcba9876543210fedcba9876543210\n2468\n'));
     expect(find.text('Acme'), findsOneWidget);
     expect(find.text('You are an owner'), findsOneWidget);
     expect(find.byKey(const Key('org-request-00112233445566778899aabbccddeeff')), findsOneWidget);

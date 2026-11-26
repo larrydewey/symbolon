@@ -19,7 +19,12 @@ class SecurityKeysPage extends StatefulWidget {
 class _SecurityKeysPageState extends State<SecurityKeysPage> {
   List<String>? names;
   bool needsPin = false;   // the list is sealed under the PIN (SPEC 9.4) and none is held
-  bool fillsNeedKey = false;   // the device's fill policy (SPEC 22.7 item 2), from its fill-policy file
+  // The fill policy (SPEC 22.7 item 2) as the PIN's profile shows it: the
+  // agent's `key list --pin` reports it ("fills keys|any"), never the
+  // device's fill-policy file, which is the real profile's alone (a change
+  // under the duress PIN shows here as made, SPEC 14.2). Null until a PIN
+  // has opened the list.
+  bool? fillsNeedKey;
   App get app => widget.app;
 
   @override
@@ -34,13 +39,13 @@ class _SecurityKeysPageState extends State<SecurityKeysPage> {
   Future<void> load({String? pin}) async {
     final p = pin ?? app.session.held;
     final r = await app.cli.keyList(app.dir, pin: p);
-    final policy = File('${app.dir}/fill-policy');
-    final need = await policy.exists() && (await policy.readAsString()).startsWith('keys');
     if (!mounted) return;
+    final lines = r.ok ? [for (final l in r.lines) l.trim()] : <String>[];
+    final fills = [for (final l in lines) if (l.startsWith('fills ')) l.substring(6)];
     setState(() {
-      names = r.ok ? [for (final l in r.lines) unhex(l.trim())] : [];
+      names = [for (final l in lines) if (l.isNotEmpty && !l.startsWith('fills ')) unhex(l)];
       needsPin = !r.ok && p == null;
-      fillsNeedKey = need;
+      fillsNeedKey = fills.isEmpty ? null : fills.last == 'keys';
     });
   }
 
@@ -54,11 +59,15 @@ class _SecurityKeysPageState extends State<SecurityKeysPage> {
   }
 
   Future<void> setFills(bool needKey) async {
-    final r = await app.withPin(context, (p) => runTask(context, needKey ? 'Requiring a key for fills' : 'Allowing fills with the PIN', () => app.cli.keyFills(app.dir, needKey, p),
-        detail: (names ?? []).isEmpty ? null : 'Touch any enrolled key.', usually: 'a few seconds'));
+    String? used;
+    final r = await app.withPin(context, (p) {
+      used = p;
+      return runTask(context, needKey ? 'Requiring a key for fills' : 'Allowing fills with the PIN', () => app.cli.keyFills(app.dir, needKey, p),
+          detail: (names ?? []).isEmpty ? null : 'Touch any enrolled key.', usually: 'a few seconds');
+    });
     if (r != null && r.ok && mounted) {
       toast(context, r.lines.isEmpty ? 'Saved' : '${r.lines.last[0].toUpperCase()}${r.lines.last.substring(1)}.');
-      load();
+      await load(pin: used);
     }
   }
 
@@ -149,12 +158,14 @@ class _SecurityKeysPageState extends State<SecurityKeysPage> {
                 child: SwitchListTile(
                   key: const Key('fills-need-key'),
                   title: const Text('Fills need a security key'),
-                  subtitle: Text(fillsNeedKey && ns.isEmpty
-                      ? 'No key is enrolled, so this device fills nothing until one is.'
-                      : 'Filling a login or a card into a page or an app asks for a touch of your key every time, and this device '
-                          'refuses to fill on the PIN alone.'),
-                  value: fillsNeedKey,
-                  onChanged: setFills,
+                  subtitle: Text(fillsNeedKey == null
+                      ? 'Enter the PIN to see this setting.'
+                      : fillsNeedKey! && ns.isEmpty
+                          ? 'No key is enrolled, so this device fills nothing until one is.'
+                          : 'Filling a login or a card into a page or an app asks for a touch of your key every time, and this device '
+                              'refuses to fill on the PIN alone.'),
+                  value: fillsNeedKey ?? false,
+                  onChanged: fillsNeedKey == null ? null : setFills,
                 ),
               ),
             ]),

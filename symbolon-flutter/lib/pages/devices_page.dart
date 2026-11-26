@@ -70,14 +70,42 @@ class _DevicesPageState extends State<DevicesPage> {
     await add();
   }
 
+  // The person compares the code the new device shows with this one: only
+  // the device in front of them is added (SPEC 11.1 step 2). A code someone
+  // else made, scanned or pasted here, would otherwise add their device.
+  Future<bool> confirmFingerprint(String fp) async {
+    if (!mounted) return false;
+    final same = await showDialog<bool>(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Is this your new device?'),
+        content: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+          const Text('Your new device now shows a code. Add it only if it shows exactly this, and it is the device in front of you:'),
+          const SizedBox(height: 12),
+          SelectableText(fp, key: const Key('add-fingerprint'), style: const TextStyle(fontFamily: 'monospace', fontSize: 18)),
+          const SizedBox(height: 12),
+          const Text('If it differs, or no device of yours shows a code, someone else made this code: do not add it.'),
+        ]),
+        actions: [
+          TextButton(key: const Key('add-fingerprint-no'), onPressed: () => Navigator.of(ctx).pop(false), child: const Text('It differs')),
+          FilledButton(key: const Key('add-fingerprint-yes'), onPressed: () => Navigator.of(ctx).pop(true), child: const Text('It is the same')),
+        ],
+      ),
+    );
+    return same == true;
+  }
+
   // Adds the device whose code this is (SPEC 11.5): the two devices meet on
-  // the local network, then the identity is re-shared to include it.
+  // the local network, the person confirms the new device's fingerprint,
+  // then the identity is re-shared to include it.
   Future<void> add() async {
     FocusScope.of(context).unfocus();
     final link = linkText.text.trim();
     if (!isLink(link)) return toast(context, "Scan the new device's code, or paste its link (symbolon://link?…).");
-    final r = await app.withPin(context, (p) => runTask(context, 'Adding the new device', () => app.cli.linkAdd(app.dir, link, p),
-        detail: 'The new device sets itself up from this one, then your identity is re-shared to include it. Keep both devices on and on this network.',
+    final r = await app.withPin(context, (p) => runTask(context, 'Adding the new device', () => app.cli.linkAdd(app.dir, link, p, confirmFingerprint),
+        detail: 'The new device sets itself up from this one; you then compare the code both devices show, and your identity is re-shared to include it. '
+            'Keep both devices on and on this network.',
         usually: '1-3 minutes'));
     if (r == null || !mounted) return;
     if (!r.ok) return toast(context, friendlyError(r));
@@ -114,7 +142,8 @@ class _DevicesPageState extends State<DevicesPage> {
             WideButton("Scan the new device's code", key: const Key('add-scan'), icon: Icons.qr_code_scanner, onPressed: scan),
             const SizedBox(height: 12),
           ],
-          Field(linkText, Platform.isAndroid || Platform.isIOS ? 'Or paste its link' : 'Paste its link', hint: 'symbolon://link?…', url: true, fieldKey: const Key('add-link'), action: TextInputAction.done),
+          Field(linkText, Platform.isAndroid || Platform.isIOS ? 'Or paste its link' : 'Paste its link', hint: 'symbolon://link?…', url: true, fieldKey: const Key('add-link'), action: TextInputAction.done,
+              helper: 'Only a link your own new device shows, here with you on this network: a link someone sent you would add their device.'),
           WideButton('Add the device', key: const Key('add-device'), icon: Icons.add, tonal: true, onPressed: add),
         ]),
         Section('Protected items', subtitle: 'Items you protect open only with your cosigner, so one stolen or infected device cannot open them on its own.', children: [

@@ -174,8 +174,45 @@ class SymbolonCli {
           onLine, input: [pin, duressPin], timeout: const Duration(minutes: 40));
 
   /// On a device with the identity: adds the device whose code [link] is.
-  Future<CliResult> linkAdd(String dir, String link, String pin) =>
-      run(['device', 'link-add', dir, link], input: [pin], timeout: const Duration(minutes: 30));
+  /// The link (it carries the code's secret) and the PIN go to standard
+  /// input, never the command line. Once the two devices have met, the agent
+  /// prints "fingerprint F", the new device's keys as both devices show
+  /// them; [confirm] asks the person whether the new device shows the same,
+  /// and only a yes lets the agent enrol it (SPEC 11.1 step 2, 11.5).
+  Future<CliResult> linkAdd(String dir, String link, String pin, Future<bool> Function(String fingerprint) confirm) async {
+    final Process p;
+    try {
+      p = await Process.start(binary, ['device', 'link-add', dir], environment: env);
+    } on ProcessException catch (e) {
+      return CliResult(127, '', 'cannot run $binary: ${e.message}');
+    }
+    final out = StringBuffer(), err = StringBuffer();
+    var answered = false;
+    Future<void> answer(bool yes) async {
+      if (answered) return;
+      answered = true;
+      try {
+        p.stdin.writeln(yes ? 'y' : 'n');
+        await p.stdin.close();
+      } catch (_) {}
+    }
+    final o = p.stdout.transform(utf8.decoder).transform(const LineSplitter()).listen((l) {
+      out.writeln(l);
+      if (l.startsWith('fingerprint ')) confirm(l.substring(12).trim()).then(answer, onError: (_) => answer(false));
+    }).asFuture<void>();
+    final e = p.stderr.transform(utf8.decoder).listen(err.write).asFuture<void>();
+    p.stdin.writeln(link);
+    p.stdin.writeln(pin);
+    final code = await p.exitCode.timeout(const Duration(minutes: 30), onTimeout: () {
+      p.kill();
+      return 124;
+    });
+    await answer(false);
+    const grace = Duration(seconds: 2);
+    await o.timeout(grace, onTimeout: () {});
+    await e.timeout(grace, onTimeout: () {});
+    return CliResult(code, out.toString(), err.toString());
+  }
 
   // ─── Device ─────────────────────────────────────────────────────────
 
@@ -345,8 +382,10 @@ class SymbolonCli {
   Future<CliResult> orgGroups(String dir) => run(['device', 'org', 'groups', dir], timeout: const Duration(minutes: 5));
 
   /// Prints "ORG-ID NAME-HEX member|pending"; [code] answers an invite.
+  /// The code is a bearer secret: it goes to standard input ("-"), before
+  /// the PIN, never on the command line.
   Future<CliResult> orgJoin(String dir, String org, String founder, String code, String pin) =>
-      run(['device', 'org', 'join', dir, org, founder, if (code.isNotEmpty) code], input: [pin], timeout: const Duration(minutes: 5));
+      run(['device', 'org', 'join', dir, org, founder, if (code.isNotEmpty) '-'], input: [if (code.isNotEmpty) code, pin], timeout: const Duration(minutes: 5));
 
   /// Prints "CODE ID" for one person of the company directory.
   Future<CliResult> orgInvite(String dir, String ext, String name, String pin, {String groups = ''}) =>

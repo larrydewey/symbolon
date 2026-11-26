@@ -46,6 +46,18 @@ if [ "$1 $2 $3" = "device vault signin-bitwarden" ]; then
   [ "$P" = "2468" ] || { echo "device: wrong PIN" >&2; exit 1; }
   echo "vault version 2, 2 items"; echo "total 2"; exit 0
 fi
+# Adding a device: the link and the PIN on stdin, then the fingerprint to confirm.
+if [ "$1 $2" = "device link-add" ]; then
+  read -r LINK; read -r PIN
+  printf '%s\n%s\n' "$LINK" "$PIN" > "$D/link.log"
+  [ "$PIN" = "2468" ] || { echo "device: wrong PIN" >&2; exit 1; }
+  echo "device: waiting for the new device to set itself up"
+  echo "fingerprint 1a2b 3c4d 5e6f 7a8b 9c0d 1e2f 3a4b 5c6d"
+  read -r OK; echo "$OK" >> "$D/link.log"
+  [ "$OK" = y ] || { echo "device: not added: the new device's code was not confirmed" >&2; exit 1; }
+  echo "device: adding the new device to the identity (usually 1 to 3 minutes)"
+  exit 0
+fi
 IN=$(cat)
 printf '%s\n--\n' "$IN" >> "$D/stdin.log"
 PIN=$(printf '%s\n' "$IN" | head -1)
@@ -101,21 +113,25 @@ case "$1 $2" in
     sleep 1.5
     [ -f "$D/link-fail" ] && { echo "device: no device answered the code" >&2; exit 1; }
     echo "device: making this device against 192.168.1.9:47101"
+    echo "fingerprint 1a2b 3c4d 5e6f 7a8b 9c0d 1e2f 3a4b 5c6d"
     echo "device: joining the identity (usually 1 to 3 minutes)"
     echo "joined" ;;
-  "device link-add")
-    [ "$PIN" = "2468" ] || { echo "device: wrong PIN" >&2; exit 1; }
-    echo "device: adding the new device to the identity (usually 1 to 3 minutes)" ;;
   "device key")
     case "$3" in
       # With --pin and the duress PIN 1357: the keys acted under it too (SPEC 14.2).
-      list) [ -f "$D/keys" ] && cat "$D/keys"; [ "$5" = --pin ] && [ "$PIN" = 1357 ] && [ -f "$D/keys.acted" ] && cat "$D/keys.acted"; true ;;
+      # Last, the fill policy the profile shows: the duress profile's own once it set one.
+      list) [ -f "$D/key-list-fails" ] && [ "$5" != --pin ] && { echo "device: the list opens with the PIN" >&2; exit 1; }
+            [ -f "$D/keys" ] && cat "$D/keys"; [ "$5" = --pin ] && [ "$PIN" = 1357 ] && [ -f "$D/keys.acted" ] && cat "$D/keys.acted"
+            if [ "$5" = --pin ] && [ "$PIN" = 1357 ] && [ -f "$D/fills.acted" ]; then echo "fills $(cat "$D/fills.acted")"; else echo "fills $(cat "$D/fills" 2>/dev/null || echo any)"; fi; true ;;
+      fills) [ "$PIN" = 1357 ] && { [ "$5" = keys ] && echo keys > "$D/fills.acted" || echo any > "$D/fills.acted"; echo "fills need a security key; none is enrolled, so this device fills nothing until one is"; exit 0; }
+         [ "$PIN" = "2468" ] || { echo "device: wrong PIN" >&2; exit 1; }
+         mkdir -p "$4"; [ "$5" = keys ] && { echo keys > "$4/fill-policy"; echo keys > "$D/fills"; } || { echo any > "$4/fill-policy"; echo any > "$D/fills"; }
+         echo "fills need a security key; none is enrolled, so this device fills nothing until one is" ;;
       add) [ "$PIN" = 1357 ] && { printf '%s\n' "$(printf %s "$5" | od -v -An -tx1 | tr -d ' \n')" >> "$D/keys.acted"; echo "security key $5 added"; exit 0; }
          [ "$PIN" = "2468" ] || { echo "device: wrong PIN" >&2; exit 1; }
          printf '%s\n' "$(printf %s "$5" | od -v -An -tx1 | tr -d ' \n')" >> "$D/keys"; echo "security key $5 added" ;;
       *) [ "$PIN" = "2468" ] || { echo "device: wrong PIN" >&2; exit 1; }
          case "$3" in
-           fills) mkdir -p "$4"; [ "$5" = keys ] && echo keys > "$4/fill-policy" || echo any > "$4/fill-policy"; echo "fills need a security key; none is enrolled, so this device fills nothing until one is" ;;
            remove) grep -v "^$(printf %s "$5" | od -v -An -tx1 | tr -d ' \n')\$" "$D/keys" > "$D/keys.n"; mv "$D/keys.n" "$D/keys"; echo "removed" ;;
          esac ;;
     esac ;;
@@ -219,6 +235,8 @@ recovery-request 00112233445566778899aabbccddeeff %s 1800000000
       groups) exit 0 ;;
       changes) printf '0123456789abcdef0123456789abcdef policy 6d61785f6f66666c696e655f64617973 37 - %s pending -\n' "$A"; exit 0 ;;
     esac
+    # `org join ... -`: the invite code is the first line, the PIN the second.
+    [ "$3" = join ] && [ "$7" = - ] && PIN=$(printf '%s\n' "$IN" | sed -n 2p)
     [ "$PIN" = "2468" ] || { echo "device: wrong PIN" >&2; exit 1; }
     case "$3" in
       join) mkdir -p "$4"; echo "$5 $6" > "$4/org"; echo owner > "$D/org-role"; echo "$5 41636d65 member" ;;

@@ -10,13 +10,33 @@ import '../qr_view.dart';
 import '../validate.dart' as v;
 import '../widgets.dart';
 
-/// This device's network addresses, for the code: IPv4 first, no loopback.
+/// Whether a code may name [h]: an address only a network the two devices
+/// share reaches (the agent refuses any other, link.resid link_host_ok):
+/// IPv4 loopback, RFC 1918, 100.64/10 (Tailscale), link-local; IPv6
+/// loopback, fe80::/10, fc00::/7; localhost and *.local.
+bool isLocalAddress(String h) {
+  final a = InternetAddress.tryParse(h);
+  if (a == null) {
+    final l = h.toLowerCase();
+    return l == 'localhost' || (l.length > 6 && l.endsWith('.local') && RegExp(r'^[a-z0-9.-]+$').hasMatch(l));
+  }
+  if (h.contains('%') || (h.contains('.') && a.type == InternetAddressType.IPv6)) return false;
+  final b = a.rawAddress;
+  if (a.type == InternetAddressType.IPv4) {
+    return b[0] == 127 || b[0] == 10 || (b[0] == 172 && b[1] >= 16 && b[1] <= 31) || (b[0] == 192 && b[1] == 168) ||
+        (b[0] == 100 && b[1] >= 64 && b[1] <= 127) || (b[0] == 169 && b[1] == 254);
+  }
+  return a.isLoopback || (b[0] & 0xfe) == 0xfc || (b[0] == 0xfe && (b[1] & 0xc0) == 0x80);
+}
+
+/// This device's network addresses on the local network, for the code:
+/// IPv4 first, no loopback, none a stranger on the internet could reach.
 Future<List<String>> localAddresses() async {
   try {
     final ifs = await NetworkInterface.list(includeLoopback: false, type: InternetAddressType.any);
     final v4 = [for (final i in ifs) for (final a in i.addresses) if (a.type == InternetAddressType.IPv4 && !a.isLinkLocal) a.address];
     final v6 = [for (final i in ifs) for (final a in i.addresses) if (a.type == InternetAddressType.IPv6 && !a.isLinkLocal) a.address];
-    return [...v4, ...v6].take(4).toList();
+    return [...v4, ...v6].where(isLocalAddress).take(4).toList();
   } catch (_) {
     return [];
   }
@@ -49,6 +69,7 @@ class _JoinPageState extends State<JoinPage> {
   HardwareState? hardware;
   _Stage stage = _Stage.pin;
   String link = '';
+  String fingerprint = '';   // this device's keys as the other device shows them, to compare (SPEC 11.1 step 2)
   String status = '';
   String error = '';
 
@@ -108,6 +129,10 @@ class _JoinPageState extends State<JoinPage> {
           link = line.substring(5).trim();
           status = 'Waiting for your other device to scan the code…';
         });
+        return;
+      }
+      if (line.startsWith('fingerprint ')) {
+        setState(() => fingerprint = line.substring(12).trim());
         return;
       }
       final s = said(line);
@@ -176,6 +201,11 @@ class _JoinPageState extends State<JoinPage> {
                   },
                 ),
               ),
+            ],
+            if (stage == _Stage.joining && fingerprint.isNotEmpty) ...[
+              const Text('Your other device asks you to compare this code. Confirm there only if it shows exactly:', textAlign: TextAlign.center),
+              const SizedBox(height: 8),
+              Center(child: SelectableText(fingerprint, key: const Key('join-fingerprint'), style: const TextStyle(fontFamily: 'monospace', fontSize: 20))),
             ],
             if (stage == _Stage.joining) const Center(child: Padding(padding: EdgeInsets.all(24), child: CircularProgressIndicator())),
             Row(mainAxisAlignment: MainAxisAlignment.center, children: [

@@ -96,8 +96,45 @@ void main() {
     await t.tap(find.byKey(const Key('secret-ok')));
     await t.pump();
     await settle(t);
+    // The new device's fingerprint, to compare with what it shows; added only on a yes.
+    expect(find.byKey(const Key('add-fingerprint')), findsOneWidget);
+    expect(find.text('1a2b 3c4d 5e6f 7a8b 9c0d 1e2f 3a4b 5c6d'), findsOneWidget);
+    await t.tap(find.byKey(const Key('add-fingerprint-yes')));
+    await t.pump();
+    await settle(t);
     final args = (await t.runAsync(() => agent.argsLog.readAsString()))!;
-    expect(args, contains('device link-add ${agent.dir.path}/dev $link'));
+    // The link carries the code's secret: on standard input, not the command line.
+    expect(args, contains('device link-add ${agent.dir.path}/dev'));
+    expect(args, isNot(contains(link)));
+    expect((await t.runAsync(() => File('${agent.dir.path}/link.log').readAsString()))!, '$link\n2468\ny\n');
     expect(find.text('Device added'), findsOneWidget);
+  });
+
+  testWidgets('adding: a fingerprint that differs adds nothing', (t) async {
+    sized(t);
+    await t.pumpWidget(MaterialApp(home: DevicesPage(app: App(settings))));
+    await t.pump();
+    const link = 'symbolon://link?a=192.168.1.20&p=40123&s=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA';
+    await t.enterText(find.byKey(const Key('add-link')), link);
+    await t.tap(find.byKey(const Key('add-device')));
+    await t.pumpAndSettle();
+    await t.enterText(find.byKey(const Key('secret-field')), '2468');
+    await t.tap(find.byKey(const Key('secret-ok')));
+    await t.pump();
+    await settle(t);
+    await t.tap(find.byKey(const Key('add-fingerprint-no')));
+    await t.pump();
+    await settle(t);
+    expect((await t.runAsync(() => File('${agent.dir.path}/link.log').readAsString()))!, '$link\n2468\nn\n');
+    expect(find.text('Device added'), findsNothing);
+  });
+
+  test('a code names only addresses on the local network', () {
+    for (final h in ['192.168.1.20', '10.0.0.5', '172.16.3.4', '100.100.1.2', '127.0.0.1', '169.254.1.1', 'fd12:3456::1', 'fe80::1', '::1', 'laptop.local']) {
+      expect(isLocalAddress(h), isTrue, reason: h);
+    }
+    for (final h in ['8.8.8.8', '172.32.0.1', '100.128.0.1', '2001:db8::1', 'example.com', '::ffff:192.168.1.1', 'fe80::1%wlan0']) {
+      expect(isLocalAddress(h), isFalse, reason: h);
+    }
   });
 }

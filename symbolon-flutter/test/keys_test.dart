@@ -111,4 +111,44 @@ void main() {
     expect(find.text('No key is enrolled, so this device fills nothing until one is.'), findsOneWidget);
     app.session.lock();
   });
+
+  // R3D-1: the switch shows what the agent says the PIN's profile shows,
+  // not the device's fill-policy file (the real profile's): a change under
+  // the duress PIN does not snap back in front of whoever forced it.
+  testWidgets('a fill policy change under the duress PIN shows as made; the page never reads the fill-policy file', (t) async {
+    t.view.devicePixelRatio = 2;
+    t.view.physicalSize = const Size(460, 1000) * 2;
+    addTearDown(t.view.reset);
+    Directory('${agent.dir.path}/dev').createSync(recursive: true);
+    File('${agent.dir.path}/dev/fill-policy').writeAsStringSync('any\n');
+    final app = App(settings);
+    await t.pumpWidget(MaterialApp(home: SecurityKeysPage(app: app)));
+    await settle(t);
+    expect((t.widget(find.byKey(const Key('fills-need-key'))) as SwitchListTile).value, isFalse);
+    await t.tap(find.byKey(const Key('fills-need-key')));
+    await t.pumpAndSettle();
+    await t.enterText(find.byKey(const Key('secret-field')), '1357');
+    await t.tap(find.byKey(const Key('secret-ok')));
+    await t.pump();
+    await settle(t);
+    expect((t.widget(find.byKey(const Key('fills-need-key'))) as SwitchListTile).value, isTrue);
+    expect(File('${agent.dir.path}/dev/fill-policy').readAsStringSync(), 'any\n');
+    app.session.lock();
+  });
+
+  testWidgets('without a PIN the fill policy is not shown', (t) async {
+    t.view.devicePixelRatio = 2;
+    t.view.physicalSize = const Size(460, 1000) * 2;
+    addTearDown(t.view.reset);
+    final app = App(settings);
+    Directory('${agent.dir.path}/dev').createSync(recursive: true);
+    File('${agent.dir.path}/dev/fill-policy').writeAsStringSync('keys\n');
+    File('${agent.dir.path}/key-list-fails').writeAsStringSync('');
+    await t.pumpWidget(MaterialApp(home: SecurityKeysPage(app: app)));
+    await settle(t);
+    final sw = t.widget(find.byKey(const Key('fills-need-key'))) as SwitchListTile;
+    expect(sw.value, isFalse);
+    expect(sw.onChanged, isNull);
+    expect(find.text('Enter the PIN to see this setting.'), findsOneWidget);
+  });
 }
