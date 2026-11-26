@@ -118,11 +118,16 @@ List(List(Int)) ids_of(List(Party) ps, Int i, ListBuf(List(Int)) acc) {
 
 Bool key_ok(List(Int) k) { return ec_public_ok(P256, k); }
 
+// A party id is SHA-256 of the party's authentication key (SPEC 20.2.1),
+// for every kind: device, cosigner and guardian ids are party_of_key(DK),
+// the kit's is recovery_key_digest(sign_pub). Without the binding a log
+// could list someone else's party id beside its own key and post to that
+// party's mailbox at the relay.
+Bool party_id_ok(Party p) { return key_ok(p.auth_key) && bytes_eq(p.id, sha256_bytes(p.auth_key)); }
+
 Bool parties_ok(List(Party) ps, Int i) {
     if (i >= ps.len()) { return true; }
-    Party p = ps[i];
-    if (!key_ok(p.auth_key)) { return false; }
-    if (p.id.len() != 32) { return false; }
+    if (!party_id_ok(ps[i])) { return false; }
     return parties_ok(ps, i + 1);
 }
 
@@ -616,6 +621,7 @@ Result(LogState, SymbolonError) do_propose(LogState s, SignedEvent e, List(Int) 
         return refuse("party already known");
     }
     if (!key_ok(party.auth_key)) { return refuse("bad party key"); }
+    if (!party_id_ok(party)) { return refuse("party id is not SHA-256 of its key"); }
     return authority(s, e, dig, false, dev_sigs);
 }
 

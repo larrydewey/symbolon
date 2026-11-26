@@ -15,8 +15,9 @@
 // its own mailbox for at most a day, signed with the key whose SHA-256 is
 // its id; only an opened mailbox takes anonymous posts, and every
 // anonymous write (such a post, an opening, an inception event, a console
-// passkey waiting for approval) is counted against one budget for the
-// whole relay: anon_window_bytes() per anon_window_secs().
+// passkey waiting for approval) is counted against the budget of its kind
+// (one per organization for the console): anon_window_bytes(pool) per
+// anon_window_secs().
 //
 // A mailbox message older than mail_keep_secs() is replaced by a small
 // placeholder that readers skip (services.resid mail_expired_body), so
@@ -29,7 +30,7 @@
 //
 // Keys: "mbxm/<log>" the parties of a log as last verified ("LEN UNTIL",
 // then "ID KIND KEY" lines); "mbxopen/<party>" until when a mailbox is
-// open; "anonq" the anonymous window ("START BYTES"); "mboxd/<to>" when a
+// open; "anonq/<pool>" a kind's anonymous window ("START BYTES"); "mboxd/<to>" when a
 // mailbox's messages were written (first line the last post's time, then
 // "INDEX TIME" from where a day's messages start); "mboxw/<to>" the first
 // index not swept; "mboxrot" the last mailbox the rotating sweep visited;
@@ -111,7 +112,7 @@ Bool mg_cache_good(Store root, List(Int) l, List(Str) lines, Int now) {
 List(MailMember) mg_rows(List(Str) lines, Int i, ListBuf(MailMember) acc) {
     if (i >= lines.len()) { return acc.finish(); }
     List(Str) p = str_split(lines[i], " ");
-    Bool ok = p.len() == 3 && mg_hex(p[0], 0) && mg_dec(p[1], 0) && mg_hex(p[2], 0);
+    Bool ok = p.len() == 3 && mg_hex(p[0], 0) && mg_dec(p[1], 0) && mg_hex(p[2], 0) && mg_bound(cose_hex_decode(p[0]), cose_hex_decode(p[2]));
     return mg_rows(lines, i + 1, if (ok) { acc.push(MailMember {.id = cose_hex_decode(p[0]), .kind = str_parse_int(p[1]), .key = cose_hex_decode(p[2])}) } else { acc });
 }
 
@@ -141,9 +142,14 @@ List(Party) mg_recover_parties(EventPayload p) {
 
 List(MailMember) mg_kept(List(Party) ps, List(List(Int)) removed, Int i, ListBuf(MailMember) acc) {
     if (i >= ps.len()) { return acc.finish(); }
-    Bool gone = mg_in(removed, ps[i].id, 0);
+    Bool gone = mg_in(removed, ps[i].id, 0) || !mg_bound(ps[i].id, ps[i].auth_key);
     return mg_kept(ps, removed, i + 1, if (gone) { acc } else { acc.push(MailMember {.id = ps[i].id, .kind = (Int)ps[i].kind, .key = ps[i].auth_key}) });
 }
+
+// A party id is SHA-256 of its key (SPEC 20.2.1; R3P-1). Logs verify only
+// so now, but rows cached before (and any log stored before) may hold an
+// id that names someone else's mailbox: such a row is no member.
+Bool mg_bound(List(Int) id, List(Int) key) { return id.len() == 32 && bytes_eq(id, sha256_bytes(key)); }
 
 Bool mg_in(List(List(Int)) xs, List(Int) x, Int i) {
     if (i >= xs.len()) { return false; }
@@ -198,24 +204,44 @@ pub Int mail_gate(Store root, MailFrom f, Str to, Int n, Int now) {
         return if (mg_sender(ms, f.party, f.key, 0) && to_ok) { 0 } else { 403 };
     }
     if (!mbox_is_open(root, to, now)) { return 401; }
-    return if (anon_take(root, n, now)) { 0 } else { 429 };
+    return if (anon_take(root, anon_post(), n, now)) { 0 } else { 429 };
 }
 
 // ─── Anonymous writes ───────────────────────────────────────────
 
+// Each kind of anonymous write has a budget of its own (R3P-5), so what
+// one kind spends never blocks another: posts to opened mailboxes (the
+// cheapest to make in bulk) cannot hold off a new log's first event or a
+// mailbox opening, and a console passkey request counts against its
+// organization's budget only. The relay does not see the client's address
+// (the HTTP server hands the handler none), so there is no per-client
+// share; whoever spends one kind's budget still delays that kind for
+// everyone for up to a window.
 pub Int anon_window_secs() { return 600; }
-pub Int anon_window_bytes() { return 67108864; }
 
-// Counts `n` bytes against the anonymous budget; false (and nothing
+pub Str anon_inception() { return "e0"; }
+pub Str anon_open() { return "open"; }
+pub Str anon_post() { return "post"; }
+pub Str anon_console(Str org) { return "con-" + org; }
+
+pub Int anon_window_bytes(Str pool) {
+    if (pool == anon_post()) { return 67108864; }
+    if (pool == anon_inception()) { return 16777216; }
+    if (pool == anon_open()) { return 8388608; }
+    return 1048576;
+}
+
+// Counts `n` bytes against `pool`'s anonymous budget; false (and nothing
 // counted) when they are over it.
 @requires(filesystem, network, clock(readonly), declassify)
-pub Bool anon_take(Store root, Int n, Int now) {
-    List(Str) p = str_split(str_trim(st_read_text(root, "anonq")), " ");
+pub Bool anon_take(Store root, Str pool, Int n, Int now) {
+    Str k = "anonq/" + pool;
+    List(Str) p = str_split(str_trim(st_read_text(root, k)), " ");
     Bool cur = p.len() == 2 && mg_int(p[0]) >= 0 && mg_int(p[1]) >= 0 && mg_int(p[0]) <= now && mg_int(p[0]) + anon_window_secs() > now;
     Int start = if (cur) { mg_int(p[0]) } else { now };
     Int bytes = (if (cur) { mg_int(p[1]) } else { 0 }) + n;
-    if (bytes > anon_window_bytes()) { return false; }
-    return st_text(root, "anonq", f"{start} {bytes}");
+    if (bytes > anon_window_bytes(pool)) { return false; }
+    return st_text(root, k, f"{start} {bytes}");
 }
 
 // What opening a mailbox counts against the budget.
@@ -235,7 +261,7 @@ pub Int mbox_open_take(Store root, Str party, Str body, Int now) {
     Int until = mg_int(p[1]);
     if (hex_encode(sha256_bytes(pk)) != party || until <= now || until > now + mbox_open_secs() + 300) { return 403; }
     if (!ecdsa_verify_raw(P256, Sha256, pk, mbox_open_message(cose_hex_decode(party), until), cose_hex_decode(p[2]))) { return 403; }
-    if (!anon_take(root, mbox_open_cost(), now)) { return 429; }
+    if (!anon_take(root, anon_open(), mbox_open_cost(), now)) { return 429; }
     _ = mg_prune(root, "mbxopen/", now);
     return if (st_text(root, "mbxopen/" + party, f"{until}")) { 200 } else { 500 };
 }

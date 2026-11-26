@@ -19,7 +19,9 @@ List(Int) sign(Int n, List(Int) msg) {
     return ecdsa_raw_of(P256, s);
 }
 
-List(Int) id32(Int n) { return sha256_bytes([n]); }
+// A party id is SHA-256 of its authentication key (SPEC 20.2.1); other
+// 32-byte values here (log ids, digests) reuse it for distinct bytes.
+List(Int) id32(Int n) { return sha256_bytes(pubk(n)); }
 
 Party test_device(Int n) {
     return Party {
@@ -618,4 +620,40 @@ test "policy field 8 is written only when a relay is named, and reads back" {
     EventPayload two = EventPayload {.log_id = Some(log_id()), .sequence = 1, .predecessor_digest = Some(id32(1)), .suite = 1,
                                      .body = SetPolicyBody(policy_seq(one.concat(one))), .next_recovery_key_digests = [id32(50)], .advisory_time = 0};
     expect(match payload_cbor(two) { Some(_) => true, None => false }).toBeFalse();
+}
+
+// R3P-1: a party id is SHA-256 of its authentication key (SPEC 20.2.1).
+// Party 2's key under the id of party 5: a log could otherwise claim
+// someone else's party id (and with it their relay mailbox).
+Party stolen_id_device() {
+    return Party {.id = id32(5), .kind = party_kind_device(), .auth_key = pubk(2), .hpke_key = pubk(2), .label = "d", .attestation = NoAttestation};
+}
+
+test "an inception listing a party id that is not SHA-256 of its key is refused" {
+    List(Int) encoded = enc(0);
+    List(Int) l = sha256_bytes(encoded);
+    Quorum q = Quorum {.parties = [stolen_id_device(), test_device(3)], .t = 2, .root_pubkey = pubk(9),
+                       .epoch = 0, .transcript_digest = id32(99), .kv_commits = []};
+    EventPayload ep = EventPayload {.log_id = None, .sequence = 0, .predecessor_digest = None, .suite = 1,
+                                    .body = InceptionBody(q, policy(86400)), .next_recovery_key_digests = [id32(50)], .advisory_time = 0};
+    List(EventSig) ss = [EventSig {.signer = id32(5), .sig = sign(2, encoded)}, EventSig {.signer = id32(3), .sig = sign(3, encoded)}];
+    expect(ok(il_verify(l, [SignedEvent {.payload = ep, .encoded = encoded, .sigs = ss, .cosigs = cosig(l, 0, l, 1000)}], 1000, lambda(x) { false }))).toBeFalse();
+    // Negative control: the honest inception, same shape, verifies.
+    expect(ok(il_verify(log_id(), [e0([2, 3])], 1000, lambda(x) { false }))).toBeTrue();
+}
+
+test "a proposal of a party whose id is not SHA-256 of its key is refused" {
+    List(Int) l = log_id();
+    Party bad = Party {.id = id32(6), .kind = party_kind_device(), .auth_key = pubk(4), .hpke_key = pubk(4), .label = "d", .attestation = NoAttestation};
+    expect(ok(il_verify(l, [e0([2, 3]), next(1, 1, enc(0), ProposePartyBody(bad, id32(44)), [2, 3], 2000)], 2000, lambda(x) { false }))).toBeFalse();
+    expect(ok(il_verify(l, [e0([2, 3]), next(1, 1, enc(0), ProposePartyBody(test_device(4), id32(44)), [2, 3], 2000)], 2000, lambda(x) { false }))).toBeTrue();
+}
+
+test "a recover whose new party id is not SHA-256 of its key is refused" {
+    List(Int) l = log_id();
+    Party bad = Party {.id = id32(6), .kind = party_kind_device(), .auth_key = pubk(4), .hpke_key = pubk(4), .label = "d", .attestation = NoAttestation};
+    RecoverBodyInner r = RecoverBodyInner {.path = recover_path_kit(), .new_parties = [bad],
+                                           .revealed_recovery_key = Some(pubk(20)), .guardian_approvals = []};
+    expect(ok(il_verify(l, [e0_kit([2, 3]), next(1, 1, enc(0), RecoverBody(r), [20], 2000)], 2000, lambda(x) { false }))).toBeFalse();
+    expect(ok(il_verify(l, [e0_kit([2, 3]), recover_ev(1, 1, enc(0), 20, 2000)], 2000, lambda(x) { false }))).toBeTrue();
 }

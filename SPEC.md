@@ -2347,6 +2347,17 @@ revision anyone could post up to 16 MiB to any id, so a relay's store
 could be filled with posts to made-up recipients (measured: 4.9 GB in
 three minutes), and anyone could write `alrt-` blobs.
 
+A log binds each party id to its key (R3P-1): an inception, a re-share's
+quorum, a proposed party and a recover's new parties are valid only when
+every party's id is SHA-256 of its auth key, for every kind (device,
+cosigner and guardian ids are SHA-256 of their DK, the kit's of its
+signing key, as Section 10 already made them). Before, a log of an
+attacker's own could list a victim's party id beside the attacker's key,
+and the attacker's session then posted to the victim's mailbox (its
+cosigner's, say) until that mailbox's quota was spent. The relay also
+drops, from the parties it keeps per log, any row whose id is not
+SHA-256 of its key (logs and rows stored before this rule).
+
 The relay takes a mailbox message (`POST /mbox/<to>`) only with proof
 that the sender is a party of the recipient's log: a bearer session that
 names a log and a party, either a device's sign-in (Section 29.4) or a
@@ -2377,13 +2388,21 @@ its mailbox while it may take an inception (after its operator paired a
 device), the device its own and its kit's before it sends the
 invitation.
 
-Every anonymous write counts against one budget for the whole relay:
-64 MiB per 10 minutes (429 beyond), stored with the quota counters. They
-are: a post to an opened mailbox, opening a mailbox (4 KiB each), a new
-log's first event (anyone can make a log), and a console passkey waiting
-for approval. A post with a session is not counted. The per-recipient
-quotas stay: 256 messages and 64 MiB per recipient per 10 minutes, 1 MiB
-per message.
+Every anonymous write counts against the budget of its kind, per 10
+minutes (429 beyond), stored with the quota counters (R3P-5; before, one
+budget for all of them, so one client posting to its own opened
+mailboxes blocked every household's inception): posts to opened
+mailboxes 64 MiB; opening a mailbox (4 KiB each) 8 MiB; a new log's first
+event (anyone can make a log) 16 MiB; a console passkey waiting for
+approval 1 MiB per organization. A post with a session is not counted.
+The per-recipient quotas stay: 256 messages and 64 MiB per recipient per
+10 minutes, 1 MiB per message. Residual: the relay's HTTP server gives a
+request no client address, so a budget is not shared out per client:
+whoever spends one kind's budget still delays that kind (inceptions, for
+one) for everyone for up to ten minutes, though no longer the others.
+Nor does an opened mailbox name its senders: anonymous posts carry no
+signature the relay could check, so an opened mailbox takes a post from
+anyone while it is open.
 
 A mailbox message older than 30 days is replaced by the 24-byte
 placeholder `"symbolon expired message"`, which readers skip without a
@@ -2406,7 +2425,8 @@ cosigner in their verified log before showing one.
 | Mailbox post | anyone, any id, 1 MiB, per-recipient quota | a party of the recipient's log by its session; or, for a party of no log yet, to a mailbox its owner opened, within the global anonymous budget |
 | Alert | anyone, 64 per log | the log's cosigner's signature; not after removal; a week |
 | Old messages | kept forever | placeholder after 30 days |
-| Anonymous writes | per recipient only | one relay-wide budget |
+| Anonymous writes | per recipient only | one relay-wide budget per kind of write |
+| Party ids | any 32 bytes | SHA-256 of the party's key |
 
 Residual: logs cost nothing to make (anyone can write a valid inception
 with keys and witnesses of their own), so whoever makes logs can post to

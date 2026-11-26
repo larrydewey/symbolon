@@ -1135,7 +1135,7 @@ HttpReply plain(Store root, HttpRequest r, List(Str) p) {
         if (r.body.len() > max_body()) { return http_reply_status(413); }
         if (!next_event_ok(root, who, str_parse_int(p[3]), r.body)) { return http_reply_status(403); }
         // A new log is an anonymous write: anyone can make one.
-        if (str_parse_int(p[3]) == 0 && !anon_take(root, r.body.len(), clock_now_seconds())) { return http_reply_status(429); }
+        if (str_parse_int(p[3]) == 0 && !anon_take(root, anon_inception(), r.body.len(), clock_now_seconds())) { return http_reply_status(429); }
         Int w = st_put_new(root, k, r.body);
         return http_reply_status(if (w == 1) { 200 } else { if (w == 0) { 409 } else { 500 } });
     }
@@ -1559,7 +1559,7 @@ HttpReply con_register(RelayCfg g, Store root, Str org, HttpRequest r) {
     // the relay keep is bounded: only for an organization this relay has,
     // and at most pending_max() passkeys waiting at once per organization.
     if (match relay_org(root, org) { None => true, Some(_) => false }) { return json_reply(404, "{\"error\":\"no such organization\"}"); }
-    if (!anon_take(root, r.body.len() + 1024, clock_now_seconds())) { return json_reply(429, "{\"error\":\"the relay takes no more anonymous requests now; try again later\"}"); }
+    if (!anon_take(root, anon_console(org), r.body.len() + 1024, clock_now_seconds())) { return json_reply(429, "{\"error\":\"the relay takes no more anonymous requests now; try again later\"}"); }
     Str pk = "console/" + org + "/pend-" + str_slice(hex_encode(sha256_bytes(cid)), 0, 32);
     _ = prune(root, "console/" + org + "/pend-", 4, 86400, clock_now_seconds());
     Bool again = str_len(str_trim(st_read_text(root, pk))) > 0;

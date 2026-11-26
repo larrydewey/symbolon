@@ -19,7 +19,9 @@ import "random.resid";
 List(Int) priv(Int n) { return [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, n]; }
 List(Int) pubk(Int n) { return ec_public_key(P256, priv(n)); }
 List(Int) sign(Int n, List(Int) msg) { return ecdsa_raw_of(P256, ecdsa_sign_digest(P256, Sha256, priv(n), hash_bytes(Sha256, msg))); }
-List(Int) id32(Int n) { return sha256_bytes([n]); }
+// A party id is SHA-256 of its authentication key (SPEC 20.2.1); other
+// 32-byte values here (log ids, digests) reuse it for distinct bytes.
+List(Int) id32(Int n) { return sha256_bytes(pubk(n)); }
 
 Party dev_party(Int n) {
     return Party {.id = id32(n), .kind = party_kind_device(), .auth_key = pubk(n), .hpke_key = pubk(n), .label = "d", .attestation = NoAttestation};

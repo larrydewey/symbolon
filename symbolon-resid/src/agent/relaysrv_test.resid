@@ -525,7 +525,8 @@ test "an administrator cannot take a member's household folder for a group folde
 List(Int) lpriv(Int n) { return [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, n]; }
 List(Int) lpub(Int n) { return ec_public_key(P256, lpriv(n)); }
 List(Int) lsign(Int n, List(Int) msg) { return ecdsa_raw_of(P256, ecdsa_sign_digest(P256, Sha256, lpriv(n), hash_bytes(Sha256, msg))); }
-List(Int) lid(Int n) { return sha256_bytes([n]); }
+// A party id is SHA-256 of its authentication key (SPEC 20.2.1).
+List(Int) lid(Int n) { return sha256_bytes(lpub(n)); }
 
 Party ldev(Int n) { return Party {.id = lid(n), .kind = party_kind_device(), .auth_key = lpub(n), .hpke_key = lpub(n), .label = "d", .attestation = NoAttestation}; }
 

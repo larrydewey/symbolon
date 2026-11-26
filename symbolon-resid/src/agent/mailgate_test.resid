@@ -46,13 +46,18 @@ List(Int) lid(Int n) { return sha256_bytes(lpub(n)); }
 Party lparty(Int n, UInt(8) kind) { return Party {.id = lid(n), .kind = kind, .auth_key = lpub(n), .hpke_key = lpub(n), .label = "p", .attestation = NoAttestation}; }
 
 // E0 with devices 2 and 3 and cosigner 4, co-signed by witnesses 7 and 8.
-StoredEvent log_e0() {
+StoredEvent log_e0() { return log_e0_kit(20); }
+
+// Another log: the same parties, another kit.
+StoredEvent log_e0b() { return log_e0_kit(21); }
+
+StoredEvent log_e0_kit(Int kit) {
     Policy pol = Policy {.device_sigs_for_authority = 2, .recovery_delay_sec = 86400, .guardians = [], .guardian_threshold = 0,
                          .witnesses = [WitnessRef {.url = "w1", .key = lpub(7)}, WitnessRef {.url = "w2", .key = lpub(8)}, WitnessRef {.url = "w3", .key = lpub(11)}],
                          .duress_window_sec = 3600, .sequencer = [], .cosigner_policy = NoCosignerPolicy};
     Quorum q = Quorum {.parties = [lparty(2, party_kind_device()), lparty(3, party_kind_device()), lparty(4, party_kind_cosigner())], .t = 2, .root_pubkey = lpub(9), .epoch = 0, .transcript_digest = lid(99), .kv_commits = []};
     EventPayload p = EventPayload {.log_id = None, .sequence = 0, .predecessor_digest = None, .suite = 1, .body = InceptionBody(q, pol),
-                                   .next_recovery_key_digests = [sha256_bytes(lpub(20))], .advisory_time = 0};
+                                   .next_recovery_key_digests = [sha256_bytes(lpub(kit))], .advisory_time = 0};
     List(Int) enc = payload_cbor(p) else { [] };
     List(Int) l = sha256_bytes(enc);
     List(WitnessCosignature) cs = [WitnessCosignature {.log_id = l, .sequence = 0, .digest = l, .witness_key = lpub(7), .signature = lsign(7, witness_message(l, 0, l)), .witness_time = 1000},
@@ -81,6 +86,43 @@ List(Int) filled(Int n, Int v, ListBuf(Int) acc) { return if (n <= 0) { acc.fini
 Str mbox(List(Int) to) { return "/mbox/" + hex_encode(to); }
 
 // ─── Mailboxes ──────────────────────────────────────────────────
+
+// R3P-1: an attacker's own log listing a victim's party id (lid(5)) beside
+// the attacker's key: before, the victim's mailbox took the attacker's mail.
+StoredEvent stolen_id_e0() {
+    Policy pol = Policy {.device_sigs_for_authority = 2, .recovery_delay_sec = 86400, .guardians = [], .guardian_threshold = 0,
+                         .witnesses = [WitnessRef {.url = "w1", .key = lpub(7)}, WitnessRef {.url = "w2", .key = lpub(8)}, WitnessRef {.url = "w3", .key = lpub(11)}],
+                         .duress_window_sec = 3600, .sequencer = [], .cosigner_policy = NoCosignerPolicy};
+    Party victim = Party {.id = lid(5), .kind = party_kind_cosigner(), .auth_key = lpub(4), .hpke_key = lpub(4), .label = "p", .attestation = NoAttestation};
+    Quorum q = Quorum {.parties = [lparty(2, party_kind_device()), lparty(3, party_kind_device()), victim], .t = 2, .root_pubkey = lpub(9), .epoch = 0, .transcript_digest = lid(99), .kv_commits = []};
+    EventPayload p = EventPayload {.log_id = None, .sequence = 0, .predecessor_digest = None, .suite = 1, .body = InceptionBody(q, pol),
+                                   .next_recovery_key_digests = [sha256_bytes(lpub(20))], .advisory_time = 0};
+    List(Int) enc = payload_cbor(p) else { [] };
+    List(Int) l = sha256_bytes(enc);
+    List(WitnessCosignature) cs = [WitnessCosignature {.log_id = l, .sequence = 0, .digest = l, .witness_key = lpub(7), .signature = lsign(7, witness_message(l, 0, l)), .witness_time = 1000},
+                                   WitnessCosignature {.log_id = l, .sequence = 0, .digest = l, .witness_key = lpub(8), .signature = lsign(8, witness_message(l, 0, l)), .witness_time = 1000}];
+    return StoredEvent {.encoded = enc, .sigs = [EventSig {.signer = lid(2), .sig = lsign(2, enc)}, EventSig {.signer = lid(3), .sig = lsign(3, enc)}, EventSig {.signer = lid(5), .sig = lsign(4, enc)}], .cosigs = cs};
+}
+
+@requires(filesystem, network, clock(readonly), declassify)
+test "a log cannot claim another party's id, so cannot post to its mailbox" {
+    Store s = tmp_store();
+    StoredEvent e0 = stolen_id_e0();
+    List(Int) l = sha256_bytes(e0.encoded);
+    // stored as a relay before this check would have taken it
+    _ = st_put(s, "log/" + hex_encode(l) + "/0", cbor_of_event(e0));
+    Str t2 = session(s, "tok", l, lid(2), lpub(2));
+    expect(status(s, "POST", mbox(lid(5)), t2, [1])).toEqual(403);
+    // and members cached from such a log before: the stolen row is no member
+    Store c = tmp_store();
+    List(Int) l2 = put_log(c);
+    _ = st_text(c, "mbxm/" + hex_encode(l2), f"1 {clock_now_seconds() + 3600}\n" + hex_encode(lid(2)) + " 1 " + hex_encode(lpub(2)) + "\n"
+                                             + hex_encode(lid(5)) + " 2 " + hex_encode(lpub(4)) + "\n");
+    Str c2 = session(c, "tok", l2, lid(2), lpub(2));
+    expect(status(c, "POST", mbox(lid(5)), c2, [1])).toEqual(403);
+    // a new log listing it is refused outright
+    expect(status(tmp_store(), "POST", "/log/" + hex_encode(l) + "/0", "", cbor_of_event(e0))).toEqual(403);
+}
 
 @requires(filesystem, network, clock(readonly), declassify)
 test "a mailbox takes a message only from a party of the recipient's log" {
@@ -162,23 +204,31 @@ test "a mailbox of no log yet takes anonymous posts once its owner opened it" {
 }
 
 @requires(filesystem, network, clock(readonly), declassify)
-test "anonymous writes share one budget" {
+test "each kind of anonymous write has its own budget" {
     Store s = tmp_store();
     Int now = clock_now_seconds();
     Str p = hex_encode(lid(6));
     expect(status(s, "POST", "/mbox-open/" + p, "", utf8(hex_encode(lpub(6)) + f" {now + 3600} " + hex_encode(lsign(6, mbox_open_message(lid(6), now + 3600)))))).toEqual(200);
-    _ = st_text(s, "anonq", f"{now} {anon_window_bytes() - 50}");
+    _ = st_text(s, "anonq/post", f"{now} {anon_window_bytes(anon_post()) - 50}");
     expect(status(s, "POST", "/mbox/" + p, "", filled(100, 1, ListBuf()))).toEqual(429);
     expect(status(s, "POST", "/mbox/" + p, "", filled(40, 1, ListBuf()))).toEqual(200);
-    // a new log is an anonymous write too
+    // R3P-5: posts that spent their budget block neither a new log nor an
+    // opening (before: one budget, and these were 429)
     StoredEvent e0 = log_e0();
     List(Int) l = sha256_bytes(e0.encoded);
-    expect(status(s, "POST", "/log/" + hex_encode(l) + "/0", "", cbor_of_event(e0))).toEqual(429);
+    Str q = hex_encode(lid(5));
+    expect(status(s, "POST", "/mbox-open/" + q, "", utf8(hex_encode(lpub(5)) + f" {now + 3600} " + hex_encode(lsign(5, mbox_open_message(lid(5), now + 3600)))))).toEqual(200);
+    expect(status(s, "POST", "/log/" + hex_encode(l) + "/0", "", cbor_of_event(e0))).toEqual(200);
+    // each budget still holds for its own kind
+    _ = st_text(s, "anonq/open", f"{now} {anon_window_bytes(anon_open())}");
+    expect(status(s, "POST", "/mbox-open/" + hex_encode(lid(10)), "", utf8(hex_encode(lpub(10)) + f" {now + 3600} " + hex_encode(lsign(10, mbox_open_message(lid(10), now + 3600)))))).toEqual(429);
+    _ = st_text(s, "anonq/e0", f"{now} {anon_window_bytes(anon_inception())}");
+    StoredEvent e0b = log_e0b();
+    expect(status(s, "POST", "/log/" + hex_encode(sha256_bytes(e0b.encoded)) + "/0", "", cbor_of_event(e0b))).toEqual(429);
     // a known party's mail is not counted
-    _ = st_put(s, "log/" + hex_encode(l) + "/0", cbor_of_event(e0));
     expect(status(s, "POST", mbox(lid(3)), session(s, "tok", l, lid(2), lpub(2)), filled(1000, 1, ListBuf()))).toEqual(200);
     // a window that has passed
-    _ = st_text(s, "anonq", f"{now - 601} {anon_window_bytes()}");
+    _ = st_text(s, "anonq/post", f"{now - 601} {anon_window_bytes(anon_post())}");
     expect(status(s, "POST", "/mbox/" + p, "", filled(100, 1, ListBuf()))).toEqual(200);
 }
 
