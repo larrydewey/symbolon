@@ -239,6 +239,47 @@ pub Result(List(Int), SymbolonError) release_target(List(SignedEvent) events, Ve
     };
 }
 
+// A veto a device sent the cosigner directly, and the witness time at
+// which the cosigner found it valid as the next event of the log it had
+// verified (cosignerd.resid on_veto).
+pub type HeldVeto = { SignedEvent veto; Int time; };
+
+// release_target, and no veto in `held` of that recovery that the log
+// does not hold (cosigner_release).
+pub Result(List(Int), SymbolonError) release_target_held(List(SignedEvent) events, VerifiedHead v, List(Int) dev, List(Option(WitnessHead)) heads, List(HeldVeto) held) {
+    List(Int) to = release_target(events, v, dev, heads)?;
+    Option(SignedEvent) oe = kit_recover_for(events, dev, 0, None);
+    Int r = match oe { None => -1, Some(e) => (Int)e.payload.sequence };
+    if (r > 0 && vetoed_aside(v.head.log_id, events, r, held, 0)) {
+        return Err(ErrRecoveryFailed("a device vetoed this recovery (the cosigner holds its veto, which the log does not show yet)"));
+    }
+    return Ok(to);
+}
+
+Bool vetoed_aside(List(Int) l, List(SignedEvent) events, Int r, List(HeldVeto) held, Int i) {
+    if (i >= held.len()) { return false; }
+    Bool hit = veto_held_ok(l, events, r, held[i]) && !in_log(events, sha256_bytes(held[i].veto.encoded), 0);
+    return hit || vetoed_aside(l, events, r, held, i + 1);
+}
+
+// A veto of the event at `r`, valid at its time as the next event of the
+// log `events` holds up to it (every rule of the step: a device of the
+// quorum signed it, two once the recovery is contested, before the delay
+// ran).
+pub Bool veto_held_ok(List(Int) l, List(SignedEvent) events, Int r, HeldVeto h) {
+    EventBody b = h.veto.payload.body;
+    Int n = (Int)h.veto.payload.sequence;
+    Bool shape = match b { VetoBody(t) => (Int)t == r, _ => false };
+    if (!shape || n <= r || n > events.len()) { return false; }
+    Result(NextOk, SymbolonError) ok = il_next(l, events[0..n], h.veto, h.time, lambda(x) { false });
+    return match ok { Ok(_) => true, Err(_) => false };
+}
+
+Bool in_log(List(SignedEvent) es, List(Int) d, Int i) {
+    if (i >= es.len()) { return false; }
+    return bytes_eq(sha256_bytes(es[i].encoded), d) || in_log(es, d, i + 1);
+}
+
 Result(List(Int), SymbolonError) release_after(SignedEvent e, VerifiedHead v, List(Int) dev, List(Option(WitnessHead)) heads) {
     Str stale = heads_problem(heads, v.head.policy.witnesses.len(), (Int)v.head.sequence, v.head.digest);
     if (str_len(stale) > 0) { return Err(ErrRecoveryFailed("the witnesses do not confirm the log's head: " + stale)); }
@@ -262,9 +303,13 @@ pub Option(Half) half_of(List(Int) b) {
 }
 
 // The cosigner wraps b || k_b to the released device, bound to the log, the
-// epoch and the device.
-pub Result(Wrapped, SymbolonError) cosigner_release(List(SignedEvent) events, VerifiedHead v, List(Int) dev, Half b, List(Int) ikm_e, List(Option(WitnessHead)) heads) {
-    List(Int) to = release_target(events, v, dev, heads)?;
+// epoch and the device. `held`: the vetoes devices sent the cosigner
+// directly (R3P-3); one of this recovery that was valid as the log's next
+// event when the cosigner took it, and is not in the log, refuses the
+// release: a relay that keeps a veto out of the log (refusing to claim
+// it) gets nothing.
+pub Result(Wrapped, SymbolonError) cosigner_release(List(SignedEvent) events, VerifiedHead v, List(Int) dev, Half b, List(Int) ikm_e, List(Option(WitnessHead)) heads, List(HeldVeto) held) {
+    List(Int) to = release_target_held(events, v, dev, heads, held)?;
     Option(Wrapped) w = offline_wrap(to, v.head.log_id, v.head.quorum.epoch, dev, half_bytes(b.share, b.key), ikm_e);
     return match w { None => Err(ErrRecoveryFailed("cannot wrap to the device's key")), Some(x) => Ok(x) };
 }

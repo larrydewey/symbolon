@@ -598,15 +598,43 @@ Option(WitnessCosignature) cosig_of(List(Int) b, List(Int) wkey, List(Int) l, UI
 // under a claim of the same relay: two signatures of the relay over two
 // events at one sequence. "" when there is no such pair.
 pub Str equivocation_in(WitnessRef sq, List(Int) l, Int n, List(Int) d, RelayClaim mine, List(CosignOut) outs, Int i) {
+    Str why = equivocation_after(sq, l, n, d, mine, [], outs, i);
+    return why;
+}
+
+// As equivocation_in, but a claim the relay's answer carried as lapsed
+// (R3P-6) is none: `lapsed` are those records of it (CBOR [event,
+// claim]) whose event the caller found can no longer be co-signed
+// (core/log.resid il_lapsed), and a claim of them made at least
+// claim_lapse_secs() before `mine` is the relay's earlier claim, not a
+// second one.
+pub Str equivocation_after(WitnessRef sq, List(Int) l, Int n, List(Int) d, RelayClaim mine, List(List(Int)) lapsed, List(CosignOut) outs, Int i) {
     if (i >= outs.len()) { return ""; }
     CosignOut o = outs[i];
     RelayClaim theirs = o.other_claim else { RelayClaim {.time = -1, .sig = []} };
-    Bool two = o.other.len() == 32 && !bytes_eq(o.other, d) && theirs.time >= 0 && claim_ok(sq, l, n, o.other, theirs);
-    if (!two) { return equivocation_in(sq, l, n, d, mine, outs, i + 1); }
+    Bool two = o.other.len() == 32 && !bytes_eq(o.other, d) && theirs.time >= 0 && claim_ok(sq, l, n, o.other, theirs)
+        && !lapsed_claim(lapsed, o.other, theirs, mine.time, 0);
+    if (!two) { return equivocation_after(sq, l, n, d, mine, lapsed, outs, i + 1); }
     return f"relay equivocation: the log's relay {sq.url} claimed sequence {n} for two events, "
         + f"{hex_encode(d)} (claim {hex_encode(claim_cbor(mine))}) and {hex_encode(o.other)} (claim {hex_encode(claim_cbor(theirs))}); "
         + "keep both as proof and move the log to another relay (SPEC 20.4)";
 }
+
+// The relay's claim margin (agent/relaysrv.resid claim_margin_secs): a
+// claim lapses no sooner than this after it was made.
+pub Int claim_lapse_secs() { return 300; }
+
+Bool lapsed_claim(List(List(Int)) recs, List(Int) d, RelayClaim c, Int later, Int i) {
+    if (i >= recs.len()) { return false; }
+    Option(ClaimRecord) r = claim_record_of(recs[i]);
+    Bool hit = match r {
+        None => false,
+        Some(x) => bytes_eq(x.claim.sig, c.sig) && x.claim.time == c.time && c.time + claim_lapse_secs() <= later && opt_digest_is(event_of_cbor(x.event), d)
+    };
+    return hit || lapsed_claim(recs, d, c, later, i + 1);
+}
+
+Bool opt_digest_is(Option(StoredEvent) o, List(Int) d) { return match o { None => false, Some(x) => bytes_eq(sha256_bytes(x.encoded), d) }; }
 
 // The relay's claim key (GET /claim-key, hex); [] when it serves none.
 @requires(network, clock(readonly), declassify)
@@ -622,7 +650,9 @@ pub List(Int) claim_key_get(Endpoint e) {
 // 409 with the event it claimed there before and that claim (`event` and
 // `claim` from CBOR [event, [time, r || s]]), or another status (a relay
 // that does not sequence: 404) with neither.
-pub type ClaimOut = { Int status; List(Int) event; Option(RelayClaim) claim; };
+// `lapsed`: the records of the claims at that sequence that lapsed before
+// this one (R3P-6), oldest first.
+pub type ClaimOut = { Int status; List(Int) event; Option(RelayClaim) claim; List(List(Int)) lapsed; };
 
 @requires(network, clock(readonly), declassify)
 pub ClaimOut claim_post(Endpoint e, List(Int) l, UInt(64) n, List(Int) stored_event) {
@@ -630,8 +660,8 @@ pub ClaimOut claim_post(Endpoint e, List(Int) l, UInt(64) n, List(Int) stored_ev
     Bool answered = o.status == 200 || o.status == 409;
     Option(ClaimRecord) r = if (answered) { claim_record_of(o.body) } else { None };
     return match r {
-        None => ClaimOut {.status = if (answered) { 502 } else { o.status }, .event = [], .claim = None},
-        Some(x) => ClaimOut {.status = o.status, .event = x.event, .claim = Some(x.claim)}
+        None => ClaimOut {.status = if (answered) { 502 } else { o.status }, .event = [], .claim = None, .lapsed = []},
+        Some(x) => ClaimOut {.status = o.status, .event = x.event, .claim = Some(x.claim), .lapsed = claim_lapsed_of(o.body)}
     };
 }
 

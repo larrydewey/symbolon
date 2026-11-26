@@ -33,6 +33,10 @@ type Pending = {
     EventBody body;
     List(Int) event_digest;
     List(List(Int)) next_digests;
+    // Filed by the kit (a recover, or the kit's escape set-policy, SPEC
+    // 20.3): one at a time, and a device may veto it without the relay's
+    // claim.
+    Bool kit;
 };
 
 type LogState = {
@@ -672,7 +676,15 @@ Bool is_recover_body(EventBody b) {
 
 Bool recover_pending(List(Pending) ps, Int i) {
     if (i >= ps.len()) { return false; }
-    return is_recover_body(ps[i].body) || recover_pending(ps, i + 1);
+    return is_recover_body(ps[i].body) || ps[i].kit || recover_pending(ps, i + 1);
+}
+
+// The pending event the kit filed (a recover or its escape set-policy;
+// at most one at a time), if any.
+Option(Pending) kit_pending(List(Pending) ps, Int i) {
+    if (i >= ps.len()) { return None; }
+    if (ps[i].kit || is_recover_body(ps[i].body)) { return Some(ps[i]); }
+    return kit_pending(ps, i + 1);
 }
 
 // ============================================================================
@@ -721,7 +733,7 @@ Result(LogState, SymbolonError) authority(LogState s, SignedEvent e, List(Int) d
     }
     Pending p = Pending {
         .seq = ep.sequence, .ready_at = s.last_time + (Int)s.policy.recovery_delay_sec,
-        .body = ep.body, .event_digest = dig, .next_digests = ep.next_recovery_key_digests };
+        .body = ep.body, .event_digest = dig, .next_digests = ep.next_recovery_key_digests, .kit = false };
     return Ok(with_pending(s, s.pending.concat([p])));
 }
 
@@ -742,7 +754,80 @@ Result(LogState, SymbolonError) do_remove(LogState s, SignedEvent e, List(Int) d
 
 Result(LogState, SymbolonError) do_set_policy(LogState s, SignedEvent e, List(Int) dig, Int dev_sigs, Policy np) {
     if (!policy_ok(np, s.quorum)) { return refuse("policy below the SPEC 8.2 floor"); }
+    if (dev_sigs == 0 && kit_signed(s, e)) { return kit_escape(s, e, dig, np); }
     return authority(s, e, dig, weakens(s.policy, np), dev_sigs);
+}
+
+// The kit's escape from its relay (SPEC 20.3): a set-policy signed by the
+// kit alone that drops the sequencing relay and changes nothing else, with
+// advisory time 0, so the kit can sign exactly one such event per sequence
+// and cannot split a sequence with variants of it. Delayed like a recover
+// (four times after two vetoes), one at a time with recovers, and vetoed
+// as one: a relay that is gone or refuses every claim then stalls the log
+// for the delay at most, and a principal who still has a device keeps the
+// relay by vetoing.
+Result(LogState, SymbolonError) kit_escape(LogState s, SignedEvent e, List(Int) dig, Policy np) {
+    if (s.policy.sequencer.len() == 0 || np.sequencer.len() != 0 || !same_but_sequencer(s.policy, np)) {
+        return refuse("the kit's set-policy may only drop the sequencing relay");
+    }
+    if ((Int)e.payload.advisory_time != 0) { return refuse("the kit's set-policy carries advisory time 0"); }
+    if (recover_pending(s.pending, 0)) { return refuse("a recover (or the kit's set-policy) is already pending"); }
+    Int mult = if (s.vetoes >= 2) { 4 } else { 1 };
+    Pending p = Pending {
+        .seq = e.payload.sequence, .ready_at = s.last_time + (Int)s.policy.recovery_delay_sec * mult,
+        .body = e.payload.body, .event_digest = dig, .next_digests = e.payload.next_recovery_key_digests, .kit = true };
+    return Ok(with_pending(s, s.pending.concat([p])));
+}
+
+// Signed by a kit of the quorum, not removed, whose key's digest is in
+// field 6 (the kit that could file a recover now).
+Bool kit_signed(LogState s, SignedEvent e) {
+    List(Party) kits = kits_in(not_removed(s.quorum.parties, s.removed, 0, ListBuf()), s.recovery_digests, 0, []);
+    return valid_signers(e.sigs, kits, false, e.encoded, 0, []).len() > 0;
+}
+
+List(Party) kits_in(List(Party) ps, List(List(Int)) digests, Int i, List(Party) acc) {
+    if (i >= ps.len()) { return acc; }
+    Bool k = ps[i].kind == party_kind_kit() && has_bytes(digests, sha256_bytes(ps[i].auth_key), 0);
+    return kits_in(ps, digests, i + 1, if (k) { acc.concat([ps[i]]) } else { acc });
+}
+
+// Policies equal in every field but the sequencing relay (field 8).
+Bool same_but_sequencer(Policy a, Policy b) {
+    return a.device_sigs_for_authority == b.device_sigs_for_authority
+        && a.recovery_delay_sec == b.recovery_delay_sec
+        && digests_eq(a.guardians, b.guardians, 0)
+        && a.guardian_threshold == b.guardian_threshold
+        && same_refs(a.witnesses, b.witnesses, 0)
+        && a.duress_window_sec == b.duress_window_sec
+        && cosigner_policy_code(a.cosigner_policy) == cosigner_policy_code(b.cosigner_policy);
+}
+
+Bool same_refs(List(WitnessRef) a, List(WitnessRef) b, Int i) {
+    if (a.len() != b.len()) { return false; }
+    if (i >= a.len()) { return true; }
+    return a[i].url == b[i].url && bytes_eq(a[i].key, b[i].key) && same_refs(a, b, i + 1);
+}
+
+// One number per cosigner policy (each limit is a UInt(32)).
+Int cosigner_policy_code(CosignerPolicy p) {
+    return match p {
+        NoCosignerPolicy => -1,
+        CosignerLimit(n) => (Int)n,
+        CosignerLimits(l) => 4294967296 + (Int)l.sign * 4294967296 + (Int)l.eval
+    };
+}
+
+Bool no_device_signed(LogState s, SignedEvent e) {
+    return valid_signers(e.sigs, not_removed(s.quorum.parties, s.removed, 0, ListBuf()), true, e.encoded, 0, []).len() == 0;
+}
+
+// Signed by every device of the quorum that is not removed (and at least
+// one): the principal's whole authority.
+Bool all_devices_signed(LogState s, SignedEvent e) {
+    List(Party) live = not_removed(s.quorum.parties, s.removed, 0, ListBuf());
+    Int n = device_count(live, 0, 0);
+    return n >= 1 && valid_signers(e.sigs, live, true, e.encoded, 0, []).len() >= n;
 }
 
 Result(LogState, SymbolonError) do_rotate(LogState s, SignedEvent e, List(Int) dig, Int dev_sigs) {
@@ -820,7 +905,7 @@ Result(LogState, SymbolonError) do_recover(LogState s, SignedEvent e, List(Int) 
     // One recover at a time (SPEC 13.4): otherwise whoever holds the kit
     // could file a recover at every next sequence, as fast as each one is
     // witnessed, and no veto would ever get a sequence of its own.
-    if (recover_pending(s.pending, 0)) { return refuse("a recover is already pending"); }
+    if (recover_pending(s.pending, 0)) { return refuse("a recover (or the kit's set-policy) is already pending"); }
     Bool authorized = if (r.path == recover_path_kit()) {
         kit_authorized(s, e, ep.next_recovery_key_digests, r.revealed_recovery_key)
     } else {
@@ -831,16 +916,17 @@ Result(LogState, SymbolonError) do_recover(LogState s, SignedEvent e, List(Int) 
     Pending p = Pending {
         .seq = ep.sequence,
         .ready_at = s.last_time + (Int)s.policy.recovery_delay_sec * mult,
-        .body = ep.body, .event_digest = dig, .next_digests = ep.next_recovery_key_digests };
+        .body = ep.body, .event_digest = dig, .next_digests = ep.next_recovery_key_digests, .kit = true };
     return Ok(with_pending(s, s.pending.concat([p])));
 }
 
 Result(LogState, SymbolonError) do_veto_found(LogState s, Int dev_sigs, UInt(64) target, Pending p) {
     // A contested recovery needs two devices to veto again (13.4).
-    Int need = if (is_recover_body(p.body) && s.vetoes >= 2) { 2 } else { 1 };
+    Bool kitev = is_recover_body(p.body) || p.kit;
+    Int need = if (kitev && s.vetoes >= 2) { 2 } else { 1 };
     if (dev_sigs < need) { return refuse("veto without enough device signatures"); }
     LogState removed_p = with_pending(s, pending_without(s.pending, target, 0, ListBuf()));
-    return Ok(if (is_recover_body(p.body)) { with_vetoes(removed_p, s.vetoes + 1) } else { removed_p });
+    return Ok(if (kitev) { with_vetoes(removed_p, s.vetoes + 1) } else { removed_p });
 }
 
 Result(LogState, SymbolonError) do_veto(LogState s, Int dev_sigs, UInt(64) target) {
@@ -996,19 +1082,103 @@ pub Result(Int, SymbolonError) il_check_next(List(Int) l, List(SignedEvent) befo
 // and the relay read the same one, whatever their clocks; a delayed change
 // of relay applies from the event after the first one witnessed once its
 // delay has run). None at sequence 0. `witnesses`: those whose
-// co-signatures the event needs (the same policy's).
-pub type NextOk = { Int time; List(WitnessRef) sequencer; List(WitnessRef) witnesses; };
+// co-signatures the event needs (the same policy's). `claimless`: whether
+// a witness may co-sign it without that relay's claim (il_claimless).
+pub type NextOk = { Int time; List(WitnessRef) sequencer; List(WitnessRef) witnesses; Bool claimless; };
 
 pub Result(NextOk, SymbolonError) il_next(List(Int) l, List(SignedEvent) before, SignedEvent e, Int now, Bool closure(EventPayload) approvals_ok) {
     if (before.len() == 0) {
         LogState s = start_at(e, l, true, now)?;
-        return Ok(NextOk {.time = now, .sequencer = [], .witnesses = []});
+        return Ok(NextOk {.time = now, .sequencer = [], .witnesses = [], .claimless = false});
     }
     LogState s0 = start(before[0], l)?;
     LogState s1 = run(s0, before, l, approvals_ok, 1)?;
     Int t = if (now > s1.last_time) { now } else { s1.last_time };
     LogState s2 = step_at(s1, e, l, t, approvals_ok)?;
-    return Ok(NextOk {.time = t, .sequencer = s1.policy.sequencer, .witnesses = s1.policy.witnesses});
+    LogState st = settle(s1, t);
+    return Ok(NextOk {.time = t, .sequencer = s1.policy.sequencer, .witnesses = s1.policy.witnesses, .claimless = il_claimless(st, e)});
+}
+
+// The relay as sequencer has an escape (SPEC 20.3, R3P-3): the events a
+// witness co-signs at sequence n without the relay's claim, when it holds
+// nothing at n yet. `st` is the log before the event settled at the
+// witness time it is checked at, and the event already passed every check
+// of that step. They are what a relay that refuses claims (working with
+// whoever holds the kit, or gone) must not be able to hold back:
+//   - a device's veto of the pending event the kit filed (a recover or the
+//     kit's escape set-policy), with advisory time 0: one event per
+//     sequence whoever of the devices signs it (signatures are not in the
+//     digest), so devices vetoing at once never split a sequence;
+//   - a set-policy that changes or drops the sequencing relay and nothing
+//     else, signed by every device of the quorum not removed, while
+//     nothing the kit filed is pending;
+//   - the kit's escape set-policy (kit_escape), one event per sequence;
+//   - any event once a delayed set-policy that dropped the relay has taken
+//     effect by the witness's time (the policy before the event, read at
+//     the previous event's time, still names it).
+// At most one claimless event of the first three kinds can exist at a
+// sequence for a given log before it but the second (whose content the
+// holders of every device choose together), so a sequence can be split
+// only between that event and one the relay claimed: with an odd number
+// of witnesses one of the two always gets its majority once every witness
+// has answered (SPEC 20.4).
+Bool il_claimless(LogState st, SignedEvent e) {
+    if (st.policy.sequencer.len() == 0) { return true; }
+    EventBody b = e.payload.body;
+    Option(Pending) kp = kit_pending(st.pending, 0);
+    return match b {
+        VetoBody(target) => (Int)e.payload.advisory_time == 0 && match kp { None => false, Some(k) => k.seq == target },
+        SetPolicyBody(np) => same_but_sequencer(st.policy, np) && !same_refs(st.policy.sequencer, np.sequencer, 0)
+                             && match kp { Some(_) => false, None => all_devices_signed(st, e) || (np.sequencer.len() == 0 && no_device_signed(st, e) && kit_signed(st, e)) },
+        _ => false
+    };
+}
+
+// Whether event `e`, which the sequencing relay claimed as the next event
+// of `before`, can no longer be co-signed by any witness: invalid at
+// witness time `now` and at every later time the log's state changes (each
+// pending event's ready time), so a witness with a slower clock refuses it
+// as well once its clock passes `now`. The relay's claim on it may then
+// lapse (R3P-6).
+pub Bool il_lapsed(List(Int) l, List(SignedEvent) before, SignedEvent e, Int now) {
+    if (before.len() == 0) { return false; }
+    Result(LogState, SymbolonError) s0 = start(before[0], l);
+    return match s0 {
+        Err(_) => false,
+        Ok(a) => match run(a, before, l, lambda(x) { false }, 1) {
+            Err(_) => false,
+            Ok(s1) => invalid_at(s1, e, l, now) && invalid_after(s1, e, l, now, s1.pending, 0)
+        }
+    };
+}
+
+Bool invalid_at(LogState s1, SignedEvent e, List(Int) l, Int now) {
+    Int t = if (now > s1.last_time) { now } else { s1.last_time };
+    return match step_at(s1, e, l, t, lambda(x) { false }) { Ok(_) => false, Err(_) => true };
+}
+
+Bool invalid_after(LogState s1, SignedEvent e, List(Int) l, Int now, List(Pending) ps, Int i) {
+    if (i >= ps.len()) { return true; }
+    Bool here = ps[i].ready_at <= now || invalid_at(s1, e, l, ps[i].ready_at);
+    return here && invalid_after(s1, e, l, now, ps, i + 1);
+}
+
+// The witness time by which everything pending at the end of `before`
+// has taken effect (its last event's time when nothing is pending); -1
+// when it does not verify. The relay checks an event offline at the last
+// event's time and at this one before it asks any witness (R3P-4).
+pub Int il_settled_time(List(Int) l, List(SignedEvent) before) {
+    if (before.len() == 0) { return -1; }
+    Result(LogState, SymbolonError) s0 = start(before[0], l);
+    return match s0 {
+        Err(_) => -1,
+        Ok(a) => match run(a, before, l, lambda(x) { false }, 1) { Err(_) => -1, Ok(s1) => latest_ready(s1.pending, 0, s1.last_time) }
+    };
+}
+
+Int latest_ready(List(Pending) ps, Int i, Int best) {
+    if (i >= ps.len()) { return best; }
+    return latest_ready(ps, i + 1, if (ps[i].ready_at > best) { ps[i].ready_at } else { best });
 }
 
 // The sequencing relay named by the policy of the verified log `before`

@@ -208,9 +208,10 @@ P-256 base point, `q` its order.
 - Denial of service by the sync service or the cosigner is detected, not
   prevented; the quorum is sized so that one unavailable party does not
   block signing (Section 10.2). A relay that sequences a log (Section
-  20.3) can stall that log's events, not the credentials' signing; moving
-  the log to another relay is a `set-policy` the current relay must claim
-  (Section 20.4).
+  20.3) can stall that log's events, not the credentials' signing, and
+  not a veto of a pending recovery or the escape from it: those are
+  co-signed without its claim (Section 20.3, "What the relay cannot hold
+  back").
 
 ### 3.4 Symbolon Home
 
@@ -1190,7 +1191,16 @@ after the delay, measured by witness time, without a valid `veto`.
   refuses until the log's next event takes that sequence.
 - **Veto.** A veto is signed by the DK of a device in the quorum preceding
   the event, which requires that device to be unlocked (Section 9.1). A
-  thief with a locked device therefore cannot veto.
+  thief with a locked device therefore cannot veto. A veto carries
+  advisory time 0, so every device's veto of one event at one sequence is
+  the same event. The witnesses co-sign a veto of a pending `recover` (or
+  of the kit's escape `set-policy`, Section 20.3) without the sequencing
+  relay's claim, and the device also leaves its signed veto in the
+  cosigner's mailbox (`WVeto`). The cosigner keeps a veto that is valid,
+  at witness time when it arrives, as the next event of the log it
+  verified, and refuses the release while it keeps a veto of that
+  recovery that the log does not show: a relay that refuses to claim the
+  veto, or to store it, has nothing released (R3P-3).
 - **One at a time.** A `recover` filed while another `recover` is pending
   is invalid. Otherwise whoever holds the kit could take every next
   sequence with another `recover` as soon as the last was witnessed, and
@@ -2574,6 +2584,90 @@ and stops cannot stall the log either, and reports which event
 took the sequence (an authority event of one device, or a recovery, is
 delayed and can be vetoed).
 
+**What the relay cannot hold back (R3P-3).** A relay that refuses to
+claim an event stalls the log; it must not decide a recovery that way. A
+witness therefore co-signs event `n` of a sequenced log without a claim,
+provided it holds nothing at `(log, n)` (no event co-signed there, so no
+claim either), when the event is valid as always and is one of:
+
+1. a `veto` with advisory time 0 of the pending event the kit filed (a
+   `recover`, or the kit's escape below), signed per the log's rules;
+2. a `set-policy` that changes or drops the sequencing relay and changes
+   nothing else, signed by every device of the quorum that is not
+   removed, while nothing the kit filed is pending;
+3. the kit's escape: a `set-policy` signed by the kit alone (a kit party
+   of the quorum whose key's digest is in field 6, and no device) that
+   drops the sequencing relay, changes nothing else and carries advisory
+   time 0. It is delayed by the recovery delay (four times after two
+   vetoes, as a `recover`), is one at a time with `recover`s (neither is
+   valid while the other is pending), and a device vetoes it as it would
+   a `recover`, without a claim;
+4. any event, once a delayed `set-policy` that dropped the relay has taken
+   effect by the witness's clock (the policy in force after `n-1` at its
+   own time still names it).
+
+So a relay that is gone, or works with whoever holds the kit, stalls the
+log for at most the recovery delay (the kit's escape, or the devices'
+escape at once), and cannot keep a veto from the witnesses. A
+principal who still has a device keeps the relay by vetoing the kit's
+escape. Without its relay, the log is exposed to the freeze of Section
+20.4 until a `set-policy` names another (adding one is not a weakening).
+
+*Splits.* A witness never co-signs two events at one sequence, so a
+claim-less event can only compete with an event the relay claimed. At
+most one claim-less event of kinds 1 and 3 exists at a sequence for a
+given log before it (advisory time 0 and signatures outside the digest);
+kind 2's content is chosen by the holders of every device together. With
+an odd number of witnesses, two candidates at a sequence cannot freeze
+it: once every witness has answered, one has a majority. A device sends
+an event without a claim only when the relay gave it none, or claimed
+another event that it then could not get witnessed; an honest relay
+claims the first valid event it is shown, so a split needs a relay that
+claimed one event and a device that could not reach it, or a malicious
+relay together with the holder of a device key. **Residual:** with an
+even number of witnesses such a split can freeze the sequence (two
+against two); and a malicious relay working with the kit can freeze the
+sequence at which the devices try the escape of kind 2 (three different
+events at three witnesses). Neither releases anything: the cosigner's
+fresh-head check (Section 13.4) fails closed on a frozen or contested
+head. Policies SHOULD name an odd number of witnesses.
+
+**Lapsed claims (R3P-6).** A claim lapses once its event can no longer be
+co-signed by any witness (it is invalid at witness time and at every later
+time the log's state changes, so a witness whose clock is behind refuses
+it too) and the witnesses' answers to `POST /head` show no majority could
+hold it (those that co-signed it there and those that did not answer
+together are not a majority, and none co-signed past the sequence), and
+no sooner than five minutes after it was made. The relay may then claim
+another event there (at most eight times per sequence), keeping each
+claim write-once (`claim/<log>/<n>`, then `claim/<log>/<n>-g<k>`), and
+answers with the lapsed claims as evidence: CBOR `[event, [time, sig],
+[record, ...]]`, the records oldest first. A device that finds a witness
+holding another event under a claim of the relay does not report
+equivocation when the relay's answer carries that claim as lapsed, it was
+made at least five minutes before the device's, and its event can no
+longer be co-signed at witness time now; otherwise it does.
+
+**What the relay asks the witnesses (R3P-4).** Anyone can make a log
+naming any witness URLs, so before the relay calls a log's witnesses for a
+claim it checks the event offline: valid as the next event at the last
+event's witness time, or once everything pending has taken effect. It
+calls no witness at a loopback, private, link-local or other internal
+address (IPv4 literals, `localhost`, `.local`, `.internal`, and numeric
+hosts in any other form than four decimal octets) unless started with
+`--allow-private-witnesses` (tests), or named with `--allow-witness
+HOST:PORT,...` (the household box of Section 20.5 passes its own
+witness ports under each of its names and the witnesses the household
+named, so a stranger's log cannot make it call another address on the
+LAN); a log naming one is refused with 403 before any call, and so is a
+device's sign-in to such a log. Host names are judged as written: one
+that resolves to an internal address is not caught. The relay runs at
+most two claims of one log at a time (leases in its store, taken over
+after two minutes; 429 beyond), starts no new round of witness calls
+after 20 seconds (three witnesses at a time; the rest count as not
+answering), and carries a claimed event to the witnesses one at a time
+for at most 20 seconds.
+
 `device init` pins its relay's claim key in `E0`'s policy, under the name
 the device reaches the relay at. A log whose policy names no sequencing
 relay (one made before field 8) is co-signed without a claim, as before,
@@ -2584,8 +2678,8 @@ devices; naming a relay never weakens a policy). A `set-policy` that drops
 the sequencing relay weakens the policy (Section 8.2). Moving a log to
 another relay is a `set-policy` naming the new relay, claimed by the old
 one; a relay that refuses to claim it, or is gone, keeps the log where it
-is (a stall: the relay is already what stores the log, the kit's
-material and the recovery requests).
+is until the escape above (signed by every device, or by the kit after
+the recovery delay).
 
 **Changing the witnesses.** `symbolon device witnesses DIR --add
 HOST:PORT:KEY ... --remove HOST:PORT ...` makes a `set-policy` from the
@@ -2644,11 +2738,13 @@ there as free, it reports "log frozen at sequence n" as a possible attack
 instead of a generic failure.
 
 With a sequencing relay (Section 20.3) this cannot happen: a witness
-co-signs at `n` only the event the relay claimed there, so at most one
-event per sequence is co-signable, and it gets its majority once the
-witnesses are asked. The freeze needs the relay to sign two claims at one
-sequence, which the device detects and reports with both claims; the
-freeze alarm stays for that case and for logs without a sequencing relay.
+co-signs at `n` only the event the relay claimed there, or the one
+claim-less event the relay must not hold back, so at most two events per
+sequence are co-signable and with an odd number of witnesses one gets its
+majority once every witness is asked. The freeze needs the relay to sign
+two claims at one sequence (not one that lapsed), which the device
+detects and reports with both claims, or the residuals of Section 20.3;
+the freeze alarm stays for those and for logs without a sequencing relay.
 
 **Residual.** A log whose policy names no sequencing relay (made before
 policy field 8) can still be frozen until a `set-policy` names one; a log

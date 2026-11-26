@@ -36,7 +36,7 @@ Store tmp_store() { return FsStore(tmp_dir()); }
 
 Str dir_of(Store s) { return match s { FsStore(d) => d, _ => "" }; }
 
-RelayCfg cfg_of(Store s, Str console) { return RelayCfg {.store = Fs(dir_of(s)), .ca = "", .console = console, .names = ""}; }
+RelayCfg cfg_of(Store s, Str console) { return RelayCfg {.store = Fs(dir_of(s)), .ca = "", .console = console, .names = "", .private_witnesses = false, .allowed_witnesses = ""}; }
 
 HttpRequest treq(Str method, Str path, Str token, List(Int) body) {
     Map(Str, Str) none = {};
@@ -382,7 +382,7 @@ test "the sign-in message names the relay, and a relay takes only its own names"
     List(Int) c = random_bytes(32);
     expect(relay_auth_message("relay.example:443", c) == relay_auth_message("other.example:443", c)).toBeFalse();
     expect(relay_name("Relay.Example", 443)).toEqual("relay.example:443");
-    RelayCfg g = RelayCfg {.store = Fs("/nonexistent"), .ca = "", .console = "https://home.test:8443", .names = "relay.example:443, 10.0.0.2:443"};
+    RelayCfg g = RelayCfg {.store = Fs("/nonexistent"), .ca = "", .console = "https://home.test:8443", .names = "relay.example:443, 10.0.0.2:443", .private_witnesses = false, .allowed_witnesses = ""};
     expect(name_ok(g, "relay.example:443")).toBeTrue();
     expect(name_ok(g, "10.0.0.2:443")).toBeTrue();
     expect(name_ok(g, "home.test:8443")).toBeTrue();
@@ -995,7 +995,11 @@ test "the relay claims each sequence of a log once, and answers another event th
 
 // POST /claim/<l>/<n> judged at witness time 5000 (E0's is 1000).
 @requires(filesystem, network, clock(readonly), declassify)
-HttpReply claim_t(Store s, List(Int) l, Int n, List(Int) body) { return claim_reply_at("", s, hex_encode(l), f"{n}", body, 5000); }
+HttpReply claim_t(Store s, List(Int) l, Int n, List(Int) body) { return claim_reply_at(env_at(5000), s, hex_encode(l), f"{n}", body); }
+
+// Judged at witness time `t`, no witness asked (R3P-4: none on a private
+// address is called anyway).
+ClaimEnv env_at(Int t) { return ClaimEnv {.ca = "", .private_ok = false, .allowed = "", .time = t, .heads = []}; }
 
 // A kit recover at 1 co-signed by witnesses 7 and 8 at `t`, stored.
 @requires(filesystem, network, clock(readonly), declassify)
@@ -1033,13 +1037,13 @@ test "the relay judges a claim at witness time, five minutes on included, not by
     StoredEvent e0 = log_e0_seq("w1", [me]);
     List(Int) l = put_e0(s, e0);
     List(Int) rd = put_recover(s, l, e0, w0);
-    expect(claim_reply_at("", s, hex_encode(l), "2", veto_at(l, rd), w0 + 86400 - 100).status).toEqual(403);
-    expect(claim_reply_at("", s, hex_encode(l), "2", veto_at(l, rd), w0 + 86400 - 3600).status).toEqual(200);
+    expect(claim_reply_at(env_at(w0 + 86400 - 100), s, hex_encode(l), "2", veto_at(l, rd)).status).toEqual(403);
+    expect(claim_reply_at(env_at(w0 + 86400 - 3600), s, hex_encode(l), "2", veto_at(l, rd)).status).toEqual(200);
     // Once the delay has run by witness time, the veto is not claimed.
     StoredEvent f0 = log_e0_seq("w1b", [me]);
     List(Int) fl = put_e0(s, f0);
     List(Int) fd = put_recover(s, fl, f0, w0);
-    expect(claim_reply_at("", s, hex_encode(fl), "2", veto_at(fl, fd), w0 + 86400 + 10).status).toEqual(403);
+    expect(claim_reply_at(env_at(w0 + 86400 + 10), s, hex_encode(fl), "2", veto_at(fl, fd)).status).toEqual(403);
 }
 
 Str http_body_text_of(List(Int) b) {
@@ -1084,4 +1088,124 @@ test "a vault or folder state is stored only above the version stored" {
     Str c = "coll-" + hex_encode(vrep(4, 16));
     expect(versioned_put(s, c, vstate(5, 15), 1000).status).toEqual(200);
     expect(versioned_put(s, c, vstate(5, 16), 1000).status).toEqual(409);
+}
+
+// The new device's (key `k`) rotate-recovery at 2 after the recover at 1
+// (digest `rd`): valid once the recovery has taken effect.
+List(Int) rotate_at(List(Int) l, List(Int) rd, Int k) {
+    EventPayload p = EventPayload {.log_id = Some(l), .sequence = 2, .predecessor_digest = Some(rd), .suite = 1, .body = RotateRecoveryBody,
+                                   .next_recovery_key_digests = [lid(52)], .advisory_time = 0};
+    List(Int) enc = payload_cbor(p) else { [] };
+    return cbor_of_event(StoredEvent {.encoded = enc, .sigs = [EventSig {.signer = lid(k), .sig = lsign(k, enc)}], .cosigs = []});
+}
+
+ClaimEnv env_heads(Int t, List(Option(WitnessHead)) hs) { return ClaimEnv {.ca = "", .private_ok = false, .allowed = "", .time = t, .heads = hs}; }
+
+@requires(filesystem, network, clock(readonly), declassify)
+test "a claim on an event that can no longer be co-signed lapses, and the next claim carries it as evidence (R3P-6)" {
+    Store s = tmp_store();
+    // The relay's claim key is key 30 here, so a claim can be made below.
+    _ = st_put(s, "auth/claim-key", lpriv(30));
+    RelayCfg g = cfg_of(s, "");
+    List(Int) k = cose_hex_decode(str_trim(http_body_text_of(relay_serve_handle(g, get("/claim-key")).body)));
+    expect(hex_encode(k)).toEqual(hex_encode(lpub(30)));
+    WitnessRef me = WitnessRef {.url = "relay:1", .key = k};
+    Int w0 = 10000000;
+    StoredEvent e0 = log_e0_seq("w1", [me]);
+    List(Int) l = put_e0(s, e0);
+    List(Int) rd = put_recover(s, l, e0, w0);
+    // Device 2's veto was claimed at 2 an hour ago and never witnessed.
+    List(Int) old = veto_at(l, rd);
+    Int ot = clock_now_seconds() - 3600;
+    RelayClaim oc = RelayClaim {.time = ot, .sig = lsign(30, claim_message("relay:1", l, 2, digest_of(old), ot))};
+    List(Int) oldrec = claim_record_cbor(old, oc);
+    _ = st_put_new(s, "claim/" + hex_encode(l) + "/2", oldrec);
+    List(Int) y = rotate_at(l, rd, 4);
+    WitnessHead at1 = WitnessHead {.seq = 1, .digest = rd, .time = 0};
+    WitnessHead at2 = WitnessHead {.seq = 2, .digest = digest_of(old), .time = 0};
+    WitnessHead at3 = WitnessHead {.seq = 3, .digest = rd, .time = 0};
+    List(Option(WitnessHead)) free = [Some(at1), Some(at1), None];
+    // While the veto can still be co-signed, the claim stands (409, the
+    // veto's record); so too once it is void but a majority may hold it,
+    // or a witness co-signed past the sequence.
+    expect(claim_reply_at(env_heads(w0 + 100, free), s, hex_encode(l), "2", y).status).toEqual(409);
+    expect(claim_reply_at(env_heads(w0 + 86400 + 10, [Some(at2), Some(at1), None]), s, hex_encode(l), "2", y).status).toEqual(409);
+    expect(claim_reply_at(env_heads(w0 + 86400 + 10, [Some(at3), Some(at1), Some(at1)]), s, hex_encode(l), "2", y).status).toEqual(409);
+    // Void (its recovery took effect) and held by no majority: the new
+    // event is claimed, with the lapsed claim as evidence.
+    HttpReply a = claim_reply_at(env_heads(w0 + 86400 + 10, free), s, hex_encode(l), "2", y);
+    expect(a.status).toEqual(200);
+    ClaimRecord ca = claim_record_of(a.body) else { ClaimRecord {.event = [], .claim = RelayClaim {.time = 0, .sig = []}} };
+    expect(hex_encode(digest_of(ca.event))).toEqual(hex_encode(digest_of(y)));
+    expect(claim_ok(me, l, 2, digest_of(y), ca.claim)).toBeTrue();
+    List(List(Int)) ev = claim_lapsed_of(a.body);
+    expect(ev.len()).toEqual(1);
+    expect(hex_encode(ev[0])).toEqual(hex_encode(oldrec));
+    // It stands now: the same answer again, the old veto gets 409.
+    expect(hex_encode(claim_reply_at(env_heads(w0 + 86400 + 10, free), s, hex_encode(l), "2", y).body)).toEqual(hex_encode(a.body));
+    expect(claim_reply_at(env_heads(w0 + 86400 + 10, free), s, hex_encode(l), "2", old).status).toEqual(409);
+    // A device holding the new claim, shown the old one by a witness,
+    // finds the relay's evidence: no equivocation. Without it, or with
+    // claims closer than the margin, it is one.
+    CosignOut o = CosignOut {.cosig = None, .other = digest_of(old), .other_claim = Some(oc)};
+    expect(equivocation_after(me, l, 2, digest_of(y), ca.claim, ev, [o], 0)).toEqual("");
+    expect(str_len(equivocation_after(me, l, 2, digest_of(y), ca.claim, [], [o], 0)) > 0).toBeTrue();
+    RelayClaim soon = RelayClaim {.time = ot + 10, .sig = lsign(30, claim_message("relay:1", l, 2, digest_of(y), ot + 10))};
+    expect(str_len(equivocation_after(me, l, 2, digest_of(y), soon, ev, [o], 0)) > 0).toBeTrue();
+}
+
+@requires(filesystem, network, clock(readonly), declassify)
+test "the relay calls no witness for an event it would refuse anyway, nor one at a private address, and runs two claims of a log at a time (R3P-4)" {
+    expect(host_private("10.0.0.5")).toBeTrue();
+    expect(host_private("127.0.0.1")).toBeTrue();
+    expect(host_private("localhost")).toBeTrue();
+    expect(host_private("169.254.169.254")).toBeTrue();
+    expect(host_private("192.168.1.20")).toBeTrue();
+    expect(host_private("172.20.0.1")).toBeTrue();
+    expect(host_private("100.100.1.1")).toBeTrue();
+    expect(host_private("2130706433")).toBeTrue();
+    expect(host_private("0x7f.1")).toBeTrue();
+    expect(host_private("017.0.0.1")).toBeTrue();
+    expect(host_private("box.local")).toBeTrue();
+    expect(host_private("witness.example")).toBeFalse();
+    expect(host_private("8.8.8.8")).toBeFalse();
+    expect(host_private("172.32.0.1")).toBeFalse();
+    Store s = tmp_store();
+    RelayCfg g = cfg_of(s, "");
+    List(Int) k = cose_hex_decode(str_trim(http_body_text_of(relay_serve_handle(g, get("/claim-key")).body)));
+    WitnessRef me = WitnessRef {.url = "relay:1", .key = k};
+    // A log naming a witness at a private address: refused at once (403),
+    // where a reachable witness would be asked the time.
+    StoredEvent p0 = log_e0_seq("10.0.0.5:9", [me]);
+    List(Int) pl = put_e0(s, p0);
+    HttpReply pr = relay_serve_handle(g, treq("POST", "/claim/" + hex_encode(pl) + "/1", "", kit_recover_at(pl, p0, 4, 20)));
+    expect(pr.status).toEqual(403);
+    expect(str_contains(http_body_text_of(pr.body), "private")).toBeTrue();
+    // A relay started to allow them asks it (and gets no time here).
+    RelayCfg gp = RelayCfg {.store = g.store, .ca = "", .console = "", .names = "", .private_witnesses = true, .allowed_witnesses = ""};
+    StoredEvent q0 = log_e0_seq("127.0.0.1:1", [me]);
+    List(Int) ql = put_e0(s, q0);
+    expect(relay_serve_handle(gp, treq("POST", "/claim/" + hex_encode(ql) + "/1", "", kit_recover_at(ql, q0, 4, 20))).status).toEqual(503);
+    // One allowed by name (a household box's own witness) is asked; any
+    // other private address is still refused.
+    RelayCfg ga = RelayCfg {.store = g.store, .ca = "", .console = "", .names = "", .private_witnesses = false, .allowed_witnesses = "127.0.0.1:1"};
+    StoredEvent a0 = log_e0_seq("127.0.0.1:1", [me]);
+    List(Int) al = put_e0(s, a0);
+    expect(relay_serve_handle(ga, treq("POST", "/claim/" + hex_encode(al) + "/1", "", kit_recover_at(al, a0, 4, 20))).status).toEqual(503);
+    StoredEvent b0 = log_e0_seq("127.0.0.1:2", [me]);
+    List(Int) bl = put_e0(s, b0);
+    expect(relay_serve_handle(ga, treq("POST", "/claim/" + hex_encode(bl) + "/1", "", kit_recover_at(bl, b0, 4, 20))).status).toEqual(403);
+    // An event signed by no key of the log: refused before the witnesses
+    // are asked (403, not the 503 of witnesses that do not answer).
+    StoredEvent h0 = log_e0_seq("w1q", [me]);
+    List(Int) hl = put_e0(s, h0);
+    expect(relay_serve_handle(g, treq("POST", "/claim/" + hex_encode(hl) + "/1", "", kit_recover_at(hl, h0, 4, 21))).status).toEqual(403);
+    // Two claims of the log in progress: a third waits (429). A lease a
+    // crashed process left is taken over.
+    _ = st_put_new(s, "claimlock/" + hex_encode(hl) + "/0", str_to_bytes(f"{clock_now_seconds()}"));
+    _ = st_put_new(s, "claimlock/" + hex_encode(hl) + "/1", str_to_bytes(f"{clock_now_seconds()}"));
+    expect(claim_t(s, hl, 1, kit_recover_at(hl, h0, 4, 20)).status).toEqual(429);
+    _ = st_put(s, "claimlock/" + hex_encode(hl) + "/1", str_to_bytes("5"));
+    expect(claim_t(s, hl, 1, kit_recover_at(hl, h0, 4, 20)).status).toEqual(200);
+    expect(absent(s, "claimlock/" + hex_encode(hl) + "/1")).toBeTrue();
 }

@@ -359,3 +359,116 @@ test "a key holder cannot split a sequenced log's next sequence among the witnes
     // An honest relay's single claim is no such proof.
     expect(equivocation_in(relay_ref(), l, 1, dig(ra), ca, [o], 0)).toEqual("");
 }
+
+// ─── What the relay cannot hold back (SPEC 20.3, R3P-3) ─────────
+
+Policy policy_seq(List(WitnessRef) sq) {
+    return Policy {.device_sigs_for_authority = 2, .recovery_delay_sec = 86400, .guardians = [], .guardian_threshold = 0,
+                   .witnesses = [WitnessRef {.url = "w1", .key = pubk(7)}, WitnessRef {.url = "w2", .key = pubk(8)}, WitnessRef {.url = "w3", .key = pubk(11)}],
+                   .duress_window_sec = 3600, .sequencer = sq, .cosigner_policy = NoCosignerPolicy};
+}
+
+// E0 of a sequenced log with devices 2 and 3 and the kit (key 20) as a
+// party, signed by all three.
+EventPayload e0_kit() {
+    Party kit = Party {.id = id32(20), .kind = party_kind_kit(), .auth_key = pubk(20), .hpke_key = pubk(20), .label = "kit", .attestation = NoAttestation};
+    Quorum q = Quorum {.parties = [dev_party(2), dev_party(3), kit], .t = 2, .root_pubkey = pubk(9), .epoch = 0, .transcript_digest = id32(99), .kv_commits = []};
+    return EventPayload {.log_id = None, .sequence = 0, .predecessor_digest = None, .suite = 1, .body = InceptionBody(q, policy_seq([relay_ref()])),
+                         .next_recovery_key_digests = [sha256_bytes(pubk(20))], .advisory_time = 0};
+}
+
+EventPayload with_advisory(EventPayload p, Int t) {
+    return EventPayload {.log_id = p.log_id, .sequence = p.sequence, .predecessor_digest = p.predecessor_digest, .suite = p.suite, .body = p.body,
+                         .next_recovery_key_digests = p.next_recovery_key_digests, .advisory_time = (UInt(64))t};
+}
+
+@requires(filesystem, clock(readonly), declassify)
+test "a witness co-signs a device's veto of a pending kit recovery without the relay's claim, and only while it holds nothing there (R3P-3)" {
+    Str w1 = fresh_root();
+    Str w2 = fresh_root();
+    Str w3 = fresh_root();
+    StoredEvent e0 = ev(e0_seq(), [2, 3]);
+    List(Int) l = dig(e0);
+    StoredEvent e0c = e0_done(e0, l);
+    // The kit's recover at 1, claimed by the relay and co-signed.
+    StoredEvent r1 = ev(after(l, 1, e0, kit_recover(4), [id32(51)]), [20]);
+    HttpReply a1 = ask_claimed(w1, 7, l, [e0c, r1], Some(claim_by(30, "relay:1", l, 1, dig(r1))));
+    expect(a1.status).toEqual(200);
+    StoredEvent r1c = with_cosigs(r1, completed(a1, pubk(7), l, 1, r1));
+    // The relay, working with whoever holds the kit, gives the device's
+    // veto no claim: the witnesses co-sign it anyway.
+    StoredEvent veto = ev(after(l, 2, r1, VetoBody(1), [sha256_bytes(pubk(20))]), [2]);
+    expect(ask_claimed(w2, 8, l, [e0c, r1c, veto], None).status).toEqual(200);
+    // Not with an advisory time (another digest per device and second),
+    // not unsigned, nor any other event (a rotate-recovery by device 3).
+    expect(ask_claimed(w3, 11, l, [e0c, r1c, ev(with_advisory(after(l, 2, r1, VetoBody(1), [sha256_bytes(pubk(20))]), 5), [2])], None).status).toEqual(403);
+    expect(ask_claimed(w3, 11, l, [e0c, r1c, ev(after(l, 2, r1, VetoBody(1), [sha256_bytes(pubk(20))]), [])], None).status).toEqual(403);
+    expect(ask_claimed(w3, 11, l, [e0c, r1c, ev(after(l, 2, r1, RotateRecoveryBody, [id32(60)]), [3])], None).status).toEqual(403);
+    // A witness that co-signed the relay's claimed event at 2 refuses the
+    // veto there (409): never two events at one sequence.
+    StoredEvent rot = ev(after(l, 2, r1, RotateRecoveryBody, [id32(60)]), [3]);
+    expect(ask_claimed(w1, 7, l, [e0c, r1c, rot], Some(claim_by(30, "relay:1", l, 2, dig(rot)))).status).toEqual(200);
+    expect(ask_claimed(w1, 7, l, [e0c, r1c, veto], None).status).toEqual(409);
+    // And the witness holding the claim-less veto refuses the relay's
+    // claimed event, showing no claim: no relay equivocation is alleged.
+    HttpReply y = ask_claimed(w2, 8, l, [e0c, r1c, rot], Some(claim_by(30, "relay:1", l, 2, dig(rot))));
+    expect(y.status).toEqual(409);
+    Held hy = held_of(y.body) else { Held {.digest = [], .claim = None} };
+    expect(hex_encode(hy.digest)).toEqual(hex_encode(dig(veto)));
+    Option(RelayClaim) hc2 = hy.claim;
+    expect(match hc2 { None => true, Some(_) => false }).toBeTrue();
+    // The third witness gives either its majority; the veto it is.
+    expect(ask_claimed(w3, 11, l, [e0c, r1c, veto], None).status).toEqual(200);
+}
+
+@requires(filesystem, clock(readonly), declassify)
+test "a set-policy that changes or drops the relay is co-signed without a claim when every device signs it, not with fewer (R3P-3)" {
+    Str w1 = fresh_root();
+    StoredEvent e0 = ev(e0_seq(), [2, 3]);
+    List(Int) l = dig(e0);
+    StoredEvent e0c = e0_done(e0, l);
+    WitnessRef other = WitnessRef {.url = "relay:2", .key = pubk(31)};
+    StoredEvent moved1 = ev(after(l, 1, e0, SetPolicyBody(policy_seq([other])), [sha256_bytes(pubk(20))]), [2]);
+    expect(ask_claimed(w1, 7, l, [e0c, moved1], None).status).toEqual(403);
+    // Another change with it (a shorter duress window) is not an escape.
+    Policy p2 = policy_seq([other]);
+    Policy pw = Policy {.device_sigs_for_authority = p2.device_sigs_for_authority, .recovery_delay_sec = p2.recovery_delay_sec, .guardians = p2.guardians,
+                        .guardian_threshold = p2.guardian_threshold, .witnesses = p2.witnesses, .duress_window_sec = 60, .sequencer = p2.sequencer, .cosigner_policy = p2.cosigner_policy};
+    expect(ask_claimed(w1, 7, l, [e0c, ev(after(l, 1, e0, SetPolicyBody(pw), [sha256_bytes(pubk(20))]), [2, 3])], None).status).toEqual(403);
+    expect(seq_of(head_of(w1, 7, l))).toEqual(0);
+    StoredEvent moved = ev(after(l, 1, e0, SetPolicyBody(policy_seq([other])), [sha256_bytes(pubk(20))]), [2, 3]);
+    expect(ask_claimed(w1, 7, l, [e0c, moved], None).status).toEqual(200);
+    // Dropping it, by both devices: co-signed too (delayed, as a
+    // weakening).
+    Str w2 = fresh_root();
+    StoredEvent dropped = ev(after(l, 1, e0, SetPolicyBody(policy_seq([])), [sha256_bytes(pubk(20))]), [2, 3]);
+    expect(ask_claimed(w2, 8, l, [e0c, dropped], None).status).toEqual(200);
+}
+
+@requires(filesystem, clock(readonly), declassify)
+test "the kit can drop the relay without its claim, in effect only after the recovery delay and vetoable (R3P-3)" {
+    Str w1 = fresh_root();
+    Str w2 = fresh_root();
+    StoredEvent e0 = ev(e0_kit(), [2, 3, 20]);
+    List(Int) l = dig(e0);
+    StoredEvent e0c = e0_done(e0, l);
+    // Naming another relay, or with an advisory time: refused.
+    expect(ask_claimed(w1, 7, l, [e0c, ev(after(l, 1, e0, SetPolicyBody(policy_seq([WitnessRef {.url = "relay:2", .key = pubk(31)}])), [sha256_bytes(pubk(20))]), [20])], None).status).toEqual(403);
+    expect(ask_claimed(w1, 7, l, [e0c, ev(with_advisory(after(l, 1, e0, SetPolicyBody(policy_seq([])), [sha256_bytes(pubk(20))]), 9), [20])], None).status).toEqual(403);
+    StoredEvent esc = ev(after(l, 1, e0, SetPolicyBody(policy_seq([])), [sha256_bytes(pubk(20))]), [20]);
+    HttpReply a1 = ask_claimed(w1, 7, l, [e0c, esc], None);
+    expect(a1.status).toEqual(200);
+    StoredEvent escc = with_cosigs(esc, completed(a1, pubk(7), l, 1, esc));
+    Int t1 = answer_time(a1);
+    // Pending: the relay still sequences the log until the delay has run.
+    List(SignedEvent) es = signed_all([e0c, escc], 0, []);
+    Result(VerifiedHead, SymbolonError) before = il_verify(l, es, t1 + 10, lambda(x) { false });
+    expect(match before { Ok(v) => v.head.policy.sequencer.len() == 1 && v.pending.len() == 1, Err(_) => false }).toBeTrue();
+    Result(VerifiedHead, SymbolonError) later = il_verify(l, es, t1 + 86400, lambda(x) { false });
+    expect(match later { Ok(v) => v.head.policy.sequencer.len() == 0 && v.pending.len() == 0, Err(_) => false }).toBeTrue();
+    // Meanwhile the kit files no recover, and a device vetoes the escape
+    // without a claim.
+    StoredEvent rec2 = ev(after(l, 2, esc, kit_recover(4), [id32(51)]), [20]);
+    expect(ask_claimed(w2, 8, l, [e0c, escc, rec2], Some(claim_by(30, "relay:1", l, 2, dig(rec2)))).status).toEqual(403);
+    expect(ask_claimed(w2, 8, l, [e0c, escc, ev(after(l, 2, esc, VetoBody(1), [sha256_bytes(pubk(20))]), [3])], None).status).toEqual(200);
+}

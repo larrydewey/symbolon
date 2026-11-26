@@ -125,24 +125,97 @@ Int veto_with(Str dir, DeviceConfig c, Str pin) {
     Result(VerifiedHead, SymbolonError) rv = verified_log(relay_ep(c), c.log_id);
     return match rv {
         Err(e) => dfail(err_text(e)),
-        Ok(vh) => if (vh.pending.len() == 0) { dfail("nothing is pending") } else { veto_target(c, u, vh, vh.pending[vh.pending.len() - 1], pin) }
+        Ok(vh) => if (vh.pending.len() == 0) { dfail("nothing is pending") } else { veto_target(dir, c, u, vh, vh.pending[vh.pending.len() - 1], pin) }
     };
 }
 
+// A veto carries advisory time 0 (R3P-3): every device's veto of one
+// target at one sequence is then the same event, which the witnesses
+// co-sign without the relay's claim when it vetoes what the kit filed
+// (core/log.resid il_claimless). It also goes straight to the cosigner's
+// mailbox, so that a relay that keeps it out of the log cannot have the
+// kit's half released while the cosigner holds it (cosignerd.resid
+// on_veto).
 @requires(filesystem, network, device, declassify, clock, environment)
-Int veto_target(DeviceConfig c, Unlocked u, VerifiedHead vh, UInt(64) target, Str pin) {
+Int veto_target(Str dir, DeviceConfig c, Unlocked u, VerifiedHead vh, UInt(64) target, Str pin) {
     List(SignedEvent) es = fetch_log(relay_ep(c), c.log_id, 0, []);
     EventPayload p = EventPayload {.log_id = Some(vh.head.log_id), .sequence = vh.head.sequence + 1, .predecessor_digest = Some(vh.head.digest),
-                                   .suite = 1, .body = VetoBody(target), .next_recovery_key_digests = field6_in_force(es, vh.pending, es.len() - 1), .advisory_time = (UInt(64))clock_now_seconds()};
+                                   .suite = 1, .body = VetoBody(target), .next_recovery_key_digests = field6_in_force(es, vh.pending, es.len() - 1), .advisory_time = (UInt(64))0};
     List(Int) enc = payload_cbor(p) else { [] };
     Result(List(Int), Str) s = dk_sign(c, u.real, u.st, enc);
     return match s {
         Err(m) => dfail(m),
-        Ok(sig) => match publish_event(c, p, enc, [EventSig {.signer = c.party, .sig = sig}]) {
-            Err(m) => dfail("veto: " + m),
-            Ok(vh2) => veto_done(target, vh2)
+        Ok(sig) => veto_publish(dir, c, u, vh.head.quorum.parties, p, enc, [EventSig {.signer = c.party, .sig = sig}], target)
+    };
+}
+
+@requires(filesystem, network, device, declassify, clock, environment)
+Int veto_publish(Str dir, DeviceConfig c, Unlocked u, List(Party) ps, EventPayload p, List(Int) enc, List(EventSig) sigs, UInt(64) target) {
+    Bool told = veto_to_cosigner(dir, c, u, ps, cbor_of_event(StoredEvent {.encoded = enc, .sigs = sigs, .cosigs = []}));
+    if (!told) { eprintln("veto: could not leave the veto in the cosigner's mailbox"); }
+    return match publish_event(c, p, enc, sigs) {
+        Err(m) => dfail("veto: " + m + if (told) { " (the cosigner holds the veto and releases nothing for that recovery)" } else { "" }),
+        Ok(vh2) => veto_done(target, vh2)
+    };
+}
+
+@requires(filesystem, network, device, declassify, clock, environment)
+Bool veto_to_cosigner(Str dir, DeviceConfig c, Unlocked u, List(Party) ps, List(Int) veto) {
+    Party cos = cosigner_of(ps, 0) else { none_party() };
+    if (cos.id.len() == 0) { return false; }
+    Local me = Local {.party = c.party, .cg = 0, .hpke_sk = device_transport(c, u.real.dek).sk};
+    Remote cr = Remote {.party = cos.id, .cg = 0, .hpke_pub = cos.hpke_key};
+    return send_to(mail_ep(dir, c, u), me, cr, WVeto(veto));
+}
+
+// `symbolon device kit-escape DIR KIT_SEED` (SPEC 20.3, R3P-3): the kit
+// signs a set-policy that drops the log's sequencing relay and changes
+// nothing else, with advisory time 0, and it goes to the witnesses with
+// or without the relay's claim. It takes effect after the recovery delay
+// unless a device vetoes it; the devices then name another relay
+// (`device sequence`).
+@requires(filesystem, network, device, declassify, clock)
+pub Int device_kit_escape(Str dir, Str seed_hex) {
+    Option(DeviceConfig) oc = load_config(dir);
+    Option(KitKeys) ok = kit_keys(cose_hex_decode(seed_hex));
+    return match oc {
+        None => dfail("not set up"),
+        Some(c) => match ok {
+            None => dfail("that is not a kit seed"),
+            Some(kit) => kit_escape_with(c, kit)
         }
     };
+}
+
+@requires(filesystem, network, device, declassify, clock)
+Int kit_escape_with(DeviceConfig c, KitKeys kit) {
+    Result(VerifiedHead, SymbolonError) rv = verified_log(relay_ep(c), c.log_id);
+    return match rv {
+        Err(e) => dfail(err_text(e)),
+        Ok(vh) => kit_escape_at(c, kit, vh)
+    };
+}
+
+@requires(filesystem, network, device, declassify, clock)
+Int kit_escape_at(DeviceConfig c, KitKeys kit, VerifiedHead vh) {
+    Policy p0 = vh.head.policy;
+    if (p0.sequencer.len() == 0) { println("the log's policy names no sequencing relay"); return 0; }
+    Policy np = Policy {.device_sigs_for_authority = p0.device_sigs_for_authority, .recovery_delay_sec = p0.recovery_delay_sec, .guardians = p0.guardians,
+                        .guardian_threshold = p0.guardian_threshold, .witnesses = p0.witnesses, .duress_window_sec = p0.duress_window_sec,
+                        .sequencer = [], .cosigner_policy = p0.cosigner_policy};
+    List(SignedEvent) es = fetch_log(relay_ep(c), c.log_id, 0, []);
+    EventPayload p = next_event(vh, SetPolicyBody(np), field6_in_force(es, vh.pending, es.len() - 1));
+    List(Int) enc = payload_cbor(p) else { [] };
+    if (enc.len() == 0) { return dfail("the policy does not encode"); }
+    return match publish_event(c, p, enc, [event_sig(recovery_key_digest(kit.sign_pub), kit.sign_priv, enc)]) {
+        Err(m) => dfail("kit-escape: " + m),
+        Ok(vh2) => kit_escaped(vh2)
+    };
+}
+
+Int kit_escaped(VerifiedHead vh) {
+    println(f"the kit's set-policy is witnessed: the log drops its sequencing relay once the recovery delay has run, unless a device vetoes ({vh.pending.len()} pending)");
+    return 0;
 }
 
 Int veto_done(UInt(64) target, VerifiedHead vh) {

@@ -374,17 +374,29 @@ pub Int witness_now(List(WitnessRef) ws, Str ca, List(Int) nonce) {
     return ts[(ts.len() - 1) / 2];
 }
 
-// The first three witnesses asked at once, each in its own region (a
-// region bound to a name runs while this goes on and is waited for where
-// it is used); any others after. Over a slow link this is one round of
-// connections instead of three.
+// The witnesses asked three at once, each in its own region (a region
+// bound to a name runs while this goes on and is waited for where it is
+// used). Over a slow link this is one round of connections instead of
+// three. No batch is started once witness_deadline_secs() have passed
+// (R3P-4: a log may name 32 witnesses that never answer): the ones left
+// count as not answering.
 @requires(network, clock(readonly), declassify)
 List(Int) witness_times_par(List(WitnessRef) ws, Str ca, List(Int) nonce) {
-    Result(Option(Int), RegionError) a = spawn (network, clock(readonly), declassify) { return time_of(ws, 0, ca, nonce); };
-    Result(Option(Int), RegionError) b = spawn (network, clock(readonly), declassify) { return time_of(ws, 1, ca, nonce); };
-    Result(Option(Int), RegionError) c = spawn (network, clock(readonly), declassify) { return time_of(ws, 2, ca, nonce); };
-    List(Int) rest = witness_times(ws, ca, nonce, 3, []);
-    return got(a).concat(got(b)).concat(got(c)).concat(rest);
+    List(Int) ts = times_batched(ws, ca, nonce, 0, [], clock_now_seconds() + witness_deadline_secs());
+    return ts;
+}
+
+// How long one round of witness calls may go on starting new calls.
+pub Int witness_deadline_secs() { return 20; }
+
+@requires(network, clock(readonly), declassify)
+List(Int) times_batched(List(WitnessRef) ws, Str ca, List(Int) nonce, Int i, List(Int) acc, Int until) {
+    if (i >= ws.len() || (i > 0 && clock_now_seconds() > until)) { return acc; }
+    Result(Option(Int), RegionError) a = spawn (network, clock(readonly), declassify) { return time_of(ws, i, ca, nonce); };
+    Result(Option(Int), RegionError) b = spawn (network, clock(readonly), declassify) { return time_of(ws, i + 1, ca, nonce); };
+    Result(Option(Int), RegionError) c = spawn (network, clock(readonly), declassify) { return time_of(ws, i + 2, ca, nonce); };
+    List(Int) here = got(a).concat(got(b)).concat(got(c));
+    return times_batched(ws, ca, nonce, i + 3, acc.concat(here), until);
 }
 
 List(Int) got(Result(Option(Int), RegionError) r) {
@@ -398,14 +410,6 @@ Option(Int) time_of(List(WitnessRef) ws, Int i, Str ca, List(Int) nonce) {
     return match oe { None => None, Some(e) => time_from(e, ws[i].key, nonce) };
 }
 
-@requires(network, clock(readonly), declassify)
-List(Int) witness_times(List(WitnessRef) ws, Str ca, List(Int) nonce, Int i, List(Int) acc) {
-    if (i >= ws.len()) { return acc; }
-    Option(Endpoint) oe = endpoint_of_url(ws[i].url, ca);
-    Option(Int) t = match oe { None => None, Some(e) => time_from(e, ws[i].key, nonce) };
-    return witness_times(ws, ca, nonce, i + 1, match t { Some(x) => acc.concat([x]), None => acc });
-}
-
 // host:port of an http(s)://host:port URL; TLS under `ca` when it is set
 // (one trust anchor for the relay and the witnesses, from the config).
 pub Option(Endpoint) endpoint_of_url(Str u, Str ca) {
@@ -413,6 +417,54 @@ pub Option(Endpoint) endpoint_of_url(Str u, Str ca) {
         if (str_len(u) > 7 && str_slice(u, 0, 7) == "http://") { str_slice(u, 7, str_len(u)) } else { u } };
     List(Str) parts = str_split(hp, ":");
     return if (parts.len() == 2) { Some(Endpoint {.host = parts[0], .port = str_parse_int(parts[1]), .ca = ca, .token = ""}) } else { None };
+}
+
+// Whether a policy's witnesses include one at a loopback, private,
+// link-local or otherwise internal address, by its URL (R3P-4): a relay
+// asks a log's witnesses for the time and to co-sign, and anyone can make
+// a log naming any URLs, so it calls such a host only when started to
+// (relay serve --allow-private-witnesses), or one named in `allowed`
+// (HOST:PORT, comma-separated: --allow-witness, the household box's own
+// witnesses). A host name is judged as written: one that resolves to an
+// internal address is not caught here.
+pub Bool witnesses_private(List(WitnessRef) ws, Str allowed) {
+    if (ws.len() == 0) { return false; }
+    Option(Endpoint) oe = endpoint_of_url(ws[0].url, "");
+    Bool here = match oe { None => false, Some(e) => host_private(e.host) && !str_split(allowed, ",").contains(str_to_lower(e.host) + f":{e.port}") };
+    return here || witnesses_private(ws[1..ws.len()], allowed);
+}
+
+// "localhost" and its subdomains, ".local", ".internal", and IPv4
+// literals in 0/8, 10/8, 100.64/10, 127/8, 169.254/16, 172.16/12,
+// 192.168/16 and 224/3; a numeric host in any other form than four
+// decimal octets is refused as well (resolvers read "2130706433" or
+// "0x7f.1" as 127.0.0.1).
+pub Bool host_private(Str host) {
+    Str h = str_to_lower(host);
+    if (str_len(h) == 0 || h == "localhost" || str_ends_with(h, ".localhost") || str_ends_with(h, ".local") || str_ends_with(h, ".internal")) { return true; }
+    List(Str) ls = str_split(h, ".");
+    Str last = ls[ls.len() - 1];
+    Bool numeric = all_digits(last, 0) || (str_len(last) > 1 && str_slice(last, 0, 2) == "0x");
+    if (!numeric) { return false; }
+    if (ls.len() != 4 || !octets_ok(ls, 0)) { return true; }
+    Int a = str_parse_int(ls[0]);
+    Int b = str_parse_int(ls[1]);
+    return a == 0 || a == 10 || a == 127 || a >= 224 || (a == 100 && b >= 64 && b < 128) || (a == 169 && b == 254) || (a == 172 && b >= 16 && b < 32) || (a == 192 && b == 168);
+}
+
+Bool all_digits(Str s, Int i) {
+    if (str_len(s) == 0) { return false; }
+    if (i >= str_len(s)) { return true; }
+    Int c = str_char_at(s, i);
+    return c >= 48 && c <= 57 && all_digits(s, i + 1);
+}
+
+// Four decimal octets 0..255, without leading zeros.
+Bool octets_ok(List(Str) ls, Int i) {
+    if (i >= ls.len()) { return true; }
+    Str o = ls[i];
+    Bool ok = all_digits(o, 0) && str_len(o) <= 3 && (str_len(o) == 1 || str_char_at(o, 0) != 48) && str_parse_int(o) <= 255;
+    return ok && octets_ok(ls, i + 1);
 }
 
 // ─── How far the witnesses co-signed a log (SPEC 20.3, POST /head) ──
@@ -448,16 +500,19 @@ Option(WitnessHead) head_from(Endpoint e, List(Int) wkey, List(Int) l, List(Int)
 // order of `ws` (None for a witness that did not answer).
 @requires(network, clock(readonly), declassify)
 pub List(Option(WitnessHead)) witness_heads(List(WitnessRef) ws, Str ca, List(Int) l) {
-    List(Option(WitnessHead)) hs = heads_from(ws, ca, l, random_bytes(32), 0, []);
+    List(Option(WitnessHead)) hs = heads_from(ws, ca, l, random_bytes(32), 0, [], clock_now_seconds() + witness_deadline_secs());
     return hs;
 }
 
+// Each witness asked in turn; after `until` the rest count as not
+// answering (R3P-4), which every user of the answers treats as failing
+// closed.
 @requires(network, clock(readonly), declassify)
-List(Option(WitnessHead)) heads_from(List(WitnessRef) ws, Str ca, List(Int) l, List(Int) nonce, Int i, List(Option(WitnessHead)) acc) {
+List(Option(WitnessHead)) heads_from(List(WitnessRef) ws, Str ca, List(Int) l, List(Int) nonce, Int i, List(Option(WitnessHead)) acc, Int until) {
     if (i >= ws.len()) { return acc; }
-    Option(Endpoint) oe = endpoint_of_url(ws[i].url, ca);
+    Option(Endpoint) oe = if (i > 0 && clock_now_seconds() > until) { None } else { endpoint_of_url(ws[i].url, ca) };
     Option(WitnessHead) h = match oe { None => None, Some(e) => head_from(e, ws[i].key, l, nonce) };
-    return heads_from(ws, ca, l, nonce, i + 1, acc.concat([h]));
+    return heads_from(ws, ca, l, nonce, i + 1, acc.concat([h]), until);
 }
 
 // Whether the head `vh` is the log's head as a majority of its policy's

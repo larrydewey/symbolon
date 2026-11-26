@@ -33,8 +33,11 @@
 //                              [event, [time, r || s]], its claim over ["symbolon v1
 //                              relay claim", name, log, n, H(event), time]; 409 with
 //                              the same record for the event it claimed there before
-//                              when this is another; 403 when the event is not valid
-//                              there or the log's policy names another relay
+//                              when this is another (with a third item, the claims
+//                              there that lapsed, R3P-6); 403 when the event is not valid
+//                              there, the log's policy names another relay, or a witness
+//                              at a private address without --allow-private-witnesses
+//                              (R3P-4); 429 with two claims of the log in progress
 //   GET  /directory/<org>      the company directory (scim.resid) for an owner's or
 //                              administrator's device; 404 when there is none
 //   /scim/v2/...               the directory's SCIM 2.0 service (scim.resid)
@@ -75,7 +78,13 @@ import "clock.resid";
 // `names`: the "HOST:PORT"s devices reach the relay at, comma-separated
 // (--name); a device signs one of them into its sign-in. With none (and no
 // console) the relay takes the name the device signed, unchecked.
-pub type RelayCfg = { StoreCfg store; Str ca; Str console; Str names; };
+// `private_witnesses`: whether the relay calls witnesses at loopback,
+// private or link-local addresses (relay serve --allow-private-witnesses:
+// tests and a household box, SPEC 20.5); otherwise a log naming one is
+// refused before any call (R3P-4). `allowed_witnesses`: HOST:PORT,
+// comma-separated, of private witnesses called all the same (relay serve
+// --allow-witness: the household box's own and the ones it was given).
+pub type RelayCfg = { StoreCfg store; Str ca; Str console; Str names; Bool private_witnesses; Str allowed_witnesses; };
 
 // The relay's names: --name, and the console's origin (it is served on
 // the relay's own port).
@@ -299,6 +308,8 @@ HttpReply signed_in(RelayCfg g, Store root, VerifiedHead vh, List(Int) l, List(S
 // its devices, with the same key.
 @requires(filesystem, network, clock(readonly), declassify)
 HttpReply witnessed(RelayCfg g, Store root, VerifiedHead vh, List(Int) l, List(SignedEvent) evs, Int t, Party x) {
+    // No call to a witness this relay does not call (R3P-4).
+    if (!g.private_witnesses && witnesses_private(vh.head.policy.witnesses, g.allowed_witnesses)) { return http_reply_status(403); }
     Int now = witness_now(witnesses_at(vh.head.policy.witnesses, ""), g.ca, random_bytes(32));
     Result(VerifiedHead, SymbolonError) rv = il_verify(l, evs, if (now > t) { now } else { t }, lambda(y) { false });
     Bool still = match rv {
@@ -1035,7 +1046,7 @@ HttpReply handle(RelayCfg g, Store root, HttpRequest r) {
     if (kind == "mbox-open" && r.method == "POST" && p.len() == 3) { return http_reply_status(mbox_open_take(root, p[2], http_body_text(r), clock_now_seconds())); }
     if (kind == "mbox" || kind == "log") { return plain(root, r, p); }
     if (r.path == "/claim-key" && r.method == "GET") { return claim_key_reply(root); }
-    if (kind == "claim" && r.method == "POST" && p.len() == 4) { return claim_reply(g.ca, root, p[2], p[3], r.body); }
+    if (kind == "claim" && r.method == "POST" && p.len() == 4) { return claim_reply(g, root, p[2], p[3], r.body); }
     if (p.len() != 3 || (kind != "blob" && kind != "list") || !blob_ok(p[2], 0)) { return http_reply_status(404); }
     Who w = who_of(g, root, r);
     Str name = p[2];
@@ -1244,15 +1255,21 @@ HttpReply claim_key_reply(Store root) {
 }
 
 @requires(filesystem, network, clock(readonly), declassify)
-HttpReply claim_reply(Str ca, Store root, Str who, Str n, List(Int) body) {
-    HttpReply r = claim_reply_at(ca, root, who, n, body, -1);
+HttpReply claim_reply(RelayCfg g, Store root, Str who, Str n, List(Int) body) {
+    HttpReply r = claim_reply_at(ClaimEnv {.ca = g.ca, .private_ok = g.private_witnesses, .allowed = g.allowed_witnesses, .time = -1, .heads = []}, root, who, n, body);
     return r;
 }
 
-// As POST /claim, judged at witness time `t` (the relay's tests); with `t`
-// negative, the time the log's witnesses give now.
+// How a claim is decided: `ca` for the witnesses; `private_ok`, whether
+// witnesses on loopback, private or link-local addresses may be called
+// (--allow-private-witnesses), or those of them in `allowed`
+// (--allow-witness); `time` >= 0, the witness time to judge at
+// (the relay's tests), with `heads` the witnesses' answers to POST /head;
+// `time` negative: both asked of the log's witnesses now.
+pub type ClaimEnv = { Str ca; Bool private_ok; Str allowed; Int time; List(Option(WitnessHead)) heads; };
+
 @requires(filesystem, network, clock(readonly), declassify)
-pub HttpReply claim_reply_at(Str ca, Store root, Str who, Str n, List(Int) body, Int t) {
+pub HttpReply claim_reply_at(ClaimEnv env, Store root, Str who, Str n, List(Int) body) {
     if (!hex_len(who, 64) || !dec_ok(n, 0) || str_parse_int(n) < 1) { return http_reply_status(404); }
     if (body.len() > max_body()) { return http_reply_status(413); }
     Int seq = str_parse_int(n);
@@ -1260,19 +1277,42 @@ pub HttpReply claim_reply_at(Str ca, Store root, Str who, Str n, List(Int) body,
     Option(SignedEvent) oe = match se { None => None, Some(x) => signed_of(x) };
     return match oe {
         None => http_reply_status(400),
-        Some(e) => claim_event(ca, root, cose_hex_decode(who), seq, e, body, t)
+        Some(e) => claim_event(env, root, cose_hex_decode(who), seq, e, body)
     };
 }
 
-// The record held for (l, seq), if any: 200 when it is this event's, 409
-// (with it) when another's.
-HttpReply claim_held(List(Int) rec, List(Int) d) {
-    Option(ClaimRecord) cr = claim_record_of(rec);
-    return match cr {
-        None => http_reply_status(500),
-        Some(x) => http_reply_bytes(if (bytes_eq(claimed_digest(x.event), d)) { 200 } else { 409 }, "application/cbor", rec)
+// The claim in force at a (log, n): generation `gen` (0 the first claim,
+// "claim/<log>/<n>"; g >= 1 a claim made after the one before it lapsed,
+// "claim/<log>/<n>-g<g>", R3P-6) and its record, and the records of the
+// lapsed ones, oldest first. `gen` -1: no claim.
+type ClaimCur = { Int gen; List(Int) rec; List(List(Int)) lapsed; };
+
+pub Int max_lapses() { return 8; }
+
+Str claim_gen_key(Str k, Int g) { return if (g == 0) { k } else { k + "-g" + f"{g}" }; }
+
+@requires(filesystem, network, clock(readonly), declassify)
+ClaimCur claim_current(Store root, Str k, Int g, List(List(Int)) seen) {
+    Option(List(Int)) had = st_get(root, claim_gen_key(k, g));
+    return match had {
+        None => if (g == 0) { ClaimCur {.gen = -1, .rec = [], .lapsed = []} } else { ClaimCur {.gen = g - 1, .rec = seen[seen.len() - 1], .lapsed = seen[0..seen.len() - 1]} },
+        Some(r) => if (g >= max_lapses()) { ClaimCur {.gen = g, .rec = r, .lapsed = seen} } else { claim_current(root, k, g + 1, seen.concat([r])) }
     };
 }
+
+// The answer for the claim in force: 200 when it is on the event with
+// digest `d`, else 409; the record, with the lapsed claims' records as a
+// third item when there are any (event_decode.resid claim_record_of).
+HttpReply claim_answer(ClaimCur cur, List(Int) d) {
+    Option(ClaimRecord) cr = claim_record_of(cur.rec);
+    List(Int) body = if (cur.lapsed.len() == 0) { cur.rec } else { cbe_array(3, []).concat(cur.rec[1..cur.rec.len()]).concat(cbe_array(cur.lapsed.len(), [])).concat(flat(cur.lapsed, 0, [])) };
+    return match cr {
+        None => http_reply_status(500),
+        Some(x) => http_reply_bytes(if (bytes_eq(claimed_digest(x.event), d)) { 200 } else { 409 }, "application/cbor", body)
+    };
+}
+
+List(Int) flat(List(List(Int)) xs, Int i, List(Int) acc) { return if (i >= xs.len()) { acc } else { flat(xs, i + 1, acc.concat(xs[i])) }; }
 
 List(Int) claimed_digest(List(Int) stored) {
     Option(StoredEvent) se = event_of_cbor(stored);
@@ -1280,18 +1320,82 @@ List(Int) claimed_digest(List(Int) stored) {
 }
 
 @requires(filesystem, network, clock(readonly), declassify)
-HttpReply claim_event(Str ca, Store root, List(Int) l, Int seq, SignedEvent e, List(Int) body, Int given) {
+HttpReply claim_event(ClaimEnv env, Store root, List(Int) l, Int seq, SignedEvent e, List(Int) body) {
     if ((Int)e.payload.sequence != seq) { return http_reply_status(400); }
     List(Int) d = sha256_bytes(e.encoded);
     Str k = "claim/" + hex_encode(l) + "/" + f"{seq}";
-    Option(List(Int)) had = st_get(root, k);
-    if (match had { None => false, Some(_) => true }) { return claim_held(had else { [] }, d); }
+    ClaimCur cur = claim_current(root, k, 0, []);
+    if (cur.gen >= 0 && bytes_eq(claimed_digest(rec_event(cur.rec)), d)) { return claim_answer(cur, d); }
     List(SignedEvent) all = log_dir(root, l, (UInt(64))0, []);
     if (all.len() < seq) { return http_reply_text(403, "text/plain", "the log before this sequence is not here"); }
+    // Taken in the log already, or claimed for another event too recently
+    // for that claim to have lapsed (or too often): the claim stands.
+    if (cur.gen >= 0 && (all.len() > seq || cur.gen >= max_lapses() || clock_now_seconds() < rec_time(cur.rec) + claim_margin_secs())) { return claim_answer(cur, d); }
     // Not an event that follows the log stored here: refused before the
     // witnesses are asked anything.
     Bool follows = opt_bytes_is(e.payload.log_id, l) && opt_bytes_is(e.payload.predecessor_digest, sha256_bytes(all[seq - 1].encoded));
     if (!follows) { return http_reply_text(403, "text/plain", "not the next event of this log"); }
+    // Nor one that is not valid there at the last event's witness time
+    // or once everything pending has taken effect (R3P-4): checked
+    // offline, so a request carrying no valid signature of the log's keys
+    // makes the relay call no witness.
+    List(SignedEvent) before = all[0..seq];
+    Str pre = offline_problem(l, before, e);
+    if (str_len(pre) > 0) { return http_reply_text(403, "text/plain", pre); }
+    List(WitnessRef) ws = il_witnesses(l, before);
+    if (!env.private_ok && witnesses_private(ws, env.allowed)) {
+        return http_reply_text(403, "text/plain", "the log's policy names a witness at a loopback, private or link-local address, which this relay does not call (relay serve --allow-private-witnesses)");
+    }
+    // At most claim_slots() claims of one log at once (R3P-4).
+    Str lease = claim_lease(root, l, 0);
+    if (str_len(lease) == 0) { return http_reply_text(429, "text/plain", "too many claims of this log at once"); }
+    HttpReply r = claim_decide(env, root, k, l, seq, e, body, d, before, ws, cur);
+    _ = st_delete(root, lease);
+    return r;
+}
+
+// Why event `e` is not valid as the next event of `before` at its last
+// event's witness time nor once everything pending there has taken
+// effect; "" when it is at one of the two.
+Str offline_problem(List(Int) l, List(SignedEvent) before, SignedEvent e) {
+    Result(NextOk, SymbolonError) a = il_next(l, before, e, 0, lambda(x) { false });
+    Str why = match a { Ok(_) => "", Err(w) => match w { ErrInvalidLog(m) => m, _ => "refused" } };
+    if (str_len(why) == 0) { return ""; }
+    Int later = il_settled_time(l, before);
+    Result(NextOk, SymbolonError) b = il_next(l, before, e, later, lambda(x) { false });
+    return match b { Ok(_) => "", Err(_) => why };
+}
+
+List(Int) rec_event(List(Int) rec) {
+    Option(ClaimRecord) cr = claim_record_of(rec);
+    return match cr { None => [], Some(x) => x.event };
+}
+
+Int rec_time(List(Int) rec) {
+    Option(ClaimRecord) cr = claim_record_of(rec);
+    return match cr { None => 0, Some(x) => x.claim.time };
+}
+
+pub Int claim_slots() { return 2; }
+pub Int claim_lease_secs() { return 120; }
+
+// One of claim_slots() leases on claims of `l` ("claimlock/<log>/<i>",
+// holding the time it was taken; one older than claim_lease_secs() is a
+// crashed process's and taken over); "" when every slot is busy.
+@requires(filesystem, network, clock(readonly), declassify)
+Str claim_lease(Store root, List(Int) l, Int i) {
+    if (i >= claim_slots()) { return ""; }
+    Str k = "claimlock/" + hex_encode(l) + f"/{i}";
+    Int now = clock_now_seconds();
+    if (st_put_new(root, k, utf8(f"{now}")) == 1) { return k; }
+    Str held = st_read_text(root, k);
+    Bool stale = dec_ok(held, 0) && str_parse_int(held) + claim_lease_secs() < now;
+    if (stale && st_delete(root, k) && st_put_new(root, k, utf8(f"{now}")) == 1) { return k; }
+    return claim_lease(root, l, i + 1);
+}
+
+@requires(filesystem, network, clock(readonly), declassify)
+HttpReply claim_decide(ClaimEnv env, Store root, Str k, List(Int) l, Int seq, SignedEvent e, List(Int) body, List(Int) d, List(SignedEvent) before, List(WitnessRef) ws, ClaimCur cur) {
     // Valid as the next event of the log stored here at witness time,
     // the time the witnesses will check it at (SPEC 20.3: a majority of
     // the policy's witnesses is trusted for time; the relay's own clock
@@ -1301,15 +1405,67 @@ HttpReply claim_event(Str ca, Store root, List(Int) l, Int seq, SignedEvent e, L
     // as a recovery's delay runs) must not hold a sequence the witnesses
     // would then refuse it at. No witness time (a majority did not
     // answer): no claim.
-    Int now = if (given >= 0) { given } else { witness_now(witnesses_at(il_witnesses(l, all[0..seq]), ""), ca, random_bytes(32)) };
+    Int now = if (env.time >= 0) { env.time } else { witness_now(witnesses_at(ws, ""), env.ca, random_bytes(32)) };
     if (now <= 0) { return http_reply_text(503, "text/plain", "the log's witnesses did not give the time"); }
-    Result(NextOk, SymbolonError) ok = il_next(l, all[0..seq], e, now, lambda(x) { false });
-    Result(NextOk, SymbolonError) later = il_next(l, all[0..seq], e, now + claim_margin_secs(), lambda(x) { false });
+    // A claim on another event lapses (R3P-6) only once that event can no
+    // longer be co-signed and no majority of the witnesses co-signed it:
+    // the new claim then carries the lapsed ones as evidence.
+    if (cur.gen >= 0) {
+        List(Option(WitnessHead)) hs = if (env.time >= 0) { env.heads } else { witness_heads(witnesses_at(ws, ""), env.ca, l) };
+        Str stays = lapse_problem(l, before, rec_event(cur.rec), now, hs, ws.len(), seq);
+        if (str_len(stays) > 0) { return claim_answer(cur, d); }
+    }
+    Result(NextOk, SymbolonError) ok = il_next(l, before, e, now, lambda(x) { false });
+    Result(NextOk, SymbolonError) later = il_next(l, before, e, now + claim_margin_secs(), lambda(x) { false });
     Str why = match later { Ok(_) => "", Err(w) => match w { ErrInvalidLog(m) => m + " (in " + f"{claim_margin_secs()}" + " seconds)", _ => "refused" } };
+    List(List(Int)) lapsed = if (cur.gen >= 0) { cur.lapsed.concat([cur.rec]) } else { [] };
     return match ok {
         Err(w) => http_reply_text(403, "text/plain", match w { ErrInvalidLog(m) => m, _ => "refused" }),
-        Ok(nx) => if (str_len(why) > 0) { http_reply_text(403, "text/plain", why) } else { claim_new(ca, root, k, l, seq, d, nx, stored_bare(e, body)) }
+        Ok(nx) => if (str_len(why) > 0) { http_reply_text(403, "text/plain", why) } else { claim_new(env.ca, root, k, cur.gen + 1, lapsed, l, seq, d, nx, stored_bare(e, body)) }
     };
+}
+
+// Why the claim on the stored event `old` at `seq` (as the relay stores
+// it) has not lapsed at witness time `now` (R3P-6); "" when it has: the
+// event can no longer be co-signed by any witness (core/log.resid
+// il_lapsed), and of the `n` witnesses' answers `hs` to POST /head none
+// is past `seq` and those that co-signed it at `seq` and those that did
+// not answer are not a majority between them.
+pub Str lapse_problem(List(Int) l, List(SignedEvent) before, List(Int) old, Int now, List(Option(WitnessHead)) hs, Int n, Int seq) {
+    Option(StoredEvent) se = event_of_cbor(old);
+    Option(SignedEvent) oe = match se { None => None, Some(x) => signed_of(x) };
+    return match oe {
+        None => "the claimed event does not parse",
+        Some(ev) => lapse_heads(l, before, ev, now, hs, n, seq)
+    };
+}
+
+Str lapse_heads(List(Int) l, List(SignedEvent) before, SignedEvent ev, Int now, List(Option(WitnessHead)) hs, Int n, Int seq) {
+    if (!il_lapsed(l, before, ev, now)) { return "the claimed event can still be co-signed"; }
+    if (hs.len() != n || head_past_any(hs, seq, 0)) { return "the witnesses co-signed past this sequence"; }
+    Int held = held_at(hs, seq, sha256_bytes(ev.encoded), 0, 0);
+    Int silent = n - answered(hs, 0, 0);
+    return if ((held + silent) * 2 > n) { "a majority of the witnesses may hold the claimed event" } else { "" };
+}
+
+Bool head_past_any(List(Option(WitnessHead)) hs, Int seq, Int i) {
+    if (i >= hs.len()) { return false; }
+    Option(WitnessHead) o = hs[i];
+    Bool past = match o { None => false, Some(h) => h.digest.len() == 32 && h.seq > seq };
+    return past || head_past_any(hs, seq, i + 1);
+}
+
+Int held_at(List(Option(WitnessHead)) hs, Int seq, List(Int) d, Int i, Int acc) {
+    if (i >= hs.len()) { return acc; }
+    Option(WitnessHead) o = hs[i];
+    Bool here = match o { None => false, Some(h) => h.seq == seq && bytes_eq(h.digest, d) };
+    return held_at(hs, seq, d, i + 1, acc + (if (here) { 1 } else { 0 }));
+}
+
+Int answered(List(Option(WitnessHead)) hs, Int i, Int acc) {
+    if (i >= hs.len()) { return acc; }
+    Option(WitnessHead) o = hs[i];
+    return answered(hs, i + 1, acc + (match o { None => 0, Some(_) => 1 }));
 }
 
 pub Int claim_margin_secs() { return 300; }
@@ -1322,7 +1478,7 @@ List(Int) stored_bare(SignedEvent e, List(Int) body) {
 }
 
 @requires(filesystem, network, clock(readonly), declassify)
-HttpReply claim_new(Str ca, Store root, Str k, List(Int) l, Int seq, List(Int) d, NextOk nx, List(Int) ev) {
+HttpReply claim_new(Str ca, Store root, Str k, Int gen, List(List(Int)) lapsed, List(Int) l, Int seq, List(Int) d, NextOk nx, List(Int) ev) {
     List(WitnessRef) sq = nx.sequencer;
     List(Int) priv = claim_priv(root);
     if (priv.len() != 32) { return http_reply_status(500); }
@@ -1335,7 +1491,7 @@ HttpReply claim_new(Str ca, Store root, Str k, List(Int) l, Int seq, List(Int) d
     Int t = clock_now_seconds();
     RelayClaim c = RelayClaim {.time = t, .sig = ecdsa_sign_raw(P256, Sha256, priv, claim_message(name, l, seq, d, t))};
     List(Int) rec = claim_record_cbor(ev, c);
-    Int w = st_put_new(root, k, rec);
+    Int w = st_put_new(root, claim_gen_key(k, gen), rec);
     if (w == 1) {
         // The relay carries the claimed event to the witnesses itself, at
         // once: a key holder who claims a sequence and never asks the
@@ -1343,11 +1499,11 @@ HttpReply claim_new(Str ca, Store root, Str k, List(Int) l, Int seq, List(Int) d
         // reached now, any device that is answered with this claim
         // carries the event later).
         _ = claim_complete(ca, root, l, seq, d, nx.witnesses, ev, c);
-        return http_reply_bytes(200, "application/cbor", rec);
+        return claim_answer(ClaimCur {.gen = gen, .rec = rec, .lapsed = lapsed}, d);
     }
     if (w < 0) { return http_reply_status(500); }
     // Another request claimed it first: that one stands.
-    return claim_held(st_bytes(root, k), d);
+    return claim_answer(claim_current(root, k, 0, []), d);
 }
 
 // The claimed event at `seq`, co-signed by a majority of `ws` (the
@@ -1358,7 +1514,7 @@ Bool claim_complete(Str ca, Store root, List(Int) l, Int seq, List(Int) d, List(
     if (ws.len() == 0) { return false; }
     List(List(Int)) shown = raw_events(root, l, 0, seq, []).concat([ev]);
     if (shown.len() != seq + 1) { return false; }
-    List(WitnessCosignature) cs = claim_cosigs(ws, ca, l, seq, d, shown, c, 0, []);
+    List(WitnessCosignature) cs = claim_cosigs(ws, ca, l, seq, d, shown, c, 0, [], clock_now_seconds() + witness_deadline_secs());
     if (cs.len() * 2 <= ws.len()) { return false; }
     Option(StoredEvent) se = event_of_cbor(ev);
     StoredEvent x = se else { StoredEvent {.encoded = [], .sigs = [], .cosigs = []} };
@@ -1376,12 +1532,15 @@ List(List(Int)) raw_events(Store root, List(Int) l, Int i, Int n, List(List(Int)
     return raw_events(root, l, i + 1, n, acc.concat([b]));
 }
 
+// Each witness asked in turn until `until` (R3P-4: the relay's whole time
+// on the witnesses is bounded, however many a log names); the ones left
+// are not asked, and the devices carry the event to them.
 @requires(network, clock(readonly), declassify)
-List(WitnessCosignature) claim_cosigs(List(WitnessRef) ws, Str ca, List(Int) l, Int seq, List(Int) d, List(List(Int)) shown, RelayClaim c, Int i, List(WitnessCosignature) acc) {
-    if (i >= ws.len()) { return acc; }
+List(WitnessCosignature) claim_cosigs(List(WitnessRef) ws, Str ca, List(Int) l, Int seq, List(Int) d, List(List(Int)) shown, RelayClaim c, Int i, List(WitnessCosignature) acc, Int until) {
+    if (i >= ws.len() || clock_now_seconds() > until) { return acc; }
     Option(Endpoint) oe = endpoint_of_url(ws[i].url, ca);
     Option(WitnessCosignature) w = match oe { None => None, Some(e) => cosign_try(e, ws[i].key, l, (UInt(64))seq, d, shown, Some(c)).cosig };
-    return claim_cosigs(ws, ca, l, seq, d, shown, c, i + 1, match w { None => acc, Some(x) => acc.concat([x]) });
+    return claim_cosigs(ws, ca, l, seq, d, shown, c, i + 1, match w { None => acc, Some(x) => acc.concat([x]) }, until);
 }
 
 // A mailbox message is one HPKE envelope of one Packet (net/proto.resid).

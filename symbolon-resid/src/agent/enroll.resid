@@ -61,7 +61,7 @@ Bool in_seqs(List(UInt(64)) xs, UInt(64) s, Int i) {
     return in_seqs(xs, s, i + 1);
 }
 
-EventPayload next_event(VerifiedHead vh, EventBody b, List(List(Int)) digests) {
+pub EventPayload next_event(VerifiedHead vh, EventBody b, List(List(Int)) digests) {
     return EventPayload {.log_id = Some(vh.head.log_id), .sequence = vh.head.sequence + 1, .predecessor_digest = Some(vh.head.digest),
                          .suite = 1, .body = b, .next_recovery_key_digests = digests, .advisory_time = (UInt(64))0};
 }
@@ -73,7 +73,11 @@ EventPayload next_event(VerifiedHead vh, EventBody b, List(List(Int)) digests) {
 // log whose policy names a sequencing relay is co-signed only with that
 // relay's claim. A relay that does not sequence (404) gives none: the
 // witnesses then co-sign as before for a log whose policy names no relay,
-// and refuse for one that does.
+// and refuse for one that does. A relay that gives no claim, or claims
+// another event that is then not witnessed, cannot hold back what it must
+// not (R3P-3): the event goes to the witnesses without a claim, and they
+// co-sign it if it is a veto of what the kit filed or an escape
+// set-policy (core/log.resid il_claimless), and refuse anything else.
 @requires(network, clock(readonly), declassify)
 pub Result(VerifiedHead, Str) publish_event(DeviceConfig c, EventPayload p, List(Int) enc, List(EventSig) sigs) {
     List(List(Int)) before = log_raw(relay_ep(c), c.log_id);
@@ -82,15 +86,18 @@ pub Result(VerifiedHead, Str) publish_event(DeviceConfig c, EventPayload p, List
     List(Int) bare = cbor_of_event(StoredEvent {.encoded = enc, .sigs = sigs, .cosigs = []});
     List(Int) d = sha256_bytes(enc);
     ClaimOut co = claim_post(relay_ep(c), c.log_id, p.sequence, bare);
-    if (co.status == 409) { return Err(claimed_by_other(c, before, p.sequence, co)); }
+    Taken tk = if (co.status == 409) { claimed_by_other(c, before, p.sequence, co) } else { Taken {.done = false, .msg = ""} };
+    if (tk.done) { return Err(tk.msg); }
     Option(RelayClaim) cl = if (co.status == 200) { co.claim } else { None };
     List(WitnessEp) ws = witnesses_for(c, before);
     List(CosignOut) outs = cosign_all(ws, c.ca, c.log_id, p.sequence, d, before.concat([bare]), cl, 0, []);
     List(WitnessCosignature) cs = cosigs_in(outs, 0, []);
     if (cs.len() * 2 <= ws.len() || cs.len() < 2) {
+        if (str_len(tk.msg) > 0) { return Err(tk.msg); }
         // The relay's two claims at one sequence, when the witnesses hold
-        // another event under a claim of the same relay.
-        Str eq = equivocation(c, before, p.sequence, d, cl, outs);
+        // another event under a claim of the same relay (not one it
+        // showed as lapsed, R3P-6).
+        Str eq = equivocation(c, before, p.sequence, d, cl, co.lapsed, outs);
         if (str_len(eq) > 0) { return Err(eq); }
         // The freeze alarm (SPEC 20.4): witnesses that co-signed different
         // events at this sequence, so none can get a majority there.
@@ -147,11 +154,13 @@ Bool relay_holds(Endpoint relay, List(Int) l, UInt(64) seq, List(Int) d) {
 // finishes cannot stall the log. Then it reports which event took the
 // sequence; one this principal did not make is pending at worst (a
 // single key's authority event or recovery is delayed) and can be vetoed.
+type Taken = { Bool done; Str msg; };
+
 @requires(network, clock(readonly), declassify)
-Str claimed_by_other(DeviceConfig c, List(List(Int)) before, UInt(64) n, ClaimOut co) {
+Taken claimed_by_other(DeviceConfig c, List(List(Int)) before, UInt(64) n, ClaimOut co) {
     Option(StoredEvent) se = event_of_cbor(co.event);
     List(Int) od = match se { None => [], Some(x) => sha256_bytes(x.encoded) };
-    if (od.len() == 0) { return f"the relay claimed sequence {n} of the log for another event it does not show"; }
+    if (od.len() == 0) { return Taken {.done = false, .msg = f"the relay claimed sequence {n} of the log for another event it does not show"}; }
     List(WitnessEp) ws = witnesses_for(c, before);
     List(CosignOut) outs = cosign_all(ws, c.ca, c.log_id, n, od, before.concat([co.event]), co.claim, 0, []);
     List(WitnessCosignature) cs = cosigs_in(outs, 0, []);
@@ -159,7 +168,7 @@ Str claimed_by_other(DeviceConfig c, List(List(Int)) before, UInt(64) n, ClaimOu
     Bool done = cs.len() * 2 > ws.len() && cs.len() >= 2
         && (log_put(relay_ep(c), c.log_id, n, cbor_of_event(StoredEvent {.encoded = x.encoded, .sigs = x.sigs, .cosigs = cs})) || relay_holds(relay_ep(c), c.log_id, n, od));
     Str what = f"sequence {n} of the log is claimed at the relay by another event (digest {hex_encode(od)})";
-    return what + if (done) { ", now witnessed and stored: check it (device status) and try again" } else { ", not witnessed yet" };
+    return Taken {.done = done, .msg = what + if (done) { ", now witnessed and stored: check it (device status) and try again" } else { ", not witnessed yet" }};
 }
 
 // ─── `device sequence DIR [HOST:PORT]` (SPEC 20.3) ───────────────
@@ -393,13 +402,28 @@ Int witnesses_published(Policy p0, Policy np, VerifiedHead vh) {
 // Proof that the log's relay equivocated (SPEC 20.4): it claimed `d` at
 // `n` for this device (`cl`) and a witness holds another digest there
 // under a claim of the same relay. "" when there is no such pair.
-Str equivocation(DeviceConfig c, List(List(Int)) before, UInt(64) n, List(Int) d, Option(RelayClaim) cl, List(CosignOut) outs) {
+@requires(network, clock(readonly), declassify)
+Str equivocation(DeviceConfig c, List(List(Int)) before, UInt(64) n, List(Int) d, Option(RelayClaim) cl, List(List(Int)) lapsed, List(CosignOut) outs) {
     RelayClaim mine = cl else { RelayClaim {.time = -1, .sig = []} };
     if (mine.time < 0) { return ""; }
-    List(WitnessRef) sq = il_sequencer(c.log_id, events_of_raw(before, 0, []));
+    List(SignedEvent) bs = events_of_raw(before, 0, []);
+    List(WitnessRef) sq = il_sequencer(c.log_id, bs);
     if (sq.len() == 0 || !claim_ok(sq[0], c.log_id, (Int)n, d, mine)) { return ""; }
-    Str why = equivocation_in(sq[0], c.log_id, (Int)n, d, mine, outs, 0);
+    // A claim the relay says lapsed counts as lapsed only if its event can
+    // no longer be co-signed, at witness time now.
+    Int now = if (lapsed.len() == 0) { 0 } else { witness_now(refs_of_eps(witnesses_for(c, before), 0, []), c.ca, random_bytes(32)) };
+    List(List(Int)) gone = if (now > 0) { really_lapsed(c.log_id, bs, lapsed, now, 0, []) } else { [] };
+    Str why = equivocation_after(sq[0], c.log_id, (Int)n, d, mine, gone, outs, 0);
     return why;
+}
+
+List(List(Int)) really_lapsed(List(Int) l, List(SignedEvent) bs, List(List(Int)) recs, Int now, Int i, List(List(Int)) acc) {
+    if (i >= recs.len()) { return acc; }
+    Option(ClaimRecord) r = claim_record_of(recs[i]);
+    Option(StoredEvent) se = match r { None => None, Some(x) => event_of_cbor(x.event) };
+    Option(SignedEvent) e = match se { None => None, Some(x) => signed_of(x) };
+    Bool gone = match e { None => false, Some(x) => il_lapsed(l, bs, x, now) };
+    return really_lapsed(l, bs, recs, now, i + 1, if (gone) { acc.concat([recs[i]]) } else { acc });
 }
 
 // ─── `device protection enable DIR [PRIMES]` (SPEC 18.10.1) ─────

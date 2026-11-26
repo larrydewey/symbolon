@@ -361,18 +361,62 @@ pub Option(ClaimAt) claim_at(List(Int) b, Int p) {
 }
 
 // The relay's record of a claim (agent/relaysrv.resid): CBOR [bstr event
-// (as the relay stores it), [time, r || s]].
+// (as the relay stores it), [time, r || s]]; after claims at the same
+// sequence lapsed (R3P-6), CBOR [bstr event, [time, r || s], [record,
+// ...]], the lapsed claims' records, oldest first, as evidence.
 pub type ClaimRecord = { List(Int) event; RelayClaim claim; };
 
 pub Option(ClaimRecord) claim_record_of(List(Int) b) {
-    Int a = arr_at(b, 0, 2);
-    RB ev = r_bytes(b, a);
-    if (a < 0 || ev.next < 0) { return None; }
+    Rd h = rd(b, 0);
+    if (h.major != 4 || (h.val != 2 && h.val != 3)) { return None; }
+    ClaimEnd e = claim_end(b, h.next);
+    Bool whole = if (h.val == 2) { e.next == b.len() } else { lapsed_end(b, e.next) == b.len() };
+    return if (e.next > 0 && whole) { Some(ClaimRecord {.event = e.event, .claim = e.claim}) } else { None };
+}
+
+// The records of the lapsed claims a claim record carries ([] for none).
+pub List(List(Int)) claim_lapsed_of(List(Int) b) {
+    Rd h = rd(b, 0);
+    if (h.major != 4 || h.val != 3) { return []; }
+    ClaimEnd e = claim_end(b, h.next);
+    if (e.next < 0) { return []; }
+    Rd la = rd(b, e.next);
+    if (la.major != 4 || la.val > 16) { return []; }
+    return lapsed_items(b, la.next, la.val, []);
+}
+
+type ClaimEnd = { List(Int) event; RelayClaim claim; Int next; };
+
+// bstr event, [time, r || s] from `p` (the items after a record's header).
+ClaimEnd claim_end(List(Int) b, Int p) {
+    ClaimEnd none = ClaimEnd {.event = [], .claim = RelayClaim {.time = -1, .sig = []}, .next = -1};
+    RB ev = r_bytes(b, p);
+    if (p < 0 || ev.next < 0) { return none; }
     Option(ClaimAt) c = claim_at(b, ev.next);
-    return match c {
-        None => None,
-        Some(x) => if (x.next == b.len()) { Some(ClaimRecord {.event = ev.v, .claim = x.claim}) } else { None }
-    };
+    return match c { None => none, Some(x) => ClaimEnd {.event = ev.v, .claim = x.claim, .next = x.next} };
+}
+
+// Where the array of lapsed records at `p` ends; -1 when it is not one.
+Int lapsed_end(List(Int) b, Int p) {
+    Rd la = rd(b, p);
+    if (la.major != 4 || la.val > 16) { return -1; }
+    return lapsed_skip(b, la.next, la.val);
+}
+
+Int lapsed_skip(List(Int) b, Int p, Int n) {
+    if (n == 0) { return p; }
+    Int a = arr_at(b, p, 2);
+    if (a < 0) { return -1; }
+    ClaimEnd e = claim_end(b, a);
+    return if (e.next < 0) { -1 } else { lapsed_skip(b, e.next, n - 1) };
+}
+
+List(List(Int)) lapsed_items(List(Int) b, Int p, Int n, List(List(Int)) acc) {
+    if (n == 0) { return acc; }
+    Int a = arr_at(b, p, 2);
+    if (a < 0) { return []; }
+    ClaimEnd e = claim_end(b, a);
+    return if (e.next < 0) { [] } else { lapsed_items(b, e.next, n - 1, acc.concat([b[p..e.next]])) };
 }
 
 // What a witness holds at a sequence it refused another digest at (409):

@@ -11,8 +11,10 @@
 //                  co-signed another digest at (log, n) (with CBOR [digest,
 //                  claim or h''], what it holds there) or at a sequence of
 //                  the log shown; 403 when En is not valid as the next event
-//                  of that log or lacks the relay's claim on it; 400 when it
-//                  does not parse.
+//                  of that log or lacks the relay's claim on it (but for
+//                  what the relay cannot hold back, a veto of what the kit
+//                  filed and the escape set-policies, core/log.resid
+//                  il_claimless, R3P-3); 400 when it does not parse.
 //   POST /time     a 32-byte nonce; answers CBOR [time, r || s] over
 //                  ["symbolon v1 witness time", nonce, time] (SPEC 13.4)
 //   POST /head     a 32-byte nonce || a 32-byte log id; answers CBOR
@@ -204,13 +206,23 @@ HttpReply witness_sign(Str root, List(Secret(UInt(8))) wpriv, Int offset, CoReq 
 // are refused here and the sequence cannot be split so that none reaches
 // a majority. The claim is kept beside what was co-signed, as evidence
 // should the relay ever claim another event at the same sequence.
+//
+// Without a claim, only what the relay must not be able to hold back
+// (core/log.resid il_claimless, R3P-3): a device's veto of the pending
+// event the kit filed, the escape set-policies that change or drop the
+// relay, and events after a set-policy that dropped it took effect. This
+// witness holds nothing at this sequence (witness_sign answers from what
+// it holds first), so it never co-signs a second event at one: a relay
+// that claims another event there later is refused with 409 and the
+// claim-less event this witness holds. Kept without a claim ("c<seq>" is
+// not written).
 @requires(filesystem, declassify)
 HttpReply witness_claimed(Str f, Str dir, List(Secret(UInt(8))) wpriv, CoReq q, UInt(64) seq, List(Int) d, NextOk at) {
     Str why = claim_problem(at.sequencer, q.l, (Int)seq, d, q.claim);
-    if (str_len(why) > 0) { return http_reply_text(403, "text/plain", why); }
+    if (str_len(why) > 0 && !at.claimless) { return http_reply_text(403, "text/plain", why); }
     Option(RelayClaim) qc = q.claim;
     List(Int) ck = match qc { None => [], Some(c) => claim_cbor(c) };
-    return witness_store(f, dir, wpriv, q.l, seq, d, at.time, if (at.sequencer.len() > 0) { ck } else { [] });
+    return witness_store(f, dir, wpriv, q.l, seq, d, at.time, if (at.sequencer.len() > 0 && str_len(why) == 0) { ck } else { [] });
 }
 
 // 409 for a second digest at a sequence: CBOR [digest, claim] (claim an

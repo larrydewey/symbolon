@@ -142,7 +142,8 @@ pub type Packet =
   | WAlertConfig(AlertConfig)             // the duress alert settings, asked for or set
   | WAlertState(AlertState)               // and answered
   | WEndDuress(EndDuressReq)              // end a duress window early (SPEC 14.3)
-  | WAlertKey(List(Int));                 // the sender's alert key (household alerts, SPEC 14.4)
+  | WAlertKey(List(Int))                  // the sender's alert key (household alerts, SPEC 14.4)
+  | WVeto(List(Int));                     // a device's signed veto (as stored), to the cosigner (SPEC 13.4, R3P-3)
 
 // What the relay carries: sender and recipient party ids, and the HPKE
 // mode_auth encapsulation and ciphertext of one Packet value.

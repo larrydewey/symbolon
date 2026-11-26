@@ -35,7 +35,7 @@ if [ -n "$LAN" ]; then
   [ -n "$HOST" ] || { echo "cannot find this machine's LAN address"; exit 1; }
   BIND=(--bind 0.0.0.0)
 fi
-cap 4000 "$BIN" relay serve "$DEMO/relay" $RP --name "$HOST:$RP" "${BIND[@]}" > "$DEMO/relay.log" 2>&1 &
+cap 4000 "$BIN" relay serve "$DEMO/relay" $RP --allow-private-witnesses --name "$HOST:$RP" "${BIND[@]}" > "$DEMO/relay.log" 2>&1 &
 WS=()
 for i in 0 1 2; do
   [ -f "$DEMO/w$i.key" ] || cap 4000 "$BIN" witness keygen "$DEMO/w$i.key" > "$DEMO/w$i.pub"

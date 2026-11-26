@@ -344,6 +344,7 @@ Cosigner handle_all(Cosigner c, List(Got) gs, Int i, List(List(UInt(64))) primes
         WAlertConfig(a) => on_alert_config(c, gs[i].from, gs[i].key, a),
         WEndDuress(e) => on_end_duress(c, gs[i].from, e),
         WAlertKey(k) => on_alert_key(c, gs[i].from, k),
+        WVeto(v) => on_veto(c, gs[i].from, v),
         _ => c
     };
     return handle_all(h, gs, i + 1, primes, primes2);
@@ -1100,12 +1101,81 @@ Cosigner on_release(Cosigner c, List(Int) from, List(Int) l) {
             // The head must be the one the witnesses co-signed up to
             // (R2W-5): a relay that cuts the log before a veto is caught
             // by the witnesses that co-signed the veto.
-            Some(half) => match cosigner_release(v.events, v.vh, from, half, random_bytes(32), witness_heads(witnesses_at(v.vh.head.policy.witnesses, local_host(c.dir)), c.cfg.ca, l)) {
+            // And no veto of the recovery a device sent here directly
+            // that the log does not show (R3P-3): a relay that refuses to
+            // claim the veto keeps it out of the log, not from here.
+            Some(half) => match cosigner_release(v.events, v.vh, from, half, random_bytes(32), witness_heads(witnesses_at(v.vh.head.policy.witnesses, local_host(c.dir)), c.cfg.ca, l), held_vetoes(c.dir)) {
                 Err(e) => release_refused(c, from, l, e),
                 Ok(w) => release_sent(c, from, w, v.vh)
             }
         }
     };
+}
+
+// A device's veto sent here directly (SPEC 13.4, R3P-3): kept when it is
+// valid, at witness time now, as the next event of the log the cosigner
+// verified (signed by enough devices of the quorum, its target pending),
+// with that time, as "veto-<target>-<seq>" ("TIME HEX"). The release
+// refuses while one of the recovery is kept and the log does not show it
+// (recovery.resid release_target_held). Only a valid veto is kept, one
+// per target and sequence.
+@requires(network, filesystem, declassify, clock)
+Cosigner on_veto(Cosigner c, List(Int) from, List(Int) raw) {
+    if (c.cfg.log_id.len() == 0 || raw.len() > 65536) { return c; }
+    Option(StoredEvent) se = event_of_cbor(raw);
+    Option(SignedEvent) oe = match se { None => None, Some(x) => signed_of(x) };
+    return match oe {
+        None => cos_fail(c, "a veto that does not decode"),
+        Some(v) => veto_keep(c, v, raw)
+    };
+}
+
+@requires(network, filesystem, declassify, clock)
+Cosigner veto_keep(Cosigner c, SignedEvent v, List(Int) raw) {
+    EventBody b = v.payload.body;
+    Int target = match b { VetoBody(t) => (Int)t, _ => -1 };
+    if (target < 1) { return cos_fail(c, "not a veto"); }
+    Str f = c.dir + "/veto-" + f"{target}-{v.payload.sequence}";
+    if (filesystem.exists(f)) { return c; }
+    Result(LogView, SymbolonError) rv = cos_view(c);
+    return match rv {
+        Err(_) => cos_fail(c, "a veto arrived and the log does not verify"),
+        Ok(lv) => veto_check(c, lv, v, raw, f)
+    };
+}
+
+@requires(network, filesystem, declassify, clock)
+Cosigner veto_check(Cosigner c, LogView lv, SignedEvent v, List(Int) raw, Str f) {
+    Int now = witness_now(witnesses_at(lv.vh.head.policy.witnesses, local_host(c.dir)), c.cfg.ca, random_bytes(32));
+    if (now <= 0) { return cos_fail(c, "a veto arrived and the witnesses gave no time"); }
+    Bool next = (Int)v.payload.sequence == lv.events.len();
+    Result(NextOk, SymbolonError) ok = il_next(c.cfg.log_id, lv.events, v, now, lambda(x) { false });
+    Bool valid = next && match ok { Ok(_) => true, Err(_) => false };
+    if (!valid) { return cos_fail(c, "a veto that is not valid as the log's next event; not kept"); }
+    _ = filesystem.write_all(f, f"{now} " + hex_encode(raw));
+    println("cosigner: holds a device's veto of event " + f"{target_of(v)}");
+    return c;
+}
+
+Int target_of(SignedEvent v) { EventBody b = v.payload.body; return match b { VetoBody(t) => (Int)t, _ => -1 }; }
+
+// The vetoes kept by on_veto.
+@requires(filesystem)
+pub List(HeldVeto) held_vetoes(Str dir) {
+    List(Str) names = filesystem.list_dir(dir);
+    return held_from(dir, names, 0, []);
+}
+
+@requires(filesystem)
+List(HeldVeto) held_from(Str dir, List(Str) names, Int i, List(HeldVeto) acc) {
+    if (i >= names.len()) { return acc; }
+    Str n = names[i];
+    Bool is = str_len(n) > 5 && str_slice(n, 0, 5) == "veto-";
+    List(Str) p = if (is) { str_split(str_trim(filesystem.read_all(dir + "/" + n)), " ") } else { [] };
+    Option(StoredEvent) se = if (p.len() == 2) { event_of_cbor(cose_hex_decode(p[1])) } else { None };
+    Option(SignedEvent) oe = match se { None => None, Some(x) => signed_of(x) };
+    List(HeldVeto) next = match oe { None => acc, Some(v) => acc.concat([HeldVeto {.veto = v, .time = str_parse_int(p[0])}]) };
+    return held_from(dir, names, i + 1, next);
 }
 
 @requires(network, declassify, clock(readonly))

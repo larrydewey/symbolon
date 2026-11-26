@@ -24,8 +24,8 @@ c() { curl -sS -o "$W/out" -w '%{http_code}' "$@"; }
 relays() {   # NAME STORE-SPEC PORT1 PORT2 [--store-ca FILE]
     local name=$1 spec=$2 p1=$3 p2=$4
     printf '%s' "$spec" > "$W/$name.store"
-    ( setsid "$BIN" relay serve "$W/$name-a" "$p1" --name "127.0.0.1:$p1" --store "@$W/$name.store" "${@:5}" > "$W/$name-a.log" 2>&1 & )
-    ( setsid "$BIN" relay serve "$W/$name-b" "$p2" --name "127.0.0.1:$p2" --store "@$W/$name.store" "${@:5}" > "$W/$name-b.log" 2>&1 & )
+    ( setsid "$BIN" relay serve "$W/$name-a" "$p1" --allow-private-witnesses --name "127.0.0.1:$p1" --store "@$W/$name.store" "${@:5}" > "$W/$name-a.log" 2>&1 & )
+    ( setsid "$BIN" relay serve "$W/$name-b" "$p2" --allow-private-witnesses --name "127.0.0.1:$p2" --store "@$W/$name.store" "${@:5}" > "$W/$name-b.log" 2>&1 & )
     wait_port "$p1" && wait_port "$p2" || fail "$name relays did not start"
 }
 

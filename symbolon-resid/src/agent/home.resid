@@ -905,6 +905,7 @@ pub Int home_serve(Str dir, Str self, Str pass_flag, Str run_base) {
     List(Str) cmds = [
         self + " home pair-serve " + dir + " " + sk.server_key,
         self + " relay serve " + dir + f"/relay {c.base + 1}" + tls + " --ca " + trust_file(dir) + " --console-origin https://" + c.hosts[0] + f":{c.base + 1}" + " --name " + relay_names_of(c.hosts, c.base + 1, 0, ListBuf())
+            + " --allow-witness " + str_join(home_witness_allow(dir, c), ",")
     ].concat(witness_cmds(dir, self, c, sk, tls, 1, []));
     println("home serving at " + c.hosts[0] + f" ports {c.base}-{c.base + 4}" + if (sealed) { ", keys unsealed in memory only" } else { "" });
     _ = remind(dir);
@@ -926,6 +927,36 @@ Bool remind(Str dir) {
     Str r = status_reminder(home_status(dir));
     if (str_len(r) > 0) { eprintln("home: " + r); }
     return str_len(r) > 0;
+}
+
+// The witnesses the box's relay may call although they are at a private
+// address (R3P-4): the box's own (every name of it, every witness port)
+// and those the household named, each HOST:PORT. A stranger's log naming
+// another address on the LAN is still refused.
+@requires(filesystem)
+pub List(Str) home_witness_allow(Str dir, HomeCfg c) {
+    List(Str) box = box_ports(c.hosts, c.base, 0, 1, []);
+    List(Str) named = witness_list(dir, c).concat(people_witnesses(dir, filesystem.list_dir(dir + "/people"), 0, []));
+    return box.concat(host_ports(named, 0, []));
+}
+
+List(Str) box_ports(List(Str) hosts, Int base, Int h, Int n, List(Str) acc) {
+    if (h >= hosts.len()) { return acc; }
+    if (n > 3) { return box_ports(hosts, base, h + 1, 1, acc); }
+    return box_ports(hosts, base, h, n + 1, acc.concat([str_to_lower(hosts[h]) + f":{base + 1 + n}"]));
+}
+
+@requires(filesystem)
+List(Str) people_witnesses(Str dir, List(Str) names, Int i, List(Str) acc) {
+    if (i >= names.len()) { return acc; }
+    return people_witnesses(dir, names, i + 1, acc.concat(person_witnesses(dir, names[i])));
+}
+
+// HOST:PORT of each HOST:PORT:KEY.
+List(Str) host_ports(List(Str) ws, Int i, List(Str) acc) {
+    if (i >= ws.len()) { return acc; }
+    List(Str) p = str_split(ws[i], ":");
+    return host_ports(ws, i + 1, if (p.len() == 3) { acc.concat([str_to_lower(p[0]) + ":" + p[1]]) } else { acc });
 }
 
 // Starts cmds[i..] concurrently, then watches for new people.

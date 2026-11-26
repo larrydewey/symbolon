@@ -49,7 +49,7 @@ fi
 echo 0 > "$W/delay"
 proxy() { python3 -I tests/perf/latency_proxy.py "$1" "$2" "$W/delay" "$W/count.$1" > /dev/null 2>&1 & PIDS+=($!); }
 RPX=$(port); RP=$(port)
-runs 3600 "$BIN" relay serve "$W/relay" "$RP" --name "127.0.0.1:$RP" "${SERVE_TLS[@]}" > "$W/relay.log" 2>&1 & PIDS+=($!)
+runs 3600 "$BIN" relay serve "$W/relay" "$RP" --allow-private-witnesses --name "127.0.0.1:$RP" "${SERVE_TLS[@]}" > "$W/relay.log" 2>&1 & PIDS+=($!)
 proxy "$RPX" "$RP"
 WS=()
 for i in 1 2 3; do

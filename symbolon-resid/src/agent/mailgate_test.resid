@@ -27,7 +27,7 @@ Store tmp_store() {
 
 Str dir_of(Store s) { return match s { FsStore(d) => d, _ => "" }; }
 
-RelayCfg cfg_of(Store s) { return RelayCfg {.store = Fs(dir_of(s)), .ca = "", .console = "", .names = ""}; }
+RelayCfg cfg_of(Store s) { return RelayCfg {.store = Fs(dir_of(s)), .ca = "", .console = "", .names = "", .private_witnesses = false, .allowed_witnesses = ""}; }
 
 HttpRequest treq(Str method, Str path, Str token, List(Int) body) {
     Map(Str, Str) none = {};

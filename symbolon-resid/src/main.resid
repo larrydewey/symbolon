@@ -3,7 +3,9 @@
 //   symbolon relay serve DIR PORT [--tls CERT KEY] [--bind ADDR] [--ca FILE] [--store SPEC] [--store-ca FILE]
 //       the sync service (SPEC 20.1, 29.4, 29.9); --console-origin https://HOST:PORT serves the console (29.10); --name HOST:PORT[,...]: the names devices reach the relay at, bound into their sign-in (29.4),
 //       required (or --console-origin) unless --insecure-any-name takes any name a device signs; --store: a directory (DIR by default),
-//       postgres://USER:PASSWORD@HOST:PORT/DB, s3://KEY:SECRET@HOST:PORT/BUCKET?region=R, or @FILE holding one
+//       postgres://USER:PASSWORD@HOST:PORT/DB, s3://KEY:SECRET@HOST:PORT/BUCKET?region=R, or @FILE holding one;
+//       --allow-private-witnesses: call witnesses at loopback, private or link-local addresses (tests);
+//       --allow-witness HOST:PORT[,...]: call those of them only (a household box's own witnesses)
 //   symbolon witness keygen KEYFILE            a witness's signing key; prints its public key
 //   symbolon relay scim-token DIR ORG-ID          a bearer token for ORG-ID's SCIM directory (SPEC 29.7)
 //   symbolon witness serve DIR PORT KEYFILE [OFFSET] [--tls CERT KEY] [--bind ADDR]
@@ -114,6 +116,8 @@
 //   symbolon device recover DIR KIT LOG_ID    a new device starts a kit recovery (SPEC 13.2); stdin: the
 //                                              kit's passphrase if it has one, then the new kit's twice
 //   symbolon device veto DIR                   PIN on stdin; vetoes the latest pending event
+//   symbolon device kit-escape DIR KIT_SEED    the kit drops the log's sequencing relay (one that is gone or
+//                                              refuses every claim): delayed by the recovery delay, vetoable (SPEC 20.3)
 //   symbolon device sequence DIR [HOST:PORT]  PIN on stdin; names the relay (this device's, or HOST:PORT) as the
 //                                              log's sequencer (policy field 8, SPEC 20.3): a set-policy
 //   symbolon device witnesses DIR [--add HOST:PORT:KEY]... [--remove HOST:PORT]...   PIN on stdin; changes the
@@ -240,7 +244,7 @@ Option(StoreCfg) store_of(Str dir, Str spec, Str store_ca) {
 Str opt(Str flag, Str v) { return if (str_len(v) == 0) { "" } else { " " + flag + " " + v }; }
 
 @requires(network, filesystem, declassify, provision, process, clock)
-Int relay_serve(Str dir, Int port, Str bind, Str cert, Str key, Str ca, Str spec, Str store_ca, Str console, Str names, Bool any_name, Str self) {
+Int relay_serve(Str dir, Int port, Str bind, Str cert, Str key, Str ca, Str spec, Str store_ca, Str console, Str names, Bool any_name, Bool private_witnesses, Str allowed, Str self) {
     Str unnamed = relay_names_problem(names, console, any_name);
     if (str_len(unnamed) > 0) { eprintln("relay: " + unnamed); return 2; }
     Tls t = tls_from(cert, key);
@@ -254,19 +258,19 @@ Int relay_serve(Str dir, Int port, Str bind, Str cert, Str key, Str ca, Str spec
     if (lfd < 0) { eprintln(f"relay: cannot listen on {port}"); return 1; }
     println(f"relay listening on {bind}:{http_bound_port(lfd)}" + if (t.on) { " (TLS)" } else { "" });
     if (any_name) { eprintln("relay: --insecure-any-name: a device's sign-in is not bound to this relay's name"); }
-    return supervise_children(self + " relay child " + dir + f" {lfd}" + tls_args(cert, key) + opt("--ca", ca) + opt("--store", spec) + opt("--store-ca", store_ca) + opt("--console-origin", console) + opt("--name", names));
+    return supervise_children(self + " relay child " + dir + f" {lfd}" + tls_args(cert, key) + opt("--ca", ca) + opt("--store", spec) + opt("--store-ca", store_ca) + opt("--console-origin", console) + opt("--name", names) + if (private_witnesses) { " --allow-private-witnesses" } else { "" } + opt("--allow-witness", allowed));
 }
 
 // `symbolon relay child DIR FD [--tls CERT KEY] [--ca FILE] [--store SPEC] [--store-ca FILE]`
 // (run by `relay serve`). --ca: the trust anchor for the witnesses the
 // relay asks the time of when it verifies a device signing in (SPEC 29.4).
 @requires(network, filesystem, declassify, provision, clock(readonly))
-Int relay_child(Str dir, Int lfd, Str cert, Str key, Str ca, Str spec, Str store_ca, Str console, Str names) {
+Int relay_child(Str dir, Int lfd, Str cert, Str key, Str ca, Str spec, Str store_ca, Str console, Str names, Bool private_witnesses, Str allowed) {
     Tls t = tls_from(cert, key);
     if (!t.ok) { return 2; }
     Option(StoreCfg) sc = store_of(dir, spec, store_ca);
     if (match sc { None => true, Some(_) => false }) { return 2; }
-    RelayCfg g = RelayCfg {.store = sc else { Fs(dir) }, .ca = if (str_len(ca) == 0) { "" } else { filesystem.read_all(ca) }, .console = console, .names = names};
+    RelayCfg g = RelayCfg {.store = sc else { Fs(dir) }, .ca = if (str_len(ca) == 0) { "" } else { filesystem.read_all(ca) }, .console = console, .names = names, .private_witnesses = private_witnesses, .allowed_witnesses = str_to_lower(allowed)};
     Int n = if (t.on) { tls_accept_loop(lfd, t.cfg, lambda(q) { relay_serve_handle(g, q) }, http_limits(), batch_conns()) }
             else { http_accept_loop(lfd, lambda(q) { relay_serve_handle(g, q) }, http_limits(), batch_conns()) };
     return if (n > 0) { 0 } else { 3 };
@@ -566,12 +570,13 @@ Int main_cmd() {
     }
     if (a1 == "device" && a2 == "kit" && args.get(3) == "status" && n == 5) { return device_kit_status(args.get(4)); }
     if (a1 == "device" && a2 == "kit" && args.get(3) == "renew" && n == 5) { return device_kit_renew(args.get(4)); }
+    if (a1 == "device" && a2 == "kit-escape" && n == 5) { return device_kit_escape(args.get(3), args.get(4)); }
     if (a1 == "device" && a2 == "sequence" && (n == 4 || n == 5)) { return device_sequence(args.get(3), if (n == 5) { args.get(4) } else { "" }); }
     if (a1 == "device" && a2 == "recover-release" && n == 4) { return device_recover_release(args.get(3)); }
     if (a1 == "device" && a2 == "recover-finish" && (n == 5 || n == 6)) { return device_recover_finish(args.get(3), args.get(4), if (n == 6) { args.get(5) } else { "" }); }
-    if (a1 == "relay" && a2 == "serve" && positional(3) == 5) { return relay_serve(args.get(3), str_parse_int(args.get(4)), bind_or(flag_arg("--bind", 1, 5)), flag_arg("--tls", 1, 5), flag_arg("--tls", 2, 5), flag_arg("--ca", 1, 5), flag_arg("--store", 1, 5), flag_arg("--store-ca", 1, 5), flag_arg("--console-origin", 1, 5), flag_arg("--name", 1, 5), has_flag("--insecure-any-name", 5), args.get(0)); }
+    if (a1 == "relay" && a2 == "serve" && positional(3) == 5) { return relay_serve(args.get(3), str_parse_int(args.get(4)), bind_or(flag_arg("--bind", 1, 5)), flag_arg("--tls", 1, 5), flag_arg("--tls", 2, 5), flag_arg("--ca", 1, 5), flag_arg("--store", 1, 5), flag_arg("--store-ca", 1, 5), flag_arg("--console-origin", 1, 5), flag_arg("--name", 1, 5), has_flag("--insecure-any-name", 5), has_flag("--allow-private-witnesses", 5), flag_arg("--allow-witness", 1, 5), args.get(0)); }
     if (a1 == "relay" && a2 == "scim-token" && positional(3) == 5) { return relay_scim_token(args.get(3), args.get(4), flag_arg("--store", 1, 5), flag_arg("--store-ca", 1, 5)); }
-    if (a1 == "relay" && a2 == "child" && positional(3) == 5) { return relay_child(args.get(3), str_parse_int(args.get(4)), flag_arg("--tls", 1, 5), flag_arg("--tls", 2, 5), flag_arg("--ca", 1, 5), flag_arg("--store", 1, 5), flag_arg("--store-ca", 1, 5), flag_arg("--console-origin", 1, 5), flag_arg("--name", 1, 5)); }
+    if (a1 == "relay" && a2 == "child" && positional(3) == 5) { return relay_child(args.get(3), str_parse_int(args.get(4)), flag_arg("--tls", 1, 5), flag_arg("--tls", 2, 5), flag_arg("--ca", 1, 5), flag_arg("--store", 1, 5), flag_arg("--store-ca", 1, 5), flag_arg("--console-origin", 1, 5), flag_arg("--name", 1, 5), has_flag("--allow-private-witnesses", 5), flag_arg("--allow-witness", 1, 5)); }
     if (a1 == "witness" && a2 == "keygen" && args.count() == 4) { return witness_keygen(args.get(3)); }
     Int np = positional(3);
     if (a1 == "witness" && a2 == "serve" && (np == 6 || np == 7)) {

@@ -901,7 +901,7 @@ Decode(EndDuressReq, F) = derive_end_duress_req_decode;
 
 // ── Packet (line 121)
 /// The serialized variant names of `Packet`, in declaration order.
-pub List(Str) derive_packet_variants() { return ["WKeygen", "WSign", "WSession", "WRefused", "WKitHalf", "WSignEvent", "WEventSig", "WReshare", "WEnrollSecrets", "WKitKey", "WKitRelease", "WDuressKey", "WKvDeal", "WKvHalf", "WEval", "WEvalAnswer", "WEvalLog", "WEvalLogAnswer", "WBeacon", "WAlertConfig", "WAlertState", "WEndDuress", "WAlertKey"]; }
+pub List(Str) derive_packet_variants() { return ["WKeygen", "WSign", "WSession", "WRefused", "WKitHalf", "WSignEvent", "WEventSig", "WReshare", "WEnrollSecrets", "WKitKey", "WKitRelease", "WDuressKey", "WKvDeal", "WKvHalf", "WEval", "WEvalAnswer", "WEvalLog", "WEvalLogAnswer", "WBeacon", "WAlertConfig", "WAlertState", "WEndDuress", "WAlertKey", "WVeto"]; }
 /// Encodes a `Packet` through the encoder `s`.
 @needs(Encoder(F))
 pub Result(F, SerialError) derive_packet_encode(Packet v, F s) {
@@ -928,7 +928,8 @@ pub Result(F, SerialError) derive_packet_encode(Packet v, F s) {
         WAlertConfig(x) => write_newtype_variant(s, "Packet", 19, "WAlertConfig", x),
         WAlertState(x) => write_newtype_variant(s, "Packet", 20, "WAlertState", x),
         WEndDuress(x) => write_newtype_variant(s, "Packet", 21, "WEndDuress", x),
-        WAlertKey(x) => write_newtype_variant(s, "Packet", 22, "WAlertKey", x)
+        WAlertKey(x) => write_newtype_variant(s, "Packet", 22, "WAlertKey", x),
+        WVeto(x) => write_newtype_variant(s, "Packet", 23, "WVeto", x)
     };
 }
 Encode(Packet, F) = derive_packet_encode;
@@ -960,6 +961,7 @@ pub Result(Parsed(Packet, F), SerialError) derive_packet_decode(F s) {
     if (i == 20) { Parsed(AlertState, F) p20 = read_newtype_payload(t.rest, "WAlertState")?; Packet u20 = WAlertState(p20.value); return parsed(u20, p20.rest); }
     if (i == 21) { Parsed(EndDuressReq, F) p21 = read_newtype_payload(t.rest, "WEndDuress")?; Packet u21 = WEndDuress(p21.value); return parsed(u21, p21.rest); }
     if (i == 22) { Parsed(List(Int), F) p22 = read_newtype_payload(t.rest, "WAlertKey")?; Packet u22 = WAlertKey(p22.value); return parsed(u22, p22.rest); }
+    if (i == 23) { Parsed(List(Int), F) p23 = read_newtype_payload(t.rest, "WVeto")?; Packet u23 = WVeto(p23.value); return parsed(u23, p23.rest); }
     return Err(custom_error(f"variant index {i} out of range"));
 }
 Decode(Packet, F) = derive_packet_decode;
