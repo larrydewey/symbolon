@@ -220,8 +220,20 @@ Result(RsStep, CgFail) rs_round2(RsCtx c, List(RsMine) mine, List(ThMsg) in) {
     List(RsAnnMsg) as = check_anns(c, anns_of(in, 0, []), mine, 0, [])?;
     List(ThMsg) fac_out = if (c.self != 0) { facs(c, mine[0], as, 0, []) } else { [] };
     if (c.old_self == 0 || c.old.len() == 0) { return Ok(RsStep {.state = RS2(c, mine, as, [], []), .out = fac_out}); }
-    List(List(UInt(64))) poly = rsh_dealer_poly(c.old[0].ecdsa, c.dealers, c.old_self, zero_poly(c, 0, []));
-    RshD1 d = rsh_d1(c.old_self, c.dealers, c.old[0].ecdsa, zero_poly(c, 0, []), peers_of(as, 0, []), c.seed);
+    // None only when this party is not among the dealers or the masking
+    // polynomial is malformed (rs_ctx_problem rules out the degree).
+    Option(List(List(UInt(64)))) opoly = rsh_dealer_poly(c.old[0].ecdsa, c.dealers, c.old_self, zero_poly(c, 0, []));
+    Option(RshD1) od = rsh_d1(c.old_self, c.dealers, c.old[0].ecdsa, zero_poly(c, 0, []), peers_of(as, 0, []), c.seed);
+    return match opoly {
+        None => Err(cg_fail("this party cannot deal: not a dealer, or a bad polynomial", [])),
+        Some(poly) => match od {
+            None => Err(cg_fail("this party cannot deal: not a dealer, or a bad polynomial", [])),
+            Some(d) => dealt(c, mine, as, poly, d, fac_out)
+        }
+    };
+}
+
+Result(RsStep, CgFail) dealt(RsCtx c, List(RsMine) mine, List(RsAnnMsg) as, List(List(UInt(64))) poly, RshD1 d, List(ThMsg) fac_out) {
     RsDealMsg dm = RsDealMsg {.dealer = c.old_self, .commits = d.commits, .parts = parts_msg(d.parts, 0, [])};
     ThMsg deal = ThRs(RsMsg {.from = c.self, .to = 0, .body = RsDeal(dm)});
     return Ok(RsStep {.state = RS2(c, mine, as, offline_of(c, poly, 0, []), [dm]), .out = [deal].concat(fac_out)});
@@ -294,15 +306,23 @@ CvPt opa(List(CgPublicCfg) ps, List(Int) ids, Int i, Int k, CvPt acc) {
     return opa(ps, ids, i, k + 1, cv_add(acc, cv_mul(lag_at(ids, ps[k].id, i, 0, [1]), ps[k].ecdsa)));
 }
 
-// Each dealer's constant term must be lambda_i X_i (lambda over the
-// dealers, at 0): a dealer that commits to anything else is named. Checked
-// by a party that holds the old public shares (every dealer that deals from
-// its own configuration); the sum check below holds for everyone.
-Result(Int, CgFail) check_constants(RsCtx c, List(RsDealMsg) ds, Int i) {
-    if (c.old.len() == 0 || c.old[0].public.len() == 0 || i >= ds.len()) { return Ok(0); }
-    CvPt want = cv_mul(cg_lagrange(c.dealers, ds[i].dealer), old_public_at(c.old[0].public, ds[i].dealer));
-    if (!cv_eq(ds[i].commits[0], want)) { return Err(cg_fail("a dealer's constant term is not its share of the root key", [ds[i].dealer])); }
-    return check_constants(c, ds, i + 1);
+// Each dealer's commitments against the old key (lib rsh_dealers_ok): its
+// constant term must be lambda_i X_i (lambda over the dealers, at 0), it
+// commits to degree + 1 coefficients, and every dealer deals once; a dealer
+// that commits to anything else is named. Checked by a party that holds the
+// old public shares (every dealer that deals from its own configuration);
+// the sum check below holds for everyone.
+Result(Int, CgFail) check_constants(RsCtx c, List(RsDealMsg) ds) {
+    if (c.old.len() == 0 || c.old[0].public.len() == 0) { return Ok(0); }
+    return match rsh_dealers_ok(d1s(ds, 0, []), c.dealers, old_pubs(c.old[0].public, c.dealers, 0, []), c.degree) {
+        Ok(_) => Ok(0),
+        Err(culprit) => Err(cg_fail("a dealer's constant term is not its share of the root key", if (culprit == 0) { [] } else { [culprit] }))
+    };
+}
+
+List(CvPt) old_pubs(List(CgPublicCfg) ps, List(Int) ids, Int i, List(CvPt) acc) {
+    if (i >= ids.len()) { return acc; }
+    return old_pubs(ps, ids, i + 1, acc.concat([old_public_at(ps, ids[i])]));
 }
 
 CvPt constant_sum(List(RsDealMsg) ds, Int i, CvPt acc) {
@@ -360,7 +380,7 @@ List(CgPublicCfg) publics(List(RsAnnMsg) as, List(RsDealMsg) ds, Int i, List(CgP
 
 Result(RsStep, CgFail) rs_round3(RsCtx c, List(RsMine) mine, List(RsAnnMsg) as, List(RsOffline) off, List(ThMsg) in, List(RsDealMsg) own_deal) {
     List(RsDealMsg) ds = ordered_deals(c, deals_of(in, 0, []).concat(own_deal), 0, [])?;
-    _ = check_constants(c, ds, 0)?;
+    _ = check_constants(c, ds)?;
     // The deals must keep X: the constant terms add up to the root key.
     Option(CvPt) ox = cv_dec(compress(c.root));
     CvPt x = ox else { cv_inf() };
