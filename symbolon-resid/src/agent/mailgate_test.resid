@@ -1,0 +1,297 @@
+// Who may post to a mailbox at the relay, what anonymous writes may cost,
+// old messages, and cosigner-signed alerts (src/agent/mailgate.resid;
+// R2R-3).
+
+import "relaysrv.resid";
+import "mailgate.resid";
+import "../types.resid";
+import "../core/log.resid";
+import "../core/event.resid";
+import "../net/store.resid";
+import "../net/services.resid";
+import "state.resid";
+import "hash.resid";
+import "serials.resid";
+import "common.resid";
+import "crypto.resid";
+import "ecdsa.resid";
+import "cose.resid";
+import "httpserv.resid";
+
+@requires(filesystem, network, clock(readonly), declassify)
+Store tmp_store() {
+    Str d = "/tmp/symbolon-mailgate-test-" + hex_encode(random_bytes(8));
+    _ = filesystem.create_dir(d);
+    return FsStore(d);
+}
+
+Str dir_of(Store s) { return match s { FsStore(d) => d, _ => "" }; }
+
+RelayCfg cfg_of(Store s) { return RelayCfg {.store = Fs(dir_of(s)), .ca = "", .console = "", .names = ""}; }
+
+HttpRequest treq(Str method, Str path, Str token, List(Int) body) {
+    Map(Str, Str) none = {};
+    Map(Str, Str) hs = if (str_len(token) > 0) { none.insert("authorization", "Bearer " + token) } else { none };
+    return HttpRequest { .method = method, .target = path, .path = path, .query = "", .version = "HTTP/1.1", .headers = hs, .body = body, .keep_alive = false, .ok = true, .status = 0 };
+}
+
+@requires(filesystem, network, clock(readonly), declassify)
+Int status(Store s, Str method, Str path, Str token, List(Int) body) { return relay_serve_handle(cfg_of(s), treq(method, path, token, body)).status; }
+
+List(Int) lpriv(Int n) { return [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, n]; }
+List(Int) lpub(Int n) { return ec_public_key(P256, lpriv(n)); }
+List(Int) lsign(Int n, List(Int) msg) { return ecdsa_raw_of(P256, ecdsa_sign_digest(P256, Sha256, lpriv(n), hash_bytes(Sha256, msg))); }
+List(Int) lid(Int n) { return sha256_bytes(lpub(n)); }
+
+Party lparty(Int n, UInt(8) kind) { return Party {.id = lid(n), .kind = kind, .auth_key = lpub(n), .hpke_key = lpub(n), .label = "p", .attestation = NoAttestation}; }
+
+// E0 with devices 2 and 3 and cosigner 4, co-signed by witnesses 7 and 8.
+StoredEvent log_e0() {
+    Policy pol = Policy {.device_sigs_for_authority = 2, .recovery_delay_sec = 86400, .guardians = [], .guardian_threshold = 0,
+                         .witnesses = [WitnessRef {.url = "w1", .key = lpub(7)}, WitnessRef {.url = "w2", .key = lpub(8)}, WitnessRef {.url = "w3", .key = lpub(11)}],
+                         .duress_window_sec = 3600, .sequencer = [], .cosigner_policy = NoCosignerPolicy};
+    Quorum q = Quorum {.parties = [lparty(2, party_kind_device()), lparty(3, party_kind_device()), lparty(4, party_kind_cosigner())], .t = 2, .root_pubkey = lpub(9), .epoch = 0, .transcript_digest = lid(99), .kv_commits = []};
+    EventPayload p = EventPayload {.log_id = None, .sequence = 0, .predecessor_digest = None, .suite = 1, .body = InceptionBody(q, pol),
+                                   .next_recovery_key_digests = [sha256_bytes(lpub(20))], .advisory_time = 0};
+    List(Int) enc = payload_cbor(p) else { [] };
+    List(Int) l = sha256_bytes(enc);
+    List(WitnessCosignature) cs = [WitnessCosignature {.log_id = l, .sequence = 0, .digest = l, .witness_key = lpub(7), .signature = lsign(7, witness_message(l, 0, l)), .witness_time = 1000},
+                                   WitnessCosignature {.log_id = l, .sequence = 0, .digest = l, .witness_key = lpub(8), .signature = lsign(8, witness_message(l, 0, l)), .witness_time = 1000}];
+    return StoredEvent {.encoded = enc, .sigs = [EventSig {.signer = lid(2), .sig = lsign(2, enc)}, EventSig {.signer = lid(3), .sig = lsign(3, enc)}, EventSig {.signer = lid(4), .sig = lsign(4, enc)}], .cosigs = cs};
+}
+
+@requires(filesystem, network, clock(readonly), declassify)
+List(Int) put_log(Store s) {
+    StoredEvent e0 = log_e0();
+    List(Int) l = sha256_bytes(e0.encoded);
+    _ = st_put(s, "log/" + hex_encode(l) + "/0", cbor_of_event(e0));
+    return l;
+}
+
+// A session as /auth or /auth/mail issues one: "LOG PARTY KEY UNTIL".
+@requires(filesystem, network, clock(readonly), declassify)
+Str session(Store s, Str kind, List(Int) l, List(Int) party, List(Int) key) {
+    Str t = hex_encode(random_bytes(32));
+    _ = st_text(s, "auth/" + kind + "-" + hex_encode(sha256_bytes(utf8(t))), hex_encode(l) + " " + hex_encode(party) + " " + hex_encode(key) + f" {clock_now_seconds() + 3600}");
+    return t;
+}
+
+List(Int) filled(Int n, Int v, ListBuf(Int) acc) { return if (n <= 0) { acc.finish() } else { filled(n - 1, v, acc.push(v)) }; }
+
+Str mbox(List(Int) to) { return "/mbox/" + hex_encode(to); }
+
+// ─── Mailboxes ──────────────────────────────────────────────────
+
+@requires(filesystem, network, clock(readonly), declassify)
+test "a mailbox takes a message only from a party of the recipient's log" {
+    Store s = tmp_store();
+    List(Int) l = put_log(s);
+    Str t2 = session(s, "tok", l, lid(2), lpub(2));
+    // a known party to the others of its log: a device, the cosigner
+    expect(status(s, "POST", mbox(lid(3)), t2, [1])).toEqual(200);
+    expect(status(s, "POST", mbox(lid(4)), t2, [2])).toEqual(200);
+    // a made-up recipient
+    expect(status(s, "POST", mbox(random_bytes(32)), t2, [3])).toEqual(403);
+    // an unknown sender: not a party of the log, or not with that key
+    expect(status(s, "POST", mbox(lid(3)), session(s, "tok", l, lid(5), lpub(5)), [4])).toEqual(403);
+    expect(status(s, "POST", mbox(lid(3)), session(s, "mtok", l, lid(2), lpub(5)), [4])).toEqual(403);
+    // a log the relay does not have
+    expect(status(s, "POST", mbox(lid(3)), session(s, "tok", random_bytes(32), lid(2), lpub(2)), [4])).toEqual(403);
+    // no session: refused, to a party of a log or to a made-up mailbox
+    expect(status(s, "POST", mbox(lid(3)), "", [5])).toEqual(401);
+    expect(status(s, "POST", mbox(random_bytes(32)), "", [5])).toEqual(401);
+    expect(st_bytes(s, "mbox/" + hex_encode(lid(3)) + "/0")).toEqual([1]);
+    expect(match st_get(s, "mbox/" + hex_encode(lid(3)) + "/1") { None => "none", Some(_) => "found" }).toEqual("none");
+}
+
+@requires(filesystem, network, clock(readonly), declassify)
+test "a mailbox keeps its quotas for a known sender" {
+    Store s = tmp_store();
+    List(Int) l = put_log(s);
+    Str t2 = session(s, "tok", l, lid(2), lpub(2));
+    Str to = hex_encode(lid(3));
+    expect(status(s, "POST", mbox(lid(3)), t2, filled(1048577, 120, ListBuf()))).toEqual(413);
+    Int now = clock_now_seconds();
+    _ = st_text(s, "mboxq/" + to, f"{now} 256 100");
+    expect(status(s, "POST", mbox(lid(3)), t2, [2])).toEqual(429);
+    _ = st_text(s, "mboxq/" + to, f"{now} 1 67108800");
+    expect(status(s, "POST", mbox(lid(3)), t2, filled(200, 121, ListBuf()))).toEqual(429);
+    _ = st_text(s, "mboxq/" + to, f"{now - 4000} 256 67108800");
+    expect(status(s, "POST", mbox(lid(3)), t2, [3])).toEqual(200);
+}
+
+@requires(filesystem, network, clock(readonly), declassify)
+test "a mail session is a party's of the log, for mail only" {
+    Store s = tmp_store();
+    List(Int) l = put_log(s);
+    HttpReply c = relay_serve_handle(cfg_of(s), treq("GET", "/auth/challenge", "", []));
+    Str chal = http_text(c.body, 0, c.body.len());
+    Str name = "relay.test:443";
+    List(Int) ch = cose_hex_decode(chal);
+    // signed by another key, or by a party that is not the log's
+    expect(status(s, "POST", "/auth/mail", "", utf8(chal + " " + hex_encode(l) + " " + hex_encode(lid(4)) + " " + hex_encode(lsign(5, mail_auth_message(name, ch))) + " " + name))).toEqual(403);
+    expect(status(s, "POST", "/auth/mail", "", utf8(chal + " " + hex_encode(l) + " " + hex_encode(lid(5)) + " " + hex_encode(lsign(5, mail_auth_message(name, ch))) + " " + name))).toEqual(403);
+    // a device's sign-in signature is not a mail sign-in's
+    expect(status(s, "POST", "/auth/mail", "", utf8(chal + " " + hex_encode(l) + " " + hex_encode(lid(4)) + " " + hex_encode(lsign(4, relay_auth_message(name, ch))) + " " + name))).toEqual(403);
+    HttpReply r = relay_serve_handle(cfg_of(s), treq("POST", "/auth/mail", "", utf8(chal + " " + hex_encode(l) + " " + hex_encode(lid(4)) + " " + hex_encode(lsign(4, mail_auth_message(name, ch))) + " " + name)));
+    expect(r.status).toEqual(200);
+    Str t = str_split(http_text(r.body, 0, r.body.len()), " ")[0];
+    // once per challenge
+    expect(status(s, "POST", "/auth/mail", "", utf8(chal + " " + hex_encode(l) + " " + hex_encode(lid(4)) + " " + hex_encode(lsign(4, mail_auth_message(name, ch))) + " " + name))).toEqual(403);
+    // the cosigner's session posts to the log's devices, and writes nothing else
+    expect(status(s, "POST", mbox(lid(2)), t, [1])).toEqual(200);
+    expect(status(s, "PUT", "/blob/card-" + hex_encode(l), t, [1])).toEqual(401);
+}
+
+@requires(filesystem, network, clock(readonly), declassify)
+test "a mailbox of no log yet takes anonymous posts once its owner opened it" {
+    Store s = tmp_store();
+    Int now = clock_now_seconds();
+    Str p = hex_encode(lid(6));
+    expect(status(s, "POST", "/mbox/" + p, "", [1])).toEqual(401);
+    Str body = hex_encode(lpub(6)) + f" {now + 3600} " + hex_encode(lsign(6, mbox_open_message(lid(6), now + 3600)));
+    // signed by another key, opened for longer than a day, or another party's id
+    expect(status(s, "POST", "/mbox-open/" + p, "", utf8(hex_encode(lpub(6)) + f" {now + 3600} " + hex_encode(lsign(5, mbox_open_message(lid(6), now + 3600)))))).toEqual(403);
+    expect(status(s, "POST", "/mbox-open/" + p, "", utf8(hex_encode(lpub(6)) + f" {now + 200000} " + hex_encode(lsign(6, mbox_open_message(lid(6), now + 200000)))))).toEqual(403);
+    expect(status(s, "POST", "/mbox-open/" + hex_encode(lid(5)), "", utf8(body))).toEqual(403);
+    expect(status(s, "POST", "/mbox-open/" + p, "", utf8(body))).toEqual(200);
+    expect(status(s, "POST", "/mbox/" + p, "", [1])).toEqual(200);
+    // once it has closed
+    _ = st_text(s, "mbxopen/" + p, f"{now - 1}");
+    expect(status(s, "POST", "/mbox/" + p, "", [2])).toEqual(401);
+}
+
+@requires(filesystem, network, clock(readonly), declassify)
+test "anonymous writes share one budget" {
+    Store s = tmp_store();
+    Int now = clock_now_seconds();
+    Str p = hex_encode(lid(6));
+    expect(status(s, "POST", "/mbox-open/" + p, "", utf8(hex_encode(lpub(6)) + f" {now + 3600} " + hex_encode(lsign(6, mbox_open_message(lid(6), now + 3600)))))).toEqual(200);
+    _ = st_text(s, "anonq", f"{now} {anon_window_bytes() - 50}");
+    expect(status(s, "POST", "/mbox/" + p, "", filled(100, 1, ListBuf()))).toEqual(429);
+    expect(status(s, "POST", "/mbox/" + p, "", filled(40, 1, ListBuf()))).toEqual(200);
+    // a new log is an anonymous write too
+    StoredEvent e0 = log_e0();
+    List(Int) l = sha256_bytes(e0.encoded);
+    expect(status(s, "POST", "/log/" + hex_encode(l) + "/0", "", cbor_of_event(e0))).toEqual(429);
+    // a known party's mail is not counted
+    _ = st_put(s, "log/" + hex_encode(l) + "/0", cbor_of_event(e0));
+    expect(status(s, "POST", mbox(lid(3)), session(s, "tok", l, lid(2), lpub(2)), filled(1000, 1, ListBuf()))).toEqual(200);
+    // a window that has passed
+    _ = st_text(s, "anonq", f"{now - 601} {anon_window_bytes()}");
+    expect(status(s, "POST", "/mbox/" + p, "", filled(100, 1, ListBuf()))).toEqual(200);
+}
+
+@requires(filesystem, network, clock(readonly), declassify)
+Bool put_at(Store s, Str to, Int n, Int t) {
+    _ = st_put(s, "mbox/" + to + "/" + f"{n}", [n + 1]);
+    _ = st_text(s, "mboxn/" + to, f"{n + 1}");
+    return mbox_mark(s, to, n, t);
+}
+
+@requires(filesystem, network, clock(readonly), declassify)
+test "messages older than 30 days become placeholders and the indexes stay" {
+    Store s = tmp_store();
+    Str to = hex_encode(lid(3));
+    Int t0 = 1000000;
+    Int day = 86400;
+    _ = put_at(s, to, 0, t0);
+    _ = put_at(s, to, 1, t0 + 100);
+    _ = put_at(s, to, 2, t0 + 2 * day);
+    _ = put_at(s, to, 3, t0 + 20 * day);
+    // nothing is old enough yet: day 0 runs until day 2
+    expect(mbox_sweep(s, to, t0 + 31 * day, 16)).toEqual(0);
+    // messages 0 and 1 are older than 30 days, 2 and 3 may not be
+    expect(mbox_sweep(s, to, t0 + 33 * day, 16)).toEqual(2);
+    expect(st_bytes(s, "mbox/" + to + "/0")).toEqual(mail_expired_body());
+    expect(st_bytes(s, "mbox/" + to + "/1")).toEqual(mail_expired_body());
+    expect(st_bytes(s, "mbox/" + to + "/2")).toEqual([3]);
+    expect(st_bytes(s, "mbox/" + to + "/3")).toEqual([4]);
+    expect(mbox_sweep(s, to, t0 + 33 * day, 16)).toEqual(0);
+    // the indexes stay: a reader walks past the placeholder
+    expect(status(s, "GET", "/mbox/" + to + "/1", "", [])).toEqual(200);
+    expect(mail_expired(relay_serve_handle(cfg_of(s), treq("GET", "/mbox/" + to + "/1", "", [])).body)).toBeTrue();
+    expect(mail_expired([1, 2, 3])).toBeFalse();
+    // a mailbox no one wrote to for 30 days: all of it, a batch at a time
+    expect(mbox_sweep(s, to, t0 + 51 * day, 1)).toEqual(1);
+    expect(mbox_sweep(s, to, t0 + 51 * day, 16)).toEqual(1);
+    expect(st_bytes(s, "mbox/" + to + "/3")).toEqual(mail_expired_body());
+    expect(status(s, "GET", "/mbox/" + to + "/4", "", [])).toEqual(404);
+}
+
+// ─── Alerts ─────────────────────────────────────────────────────
+
+Str alert_name(List(Int) l, Int t) { return "alrt-" + hex_encode(l) + f"-{t}-" + hex_encode(random_bytes(4)); }
+
+List(Int) signed_alert(Int key, Str name, List(Int) rest) { return alert_signed(lsign(key, alert_sig_message(name, rest)), rest); }
+
+@requires(filesystem, network, clock(readonly), declassify)
+Int put_junk(Store s, List(Int) l, Int i, Int n, Int ok) {
+    if (i >= n) { return ok; }
+    Str name = alert_name(l, clock_now_seconds());
+    Int a = status(s, "PUT", "/blob/" + name, "", [1, 2, 3]);
+    Int b = status(s, "PUT", "/blob/" + name, "", signed_alert(2, name, [1, 2, 3]));
+    return put_junk(s, l, i + 1, n, ok + (if (a == 200) { 1 } else { 0 }) + (if (b == 200) { 1 } else { 0 }));
+}
+
+@requires(filesystem, network, clock(readonly), declassify)
+test "an alert is taken only signed by the log's cosigner" {
+    Store s = tmp_store();
+    List(Int) l = put_log(s);
+    Int now = clock_now_seconds();
+    Str n = alert_name(l, now);
+    // unsigned junk, a device's signature, a signature over another name
+    expect(status(s, "PUT", "/blob/" + n, "", [1, 2, 3])).toEqual(401);
+    expect(status(s, "PUT", "/blob/" + n, "", signed_alert(2, n, utf8("x y\n")))).toEqual(401);
+    expect(status(s, "PUT", "/blob/" + n, "", signed_alert(4, alert_name(l, now), utf8("x y\n")))).toEqual(401);
+    // a log the relay does not have
+    Str other = alert_name(random_bytes(32), now);
+    expect(status(s, "PUT", "/blob/" + other, "", signed_alert(4, other, utf8("x y\n")))).toEqual(401);
+    // older than a week
+    Str old = alert_name(l, now - 700000);
+    expect(status(s, "PUT", "/blob/" + old, "", signed_alert(4, old, utf8("x y\n")))).toEqual(401);
+    expect(status(s, "PUT", "/blob/" + n, "", signed_alert(4, n, utf8("x y\n")))).toEqual(200);
+    expect(alert_parts(st_bytes(s, "blob/" + n)).rest).toEqual(utf8("x y\n"));
+}
+
+@requires(filesystem, network, clock(readonly), declassify)
+test "a real alert is not displaced, overwritten or put back" {
+    Store s = tmp_store();
+    List(Int) l = put_log(s);
+    Str n = alert_name(l, clock_now_seconds());
+    expect(status(s, "PUT", "/blob/" + n, "", signed_alert(4, n, utf8("a b\n")))).toEqual(200);
+    expect(status(s, "PUT", "/blob/" + n, "", signed_alert(4, n, utf8("c d\n")))).toEqual(409);
+    // junk fills nothing: every later real alert is still taken
+    expect(put_junk(s, l, 0, 70, 0)).toEqual(0);
+    Str n2 = alert_name(l, clock_now_seconds());
+    expect(status(s, "PUT", "/blob/" + n2, "", signed_alert(4, n2, utf8("e f\n")))).toEqual(200);
+    expect(alert_parts(st_bytes(s, "blob/" + n)).rest).toEqual(utf8("a b\n"));
+    // a device of the log removes it; a copy is not put back
+    List(Int) copy = st_bytes(s, "blob/" + n);
+    expect(status(s, "PUT", "/blob/" + n, "", [])).toEqual(401);
+    expect(status(s, "PUT", "/blob/" + n, session(s, "tok", l, lid(2), lpub(2)), [])).toEqual(200);
+    expect(status(s, "PUT", "/blob/" + n, "", copy)).toEqual(401);
+}
+
+@requires(filesystem, network, clock(readonly), declassify)
+Int put_real(Store s, List(Int) l, Int i, Int n, Int ok) {
+    if (i >= n) { return ok; }
+    Str name = alert_name(l, clock_now_seconds() - i);
+    Int st = status(s, "PUT", "/blob/" + name, "", signed_alert(4, name, utf8("a b\n")));
+    return put_real(s, l, i + 1, n, ok + (if (st == 200) { 1 } else { 0 }));
+}
+
+@requires(filesystem, network, clock(readonly), declassify)
+test "at most 64 alerts wait for one log, and its devices remove them" {
+    Store s = tmp_store();
+    List(Int) l = put_log(s);
+    expect(put_real(s, l, 0, 64, 0)).toEqual(64);
+    Str extra = alert_name(l, clock_now_seconds());
+    expect(status(s, "PUT", "/blob/" + extra, "", signed_alert(4, extra, utf8("c d\n")))).toEqual(429);
+    // someone else cannot remove them; a device of the log can
+    List(Str) names = st_list(s, "blob/alrt-" + hex_encode(l) + "-", "", 100);
+    Str first = str_slice(names[0], 5, str_len(names[0]));
+    expect(status(s, "PUT", "/blob/" + first, session(s, "tok", random_bytes(32), lid(2), lpub(2)), [])).toEqual(401);
+    expect(status(s, "PUT", "/blob/" + first, session(s, "tok", l, lid(2), lpub(2)), [])).toEqual(200);
+    expect(status(s, "PUT", "/blob/" + extra, "", signed_alert(4, extra, utf8("c d\n")))).toEqual(200);
+}

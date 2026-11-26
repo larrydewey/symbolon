@@ -70,7 +70,7 @@ Drained drain_open(Local me, List(Remote) known, List(List(Int)) envs, Int i, Cu
     if (i >= envs.len()) { return Drained {.got = acc.finish(), .cur = c, .unknown = unknown, .unopened = unopened}; }
     Bool unk = from_unknown(known, envs[i]);
     Option(Got) og = open_env(me, known, envs[i]);
-    Bool shut = !unk && match og { None => true, Some(_) => false };
+    Bool shut = !unk && !mail_expired(envs[i]) && match og { None => true, Some(_) => false };
     ListBuf(Got) acc2 = match og { None => acc, Some(g) => acc.push(g) };
     return drain_open(me, known, envs, i + 1, c, acc2, unknown + (if (unk) { 1 } else { 0 }), unopened + (if (shut) { 1 } else { 0 }));
 }
@@ -90,6 +90,8 @@ ListBuf(Got) push_open(ListBuf(Got) acc, Local me, List(Remote) known, List(Int)
 @requires(declassify)
 @robust_exempt(reason = "declassifies only envelope plaintext that HPKE mode_auth authenticated under this party's key; nothing is disclosed outward")
 pub Option(Got) open_env(Local me, List(Remote) known, List(Int) b) {
+    // A message the relay replaced after 30 days: skipped without a word.
+    if (mail_expired(b)) { return None; }
     Option(Envelope) oe = envelope_decode(b);
     return match oe {
         None => dropped(f"an envelope that does not decode ({b.len()} bytes)"),

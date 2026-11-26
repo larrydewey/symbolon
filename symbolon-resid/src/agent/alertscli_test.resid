@@ -1,0 +1,30 @@
+// A device shows a household alert only when its log's cosigner signed it
+// (src/agent/alertscli.resid open_signed; R2R-3).
+
+import "alertscli.resid";
+import "alerts.resid";
+import "../net/services.resid";
+import "common.resid";
+import "crypto.resid";
+import "ecdsa.resid";
+import "hpkeg.resid";
+import "word.resid";
+import "httpserv.resid";
+
+List(Int) kpriv(Int n) { return [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, n]; }
+
+@requires(declassify)
+test "a device opens only an alert its cosigner signed" {
+    HpkeKeyPairG(Secret(UInt(8))) dev = hpkeg_derive_keypair(16, secret_bytes(random_bytes(32)));
+    HpkeKeyPairG(Secret(UInt(8))) cos = hpkeg_derive_keypair(16, secret_bytes(random_bytes(32)));
+    List(Int) cos_dk = ec_public_key(P256, kpriv(4));
+    Str name = "alrt-" + hex_encode(random_bytes(32)) + "-1800000000-0a0b0c0d";
+    List(Int) rest = str_to_bytes(seal_each([dev.pk], str_to_bytes("DURESS: A\nat noon"), cos.sk, cos.pk, 0, StrBuf()));
+    List(Int) good = alert_signed(ecdsa_sign_raw(P256, Sha256, kpriv(4), alert_sig_message(name, rest)), rest);
+    expect(match open_signed(name, good, dev.sk, cos.pk, cos_dk) { None => "", Some(m) => http_text(m, 0, m.len()) }).toEqual("DURESS: A\nat noon");
+    // the sealed lines alone (as before signatures), another signer, another name
+    expect(match open_signed(name, rest, dev.sk, cos.pk, cos_dk) { None => "none", Some(_) => "opened" }).toEqual("none");
+    List(Int) other = alert_signed(ecdsa_sign_raw(P256, Sha256, kpriv(5), alert_sig_message(name, rest)), rest);
+    expect(match open_signed(name, other, dev.sk, cos.pk, cos_dk) { None => "none", Some(_) => "opened" }).toEqual("none");
+    expect(match open_signed("alrt-" + hex_encode(random_bytes(32)) + "-1800000000-0a0b0c0d", good, dev.sk, cos.pk, cos_dk) { None => "none", Some(_) => "opened" }).toEqual("none");
+}

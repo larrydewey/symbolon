@@ -22,6 +22,7 @@ import "ecdsa.resid";
 import "cose.resid";
 import "cbor.resid";
 import "httpserv.resid";
+import "../net/services.resid";
 
 @requires(filesystem, network, clock(readonly), declassify)
 Str tmp_dir() {
@@ -231,16 +232,16 @@ test "a household folder is written only by its owner and its members" {
     expect(may_write(s, wn, wraps_bytes(nid, m.log, o), twho(o))).toEqual("");
 }
 
-// S-3: a cosigner's alert needs no sign-in (it has none) but is written
-// once: no one replaces a sealed alert.
+// S-3: a cosigner's alert needs no sign-in (it has none), but it needs the
+// cosigner's signature (R2R-3; written once and the rest:
+// mailgate_test.resid).
 @requires(filesystem, network, clock(readonly), declassify)
-test "an alert is written once and never replaced" {
+test "an unsigned alert is refused" {
     Store s = tmp_store();
     RelayCfg g = cfg_of(s, "");
-    Str n = "alrt-" + hex_encode(random_bytes(32)) + "-1700000000-0a1b2c3d";
-    expect(relay_serve_handle(g, treq("PUT", "/blob/" + n, "", [1, 2, 3])).status).toEqual(200);
-    expect(relay_serve_handle(g, treq("PUT", "/blob/" + n, "", [9])).status).toEqual(409);
-    expect(st_bytes(s, "blob/" + n)).toEqual([1, 2, 3]);
+    Str n = "alrt-" + hex_encode(random_bytes(32)) + f"-{clock_now_seconds()}-0a1b2c3d";
+    expect(relay_serve_handle(g, treq("PUT", "/blob/" + n, "", [1, 2, 3])).status).toEqual(401);
+    expect(absent(s, "blob/" + n)).toBeTrue();
     expect(relay_serve_handle(g, treq("PUT", "/blob/alrt-zz", "", [9])).status).toEqual(401);
 }
 
@@ -393,7 +394,7 @@ test "the sign-in message names the relay, and a relay takes only its own names"
 test "a mailbox post uses the kept next index" {
     Store s = tmp_store();
     RelayCfg g = cfg_of(s, "");
-    Str to = hex_encode(random_bytes(16));
+    Str to = open_box(g, 6);
     expect(relay_serve_handle(g, treq("POST", "/mbox/" + to, "", [1])).status).toEqual(200);
     expect(relay_serve_handle(g, treq("POST", "/mbox/" + to, "", [2])).status).toEqual(200);
     expect(st_read_text(s, "mboxn/" + to)).toEqual("2");
@@ -551,6 +552,16 @@ List(Int) put_log(Store s, Str w1) {
     return l;
 }
 
+// A mailbox of no log yet, opened by the owner of key `n` (R2R-3,
+// mailgate.resid); its id, hex.
+@requires(filesystem, network, clock(readonly), declassify)
+Str open_box(RelayCfg g, Int n) {
+    List(Int) id = sha256_bytes(lpub(n));
+    Int until = clock_now_seconds() + 3600;
+    _ = relay_serve_handle(g, treq("POST", "/mbox-open/" + hex_encode(id), "", utf8(hex_encode(lpub(n)) + f" {until} " + hex_encode(lsign(n, mbox_open_message(id, until)))))).status;
+    return hex_encode(id);
+}
+
 // R2R-2: a session whose device is not a device of its log (removed) is
 // deleted when the relay checks the log again: not checked again per
 // request.
@@ -613,7 +624,7 @@ List(Int) filled(Int n, Int v, ListBuf(Int) acc) { return if (n <= 0) { acc.fini
 test "a mailbox takes messages of at most 1 MiB, and so many per recipient at a time" {
     Store s = tmp_store();
     RelayCfg g = cfg_of(s, "");
-    Str to = hex_encode(random_bytes(32));
+    Str to = open_box(g, 6);
     expect(relay_serve_handle(g, treq("POST", "/mbox/" + to, "", filled(1048577, 120, ListBuf()))).status).toEqual(413);
     expect(relay_serve_handle(g, treq("POST", "/mbox/" + to, "", [1])).status).toEqual(200);
     Int now = clock_now_seconds();
@@ -622,7 +633,7 @@ test "a mailbox takes messages of at most 1 MiB, and so many per recipient at a 
     _ = st_text(s, "mboxq/" + to, f"{now} 1 67108800");
     expect(relay_serve_handle(g, treq("POST", "/mbox/" + to, "", filled(200, 121, ListBuf()))).status).toEqual(429);
     // another recipient, or a window that has passed: taken
-    expect(relay_serve_handle(g, treq("POST", "/mbox/" + hex_encode(random_bytes(32)), "", [2])).status).toEqual(200);
+    expect(relay_serve_handle(g, treq("POST", "/mbox/" + open_box(g, 12), "", [2])).status).toEqual(200);
     _ = st_text(s, "mboxq/" + to, f"{now - 4000} 256 67108800");
     expect(relay_serve_handle(g, treq("POST", "/mbox/" + to, "", [3])).status).toEqual(200);
     List(Str) q = str_split(st_read_text(s, "mboxq/" + to), " ");
@@ -632,35 +643,7 @@ test "a mailbox takes messages of at most 1 MiB, and so many per recipient at a 
     expect(q[2]).toEqual("1");
 }
 
-@requires(filesystem, network, clock(readonly), declassify)
-Int put_alerts(RelayCfg g, Str l, Int i, Int n, Int ok) {
-    if (i >= n) { return ok; }
-    Int st = relay_serve_handle(g, treq("PUT", "/blob/alrt-" + l + f"-{1700000000 + i}-" + hex_encode(random_bytes(4)), "", [1, 2, 3])).status;
-    return put_alerts(g, l, i + 1, n, ok + (if (st == 200) { 1 } else { 0 }));
-}
-
-// R2R-3: the relay cannot tell a cosigner's sealed alert from junk, so at
-// most 64 wait for one person; their devices remove what they read.
-@requires(filesystem, network, clock(readonly), declassify)
-test "at most 64 alerts wait for one log, and its devices remove them" {
-    Store s = tmp_store();
-    RelayCfg g = cfg_of(s, "");
-    TDev a = tdev();
-    Str l = hex_encode(a.log);
-    expect(put_alerts(g, l, 0, 64, 0)).toEqual(64);
-    Str extra = "alrt-" + l + "-1800000000-0a0b0c0d";
-    expect(relay_serve_handle(g, treq("PUT", "/blob/" + extra, "", [9])).status).toEqual(429);
-    // another person's alerts are not affected
-    expect(put_alerts(g, hex_encode(random_bytes(32)), 0, 1, 0)).toEqual(1);
-    // someone else cannot remove them; a device of the log can
-    List(Str) names = st_list(s, "blob/alrt-" + l + "-", "", 100);
-    Str first = str_slice(names[0], 5, str_len(names[0]));
-    expect(relay_serve_handle(g, treq("PUT", "/blob/" + first, "", [])).status).toEqual(401);
-    expect(relay_serve_handle(g, treq("PUT", "/blob/" + first, tsession(s, tdev(), 0), [])).status).toEqual(403);
-    expect(relay_serve_handle(g, treq("PUT", "/blob/" + first, tsession(s, a, 0), [])).status).toEqual(200);
-    expect(absent(s, "blob/" + first)).toBeTrue();
-    expect(relay_serve_handle(g, treq("PUT", "/blob/" + extra, "", [9])).status).toEqual(200);
-}
+// (R2R-3: at most 64 alerts wait for one log: mailgate_test.resid.)
 
 // R2R-4: the relay counts governance versions from a pointer it keeps,
 // not by reading every version from the first.

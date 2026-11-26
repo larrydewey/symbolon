@@ -14,6 +14,7 @@ import "hpkeg.resid";
 import "word.resid";
 import "ecdsa.resid";
 import "crypto.resid";
+import "clock.resid";
 
 List(Int) rep(Int b, Int n) { return if (n == 0) { [] } else { [b].concat(rep(b, n - 1)) }; }
 
@@ -26,7 +27,14 @@ Endpoint witness_at() { return Endpoint {.host = "127.0.0.1", .port = str_parse_
 @requires(network, environment, declassify, clock(readonly))
 test "relay: mailboxes in order, a log takes only its valid next event, blobs; names are checked" {
     Endpoint e = relay_at();
-    List(Int) to = random_bytes(32);
+    // A mailbox takes anonymous posts only once its owner opened it (a party
+    // of no log yet; agent/mailgate.resid): a made-up one takes none.
+    expect(mbox_put(e, random_bytes(32), [1])).toEqual(-1);
+    List(Int) k = ec_generate(P256);
+    List(Int) pk = ec_public_key(P256, k);
+    List(Int) to = sha256_bytes(pk);
+    Int until = clock_now_seconds() + 3600;
+    expect(mbox_open(e, pk, until, ecdsa_sign_raw(P256, Sha256, k, mbox_open_message(to, until)))).toBeTrue();
     expect(mbox_put(e, to, [1, 2, 3])).toEqual(0);
     expect(mbox_put(e, to, [4])).toEqual(1);
     expect(hex_encode(mbox_get(e, to, 1) else { [] })).toEqual("04");
@@ -38,15 +46,14 @@ test "relay: mailboxes in order, a log takes only its valid next event, blobs; n
     expect(match log_get(e, l, 0) { Some(_) => "found", None => "none" }).toEqual("none");
     // Blobs: every write but a cosigner's alert needs a signed-in device
     // (agent/relaysrv.resid; signing in needs a log with witnesses, which
-    // agent/relaysrv_test.resid covers): an anonymous write is refused; an
-    // alert is taken once and read back.
+    // agent/relaysrv_test.resid covers): an anonymous write is refused; so
+    // is an alert its log's cosigner did not sign (agent/mailgate_test.resid).
     List(Int) vl = random_bytes(32);
     expect(blob_put(e, "vault-" + hex_encode(vl), [7])).toBeFalse();
     expect(match blob_get(e, "vault-" + hex_encode(vl)) { Some(_) => "found", None => "none" }).toEqual("none");
     Str al = "alrt-" + hex_encode(vl) + "-1700000000-0a0b0c0d";
-    expect(blob_put(e, al, [7])).toBeTrue();
-    expect(blob_put(e, al, [8])).toBeFalse();
-    expect(hex_encode(blob_get(e, al) else { [] })).toEqual("07");
+    expect(blob_put(e, al, [7])).toBeFalse();
+    expect(match blob_get(e, al) { Some(_) => "found", None => "none" }).toEqual("none");
     expect(http_call_bytes(e.host, e.port, "GET", "/blob/..%2fetc", []).status).toEqual(404);
     expect(http_call_bytes(e.host, e.port, "GET", "/mbox/XYZ/0", []).status).toEqual(404);
 }

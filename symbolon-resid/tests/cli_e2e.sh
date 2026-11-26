@@ -383,7 +383,10 @@ grep -q 'recovery pending: 1' "$W/recover.log" || fail "recover: $(cat "$W/recov
 grep -q 'NEW RECOVERY KIT' "$W/recover.log" || fail "no new kit"
 run 120 "$BIN" device status "$W/dev" | grep -q 'pending 1' || fail "status does not show the pending recovery"
 printf '3333\n' | run 300 "$BIN" device recover-release "$W/dev3" > "$W/rel1.log" 2>&1 && fail "the kit half was released before the delay"
-grep -q 'refused' "$W/rel1.log" || fail "release: $(cat "$W/rel1.log")"
+# Since S-5 (the cosigner's peers come only from the quorum) the cosigner
+# does not answer a party whose recovery is pending: the release fails
+# with no answer rather than an explicit refusal.
+grep -Eq 'refused|no answer from the cosigner' "$W/rel1.log" || fail "release: $(cat "$W/rel1.log")"
 printf '2468\n' | run 300 "$BIN" device veto "$W/dev" > "$W/veto.log" 2>&1 || fail "veto: $(cat "$W/veto.log")"
 grep -q 'pending now 0' "$W/veto.log" || fail "veto: $(cat "$W/veto.log")"
 printf '3333\n' | run 300 "$BIN" device recover-release "$W/dev3" > "$W/rel2.log" 2>&1 && fail "the kit half was released after a veto"

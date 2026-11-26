@@ -1271,9 +1271,14 @@ the cosigner keeps the HPKE public keys of at most eight devices. An
 alert for a household member is left in their cosigner's inbox on the
 box; their cosigner seals it with HPKE (the envelope suite, mode auth
 from the cosigner's key, info "symbolon v1 duress alert"), one line per
-alert key, to the relay blob `alrt-<log id>-<n>`. Their devices read it
-with `device alerts inbox DIR` (no PIN): the Android app every 15 minutes
-and at every start, as a notification; elsewhere when the app opens.
+alert key, to the relay blob `alrt-<log id>-<time>-<8 hex>`, signed with
+the cosigner's party key (Section 20.2). Their devices read it with
+`device alerts inbox DIR` (no PIN): the Android app every 15 minutes and
+at every start, as a notification; elsewhere when the app opens. A device
+shows an alert only when the cosigner of its log (from the verified log)
+signed it, and removes an alert it has read a day after it was made, so
+the person's other devices read it first and the relay's limit of 64
+waiting alerts per log does not fill.
 
 **The message.** "DURESS: NAME unlocked Symbolon with the duress PIN at
 TIME. Last known location: LAT, LON (within ACC m, AGE old): an
@@ -2268,6 +2273,81 @@ attacker impersonates can only withhold. What TLS adds is confidentiality
 of the traffic's metadata and of the request patterns against a passive
 network observer. A deployment without the anchor (loopback tests) speaks
 plain HTTP.
+
+### 20.2.1 Who may use a mailbox (R2R-3)
+
+Mailbox ids are party ids (SHA-256 of the party's auth key). Before this
+revision anyone could post up to 16 MiB to any id, so a relay's store
+could be filled with posts to made-up recipients (measured: 4.9 GB in
+three minutes), and anyone could write `alrt-` blobs.
+
+The relay takes a mailbox message (`POST /mbox/<to>`) only with proof
+that the sender is a party of the recipient's log: a bearer session that
+names a log and a party, either a device's sign-in (Section 29.4) or a
+mail session, and both the sender (with the key the session was issued
+for) and `<to>` must be parties of that log as the relay verifies it from
+the events it stores, at its own clock: the quorum, a party proposed and
+not yet re-shared in, or a new party of a pending recovery, without the
+parties removed. The relay keeps the verified parties per log length
+(again after five minutes while something is pending). Otherwise 403; no
+session, 401.
+
+A mail session is for a party that cannot sign in as a device: the
+cosigner, a device being enrolled (a proposed party) or recovering (a
+party of a pending recovery). `POST /auth/mail` takes `CHALLENGE LOG
+PARTY SIG NAME` as `/auth`, SIG over `"symbolon v1 relay mail auth " ||
+NAME || "\n" || CHALLENGE` by the party's auth key from the log, and
+answers `TOKEN UNTIL`, good for a day and for mailbox posts only (it is
+not a sign-in: no blob write). Under the duress PIN a device sends with
+the session it has and signs nothing in (as for its other writes).
+
+A party of no log yet (inception: the device, its kit and the cosigner
+exchange key generation messages before the log exists) opens its own
+mailbox: `POST /mbox-open/<party>` with `PUBKEY UNTIL SIG`, where
+SHA-256(PUBKEY) is the party id, UNTIL at most a day ahead, and SIG over
+`"symbolon v1 mailbox open\n" || party || UNTIL (8 bytes, big-endian)`.
+Only an opened mailbox takes posts without a session. The cosigner opens
+its mailbox while it may take an inception (after its operator paired a
+device), the device its own and its kit's before it sends the
+invitation.
+
+Every anonymous write counts against one budget for the whole relay:
+64 MiB per 10 minutes (429 beyond), stored with the quota counters. They
+are: a post to an opened mailbox, opening a mailbox (4 KiB each), a new
+log's first event (anyone can make a log), and a console passkey waiting
+for approval. A post with a session is not counted. The per-recipient
+quotas stay: 256 messages and 64 MiB per recipient per 10 minutes, 1 MiB
+per message.
+
+A mailbox message older than 30 days is replaced by the 24-byte
+placeholder `"symbolon expired message"`, which readers skip without a
+word; its index stays, so reading on from an index still works. The relay
+records where each day's messages start in a mailbox and sweeps at most
+16 old messages of the mailbox posted to and of one other mailbox in turn
+on each post.
+
+An alert (`alrt-<log>-<time>-<8 hex>`, Section 14.4) is taken only signed
+by a cosigner party of that log: its body is `"sig1 " || hex(SIG) || "
+-\n"` and then the sealed lines, SIG over `"symbolon v1 alert " || name ||
+"\n" || SHA-256(sealed lines)` with the cosigner's auth key. Its time is
+within the last week (and not in the future); it is written once; once a
+device of the log removed it, the same name is never taken again. At
+most 64 wait for one log. Devices check the same signature against the
+cosigner in their verified log before showing one.
+
+| | Before | After |
+|---|---|---|
+| Mailbox post | anyone, any id, 1 MiB, per-recipient quota | a party of the recipient's log by its session; or, for a party of no log yet, to a mailbox its owner opened, within the global anonymous budget |
+| Alert | anyone, 64 per log | the log's cosigner's signature; not after removal; a week |
+| Old messages | kept forever | placeholder after 30 days |
+| Anonymous writes | per recipient only | one relay-wide budget |
+
+Residual: logs cost nothing to make (anyone can write a valid inception
+with keys and witnesses of their own), so whoever makes logs can post to
+the mailboxes of their own logs' parties: a relay bounds that only by the
+global budget on new logs and by the per-recipient quotas. A relay that
+must bound it further needs to restrict which witnesses or cosigners it
+serves.
 
 ### 20.3 Witnesses
 

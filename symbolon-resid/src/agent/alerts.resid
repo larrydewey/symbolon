@@ -427,14 +427,18 @@ Bool name_is_ok(Str n) { return str_len(n) >= 1 && str_len(n) <= 32 && !str_cont
 
 // This person's inbox, sealed to each alert key and put on the relay as
 // alrt-LOG-NAME (base64 of the HPKE encapsulation and ciphertext, one per
-// key, newline-separated). `sk` is this cosigner's HPKE key.
+// key, newline-separated), signed with `dk`, this cosigner's party key
+// (services.resid alert_signed: the relay and the person's devices take
+// only an alert their log's cosigner signed). `sk` is this cosigner's HPKE
+// key. An alert the relay has not taken within a week is dropped: the
+// relay takes none older (SPEC 14.4).
 @requires(filesystem, network, clock(readonly), declassify)
-pub Int deliver_inbox(Str cos, Endpoint relay, List(Int) log_id, List(Secret(UInt(8))) sk, List(Int) pk) {
+pub Int deliver_inbox(Str cos, Endpoint relay, List(Int) log_id, List(Secret(UInt(8))) sk, List(Int) pk, List(Secret(UInt(8))) dk) {
     List(Str) names = filesystem.list_dir(cos + "/inbox");
     if (names.len() == 0 || log_id.len() == 0) { return 0; }
     List(List(Int)) keys = alert_keys(get_file(cos + "/alert-keys"), 0, []);
     if (keys.len() == 0) { return 0; }
-    return deliver_each(cos, relay, log_id, sk, pk, keys, sort(names), 0);
+    return deliver_each(cos, relay, log_id, sk, pk, dk, keys, sort(names), 0);
 }
 
 pub List(List(Int)) alert_keys(List(Int) b, Int i, List(List(Int)) acc) {
@@ -443,12 +447,14 @@ pub List(List(Int)) alert_keys(List(Int) b, Int i, List(List(Int)) acc) {
 }
 
 @requires(filesystem, network, clock(readonly), declassify)
-Int deliver_each(Str cos, Endpoint relay, List(Int) log_id, List(Secret(UInt(8))) sk, List(Int) pk, List(List(Int)) keys, List(Str) names, Int i) {
+Int deliver_each(Str cos, Endpoint relay, List(Int) log_id, List(Secret(UInt(8))) sk, List(Int) pk, List(Secret(UInt(8))) dk, List(List(Int)) keys, List(Str) names, Int i) {
     if (i >= names.len()) { return 0; }
     List(Int) msg = get_file(cos + "/inbox/" + names[i]);
-    Str sealed = seal_each(keys, msg, sk, pk, 0, StrBuf());
-    if (msg.len() > 0 && blob_put(relay, "alrt-" + hex_encode(log_id) + "-" + names[i], str_to_bytes(sealed))) { _ = filesystem.write_all(cos + "/inbox/" + names[i], ""); }
-    return deliver_each(cos, relay, log_id, sk, pk, keys, names, i + 1);
+    Str name = "alrt-" + hex_encode(log_id) + "-" + names[i];
+    List(Int) sealed = str_to_bytes(seal_each(keys, msg, sk, pk, 0, StrBuf()));
+    Bool stale = str_parse_int(str_slice(names[i], 0, str_index_of(names[i], "-", 0))) + 604800 < clock_now_seconds();
+    if (msg.len() > 0 && (stale || blob_put(relay, name, alert_signed(sw_sign(dk, alert_sig_message(name, sealed)), sealed)))) { _ = filesystem.write_all(cos + "/inbox/" + names[i], ""); }
+    return deliver_each(cos, relay, log_id, sk, pk, dk, keys, names, i + 1);
 }
 
 pub List(Int) alert_info() { return utf8("symbolon v1 duress alert"); }
@@ -456,7 +462,7 @@ pub List(Int) alert_info() { return utf8("symbolon v1 duress alert"); }
 // HPKE mode_auth (the envelopes' suite: P-256, HKDF-SHA256) to each alert key, from
 // this cosigner's HPKE key; info names the purpose.
 @requires(declassify)
-Str seal_each(List(List(Int)) keys, List(Int) msg, List(Secret(UInt(8))) sk, List(Int) pk, Int i, StrBuf acc) {
+pub Str seal_each(List(List(Int)) keys, List(Int) msg, List(Secret(UInt(8))) sk, List(Int) pk, Int i, StrBuf acc) {
     if (i >= keys.len()) { return acc.finish(); }
     List(Secret(UInt(8))) none = [];
     HpkeSenderG(Secret(UInt(8))) h = hpkeg_setup_sender_full(envelope_suite(), keys[i], alert_info(), none, [], sk, none);

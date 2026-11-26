@@ -6,7 +6,9 @@
 // HPKE mode_auth, log events are signed and witnessed, vault items are
 // AEAD-sealed under a signed head).
 //
-//   POST /mbox/<to>            an envelope for party <to>; answers its index
+//   POST /mbox/<to>            an envelope for party <to>; answers its index (the
+//                              organization relay, agent/relaysrv.resid, takes it only
+//                              from a party of <to>'s log: agent/mailgate.resid)
 //   GET  /mbox/<to>/<n>        envelope n for <to>, 404 when there is none
 //   POST /log/<log>/<seq>      an event; refused (409) when <seq> is taken
 //   GET  /log/<log>/<seq>      the event
@@ -647,4 +649,79 @@ pub Option(Int) time_from(Endpoint e, List(Int) wkey, List(Int) nonce) {
     Int t = if (n == 0) { ai } else { be_at(b, 2, n, 0) };
     if (b[2 + n] != 88 || b[3 + n] != 64) { return None; }
     return if (ecdsa_verify_raw(P256, Sha256, wkey, time_message(nonce, t), b[4 + n..b.len()])) { Some(t) } else { None };
+}
+
+// ============================================================================
+// Mail credentials (SPEC 20.2)
+// ============================================================================
+//
+// The relay keeps a mailbox message only from a known party of the
+// recipient's log: the sender's bearer session (`Authorization: Bearer`,
+// a device's sign-in or a mail session from POST /auth/mail) names its
+// log and party, and the recipient must be a party of that same log (its
+// quorum, a proposed party, or a party of a pending recovery). The one
+// exception is a party of no log yet (an inception): its owner opens its
+// mailbox for at most a day (POST /mbox-open/<party>, signed with the key
+// whose SHA-256 is the party id), and anonymous posts to an opened mailbox
+// count against the relay's budget for all anonymous writes.
+
+List(Int) svc_be8(Int v) { return [(v >> 56) & 255, (v >> 48) & 255, (v >> 40) & 255, (v >> 32) & 255, (v >> 24) & 255, (v >> 16) & 255, (v >> 8) & 255, v & 255]; }
+
+// What a party signs for a mail session: the relay's name and a challenge
+// from GET /auth/challenge, apart from a device's sign-in.
+pub List(Int) mail_auth_message(Str name, List(Int) chal) { return ascii("symbolon v1 relay mail auth " + name + "\n").concat(chal); }
+
+// What a party of no log yet signs to open its mailbox until `until`.
+pub List(Int) mbox_open_message(List(Int) party, Int until) { return ascii("symbolon v1 mailbox open\n").concat(party).concat(svc_be8(until)); }
+
+// The longest a mailbox stays open: a day.
+pub Int mbox_open_secs() { return 86400; }
+
+// What a cosigner signs for the alert `name` whose sealed lines are `rest`.
+pub List(Int) alert_sig_message(Str name, List(Int) rest) { return ascii("symbolon v1 alert " + name + "\n").concat(sha256_bytes(rest)); }
+
+// A signed alert: "sig1 HEX -\n", then the sealed lines (a reader from
+// before signatures skips the first line: it is not "ENC CT").
+pub List(Int) alert_signed(List(Int) sig, List(Int) rest) { return ascii("sig1 " + hex_encode(sig) + " -\n").concat(rest); }
+
+pub type AlertParts = { List(Int) sig; List(Int) rest; };
+
+// The signature and the sealed lines of a signed alert; an empty `sig`
+// when it is not one.
+pub AlertParts alert_parts(List(Int) b) {
+    AlertParts none = AlertParts {.sig = [], .rest = []};
+    if (b.len() < 136 || b[135] != 10 || b[133] != 32 || b[134] != 45 || http_text(b, 0, 5) != "sig1 ") { return none; }
+    Str h = http_text(b, 5, 133);
+    if (!hex_name(h, 0)) { return none; }
+    return AlertParts {.sig = cose_hex_decode(h), .rest = b[136..b.len()]};
+}
+
+// What the relay keeps in place of a mailbox message older than 30 days:
+// readers skip it without a word, and the indexes after it stay.
+pub List(Int) mail_expired_body() { return ascii("symbolon expired message"); }
+
+pub Bool mail_expired(List(Int) b) { return b.len() == 24 && http_text(b, 0, 24) == "symbolon expired message"; }
+
+// A sign-in challenge from the relay (hex); "" when it gave none.
+@requires(network, clock(readonly), declassify)
+pub Str relay_challenge(Endpoint e) {
+    HttpOut ch = http_call_ep(e, "GET", "/auth/challenge", []);
+    Str c = str_trim(http_text(ch.body, 0, ch.body.len()));
+    return if (ch.status == 200 && str_len(c) == 64) { c } else { "" };
+}
+
+// A mail session for `party` of log `l`: "TOKEN UNTIL", or "" when the
+// relay refused. `sig` is over mail_auth_message(name, challenge).
+@requires(network, clock(readonly), declassify)
+pub Str mail_session_from(Endpoint e, Str chal, List(Int) l, List(Int) party, List(Int) sig, Str name) {
+    HttpOut r = http_call_ep(e, "POST", "/auth/mail", ascii(chal + " " + hex_encode(l) + " " + hex_encode(party) + " " + hex_encode(sig) + " " + name));
+    Str t = str_trim(http_text(r.body, 0, r.body.len()));
+    return if (r.status == 200 && str_len(t) > 65) { t } else { "" };
+}
+
+// Opens the mailbox of the party whose key is `pubkey` until `until`; `sig`
+// is over mbox_open_message.
+@requires(network, clock(readonly), declassify)
+pub Bool mbox_open(Endpoint e, List(Int) pubkey, Int until, List(Int) sig) {
+    return http_call_ep(e, "POST", "/mbox-open/" + hex_encode(sha256_bytes(pubkey)), ascii(hex_encode(pubkey) + " " + f"{until} " + hex_encode(sig))).status == 200;
 }

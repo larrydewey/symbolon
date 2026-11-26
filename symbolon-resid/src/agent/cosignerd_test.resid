@@ -34,7 +34,7 @@ Str fresh_dir() {
 Cosigner cosigner_in(Str dir) {
     CosignerConfig cfg = CosignerConfig {.relay_host = "127.0.0.1", .relay_port = 1, .ca = "", .party = rep(1, 32), .dk_pub = [], .hpke_pub = [],
                                          .log_id = rep(7, 32), .mbox_next = 0, .peers = [], .accept_inception = false};
-    return Cosigner {.dir = dir, .cfg = cfg, .root = random_secret(32)};
+    return Cosigner {.dir = dir, .cfg = cfg, .root = random_secret(32), .mail = ""};
 }
 
 Quorum quorum_at(Int epoch) {

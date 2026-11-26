@@ -1,0 +1,420 @@
+// Who may post to a mailbox, what anonymous writes may cost, and what the
+// relay keeps of mailboxes and alerts over time (SPEC 20.2; R2R-3).
+//
+// A mailbox message is taken from a known party of the recipient's log
+// only: the request's bearer session (a device's sign-in, "auth/tok-", or
+// a mail session, "auth/mtok-", POST /auth/mail) names a log and a party,
+// and both the sender (with the key the session was issued for) and the
+// recipient must be parties of that log as this relay verifies it from
+// the events it stores: its quorum, a party proposed and not yet re-shared
+// in, or a new party of a pending recovery, without the parties removed.
+// Mailbox ids are party ids (SHA-256 of the party's auth key).
+//
+// A party of no log yet (an inception: the device, its kit and the
+// cosigner exchange key generation messages before the log exists) opens
+// its own mailbox for at most a day, signed with the key whose SHA-256 is
+// its id; only an opened mailbox takes anonymous posts, and every
+// anonymous write (such a post, an opening, an inception event, a console
+// passkey waiting for approval) is counted against one budget for the
+// whole relay: anon_window_bytes() per anon_window_secs().
+//
+// A mailbox message older than mail_keep_secs() is replaced by a small
+// placeholder that readers skip (services.resid mail_expired_body), so
+// indexes stay and storage is bounded; the sweep runs a few messages at a
+// time on each post.
+//
+// An alert ("alrt-<log>-<time>-<8 hex>") is taken only signed by a
+// cosigner party of that log, at most a week after its time, and never
+// again once its devices removed it.
+//
+// Keys: "mbxm/<log>" the parties of a log as last verified ("LEN UNTIL",
+// then "ID KIND KEY" lines); "mbxopen/<party>" until when a mailbox is
+// open; "anonq" the anonymous window ("START BYTES"); "mboxd/<to>" when a
+// mailbox's messages were written (first line the last post's time, then
+// "INDEX TIME" from where a day's messages start); "mboxw/<to>" the first
+// index not swept; "mboxrot" the last mailbox the rotating sweep visited;
+// "alrtgone/<name>" a removed alert; "auth/mtok-<H(token)>" a mail
+// session ("LOG PARTY KEY UNTIL").
+
+import "../types.resid";
+import "../core/log.resid";
+import "../net/services.resid";
+import "../net/store.resid";
+import "common.resid";
+import "crypto.resid";
+import "ecdsa.resid";
+import "cose.resid";
+import "httpserv.resid";
+
+pub type MailMember = { List(Int) id; Int kind; List(Int) key; };
+
+Bool mg_hex(Str s, Int i) {
+    if (i >= str_len(s)) { return str_len(s) > 0 && str_len(s) % 2 == 0; }
+    Int c = str_char_at(s, i);
+    return ((c >= 48 && c <= 57) || (c >= 97 && c <= 102)) && mg_hex(s, i + 1);
+}
+
+Bool mg_dec(Str s, Int i) {
+    if (str_len(s) == 0 || str_len(s) > 18) { return false; }
+    if (i >= str_len(s)) { return true; }
+    Int c = str_char_at(s, i);
+    return c >= 48 && c <= 57 && mg_dec(s, i + 1);
+}
+
+Int mg_int(Str s) { return if (mg_dec(s, 0)) { str_parse_int(s) } else { -1 }; }
+
+@requires(filesystem, network, clock(readonly), declassify)
+Bool mg_has(Store root, Str k) { return match st_get(root, k) { None => false, Some(_) => true }; }
+
+// ─── The parties of a log ───────────────────────────────────────
+
+@requires(filesystem, network, clock(readonly), declassify)
+List(SignedEvent) mg_log(Store root, List(Int) l, Int seq, ListBuf(SignedEvent) acc) {
+    Option(List(Int)) b = st_get(root, "log/" + hex_encode(l) + "/" + f"{seq}");
+    if (match b { None => true, Some(_) => false }) { return acc.finish(); }
+    Option(StoredEvent) se = event_of_cbor(b else { [] });
+    Option(SignedEvent) oe = match se { None => None, Some(x) => signed_of(x) };
+    return match oe { None => acc.finish(), Some(e) => mg_log(root, l, seq + 1, acc.push(e)) };
+}
+
+// The parties of log `l` who may send and receive mail, as the relay
+// verifies the log from the events it stores at its own clock `now` (no
+// witness is asked: this decides only who may use the relay's storage).
+// Verified once per length of the log (again after five minutes while
+// something is pending, after a day otherwise); [] for a log that is not
+// there or does not verify.
+@requires(filesystem, network, clock(readonly), declassify)
+pub List(MailMember) mail_members(Store root, List(Int) l, Int now) {
+    if (l.len() != 32) { return []; }
+    Str k = "mbxm/" + hex_encode(l);
+    List(Str) lines = str_split(st_read_text(root, k), "\n");
+    if (mg_cache_good(root, l, lines, now)) { return mg_rows(lines, 1, ListBuf()); }
+    List(SignedEvent) evs = mg_log(root, l, 0, ListBuf());
+    if (evs.len() == 0) { return []; }
+    Int t0 = last_time(evs, policy_of_e0(evs));
+    Int t = if (now > t0) { now } else { t0 };
+    Result(VerifiedHead, SymbolonError) rv = il_verify(l, evs, t, lambda(x) { true });
+    return match rv {
+        Err(_) => [],
+        Ok(vh) => mg_cache(root, k, evs, vh, il_membership(l, evs, t, lambda(x) { true }), now)
+    };
+}
+
+@requires(filesystem, network, clock(readonly), declassify)
+Bool mg_cache_good(Store root, List(Int) l, List(Str) lines, Int now) {
+    if (lines.len() < 2) { return false; }
+    List(Str) h = str_split(lines[0], " ");
+    if (h.len() != 2 || mg_int(h[0]) <= 0 || mg_int(h[1]) < now) { return false; }
+    return !mg_has(root, "log/" + hex_encode(l) + "/" + h[0]);
+}
+
+List(MailMember) mg_rows(List(Str) lines, Int i, ListBuf(MailMember) acc) {
+    if (i >= lines.len()) { return acc.finish(); }
+    List(Str) p = str_split(lines[i], " ");
+    Bool ok = p.len() == 3 && mg_hex(p[0], 0) && mg_dec(p[1], 0) && mg_hex(p[2], 0);
+    return mg_rows(lines, i + 1, if (ok) { acc.push(MailMember {.id = cose_hex_decode(p[0]), .kind = str_parse_int(p[1]), .key = cose_hex_decode(p[2])}) } else { acc });
+}
+
+@requires(filesystem, network, clock(readonly), declassify)
+List(MailMember) mg_cache(Store root, Str k, List(SignedEvent) evs, VerifiedHead vh, Option(Membership) om, Int now) {
+    Membership m = om else { Membership {.proposed = [], .removed = []} };
+    List(Party) all = vh.head.quorum.parties.concat(m.proposed).concat(mg_recovering(evs, vh.pending, 0, []));
+    List(MailMember) ms = mg_kept(all, m.removed, 0, ListBuf());
+    Int until = now + (if (vh.pending.len() > 0) { 300 } else { 86400 });
+    _ = st_text(root, k, f"{evs.len()} {until}\n" + mg_rows_text(ms, 0, StrBuf()));
+    return ms;
+}
+
+// The new parties of the recoveries pending at the head: a device that
+// recovers asks the cosigner for its half before its recovery takes effect.
+List(Party) mg_recovering(List(SignedEvent) evs, List(UInt(64)) ps, Int i, List(Party) acc) {
+    if (i >= ps.len()) { return acc; }
+    Int s = (Int)ps[i];
+    List(Party) np = if (s >= 0 && s < evs.len()) { mg_recover_parties(evs[s].payload) } else { [] };
+    return mg_recovering(evs, ps, i + 1, acc.concat(np));
+}
+
+List(Party) mg_recover_parties(EventPayload p) {
+    EventBody b = p.body;
+    return match b { RecoverBody(r) => r.new_parties, _ => [] };
+}
+
+List(MailMember) mg_kept(List(Party) ps, List(List(Int)) removed, Int i, ListBuf(MailMember) acc) {
+    if (i >= ps.len()) { return acc.finish(); }
+    Bool gone = mg_in(removed, ps[i].id, 0);
+    return mg_kept(ps, removed, i + 1, if (gone) { acc } else { acc.push(MailMember {.id = ps[i].id, .kind = (Int)ps[i].kind, .key = ps[i].auth_key}) });
+}
+
+Bool mg_in(List(List(Int)) xs, List(Int) x, Int i) {
+    if (i >= xs.len()) { return false; }
+    return bytes_eq(xs[i], x) || mg_in(xs, x, i + 1);
+}
+
+Str mg_rows_text(List(MailMember) ms, Int i, StrBuf acc) {
+    if (i >= ms.len()) { return acc.finish(); }
+    return mg_rows_text(ms, i + 1, acc.push(hex_encode(ms[i].id) + f" {ms[i].kind} " + hex_encode(ms[i].key) + "\n"));
+}
+
+pub Option(MailMember) mail_member(List(MailMember) ms, List(Int) id, Int i) {
+    if (i >= ms.len()) { return None; }
+    if (bytes_eq(ms[i].id, id)) { return Some(ms[i]); }
+    return mail_member(ms, id, i + 1);
+}
+
+Bool mg_sender(List(MailMember) ms, List(Int) id, List(Int) key, Int i) {
+    if (i >= ms.len()) { return false; }
+    return (bytes_eq(ms[i].id, id) && bytes_eq(ms[i].key, key)) || mg_sender(ms, id, key, i + 1);
+}
+
+// ─── Who sent a request ─────────────────────────────────────────
+
+// The party a bearer session names: a device's sign-in or a mail session.
+pub type MailFrom = { Bool on; List(Int) log; List(Int) party; List(Int) key; };
+
+pub MailFrom mail_nobody() { return MailFrom {.on = false, .log = [], .party = [], .key = []}; }
+
+@requires(filesystem, network, clock(readonly), declassify)
+pub MailFrom mail_from(Store root, Str authz, Int now) {
+    if (str_len(authz) != 71 || str_slice(authz, 0, 7) != "Bearer ") { return mail_nobody(); }
+    Str t = str_slice(authz, 7, 71);
+    if (!mg_hex(t, 0)) { return mail_nobody(); }
+    Str h = hex_encode(sha256_bytes(http_bytes(t)));
+    Str dev = str_trim(st_read_text(root, "auth/tok-" + h));
+    Str rec = if (str_len(dev) > 0) { dev } else { str_trim(st_read_text(root, "auth/mtok-" + h)) };
+    List(Str) p = str_split(rec, " ");
+    if (p.len() < 4 || str_len(p[0]) != 64 || !mg_hex(p[0], 0) || !mg_hex(p[1], 0) || !mg_hex(p[2], 0) || mg_int(p[3]) < now) { return mail_nobody(); }
+    return MailFrom {.on = true, .log = cose_hex_decode(p[0]), .party = cose_hex_decode(p[1]), .key = cose_hex_decode(p[2])};
+}
+
+// 0 when a message of `n` bytes from `f` may go to the mailbox `to` (hex);
+// else the HTTP status that refuses it: 403 a sender or recipient that is
+// not a party of the session's log, 401 an anonymous post to a mailbox
+// that is not open, 429 the anonymous budget spent.
+@requires(filesystem, network, clock(readonly), declassify)
+pub Int mail_gate(Store root, MailFrom f, Str to, Int n, Int now) {
+    if (f.on) {
+        List(MailMember) ms = mail_members(root, f.log, now);
+        Bool to_ok = match mail_member(ms, cose_hex_decode(to), 0) { None => false, Some(_) => true };
+        return if (mg_sender(ms, f.party, f.key, 0) && to_ok) { 0 } else { 403 };
+    }
+    if (!mbox_is_open(root, to, now)) { return 401; }
+    return if (anon_take(root, n, now)) { 0 } else { 429 };
+}
+
+// ─── Anonymous writes ───────────────────────────────────────────
+
+pub Int anon_window_secs() { return 600; }
+pub Int anon_window_bytes() { return 67108864; }
+
+// Counts `n` bytes against the anonymous budget; false (and nothing
+// counted) when they are over it.
+@requires(filesystem, network, clock(readonly), declassify)
+pub Bool anon_take(Store root, Int n, Int now) {
+    List(Str) p = str_split(str_trim(st_read_text(root, "anonq")), " ");
+    Bool cur = p.len() == 2 && mg_int(p[0]) >= 0 && mg_int(p[1]) >= 0 && mg_int(p[0]) <= now && mg_int(p[0]) + anon_window_secs() > now;
+    Int start = if (cur) { mg_int(p[0]) } else { now };
+    Int bytes = (if (cur) { mg_int(p[1]) } else { 0 }) + n;
+    if (bytes > anon_window_bytes()) { return false; }
+    return st_text(root, "anonq", f"{start} {bytes}");
+}
+
+// What opening a mailbox counts against the budget.
+pub Int mbox_open_cost() { return 4096; }
+
+@requires(filesystem, network, clock(readonly), declassify)
+pub Bool mbox_is_open(Store root, Str to, Int now) { return mg_int(str_trim(st_read_text(root, "mbxopen/" + to))) >= now; }
+
+// POST /mbox-open/<party>, "PUBKEY UNTIL SIG" (hex, decimal, hex): the
+// owner of the key whose SHA-256 is <party> opens its mailbox until UNTIL
+// (at most a day ahead). The HTTP status.
+@requires(filesystem, network, clock(readonly), declassify)
+pub Int mbox_open_take(Store root, Str party, Str body, Int now) {
+    List(Str) p = str_split(str_trim(body), " ");
+    if (p.len() != 3 || str_len(party) != 64 || !mg_hex(party, 0) || str_len(p[0]) != 130 || !mg_hex(p[0], 0) || !mg_hex(p[2], 0)) { return 400; }
+    List(Int) pk = cose_hex_decode(p[0]);
+    Int until = mg_int(p[1]);
+    if (hex_encode(sha256_bytes(pk)) != party || until <= now || until > now + mbox_open_secs() + 300) { return 403; }
+    if (!ecdsa_verify_raw(P256, Sha256, pk, mbox_open_message(cose_hex_decode(party), until), cose_hex_decode(p[2]))) { return 403; }
+    if (!anon_take(root, mbox_open_cost(), now)) { return 429; }
+    _ = mg_prune(root, "mbxopen/", now);
+    return if (st_text(root, "mbxopen/" + party, f"{until}")) { 200 } else { 500 };
+}
+
+// Removes a few expired records under `prefix` (each holds its end time
+// first), from a random place.
+@requires(filesystem, network, clock(readonly), declassify)
+Int mg_prune(Store root, Str prefix, Int now) {
+    List(Str) ks = st_list(root, prefix, prefix + hex_encode(random_bytes(2)), 4);
+    return mg_prune_each(root, ks, 0, now, 0);
+}
+
+@requires(filesystem, network, clock(readonly), declassify)
+Int mg_prune_each(Store root, List(Str) ks, Int i, Int now, Int n) {
+    if (i >= ks.len()) { return n; }
+    List(Str) p = str_split(str_trim(st_read_text(root, ks[i])), " ");
+    Int end = mg_int(p[0]);
+    Bool gone = end < now && st_delete(root, ks[i]);
+    return mg_prune_each(root, ks, i + 1, now, n + (if (gone) { 1 } else { 0 }));
+}
+
+// ─── Mail sessions ──────────────────────────────────────────────
+
+pub Int mail_session_secs() { return 86400; }
+
+// A mail session for party `m` of log `lhex`: "TOKEN UNTIL". It is good
+// for mailbox posts only (who_of reads "auth/tok-" alone), for a day,
+// while the party stays a party of the log.
+@requires(filesystem, network, clock(readonly), declassify)
+pub HttpReply mail_issue(Store root, Str lhex, MailMember m, Int now) {
+    _ = mg_prune_mtok(root, now);
+    Str t = hex_encode(random_bytes(32));
+    Int until = now + mail_session_secs();
+    Bool ok = st_text(root, "auth/mtok-" + hex_encode(sha256_bytes(http_bytes(t))), lhex + " " + hex_encode(m.id) + " " + hex_encode(m.key) + f" {until}");
+    return if (ok) { http_reply_text(200, "text/plain", t + f" {until}") } else { http_reply_status(500) };
+}
+
+@requires(filesystem, network, clock(readonly), declassify)
+Int mg_prune_mtok(Store root, Int now) {
+    List(Str) ks = st_list(root, "auth/mtok-", "auth/mtok-" + hex_encode(random_bytes(2)), 4);
+    return mg_prune_tok(root, ks, 0, now, 0);
+}
+
+@requires(filesystem, network, clock(readonly), declassify)
+Int mg_prune_tok(Store root, List(Str) ks, Int i, Int now, Int n) {
+    if (i >= ks.len()) { return n; }
+    List(Str) p = str_split(str_trim(st_read_text(root, ks[i])), " ");
+    Bool dead = p.len() < 4 || mg_int(p[3]) < now;
+    Bool gone = dead && st_delete(root, ks[i]);
+    return mg_prune_tok(root, ks, i + 1, now, n + (if (gone) { 1 } else { 0 }));
+}
+
+// ─── Old messages ───────────────────────────────────────────────
+
+pub Int mail_keep_secs() { return 2592000; }
+
+// At most this many messages are swept per mailbox per post.
+pub Int sweep_batch() { return 16; }
+
+type Marks = { Int last; List(Int) idx; List(Int) at; };
+
+@requires(filesystem, network, clock(readonly), declassify)
+Marks mg_marks(Store root, Str to) {
+    List(Str) ls = str_split(str_trim(st_read_text(root, "mboxd/" + to)), "\n");
+    return mg_marks_at(ls, 1, Marks {.last = if (ls.len() > 0) { mg_int(ls[0]) } else { -1 }, .idx = [], .at = []});
+}
+
+Marks mg_marks_at(List(Str) ls, Int i, Marks m) {
+    if (i >= ls.len()) { return m; }
+    List(Str) p = str_split(ls[i], " ");
+    Bool ok = p.len() == 2 && mg_int(p[0]) >= 0 && mg_int(p[1]) >= 0;
+    return mg_marks_at(ls, i + 1, if (ok) { Marks {.last = m.last, .idx = m.idx.concat([mg_int(p[0])]), .at = m.at.concat([mg_int(p[1])])} } else { m });
+}
+
+Str mg_marks_text(Marks m, Int i, StrBuf acc) {
+    if (i >= m.idx.len()) { return acc.finish(); }
+    return mg_marks_text(m, i + 1, acc.push(f"\n{m.idx[i]} {m.at[i]}"));
+}
+
+// After message `n` of mailbox `to` was stored at `now`: the time of the
+// last post, and a mark where a day's messages begin. A mailbox with
+// messages from before this record starts its first day at index 0.
+@requires(filesystem, network, clock(readonly), declassify)
+pub Bool mbox_mark(Store root, Str to, Int n, Int now) {
+    Marks m = mg_unswept(mg_marks(root, to), mg_int(str_trim(st_read_text(root, "mboxw/" + to))));
+    Int k = m.idx.len();
+    Bool fresh = k == 0 || m.at[k - 1] + 86400 <= now;
+    Marks m2 = if (k == 0) { Marks {.last = now, .idx = [0], .at = [now]} } else {
+        if (fresh) { Marks {.last = now, .idx = m.idx.concat([n]), .at = m.at.concat([now])} } else { Marks {.last = now, .idx = m.idx, .at = m.at} } };
+    return st_text(root, "mboxd/" + to, f"{now}" + mg_marks_text(m2, 0, StrBuf()));
+}
+
+// Without the days the sweep has passed (all of a day's messages before
+// the index `swept`): the marks stay as many as the days kept.
+Marks mg_unswept(Marks m, Int swept) {
+    if (m.idx.len() < 2 || m.idx[1] > swept) { return m; }
+    return mg_unswept(Marks {.last = m.last, .idx = m.idx[1..m.idx.len()], .at = m.at[1..m.at.len()]}, swept);
+}
+
+// Where the messages older than mail_keep_secs() end in `to`: every
+// message before the returned index was written before now - keep.
+Int mg_old_end(Marks m, Int next, Int now) {
+    Int cut = now - mail_keep_secs();
+    if (m.idx.len() == 0) { return 0; }
+    if (m.last >= 0 && m.last < cut) { return next; }
+    return mg_first_young(m, cut, 1);
+}
+
+// Day i holds the messages from m.idx[i], written from m.at[i] until
+// m.at[i + 1]; the first day that ends after `cut` may hold young ones.
+Int mg_first_young(Marks m, Int cut, Int i) {
+    if (i >= m.idx.len()) { return m.idx[m.idx.len() - 1]; }
+    return if (m.at[i] > cut) { m.idx[i - 1] } else { mg_first_young(m, cut, i + 1) };
+}
+
+// Replaces at most `max` messages of `to` older than mail_keep_secs() by
+// the placeholder, from where the last sweep stopped; how many.
+@requires(filesystem, network, clock(readonly), declassify)
+pub Int mbox_sweep(Store root, Str to, Int now, Int max) {
+    Marks m = mg_marks(root, to);
+    Int next = mg_int(str_trim(st_read_text(root, "mboxn/" + to)));
+    Int end = mg_old_end(m, if (next < 0) { 0 } else { next }, now);
+    Int from0 = mg_int(str_trim(st_read_text(root, "mboxw/" + to)));
+    Int from = if (from0 < 0) { 0 } else { from0 };
+    Int stop = if (end < from + max) { end } else { from + max };
+    if (stop <= from) { return 0; }
+    Int n = mg_blank(root, to, from, stop, 0);
+    _ = st_text(root, "mboxw/" + to, f"{stop}");
+    return n;
+}
+
+@requires(filesystem, network, clock(readonly), declassify)
+Int mg_blank(Store root, Str to, Int i, Int stop, Int n) {
+    if (i >= stop) { return n; }
+    Str k = "mbox/" + to + "/" + f"{i}";
+    Bool done = mg_has(root, k) && st_put(root, k, mail_expired_body());
+    return mg_blank(root, to, i + 1, stop, n + (if (done) { 1 } else { 0 }));
+}
+
+// After a post to `to`: its marks, its own old messages, and one other
+// mailbox in turn (so a mailbox no one posts to any more is swept too).
+@requires(filesystem, network, clock(readonly), declassify)
+pub Int mbox_after_post(Store root, Str to, Int n, Int now) {
+    _ = mbox_mark(root, to, n, now);
+    Int a = mbox_sweep(root, to, now, sweep_batch());
+    List(Str) ks = st_list(root, "mboxd/", str_trim(st_read_text(root, "mboxrot")), 1);
+    List(Str) ks2 = if (ks.len() > 0) { ks } else { st_list(root, "mboxd/", "", 1) };
+    if (ks2.len() == 0) { return a; }
+    _ = st_text(root, "mboxrot", ks2[0]);
+    return a + mbox_sweep(root, str_slice(ks2[0], 6, str_len(ks2[0])), now, sweep_batch());
+}
+
+// ─── Alerts ─────────────────────────────────────────────────────
+
+pub Int alert_max_age() { return 604800; }
+
+// Why `body` is not an alert of `name` ("alrt-<log>-<time>-<8 hex>", its
+// form checked) that this relay takes: signed by a cosigner party of the
+// log over the name and the sealed lines, made within the last week (not
+// in the future), not removed before. "" when it is.
+@requires(filesystem, network, clock(readonly), declassify)
+pub Str alert_problem(Store root, Str name, List(Int) body, Int now) {
+    List(Str) p = str_split(name, "-");
+    Int t = if (p.len() == 4) { mg_int(p[2]) } else { -1 };
+    if (t < 0 || t > now + 300 || t + alert_max_age() < now) { return "an alert carries the time it was made"; }
+    if (mg_has(root, "alrtgone/" + name)) { return "that alert was removed"; }
+    AlertParts a = alert_parts(body);
+    if (a.sig.len() != 64 || a.rest.len() == 0) { return "an alert is signed by the person's cosigner"; }
+    List(MailMember) ms = mail_members(root, cose_hex_decode(p[1]), now);
+    return if (mg_cosigner_signed(ms, alert_sig_message(name, a.rest), a.sig, 0)) { "" } else { "an alert is signed by the person's cosigner" };
+}
+
+Bool mg_cosigner_signed(List(MailMember) ms, List(Int) msg, List(Int) sig, Int i) {
+    if (i >= ms.len()) { return false; }
+    Bool ok = ms[i].kind == (Int)party_kind_cosigner() && ecdsa_verify_raw(P256, Sha256, ms[i].key, msg, sig);
+    return ok || mg_cosigner_signed(ms, msg, sig, i + 1);
+}
+
+// A removed alert's name is never taken again (a copy of it cannot be put
+// back to show again or to fill the person's alerts).
+@requires(filesystem, network, clock(readonly), declassify)
+pub Bool alert_removed(Store root, Str name, Int now) { return st_text(root, "alrtgone/" + name, f"{now}"); }

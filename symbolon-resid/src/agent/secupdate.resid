@@ -176,7 +176,7 @@ Result(Int, Str) register_keys(Str dir, DeviceConfig c, Unlocked u, List(Int) dp
     Remote cos = cos_remote(vh);
     if (cos.party.len() == 0) { return Err("no cosigner in the quorum"); }
     Local me = Local {.party = c.party, .cg = 0, .hpke_sk = device_transport(c, u.real.dek).sk};
-    return if (send_to(relay_ep(c), me, cos, WDuressKey(dpub))) { Ok(0) } else { Err("cannot reach the relay; nothing changed") };
+    return if (send_to(mail_relay(dir, c), me, cos, WDuressKey(dpub))) { Ok(0) } else { Err("cannot reach the relay; nothing changed") };
 }
 
 // ─── 2. The device's transport key ──────────────────────────────

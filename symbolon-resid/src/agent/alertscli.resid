@@ -40,6 +40,7 @@ import "session.resid";
 import "device.resid";
 import "alerts.resid";
 import "crypto.resid";
+import "ecdsa.resid";
 import "word.resid";
 import "hpkeg.resid";
 import "httpserv.resid";
@@ -115,16 +116,16 @@ Int beacon_unlocked(Str dir, DeviceConfig c, Unlocked u, Str location) {
     Int epoch = epoch_of(dir, c);
     return match cos {
         None => dfail("no cosigner"),
-        Some(p) => beacon_send(c, u, p, epoch, location_bytes(location))
+        Some(p) => beacon_send(mail_ep(dir, c, u), c, u, p, epoch, location_bytes(location))
     };
 }
 
 @requires(device, network, declassify, clock, environment)
-Int beacon_send(DeviceConfig c, Unlocked u, Party cos, Int epoch, List(Int) loc) {
+Int beacon_send(Endpoint relay, DeviceConfig c, Unlocked u, Party cos, Int epoch, List(Int) loc) {
     Beacon b0 = Beacon {.session_id = random_bytes(32), .log_id = c.log_id, .epoch = epoch, .time = clock_now_seconds(), .location = loc, .requester = c.party, .sig = []};
     List(Int) sig = sign_as(c, u, request_tbs(b0.session_id, beacon_message(b0), (UInt(32))epoch, c.party, request_beacon()));
     Beacon b = Beacon {.session_id = b0.session_id, .log_id = b0.log_id, .epoch = b0.epoch, .time = b0.time, .location = b0.location, .requester = b0.requester, .sig = sig};
-    Bool sent = send_to(relay_ep(c), local_of(c, u), Remote {.party = cos.id, .cg = 0, .hpke_pub = cos.hpke_key}, WBeacon(b));
+    Bool sent = send_to(relay, local_of(c, u), Remote {.party = cos.id, .cg = 0, .hpke_pub = cos.hpke_key}, WBeacon(b));
     if (!sent) { return dfail("cannot reach the relay"); }
     println("ok");
     return 0;
@@ -168,7 +169,7 @@ Option(AlertState) alert_request(Str dir, DeviceConfig c, Unlocked u, Bool set, 
     AlertConfig a0 = AlertConfig {.session_id = random_bytes(32), .log_id = c.log_id, .epoch = epoch, .set = set, .person = person, .contacts = cs, .requester = c.party, .sig = []};
     List(Int) sig = sign_as(c, u, request_tbs(a0.session_id, alert_config_message(a0), (UInt(32))epoch, c.party, request_alert_config()));
     AlertConfig a = AlertConfig {.session_id = a0.session_id, .log_id = a0.log_id, .epoch = a0.epoch, .set = set, .person = person, .contacts = cs, .requester = c.party, .sig = sig};
-    Endpoint relay = relay_ep(c);
+    Endpoint relay = mail_ep(dir, c, u);
     Local me = local_of(c, u);
     Remote cr = Remote {.party = cos.id, .cg = 0, .hpke_pub = cos.hpke_key};
     Int start = mailbox_end(relay, c.party, c.mbox_next);
@@ -270,7 +271,7 @@ Int end_send(Str dir, DeviceConfig c, Unlocked u, AlertState s) {
     Option(Party) cos = cosigner_party(dir, c);
     Bool sent = match cos {
         None => false,
-        Some(p) => send_to(relay_ep(c), local_of(c, u), Remote {.party = p.id, .cg = 0, .hpke_pub = p.hpke_key},
+        Some(p) => send_to(mail_ep(dir, c, u), local_of(c, u), Remote {.party = p.id, .cg = 0, .hpke_pub = p.hpke_key},
                            WEndDuress(EndDuressReq {.log_id = c.log_id, .started_at = s.started_at, .signers = [c.party], .sigs = [sig]}))
     };
     if (!sent) { return dfail("cannot reach the relay"); }
@@ -310,7 +311,7 @@ Int register_unlocked(Str dir, DeviceConfig c, Unlocked u) {
     Option(Party) cos = cosigner_party(dir, c);
     return match cos {
         None => dfail("no cosigner"),
-        Some(p) => if (filesystem.write_bytes(dir + "/alert-cos", p.hpke_key) && send_to(relay_ep(c), local_of(c, u), Remote {.party = p.id, .cg = 0, .hpke_pub = p.hpke_key}, WAlertKey(kp.pk))) { registered() } else { dfail("cannot reach the relay") }
+        Some(p) => if (filesystem.write_bytes(dir + "/alert-cos", p.hpke_key) && send_to(mail_ep(dir, c, u), local_of(c, u), Remote {.party = p.id, .cg = 0, .hpke_pub = p.hpke_key}, WAlertKey(kp.pk))) { registered() } else { dfail("cannot reach the relay") }
     };
 }
 
@@ -328,12 +329,32 @@ Int inbox_read(Str dir, DeviceConfig c) {
     List(Int) cos_pk = get_file(dir + "/alert-cos");
     if (ikm.len() != 32 || cos_pk.len() != 65) { return dfail("this device is not registered for household alerts"); }
     List(Str) seen = str_split(filesystem.read_all(dir + "/alerts-seen"), "\n");
+    // Only an alert the log's cosigner signed is shown (the relay checks
+    // too; a relay that does not cannot show a forged one here).
+    Option(Party) cos = cosigner_party(dir, c);
+    List(Int) cos_dk = match cos { None => [], Some(p) => p.auth_key };
+    if (cos_dk.len() != 65) { return dfail("the log names no cosigner"); }
     List(Str) names = blob_list(relay_ep(c), "alrt-" + hex_encode(c.log_id) + "-");
     HpkeKeyPairG(Secret(UInt(8))) kp = hpkeg_derive_keypair(16, secret_bytes(ikm));
     List(Str) fresh = unseen(names, seen, 0, ListBuf());
-    Int shown = show_each(relay_ep(c), kp.sk, cos_pk, fresh, 0, 0);
+    Int shown = show_each(relay_ep(c), kp.sk, cos_pk, cos_dk, fresh, 0, 0);
     _ = filesystem.write_all(dir + "/alerts-seen", str_join(seen.concat(fresh), "\n"));
+    // What has been read is removed, so the person's alerts do not fill up
+    // (the relay keeps at most 64): a day after it was made, so the
+    // person's other devices read it first.
+    _ = remove_read(mail_relay(dir, c), names, seen.concat(fresh), clock_now_seconds(), 0, 0);
     return 0;
+}
+
+// Removes each of `names` that this device has read and that was made
+// more than a day before `now`; how many.
+@requires(network, clock(readonly), declassify)
+Int remove_read(Endpoint relay, List(Str) names, List(Str) read, Int now, Int i, Int n) {
+    if (i >= names.len()) { return n; }
+    List(Str) p = str_split(names[i], "-");
+    Bool old = p.len() == 4 && str_parse_int(p[2]) + 86400 < now;
+    Bool gone = old && read.contains(names[i]) && blob_put(relay, names[i], []);
+    return remove_read(relay, names, read, now, i + 1, n + (if (gone) { 1 } else { 0 }));
 }
 
 List(Str) unseen(List(Str) xs, List(Str) seen, Int i, ListBuf(Str) acc) {
@@ -342,15 +363,23 @@ List(Str) unseen(List(Str) xs, List(Str) seen, Int i, ListBuf(Str) acc) {
 }
 
 @requires(network, clock(readonly), declassify)
-Int show_each(Endpoint relay, List(Secret(UInt(8))) sk, List(Int) cos_pk, List(Str) names, Int i, Int n) {
+Int show_each(Endpoint relay, List(Secret(UInt(8))) sk, List(Int) cos_pk, List(Int) cos_dk, List(Str) names, Int i, Int n) {
     if (i >= names.len()) { return n; }
     Option(List(Int)) b = blob_get(relay, names[i]);
-    Option(List(Int)) pt = match b { None => None, Some(x) => open_any(str_split(http_text(x, 0, x.len()), "\n"), sk, cos_pk, 0) };
+    Option(List(Int)) pt = match b { None => None, Some(x) => open_signed(names[i], x, sk, cos_pk, cos_dk) };
     Int shown = match pt {
         None => 0,
         Some(m) => show_alert(http_text(m, 0, m.len()))
     };
-    return show_each(relay, sk, cos_pk, names, i + 1, n + shown);
+    return show_each(relay, sk, cos_pk, cos_dk, names, i + 1, n + shown);
+}
+
+// The alert `name` opened, if its log's cosigner (key `cos_dk`) signed it.
+@requires(declassify)
+pub Option(List(Int)) open_signed(Str name, List(Int) b, List(Secret(UInt(8))) sk, List(Int) cos_pk, List(Int) cos_dk) {
+    AlertParts a = alert_parts(b);
+    if (a.sig.len() != 64 || !ecdsa_verify_raw(P256, Sha256, cos_dk, alert_sig_message(name, a.rest), a.sig)) { return None; }
+    return open_any(str_split(http_text(a.rest, 0, a.rest.len()), "\n"), sk, cos_pk, 0);
 }
 
 // The line meant for this key: each is "ENC CT" in base64, one per alert key.

@@ -146,7 +146,7 @@ Int release_with(Str dir, DeviceConfig c, Str pin) {
     Unlocked u = unlock_dir(dir, c, pin);
     if (u.kind == 2) { return dfail(duress_refusal(dir, c)); }
     if (u.kind != 1) { return dfail("wrong PIN"); }
-    Endpoint relay = relay_ep(c);
+    Endpoint relay = mail_ep(dir, c, u);
     List(SignedEvent) es = fetch_log(relay, c.log_id, 0, []);
     Party cos = cosigner_of(quorum_before(es), 0) else { none_party() };
     if (cos.id.len() == 0) { return dfail("no cosigner"); }
@@ -255,7 +255,7 @@ Int finish_with(Str dir, DeviceConfig c, KitKeys kit, Str pin, Str primes_file) 
 
 @requires(filesystem, network, device, declassify, clock, provision, environment)
 Int release_then(Str dir, DeviceConfig c, Unlocked u, KitKeys kit, VerifiedHead vh, Quorum pre, Str pin, Str primes_file) {
-    Endpoint relay = relay_ep(c);
+    Endpoint relay = mail_ep(dir, c, u);
     Party cos = cosigner_of(vh.head.quorum.parties, 0) else { none_party() };
     Party oldkit = kit_of(pre.parties, 0) else { none_party() };
     Local me = Local {.party = c.party, .cg = 0, .hpke_sk = device_transport(c, u.real.dek).sk};
@@ -305,7 +305,7 @@ Int reshare_as_kit(Str dir, DeviceConfig c, Unlocked u0, KitSecrets s, List(UInt
     List(Int) rsig = match rs { Ok(x) => x, Err(_) => [] };
     ReshareInvite inv = ReshareInvite {.session_id = sid, .log_id = c.log_id, .new_parties = np, .dealers = inv0.dealers, .receivers = inv0.receivers,
         .offline = inv0.offline, .degree = inv0.degree, .epoch = inv0.epoch, .requester = c.party, .sig = rsig};
-    Endpoint relay = relay_ep(c);
+    Endpoint relay = mail_ep(dir, c, u);
     Int me_new = pos1(np, c.party, 0);
     Local me = Local {.party = c.party, .cg = me_new, .hpke_sk = device_transport(c, u.real.dek).sk};
     List(Remote) rem = session_remotes(np, inv.receivers, c.party, 0, []);
@@ -332,7 +332,7 @@ Int sealed_after(Str dir, DeviceConfig c, Unlocked u, Str pin, Quorum pre, Int r
     if (!write_blob(dir, if (a_real) { "a" } else { "b" }, seal_blob(k, random_bytes(12), rp), u.wrap)) { return dfail("cannot reseal the profile"); }
     println("recovered: this device holds a share of the recovered quorum");
     Result(VerifiedHead, SymbolonError) rv0 = verified_log(relay_ep(c), c.log_id);
-    _ = match rv0 { Ok(v) => send_duress_key(dir, relay_ep(c), Local {.party = c.party, .cg = 0, .hpke_sk = device_transport(c, u.real.dek).sk}, cos_remote(v)), Err(_) => false };
+    _ = match rv0 { Ok(v) => send_duress_key(dir, mail_ep(dir, c, u), Local {.party = c.party, .cg = 0, .hpke_sk = device_transport(c, u.real.dek).sk}, cos_remote(v)), Err(_) => false };
     // The vault, re-anchored to the recovered quorum (SPEC 18.4).
     Result(VerifiedHead, SymbolonError) rv = verified_log(relay_ep(c), c.log_id);
     List(SignedEvent) es = fetch_log(relay_ep(c), c.log_id, 0, []);

@@ -96,6 +96,65 @@ pub Endpoint relay_session(Str dir, DeviceConfig c, Unlocked u) {
     return Endpoint {.host = c.relay_host, .port = c.relay_port, .ca = c.ca, .token = if (p.len() >= 1 && str_len(p[0]) == 64) { p[0] } else { "" }};
 }
 
+// ─── Mail sessions (SPEC 20.2) ──────────────────────────────────
+// The relay takes a mailbox message only from a party of the recipient's
+// log, named by the request's bearer session: this device's sign-in
+// (relay.token), or, while it is not yet one of its log's devices (being
+// enrolled, recovering), a mail session (relay.mtoken, "TOKEN UNTIL",
+// POST /auth/mail). Before the log exists (inception), posts go without a
+// session to mailboxes their owners opened.
+
+// The relay with the session this device has for mail, read from its
+// files only: the duress profile, which signs nothing in, uses it as is.
+@requires(filesystem, clock(readonly))
+pub Endpoint mail_relay(Str dir, DeviceConfig c) {
+    Str t = live_token(dir + "/relay.token");
+    return Endpoint {.host = c.relay_host, .port = c.relay_port, .ca = c.ca, .token = if (str_len(t) > 0) { t } else { live_token(dir + "/relay.mtoken") }};
+}
+
+// The token in a "TOKEN UNTIL" file while it has more than an hour left.
+@requires(filesystem, clock(readonly))
+Str live_token(Str f) {
+    List(Str) p = str_split(str_trim(filesystem.read_all(f)), " ");
+    return if (p.len() == 2 && str_len(p[0]) == 64 && str_parse_int(p[1]) > clock_now_seconds() + 3600) { p[0] } else { "" };
+}
+
+// The relay for mail under the real PIN: signed in again when the session
+// is old; a device that is not one of its log's devices yet takes a mail
+// session. With no log yet, no session.
+@requires(filesystem, network, device, declassify, clock, environment)
+pub Endpoint mail_ep(Str dir, DeviceConfig c, Unlocked u) {
+    if (c.log_id.len() == 0) { return relay_ep(c); }
+    if (u.kind != 1) { return mail_relay(dir, c); }
+    _ = relay_session(dir, c, u);
+    if (str_len(live_token(dir + "/relay.token")) > 0) { return mail_relay(dir, c); }
+    _ = if (str_len(live_token(dir + "/relay.mtoken")) == 0) { mail_sign_in_dev(dir, c, u) } else { true };
+    return mail_relay(dir, c);
+}
+
+@requires(filesystem, network, device, declassify, clock, environment)
+Bool mail_sign_in_dev(Str dir, DeviceConfig c, Unlocked u) {
+    Endpoint e = relay_ep(c);
+    Str chal = relay_challenge(e);
+    if (str_len(chal) == 0) { return false; }
+    Str name = relay_name(c.relay_host, c.relay_port);
+    Result(List(Int), Str) sig = dk_sign(c, u.real, u.st, mail_auth_message(name, cose_hex_decode(chal)));
+    List(Int) s = match sig { Ok(x) => x, Err(_) => [] };
+    if (s.len() != 64) { return false; }
+    Str t = mail_session_from(e, chal, c.log_id, c.party, s, name);
+    return str_len(t) > 0 && filesystem.write_secret(dir + "/relay.mtoken", str_to_bytes(t));
+}
+
+// Opens this device's mailbox (and its kit's) for an inception: the
+// cosigner's messages reach them before there is a log to name them.
+@requires(filesystem, network, device, declassify, clock, environment)
+Bool open_mailbox_dev(DeviceConfig c, Unlocked u) {
+    Int until = clock_now_seconds() + mbox_open_secs();
+    Result(List(Int), Str) sig = dk_sign(c, u.real, u.st, mbox_open_message(c.party, until));
+    List(Int) s = match sig { Ok(x) => x, Err(_) => [] };
+    return s.len() == 64 && mbox_open(relay_ep(c), c.dk_pub, until, s);
+}
+
 pub Int dfail(Str m) { eprintln("device: " + m); return 1; }
 
 @requires(filesystem)
@@ -498,7 +557,10 @@ Int init_unlocked(Str dir, DeviceConfig c, PartyKeys cos, InitArgs a, Str pin) {
     Remote cr = Remote {.party = cos.party, .cg = 3, .hpke_pub = cos.hpke_key};
     Endpoint relay = relay_ep(c);
     Int start = mailbox_end(relay, me.party, c.mbox_next);
-    if (!send_to(relay, dev, cr, WKeygen(KeygenInvite {.session_id = sid, .parties = parties, .threshold = 1}))) { return dfail("cannot reach the relay"); }
+    // No log names these mailboxes yet: their owners open them (SPEC 20.2).
+    Int kuntil = clock_now_seconds() + mbox_open_secs();
+    if (!open_mailbox_dev(c, u) || !mbox_open(relay, kit.sign_pub, kuntil, ecdsa_sign_raw(P256, Sha256, kit.sign_priv, mbox_open_message(kp.party, kuntil)))) { return dfail("the relay does not open this device's mailbox"); }
+    if (!send_invite(relay, dev, cr, WKeygen(KeygenInvite {.session_id = sid, .parties = parties, .threshold = 1}), clock_now_seconds() + 60)) { return dfail("cannot reach the relay (is the cosigner running? its mailbox opens when it is)"); }
     println("device: key generation with the cosigner (Paillier keys: this can take minutes)...");
     Result(KgStep, CgFail) s1 = kg_begin(kg_ctx(1, [1, 2, 3], 1, [], sid, random_bytes(32), primes_of(a.device_primes)));
     Result(KgStep, CgFail) s2 = kg_begin(kg_ctx(2, [1, 2, 3], 1, [], sid, random_bytes(32), primes_of(a.kit_primes)));
@@ -513,6 +575,16 @@ Int init_unlocked(Str dir, DeviceConfig c, PartyKeys cos, InitArgs a, Str pin) {
                             lambda(st, msgs) { kg_adapt(st, msgs) }, 1800), pin, seed, sid)
         }
     };
+}
+
+// The invitation, again every two seconds until `until`: the cosigner opens
+// its mailbox at its next turn after the operator paired this device.
+@requires(network, declassify, clock)
+Bool send_invite(Endpoint relay, Local dev, Remote cr, Packet w, Int until) {
+    if (send_to(relay, dev, cr, w)) { return true; }
+    if (clock_now_seconds() > until) { return false; }
+    _ = clock_sleep_ms(2000);
+    return send_invite(relay, dev, cr, w, until);
 }
 
 Party party_from(PartyKeys k, UInt(8) kind, Str label) {
@@ -847,6 +919,7 @@ Result(List(Int), Str) run_sign(Str dir, DeviceConfig c, Unlocked u, CgConfig x,
     List(List(Int)) signers = [c.party, cos.id];
     Result(List(Int), Str) rs = dk_sign(c, u.real, u.st, request_tbs(sid, m, q.epoch, c.party, request_sign()));
     List(Int) rsig = match rs { Ok(s) => s, Err(_) => [] };
+    _ = mail_ep(dir, c, u);
     return run_sign_core(dir, c, device_transport(c, u.real.dek).sk, x, vh, tau, m, sid, rsig);
 }
 
@@ -863,7 +936,7 @@ Result(List(Int), Str) run_sign_core(Str dir, DeviceConfig c, List(Secret(UInt(8
     // aborts that identified no one, until a re-share (SPEC 6.2).
     Result(Int, SymbolonError) mr = may_run(load_aborts(dir, q), signers);
     if (match mr { Err(_) => true, Ok(_) => false }) { return Err("signing stopped after an abort: " + match mr { Err(e) => err_text(e), Ok(_) => "" }); }
-    Endpoint relay = relay_ep(c);
+    Endpoint relay = mail_relay(dir, c);
     Local dev = Local {.party = c.party, .cg = cg_id_of(q, c.party, 0), .hpke_sk = hpke_sk};
     Remote cr = Remote {.party = cos.id, .cg = cg_id_of(q, cos.id, 0), .hpke_pub = cos.hpke_key};
     Int start = mailbox_end(relay, c.party, c.mbox_next);

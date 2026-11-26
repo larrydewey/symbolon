@@ -388,7 +388,7 @@ pub Int reshare_in(Str dir, DeviceConfig c, Unlocked u, CgConfig x, VerifiedHead
     if (rsig.len() != 64) { return dfail("the device key did not sign the request"); }
     ReshareInvite inv = ReshareInvite {.session_id = sid, .log_id = c.log_id, .new_parties = np, .dealers = inv0.dealers, .receivers = inv0.receivers,
         .offline = inv0.offline, .degree = inv0.degree, .epoch = inv0.epoch, .requester = c.party, .sig = rsig};
-    Endpoint relay = relay_ep(c);
+    Endpoint relay = mail_ep(dir, c, u);
     Int me_new = pos1(np, c.party, 0);
     Local me = Local {.party = c.party, .cg = me_new, .hpke_sk = device_transport(c, u.real.dek).sk};
     List(Remote) rem = session_remotes(np, inv.receivers, c.party, 0, []);
@@ -414,7 +414,7 @@ pub Bool send_all_invites(Endpoint relay, Local me, List(Remote) rs, Packet w, I
 @requires(filesystem, network, device, declassify, clock, environment)
 pub Int after_session(Str dir, DeviceConfig c, Unlocked u, VerifiedHead vh, List(Party) np, ReshareInvite inv, List(Remote) rem, Str pin, KvMode kv, Run(RsState) r) {
     if (str_len(r.fail) > 0) { return dfail("re-share: " + r.fail); }
-    KvDone kd = kv_reshare(relay_ep(c), Local {.party = c.party, .cg = 0, .hpke_sk = device_transport(c, u.real.dek).sk}, vh.head.quorum, np, inv, rem, kv, mailbox_end(relay_ep(c), c.party, c.mbox_next));
+    KvDone kd = kv_reshare(mail_ep(dir, c, u), Local {.party = c.party, .cg = 0, .hpke_sk = device_transport(c, u.real.dek).sk}, vh.head.quorum, np, inv, rem, kv, mailbox_end(relay_ep(c), c.party, c.mbox_next));
     if (str_len(kd.why) > 0) { return dfail(kd.why); }
     RsResult res = rs_result(r.seats[0].st) else { RsResult {.cfg = None, .offline = [], .transcript = []} };
     Option(CgConfig) ocfg = res.cfg;
@@ -425,7 +425,7 @@ pub Int after_session(Str dir, DeviceConfig c, Unlocked u, VerifiedHead vh, List
     List(SignedEvent) es = fetch_log(relay_ep(c), c.log_id, 0, []);
     EventPayload p = next_event(vh, ReshareBody(nq), field6_in_force(es, vh.pending, es.len() - 1));
     List(Int) enc = payload_cbor(p) else { [] };
-    Endpoint relay = relay_ep(c);
+    Endpoint relay = mail_ep(dir, c, u);
     Local me = Local {.party = c.party, .cg = 0, .hpke_sk = device_transport(c, u.real.dek).sk};
     Int start = mailbox_end(relay, c.party, c.mbox_next);
     if (!send_all_invites(relay, me, rem, WSignEvent(enc), 0)) { return dfail("cannot reach the relay"); }
@@ -576,8 +576,9 @@ Waited wait_more(Endpoint relay, Local me, List(Remote) from, Cursor cur, Int si
 
 @requires(filesystem, network, device, declassify, clock, provision, environment)
 Int join_session(Str dir, DeviceConfig c, Unlocked u, Remote x, ReshareInvite inv, Waited w, Str pin, Str primes_file) {
-    Endpoint relay = relay_ep(c);
     DeviceConfig c1 = with_log(c, c.witnesses, inv.log_id, w.cur.next, c.peers);
+    // Not one of the log's devices yet: a mail session as a proposed party.
+    Endpoint relay = mail_ep(dir, c1, u);
     Result(VerifiedHead, SymbolonError) rv = verified_log(relay, inv.log_id);
     VerifiedHead vh = match rv { Ok(v) => v, Err(_) => VerifiedHead {.head = LogHead {.log_id = [], .sequence = 0, .digest = [], .quorum = Quorum {.parties = [], .t = 0, .root_pubkey = [], .epoch = 0, .transcript_digest = [], .kv_commits = []}, .policy = policy_of_e0([])}, .witness_cosigs = [], .pending = []} };
     if (vh.head.log_id.len() == 0) { return dfail("the log does not verify"); }
@@ -602,7 +603,7 @@ Int join_after(Str dir, DeviceConfig c, Unlocked u, Remote x, ReshareInvite inv,
     Option(CgConfig) ocfg = res.cfg;
     CgConfig ncfg = ocfg else { CgConfig {.id = 0, .threshold = 0, .ecdsa = [], .elgamal = [], .p = [], .q = [], .rid = [], .chain_key = [], .public = []} };
     if (ncfg.ecdsa.len() == 0) { return dfail("the re-share gave no share"); }
-    Endpoint relay = relay_ep(c);
+    Endpoint relay = mail_ep(dir, c, u);
     Local me = Local {.party = c.party, .cg = 0, .hpke_sk = device_transport(c, u.real.dek).sk};
     Cursor cur = r.cursors[0];
     Waited ev = wait_wire(relay, me, [x], cur, clock_now_seconds(), 600, 2);
@@ -665,7 +666,7 @@ Int joined(Str dir, DeviceConfig c, Unlocked u, Str pin, CgConfig ncfg, EnrollSe
     Bool ok = write_blob(dir, if (a_real) { "a" } else { "b" }, blob, u.wrap)
         && store_share(dir, u.real.dek, ncfg) && store_dshare(dir, real, ncfg)
         && match kvo { None => true, Some(o) => kv_store(dir, u.real.dek, KvKept {.epoch = inv.epoch, .id = pos1(inv.new_parties, c.party, 0), .share = o.share}) }
-        && send_duress_key(dir, relay_ep(c), Local {.party = c.party, .cg = 0, .hpke_sk = device_transport(c, u.real.dek).sk}, cos_remote(vh))
+        && send_duress_key(dir, mail_ep(dir, c, u), Local {.party = c.party, .cg = 0, .hpke_sk = device_transport(c, u.real.dek).sk}, cos_remote(vh))
         && save_config(dir, with_log(c, eps_of(vh.head.policy.witnesses, 0, []), c.log_id, cur.next, c.peers));
     if (!ok) { return dfail("cannot store the enrollment"); }
     println("joined the quorum: log " + hex_encode(c.log_id));

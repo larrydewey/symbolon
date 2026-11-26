@@ -328,7 +328,7 @@ test "without a duress PIN the update leaves decoys of the same shape" {
 Cosigner cosigner_with(Str dir, List(Int) dev, List(Int) dev_pk, List(Secret(UInt(8))) root) {
     CosignerConfig cfg = CosignerConfig {.relay_host = "127.0.0.1", .relay_port = 1, .ca = "", .party = rep(1, 32), .dk_pub = [], .hpke_pub = [],
                                          .log_id = rep(7, 32), .mbox_next = 0, .peers = [PartyKeys {.party = dev, .auth_key = [], .hpke_key = dev_pk}], .accept_inception = false};
-    return Cosigner {.dir = dir, .cfg = cfg, .root = root};
+    return Cosigner {.dir = dir, .cfg = cfg, .root = root, .mail = ""};
 }
 
 List(Int) got_key(Option(Got) g) { return match g { None => [], Some(x) => x.key }; }

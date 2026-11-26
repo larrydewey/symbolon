@@ -68,7 +68,7 @@ pub Result(List(List(Secret(UInt(8)))), Str) protected_keys(Str dir, Opener o, L
 @requires(filesystem, network, device, declassify, clock, environment)
 Result(List(List(Secret(UInt(8)))), Str) keys_with(Str dir, Opener o, VerifiedHead vh, List(Secret(UInt(8))) vk, List(Int) vid, List(List(Int)) ids, Int purpose) {
     Quorum q = vh.head.quorum;
-    Endpoint relay = relay_ep(o.c);
+    Endpoint relay = mail_ep(dir, o.c, o.u);
     if (q.kv_commits.len() == 0) { return Err("protected items are off for this identity (device protection enable)"); }
     Int me = pos1(q.parties, o.c.party, 0);
     Option(KvKept) mine = kv_load(dir, o.u.real.dek);
@@ -229,7 +229,7 @@ Int openings_ask(Str dir, DeviceConfig c, Unlocked u, VerifiedHead vh) {
     Result(List(Int), Str) rs = dk_sign(c, u.real, u.st, request_tbs(sid, eval_log_message(), q.epoch, c.party, request_eval()));
     List(Int) sig = match rs { Ok(v) => v, Err(_) => [] };
     if (sig.len() != 64) { return dfail("the device key did not sign the request"); }
-    Endpoint relay = relay_ep(c);
+    Endpoint relay = mail_ep(dir, c, u);
     Local lm = Local {.party = c.party, .cg = 0, .hpke_sk = device_transport(c, u.real.dek).sk};
     Remote cr = Remote {.party = cos.id, .cg = 0, .hpke_pub = cos.hpke_key};
     Int start = mailbox_end(relay, c.party, c.mbox_next);

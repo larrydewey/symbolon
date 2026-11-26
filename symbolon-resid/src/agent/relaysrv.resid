@@ -18,6 +18,12 @@
 //                              || CHALLENGE, NAME one of the relay's names (--name);
 //                              answers "TOKEN UNTIL", a bearer token for seven days, good
 //                              while PARTY stays a device of LOG
+//   POST /auth/mail            as /auth, SIG over "symbolon v1 relay mail auth NAME\n" ||
+//                              CHALLENGE by any party of LOG: a session for a day, for mailbox
+//                              posts only (mailgate.resid)
+//   POST /mbox/<to>            as the plain relay, from a party of <to>'s log by its session;
+//                              without one, only to a mailbox its owner opened
+//   POST /mbox-open/<party>    "PUBKEY UNTIL SIG": a party of no log yet opens its mailbox
 //   GET  /healthz              "ok"
 //   GET  /claim-key            the relay's claim key, hex (SEC1): what a log's policy
 //                              names as its sequencing relay (field 8, SPEC 20.3)
@@ -38,7 +44,7 @@
 // The relay verifies the device's log itself, from the events it stores,
 // at the time its witnesses sign. Records are checked against the device
 // that signed in: a record's signer must be that device. Every write but a
-// cosigner's alert needs a signed-in device, and a name that is one log's
+// cosigner's alert (which its signature proves) needs a signed-in device, and a name that is one log's
 // (vault-, kit-, kitv-, card-) or one folder's (roster-, coll-, wrap-,
 // leave-) is written only by that log's devices or that folder's people.
 
@@ -53,6 +59,7 @@ import "serials.resid";
 import "orgtypes.resid";
 import "orgcore.resid";
 import "scim.resid";
+import "mailgate.resid";
 import "../browser/json.resid";
 import "crypto.resid";
 import "ecdsa.resid";
@@ -307,6 +314,28 @@ HttpReply issue(Store root, List(Int) l, Party d, Int len) {
     Int until = clock_now_seconds() + session_secs();
     Bool ok = st_text(root, "auth/tok-" + hex_encode(sha256_bytes(utf8(t))), hex_encode(l) + " " + hex_encode(d.id) + " " + hex_encode(d.auth_key) + f" {until} {len}");
     return if (ok) { http_reply_text(200, "text/plain", t + f" {until}") } else { http_reply_status(500) };
+}
+
+// ─── Mail sessions (SPEC 20.2) ──────────────────────────────────
+// A party of a log that cannot sign in as a device (the cosigner, a device
+// being enrolled or recovering) signs the relay's challenge for a mail
+// session: "CHALLENGE LOG PARTY SIG NAME" as /auth, SIG over
+// mail_auth_message(NAME, CHALLENGE). It is good for mailbox posts only,
+// for a day (mailgate.resid). The relay verifies the log from its own
+// store at its own clock and asks no witness.
+@requires(filesystem, network, clock(readonly), declassify)
+HttpReply mail_sign_in(RelayCfg g, Store root, HttpRequest r) {
+    List(Str) p = str_split(str_trim(http_body_text(r)), " ");
+    if (p.len() != 5 || !hex_len(p[0], 64) || !hex_len(p[1], 64) || !hex_ok(p[2], 0) || !hex_ok(p[3], 0)) { return http_reply_status(400); }
+    Str name = str_to_lower(p[4]);
+    if (!name_ok(g, name)) { return http_reply_status(403); }
+    List(Int) chal = cose_hex_decode(p[0]);
+    if (!challenge_good(challenge_key(root), "relay", chal, clock_now_seconds())) { return http_reply_status(403); }
+    Option(MailMember) m = mail_member(mail_members(root, cose_hex_decode(p[1]), clock_now_seconds()), cose_hex_decode(p[2]), 0);
+    return match m {
+        None => http_reply_status(403),
+        Some(x) => if (ecdsa_verify_raw(P256, Sha256, x.key, mail_auth_message(name, chal), cose_hex_decode(p[3])) && challenge_spend(root, "relay", chal)) { mail_issue(root, p[1], x, clock_now_seconds()) } else { http_reply_status(403) }
+    };
 }
 
 // ─── Expiry ─────────────────────────────────────────────────────
@@ -634,18 +663,20 @@ pub Int max_alerts() { return 64; }
 
 // "alrt-<log>-<time>-<8 hex>": an alert a cosigner sealed (HPKE mode_auth
 // from its key, which the person's devices check) to its person's alert
-// keys. The relay cannot tell a cosigner's alert from anyone else's: HPKE
-// mode_auth is checked only by the recipient, and a cosigner has no
-// sign-in or key the relay could check a signature with; so what anyone
-// can make it keep for one log is bounded: max_alerts() of max_alert()
-// bytes. A cosigner keeps an alert the relay refuses and sends it again
-// later; the person's devices remove what they have read.
+// keys and signed with its party key, which the relay checks against the
+// cosigner party of <log> (mailgate.resid alert_problem): no one else
+// writes one, nor puts back one that was removed. At most max_alerts() of
+// max_alert() bytes wait for one log. A cosigner keeps an alert the relay
+// refuses and sends it again later; the person's devices remove what they
+// have read.
 @requires(filesystem, network, clock(readonly), declassify)
 pub Str alert_write(Store root, Str name, List(Int) body, Who w) {
     List(Str) p = str_split(name, "-");
     if (p.len() != 4 || !hex_len(p[1], 64) || !dec_ok(p[2], 0) || !hex_len(p[3], 8)) { return "not an alert's name"; }
     if (body.len() == 0) { return if (w.on && p[1] == hex_encode(w.log)) { "" } else { "only a device of that log removes its alerts" }; }
     if (body.len() > max_alert()) { return "an alert is 1 to 65536 bytes"; }
+    Str unsigned = alert_problem(root, name, body, clock_now_seconds());
+    if (str_len(unsigned) > 0) { return unsigned; }
     if (st_list(root, "blob/alrt-" + p[1] + "-", "", max_alerts()).len() >= max_alerts()) { return alerts_full(); }
     return "";
 }
@@ -994,11 +1025,13 @@ pub HttpReply relay_serve_handle(RelayCfg g, HttpRequest r) {
 HttpReply handle(RelayCfg g, Store root, HttpRequest r) {
     if (r.path == "/auth/challenge" && r.method == "GET") { return challenge(root); }
     if (r.path == "/auth" && r.method == "POST") { return sign_in(g, root, r); }
+    if (r.path == "/auth/mail" && r.method == "POST") { return mail_sign_in(g, root, r); }
     if (str_starts_with(r.path, "/scim/")) { return scim_handle(root, r); }
     if (str_starts_with(r.path, "/console/") || r.path == "/console") { return console_handle(g, root, r); }
     List(Str) p = str_split(r.path, "/");
     Str kind = seg_at(p, 1);
     if (p.len() == 3 && kind == "directory" && r.method == "GET") { return directory_reply(root, p[2], who_of(g, root, r)); }
+    if (kind == "mbox-open" && r.method == "POST" && p.len() == 3) { return http_reply_status(mbox_open_take(root, p[2], http_body_text(r), clock_now_seconds())); }
     if (kind == "mbox" || kind == "log") { return plain(root, r, p); }
     if (r.path == "/claim-key" && r.method == "GET") { return claim_key_reply(root); }
     if (kind == "claim" && r.method == "POST" && p.len() == 4) { return claim_reply(g.ca, root, p[2], p[3], r.body); }
@@ -1036,6 +1069,7 @@ pub Bool write_once(Str name) {
 // a governance version with the organization's head pointer.
 @requires(filesystem, network, clock(readonly), declassify)
 pub HttpReply stored_reply(Store root, Str name, List(Int) body) {
+    if (str_starts_with(name, "alrt-") && body.len() == 0) { _ = alert_removed(root, name, clock_now_seconds()); }
     if (write_once(name) && body.len() == 0) { return http_reply_status(if (st_delete(root, "blob/" + name)) { 200 } else { 500 }); }
     if (write_once(name)) {
         Int n = st_put_new(root, "blob/" + name, body);
@@ -1087,8 +1121,11 @@ HttpReply plain(Store root, HttpRequest r, List(Str) p) {
         if (r.body.len() == 0 || r.body.len() > max_mbox()) { return http_reply_status(413); }
         Str q = mbox_quota(root, who, r.body.len(), clock_now_seconds());
         if (str_len(q) == 0) { return http_reply_status(429); }
+        Int gate = mail_gate(root, mail_from(root, http_header(r, "authorization"), clock_now_seconds()), who, r.body.len(), clock_now_seconds());
+        if (gate != 0) { return http_reply_status(gate); }
         HttpReply rep = mbox_put_at(root, who, mbox_next(root, who), r.body, 0);
         if (rep.status == 200) { _ = st_text(root, "mboxq/" + who, q); }
+        if (rep.status == 200) { _ = mbox_after_post(root, who, str_parse_int(http_text(rep.body, 0, rep.body.len())), clock_now_seconds()); }
         return rep;
     }
     if (p.len() != 4 || !dec_ok(p[3], 0)) { return http_reply_status(404); }
@@ -1097,6 +1134,8 @@ HttpReply plain(Store root, HttpRequest r, List(Str) p) {
     if (kind == "log" && r.method == "POST") {
         if (r.body.len() > max_body()) { return http_reply_status(413); }
         if (!next_event_ok(root, who, str_parse_int(p[3]), r.body)) { return http_reply_status(403); }
+        // A new log is an anonymous write: anyone can make one.
+        if (str_parse_int(p[3]) == 0 && !anon_take(root, r.body.len(), clock_now_seconds())) { return http_reply_status(429); }
         Int w = st_put_new(root, k, r.body);
         return http_reply_status(if (w == 1) { 200 } else { if (w == 0) { 409 } else { 500 } });
     }
@@ -1284,9 +1323,9 @@ List(WitnessCosignature) claim_cosigs(List(WitnessRef) ws, Str ca, List(Int) l, 
 // (threshold/rsmsg.resid RsAnnMsg: a 2048-bit Paillier modulus, Pedersen
 // parameters and the mod and prm proofs, 80 rounds of 2048-bit numbers
 // each: about 120 KiB in CBOR) or a cosigner's evaluation log (a week of
-// entries); 1 MiB leaves room over both. Anyone may post (a device being
-// enrolled has no sign-in), so what one recipient can be sent is bounded
-// too: at most mbox_window_count() messages and mbox_window_bytes() bytes
+// entries); 1 MiB leaves room over both. Who may post is mailgate.resid's
+// (a party of the recipient's log); what one recipient can be sent is
+// bounded too: at most mbox_window_count() messages and mbox_window_bytes() bytes
 // per recipient in any mbox_window_secs() (429 beyond). A multi-party
 // session sends each party a few batches per round, far below either.
 pub Int max_mbox() { return 1048576; }
@@ -1504,6 +1543,7 @@ HttpReply con_register(RelayCfg g, Store root, Str org, HttpRequest r) {
     // the relay keep is bounded: only for an organization this relay has,
     // and at most pending_max() passkeys waiting at once per organization.
     if (match relay_org(root, org) { None => true, Some(_) => false }) { return json_reply(404, "{\"error\":\"no such organization\"}"); }
+    if (!anon_take(root, r.body.len() + 1024, clock_now_seconds())) { return json_reply(429, "{\"error\":\"the relay takes no more anonymous requests now; try again later\"}"); }
     Str pk = "console/" + org + "/pend-" + str_slice(hex_encode(sha256_bytes(cid)), 0, 32);
     _ = prune(root, "console/" + org + "/pend-", 4, 86400, clock_now_seconds());
     Bool again = str_len(str_trim(st_read_text(root, pk))) > 0;

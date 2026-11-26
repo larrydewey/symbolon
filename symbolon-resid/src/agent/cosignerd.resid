@@ -43,9 +43,14 @@ import "word.resid";
 import "crypto.resid";
 import "clock.resid";
 
-pub type Cosigner = { Str dir; CosignerConfig cfg; List(Secret(UInt(8))) root; };
+// `mail`: the cosigner's mail session at the relay (dir/relay.mtoken, read
+// at the start of each turn by cos_mail_ready), "" for none (SPEC 20.2).
+pub type Cosigner = { Str dir; CosignerConfig cfg; List(Secret(UInt(8))) root; Str mail; };
 
 Endpoint relay_of(CosignerConfig c) { return Endpoint {.host = c.relay_host, .port = c.relay_port, .ca = c.ca, .token = ""}; }
+
+// The relay with the cosigner's mail session: for the messages it posts.
+Endpoint mail_of(Cosigner c) { return Endpoint {.host = c.cfg.relay_host, .port = c.cfg.relay_port, .ca = c.cfg.ca, .token = c.mail}; }
 
 @requires(declassify)
 List(Secret(UInt(8))) cos_dk(List(Secret(UInt(8))) root) { return software_key(root, "symbolon v1 cosigner dk"); }
@@ -55,6 +60,43 @@ HpkeKeyPairG(Secret(UInt(8))) cos_hpke(List(Secret(UInt(8))) root) { return hpke
 
 @requires(declassify)
 Local me_of(Cosigner c) { return Local {.party = c.cfg.party, .cg = 0, .hpke_sk = cos_hpke(c.root).sk}; }
+
+// ─── Mail at the relay (SPEC 20.2) ─────────────────────────────
+// The relay takes a message only from a party of the recipient's log, by
+// its session. Once the cosigner is in a log, it signs the relay's
+// challenge for a mail session (a day; again with an hour left, at most
+// every ten seconds while the relay refuses: the inception it signed may
+// not be stored yet). Before, while it may take an inception, it opens
+// its own mailbox to the device it was paired with (a day; again with
+// twelve hours left).
+
+@requires(filesystem, clock(readonly))
+Str cos_token(Str dir) {
+    List(Str) p = str_split(str_trim(filesystem.read_all(dir + "/relay.mtoken")), " ");
+    return if (p.len() == 2 && str_len(p[0]) == 64 && str_parse_int(p[1]) > clock_now_seconds() + 3600) { p[0] } else { "" };
+}
+
+@requires(network, filesystem, declassify, clock)
+Cosigner cos_mail_ready(Cosigner c) {
+    Int now = clock_now_seconds();
+    if (c.cfg.log_id.len() == 0) {
+        Int open_until = str_parse_int(str_trim(filesystem.read_all(c.dir + "/mbox.open")));
+        Bool want = c.cfg.accept_inception && open_until < now + 43200;
+        Int until = now + mbox_open_secs();
+        _ = if (want && mbox_open(relay_of(c.cfg), c.cfg.dk_pub, until, sw_sign(cos_dk(c.root), mbox_open_message(c.cfg.party, until)))) { filesystem.write_all(c.dir + "/mbox.open", f"{until}") } else { false };
+        return c;
+    }
+    Str kept = cos_token(c.dir);
+    if (str_len(kept) > 0) { return Cosigner {.dir = c.dir, .cfg = c.cfg, .root = c.root, .mail = kept}; }
+    if (str_parse_int(str_trim(filesystem.read_all(c.dir + "/relay.mtoken-try"))) + 10 > now) { return c; }
+    _ = filesystem.write_all(c.dir + "/relay.mtoken-try", f"{now}");
+    Endpoint e = relay_of(c.cfg);
+    Str chal = relay_challenge(e);
+    Str name = relay_name(c.cfg.relay_host, c.cfg.relay_port);
+    Str t = if (str_len(chal) == 0) { "" } else { mail_session_from(e, chal, c.cfg.log_id, c.cfg.party, sw_sign(cos_dk(c.root), mail_auth_message(name, cose_hex_decode(chal))), name) };
+    if (str_len(t) == 0 || !filesystem.write_secret(c.dir + "/relay.mtoken", str_to_bytes(t))) { return c; }
+    return Cosigner {.dir = c.dir, .cfg = c.cfg, .root = c.root, .mail = cos_token(c.dir)};
+}
 
 @requires(filesystem)
 Bool save_cfg(Str dir, CosignerConfig c) { return filesystem.write_bytes(dir + "/cosigner.cbor", cbor_of_cosigner(c)); }
@@ -90,7 +132,7 @@ pub Str cosigner_make(Str dir, Str host, Int port, Str ca) {
 Option(Cosigner) load(Str dir) {
     Option(CosignerConfig) oc = cosigner_of_cbor(get_file(dir + "/cosigner.cbor"));
     List(Int) r = get_file(dir + "/root");
-    return match oc { None => None, Some(c) => if (r.len() == 32) { Some(Cosigner {.dir = dir, .cfg = take_pairing(dir, c), .root = provisioned_key(secret_bytes(r), "the cosigner's root key from its key file")}) } else { None } };
+    return match oc { None => None, Some(c) => if (r.len() == 32) { Some(Cosigner {.dir = dir, .cfg = take_pairing(dir, c), .root = provisioned_key(secret_bytes(r), "the cosigner's root key from its key file"), .mail = ""}) } else { None } };
 }
 
 // `symbolon cosigner pair DIR DEVICE_KEYS_HEX`: the operator pins the
@@ -269,8 +311,9 @@ List(Kept) serve_turn(Str dir, Str primes_file, List(Kept) kept, Int n) {
 
 @requires(network, filesystem, declassify, clock, process, environment)
 List(Kept) serve_once(Cosigner c0, List(List(UInt(64))) primes, List(List(UInt(64))) primes2, List(Kept) kept, Int n) {
-    Cosigner c = if (n % 25 == 0) { refresh_peers(c0) } else { c0 };
-    Endpoint relay = relay_of(c.cfg);
+    Cosigner cp = if (n % 25 == 0) { refresh_peers(c0) } else { c0 };
+    Cosigner c = cos_mail_ready(cp);
+    Endpoint relay = mail_of(c);
     List(Remote) known = known_of(c);
     Cursor cur = Cursor {.party = c.cfg.party, .next = c.cfg.mbox_next};
     Drained d0 = drain(relay, me_of(c), known, cur, ListBuf());
@@ -283,7 +326,7 @@ List(Kept) serve_once(Cosigner c0, List(List(UInt(64))) primes, List(List(UInt(6
     Drained d = if (again) { drain(relay, me_of(c1), known_of(c1), cur, ListBuf()) } else { d0 };
     List(Got) gs = d.got;
     Int next = d.cur.next;
-    Cosigner c2 = Cosigner {.dir = c1.dir, .cfg = with_log(c1.cfg, c1.cfg.log_id, next), .root = c1.root};
+    Cosigner c2 = Cosigner {.dir = c1.dir, .cfg = with_log(c1.cfg, c1.cfg.log_id, next), .root = c1.root, .mail = c1.mail};
     _ = save_cfg(c.dir, c2.cfg);
     Handled h = handle_all(c2, gs, 0, primes, primes2, kept);
     _ = save_cfg(c.dir, h.c.cfg);
@@ -291,7 +334,7 @@ List(Kept) serve_once(Cosigner c0, List(List(UInt(64))) primes, List(List(UInt(6
     // alerts other people's cosigners left for this person.
     _ = check_window(h.c);
     _ = send_queued(h.c.dir, relay);
-    _ = deliver_inbox(h.c.dir, relay, h.c.cfg.log_id, cos_hpke(h.c.root).sk, cos_hpke(h.c.root).pk);
+    _ = deliver_inbox(h.c.dir, relay, h.c.cfg.log_id, cos_hpke(h.c.root).sk, cos_hpke(h.c.root).pk, cos_dk(h.c.root));
     return h.kept;
 }
 
@@ -357,7 +400,7 @@ Cosigner run_keygen(Cosigner c, KeygenInvite inv, Int mine, KgStep s, List(Got) 
     // From the start of the mailbox: batches that arrived with the invite
     // from parties the cosigner did not know yet (the kit) were skipped by
     // the drain that found the invite. The session id filters the rest.
-    Run(KgState) r = run_session(relay_of(c.cfg), inv.session_id, [seat], rs, [Cursor {.party = c.cfg.party, .next = 0}], early,
+    Run(KgState) r = run_session(mail_of(c), inv.session_id, [seat], rs, [Cursor {.party = c.cfg.party, .next = 0}], early,
         lambda(st, msgs) { kg_adapt(st, msgs) }, 1800);
     if (str_len(r.fail) > 0) { return cos_fail(c, "keygen: " + r.fail); }
     Option(CgConfig) cfg = kg_result(r.seats[0].st);
@@ -371,7 +414,7 @@ Cosigner run_keygen(Cosigner c, KeygenInvite inv, Int mine, KgStep s, List(Got) 
 Cosigner keygen_done(Cosigner c, KeygenInvite inv, CgConfig x) {
     if (!put_secret_file(c.dir + "/cg-1.cfg", cg_cfg_encode(x)) || !filesystem.write_bytes(c.dir + "/keygen.sid", inv.session_id)) { return cos_fail(c, "cannot store the configuration"); }
     println("cosigner: key generation done");
-    return Cosigner {.dir = c.dir, .cfg = with_peers(c.cfg, inv.parties, true), .root = c.root};
+    return Cosigner {.dir = c.dir, .cfg = with_peers(c.cfg, inv.parties, true), .root = c.root, .mail = c.mail};
 }
 
 pub Result(Stepped(KgState), CgFail) kg_adapt(KgState st, List(ThMsg) msgs) {
@@ -456,10 +499,10 @@ Cosigner sign_inception(Cosigner c, List(Int) from, EventPayload p, List(Int) en
     if (!kv_pending_matches(c.dir + "/kvpend-1", kvc)) { return cos_fail(c, "the inception's vault OPRF key is not the one dealt"); }
     List(Int) sig = sw_sign(cos_dk(c.root), encoded);
     Option(Remote) r = remote_by_party(remotes_of(c.cfg.peers, 0, []), from, 0);
-    _ = match r { None => false, Some(rr) => send_to(relay_of(c.cfg), me_of(c), rr, WEventSig(sig)) };
+    _ = match r { None => false, Some(rr) => send_to(mail_of(c), me_of(c), rr, WEventSig(sig)) };
     println("cosigner: signed the inception event " + hex_encode(sha256_bytes(encoded)));
     _ = kv_promote_inception(c, kvc);
-    return Cosigner {.dir = c.dir, .cfg = with_log(c.cfg, sha256_bytes(encoded), c.cfg.mbox_next), .root = c.root};
+    return Cosigner {.dir = c.dir, .cfg = with_log(c.cfg, sha256_bytes(encoded), c.cfg.mbox_next), .root = c.root, .mail = c.mail};
 }
 
 Bool has_me(List(Party) ps, CosignerConfig c, Int i) {
@@ -638,14 +681,14 @@ Handled on_sign(Cosigner c, List(Int) from, List(Int) via, SignInvite inv, List(
 
 @requires(network, declassify, clock(readonly))
 Cosigner refuse_to(Cosigner c, Remote to, List(Int) sid) {
-    _ = send_to(relay_of(c.cfg), me_of(c), to, WRefused(sid));
+    _ = send_to(mail_of(c), me_of(c), to, WRefused(sid));
     return c;
 }
 
 @requires(network, declassify, clock(readonly))
 Cosigner refuse(Cosigner c, List(Int) to, List(Int) sid) {
     Option(Remote) r = remote_by_party(remotes_of(c.cfg.peers, 0, []), to, 0);
-    _ = match r { None => false, Some(rr) => send_to(relay_of(c.cfg), me_of(c), rr, WRefused(sid)) };
+    _ = match r { None => false, Some(rr) => send_to(mail_of(c), me_of(c), rr, WRefused(sid)) };
     return c;
 }
 
@@ -720,7 +763,7 @@ Handled run_cosign(Cosigner c, SignInvite inv, Quorum q, CgCtx ctx, List(Got) ea
     List(Remote) rs = keyed(quorum_remotes(q, inv.signers, c.cfg.party, 0, []), inv.requester, via, 0, []);
     Local me = Local {.party = c.cfg.party, .cg = ctx.self, .hpke_sk = cos_hpke(c.root).sk};
     Seat(ThState) seat = Seat {.me = me, .st = st.state, .round = 1, .out = st.out, .done = false};
-    Run(ThState) r = run_session(relay_of(c.cfg), inv.session_id, [seat], rs, [Cursor {.party = c.cfg.party, .next = c.cfg.mbox_next}], early,
+    Run(ThState) r = run_session(mail_of(c), inv.session_id, [seat], rs, [Cursor {.party = c.cfg.party, .next = c.cfg.mbox_next}], early,
         lambda(t, msgs) { sign_adapt(t, msgs) }, 120);
     _ = save_aborts(c.dir, record_run(load_aborts(c.dir, q), q, r.fail, r.culprits), q);
     if (str_len(r.fail) > 0) { return Handled {.c = cos_fail(c, "session: " + r.fail), .kept = kept}; }
@@ -749,7 +792,7 @@ List(Kept) on_late(Cosigner c, List(Int) from, SessionMsg m, List(Kept) kept) {
 @requires(network, declassify, clock(readonly))
 List(Kept) answer(Cosigner c, List(Int) to, List(Int) sid, List(ThMsg) out, List(Remote) peers) {
     Option(Remote) r = remote_by_party(peers, to, 0);
-    _ = match r { None => false, Some(rr) => send_to(relay_of(c.cfg), me_of(c), rr, WSession(SessionMsg {.session_id = sid, .round = 7, .msgs = out})) };
+    _ = match r { None => false, Some(rr) => send_to(mail_of(c), me_of(c), rr, WSession(SessionMsg {.session_id = sid, .round = 7, .msgs = out})) };
     return [];
 }
 
@@ -861,7 +904,7 @@ Cosigner run_reshare(Cosigner c, ReshareInvite inv, Quorum q, CgConfig old, Cosi
         .session_id = inv.session_id, .seed = random_bytes(32), .primes = primes};
     return match rs_start(rc) {
         Err(e) => cos_fail(c, "re-share start: " + e.why),
-        Ok(st0) => after_reshare(c, inv, run_session(relay_of(c.cfg), inv.session_id,
+        Ok(st0) => after_reshare(c, inv, run_session(mail_of(c), inv.session_id,
             [Seat {.me = Local {.party = c.cfg.party, .cg = new_id, .hpke_sk = cos_hpke(c.root).sk}, .st = st0.state, .round = 1, .out = st0.out, .done = false}],
             session_remotes(inv.new_parties, inv.receivers, c.cfg.party, 0, []), [Cursor {.party = c.cfg.party, .next = 0}], early,
             lambda(t, msgs) { rs_adapt(t, msgs) }, 1800))
@@ -935,14 +978,14 @@ Cosigner sign_reshare_event(Cosigner c, List(Int) from, EventPayload p, List(Int
     if (!kv_pending_matches(pending_file(c.dir, tag, "kv"), kvc)) { return cos_fail(c, "the reshare event's vault OPRF key is not the one dealt"); }
     List(Int) sig = sw_sign(cos_dk(c.root), encoded);
     Option(Remote) r = remote_of_party(c, from);
-    _ = match r { None => false, Some(rr) => send_to(relay_of(c.cfg), me_of(c), rr, WEventSig(sig)) };
+    _ = match r { None => false, Some(rr) => send_to(mail_of(c), me_of(c), rr, WEventSig(sig)) };
     println(f"cosigner: signed the reshare event to epoch {tag_epoch(tag)}");
     // The new quorum's parties are its peers from now on.
     EventBody b2 = p.body;
     List(PartyKeys) ks = match b2 { ReshareBody(nq) => keys_of_parties(nq.parties, 0, []), _ => c.cfg.peers };
     CosignerConfig nc = with_peers(c.cfg, ks, c.cfg.accept_inception);
     _ = save_cfg(c.dir, nc);
-    return Cosigner {.dir = c.dir, .cfg = nc, .root = c.root};
+    return Cosigner {.dir = c.dir, .cfg = nc, .root = c.root, .mail = c.mail};
 }
 
 // The reshare event's quorum is the one the cosigner dealt to: the same
@@ -1056,7 +1099,7 @@ Cosigner with_known(Cosigner c, List(PartyKeys) ps) {
     if (same_peer_keys(ps, c.cfg.peers, 0)) { return c; }
     CosignerConfig nc = with_peers(c.cfg, ps, c.cfg.accept_inception);
     _ = save_cfg(c.dir, nc);
-    return Cosigner {.dir = c.dir, .cfg = nc, .root = c.root};
+    return Cosigner {.dir = c.dir, .cfg = nc, .root = c.root, .mail = c.mail};
 }
 
 // The cosigner's half b || k_b of the newest epoch it holds (a promoted
@@ -1109,12 +1152,12 @@ Cosigner release_refused(Cosigner c, List(Int) from, List(Int) l, SymbolonError 
 @requires(network, declassify, clock(readonly), filesystem)
 Cosigner release_sent(Cosigner c, List(Int) from, Wrapped w, VerifiedHead vh) {
     Option(Remote) r = remote_of_party(c, from);
-    _ = match r { None => false, Some(rr) => send_to(relay_of(c.cfg), me_of(c), rr, WKitHalf(WrappedBlob {.enc = w.enc, .ct = w.ct})) };
+    _ = match r { None => false, Some(rr) => send_to(mail_of(c), me_of(c), rr, WKitHalf(WrappedBlob {.enc = w.enc, .ct = w.ct})) };
     // The kit's k_v half b_v as well (SPEC 18.10.1), under the same rule:
     // only to a device whose recovery took effect (cosigner_release).
     List(Int) bv = kv_kit_half(c);
     Option(Wrapped) wv = match r { None => None, Some(rr) => if (bv.len() == 32) { offline_wrap(rr.hpke_pub, vh.head.log_id, vh.head.quorum.epoch, from, bv, random_bytes(32)) } else { None } };
-    _ = match r { None => false, Some(rr) => match wv { None => false, Some(x) => send_to(relay_of(c.cfg), me_of(c), rr, WKvHalf(WrappedBlob {.enc = x.enc, .ct = x.ct})) } };
+    _ = match r { None => false, Some(rr) => match wv { None => false, Some(x) => send_to(mail_of(c), me_of(c), rr, WKvHalf(WrappedBlob {.enc = x.enc, .ct = x.ct})) } };
     println("cosigner: released its kit half to " + hex_encode(from));
     return c;
 }
@@ -1209,7 +1252,7 @@ Cosigner kv_pending_then_send(Cosigner c, KvOut o, KvDealing d, Int kit, Int epo
     List(Int) bv = if (kit > 0) { part_bytes(d, kit) } else { [] };
     List(Int) rec = reveal(kv_share_bytes(o.share.v)).concat(if (bv.len() == 32) { bv } else { zeros32() }).concat(flat(o.commits, 0, []));
     if (!put_secret_file(pend, rec)) { return cos_fail(c, "cannot keep the vault OPRF share"); }
-    if (!kv_send(relay_of(c.cfg), me_of(c), to, sid, me_dealer, d, 0)) { return cos_fail(c, "cannot send the vault OPRF dealing"); }
+    if (!kv_send(mail_of(c), me_of(c), to, sid, me_dealer, d, 0)) { return cos_fail(c, "cannot send the vault OPRF dealing"); }
     println(f"cosigner: dealt the vault OPRF key for epoch {epoch}");
     return c;
 }
@@ -1308,7 +1351,7 @@ Cosigner evaluated(Cosigner c, List(Int) from, EvalRequest r, CosignerState s, T
     if (!e.ok) { return refuse(c, from, r.session_id); }
     _ = filesystem.write_bytes(c.dir + "/state.cbor", cbor_of_state(s));
     Option(Remote) rr = remote_of_party(c, from);
-    _ = match rr { None => false, Some(x) => send_to(relay_of(c.cfg), me_of(c), x, WEvalAnswer(EvalAnswer {.session_id = r.session_id, .elements = e.elements, .proof = e.proof})) };
+    _ = match rr { None => false, Some(x) => send_to(mail_of(c), me_of(c), x, WEvalAnswer(EvalAnswer {.session_id = r.session_id, .elements = e.elements, .proof = e.proof})) };
     println(f"cosigner: evaluated {r.blinded.len()} protected item element(s), purpose {r.purpose}");
     return c;
 }
@@ -1342,7 +1385,7 @@ Cosigner eval_log_answer(Cosigner c, List(Int) from, EvalLogRequest r, VerifiedH
     Int limit = match cp { CosignerLimits(l) => (Int)l.eval, CosignerLimit(_) => 60, NoCosignerPolicy => 0 };
     List(EvalLogEntry) es = eval_entries(st.records, now - 7 * 86400, 0, []);
     Option(Remote) rr = remote_of_party(c, from);
-    _ = match rr { None => false, Some(x) => send_to(relay_of(c.cfg), me_of(c), x, WEvalLogAnswer(EvalLogAnswer {.session_id = r.session_id, .now = now, .limit = limit, .entries = es})) };
+    _ = match rr { None => false, Some(x) => send_to(mail_of(c), me_of(c), x, WEvalLogAnswer(EvalLogAnswer {.session_id = r.session_id, .now = now, .limit = limit, .entries = es})) };
     return c;
 }
 
@@ -1464,7 +1507,7 @@ Cosigner alert_config_with(Cosigner c, Remote back, AlertConfig a, VerifiedHead 
     Option(DuressState) w = st.duress;
     AlertState out = AlertState {.session_id = a.session_id, .person = s.person, .contacts = s.contacts, .topics = s.topics, .duress = in_duress,
                                  .started_at = match w { None => 0, Some(x) => x.started_at }, .party = match w { None => [], Some(x) => x.party }};
-    _ = send_to(relay_of(c.cfg), me_of(c), back, WAlertState(out));
+    _ = send_to(mail_of(c), me_of(c), back, WAlertState(out));
     return c;
 }
 
