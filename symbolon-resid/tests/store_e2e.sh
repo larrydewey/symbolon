@@ -24,8 +24,8 @@ c() { curl -sS -o "$W/out" -w '%{http_code}' "$@"; }
 relays() {   # NAME STORE-SPEC PORT1 PORT2 [--store-ca FILE]
     local name=$1 spec=$2 p1=$3 p2=$4
     printf '%s' "$spec" > "$W/$name.store"
-    ( setsid "$BIN" relay serve "$W/$name-a" "$p1" --store "@$W/$name.store" "${@:5}" > "$W/$name-a.log" 2>&1 & )
-    ( setsid "$BIN" relay serve "$W/$name-b" "$p2" --store "@$W/$name.store" "${@:5}" > "$W/$name-b.log" 2>&1 & )
+    ( setsid "$BIN" relay serve "$W/$name-a" "$p1" --name "127.0.0.1:$p1" --store "@$W/$name.store" "${@:5}" > "$W/$name-a.log" 2>&1 & )
+    ( setsid "$BIN" relay serve "$W/$name-b" "$p2" --name "127.0.0.1:$p2" --store "@$W/$name.store" "${@:5}" > "$W/$name-b.log" 2>&1 & )
     wait_port "$p1" && wait_port "$p2" || fail "$name relays did not start"
 }
 
@@ -63,7 +63,7 @@ for _ in $(seq 120); do [ "$(docker logs "$PG" 2>&1 | grep -c 'ready to accept c
 wait_port "$PGP" || fail "postgres port"
 sleep 1
 printf 'postgres://sym:wrong@127.0.0.1:%s/sym' "$PGP" > "$W/badpg.store"
-timeout 30 "$BIN" relay serve "$W/bad" $((BASE + 9)) --store "@$W/badpg.store" > "$W/badpg.log" 2>&1 && fail "a relay started with a wrong database password"
+timeout 30 "$BIN" relay serve "$W/bad" $((BASE + 9)) --insecure-any-name --store "@$W/badpg.store" > "$W/badpg.log" 2>&1 && fail "a relay started with a wrong database password"
 grep -q "not ready" "$W/badpg.log" || fail "wrong password: $(cat "$W/badpg.log")"
 relays pg "postgres://sym:s3cret-pw@127.0.0.1:$PGP/sym" $((BASE + 1)) $((BASE + 2))
 exercise postgres $((BASE + 1)) $((BASE + 2))
@@ -91,7 +91,7 @@ for _ in $(seq 120); do [ "$(docker logs "$PGT" 2>&1 | grep -c 'ready to accept 
 wait_port "$PGTP" || fail "postgres (TLS) port"
 sleep 1
 printf 'postgres://sym:s3cret-pw@127.0.0.1:%s/sym?sslmode=verify-full' "$PGTP" > "$W/badca.store"
-timeout 30 "$BIN" relay serve "$W/bad3" $((BASE + 9)) --store "@$W/badca.store" --store-ca "$W/pgtls/other.pem" > "$W/badca.log" 2>&1 && fail "a relay trusted a database under another CA"
+timeout 30 "$BIN" relay serve "$W/bad3" $((BASE + 9)) --insecure-any-name --store "@$W/badca.store" --store-ca "$W/pgtls/other.pem" > "$W/badca.log" 2>&1 && fail "a relay trusted a database under another CA"
 grep -q "certificate\|TLS" "$W/badca.log" || fail "wrong CA: $(cat "$W/badca.log")"
 relays pgtls "postgres://sym:s3cret-pw@127.0.0.1:$PGTP/sym?sslmode=verify-full" $((BASE + 1)) $((BASE + 2)) --store-ca "$W/pgtls/ca.pem"
 exercise "postgres over TLS" $((BASE + 1)) $((BASE + 2))
@@ -103,7 +103,7 @@ S3P=$((BASE + 6))
 ( setsid python3 tests/s3_oracle.py "$S3P" AKIDTEST secretkey123 symbolon eu-west-1 > "$W/s3.log" 2>&1 & echo $! > "$W/s3.pid" )
 wait_port "$S3P" || fail "s3 oracle"
 printf 's3://AKIDTEST:wrongsecret@127.0.0.1:%s/symbolon?region=eu-west-1' "$S3P" > "$W/bads3.store"
-timeout 30 "$BIN" relay serve "$W/bad2" $((BASE + 8)) --store "@$W/bads3.store" > "$W/bads3.log" 2>&1 && fail "a relay started with a wrong S3 secret"
+timeout 30 "$BIN" relay serve "$W/bad2" $((BASE + 8)) --insecure-any-name --store "@$W/bads3.store" > "$W/bads3.log" 2>&1 && fail "a relay started with a wrong S3 secret"
 relays s3 "s3://AKIDTEST:secretkey123@127.0.0.1:$S3P/symbolon?region=eu-west-1" $((BASE + 3)) $((BASE + 4))
 exercise s3 $((BASE + 3)) $((BASE + 4))
 

@@ -42,7 +42,7 @@ open(f'{sys.argv[1]}/cosigner.primes', 'w').write(f"{k[2]['P']} {k[2]['Q']}\n{k[
 EOF
 
 RP=$(port)
-runs 3600 "$BIN" relay serve "$W/relay" "$RP" > "$W/relay.log" 2>&1 & PIDS+=($!)
+runs 3600 "$BIN" relay serve "$W/relay" "$RP" --name "127.0.0.1:$RP" > "$W/relay.log" 2>&1 & PIDS+=($!)
 WS=()
 for i in 1 2 3; do
   P=$(port)

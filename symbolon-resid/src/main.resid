@@ -1,7 +1,8 @@
 // symbolon: the Linux command-line agent and its services.
 //
 //   symbolon relay serve DIR PORT [--tls CERT KEY] [--bind ADDR] [--ca FILE] [--store SPEC] [--store-ca FILE]
-//       the sync service (SPEC 20.1, 29.4, 29.9); --console-origin https://HOST:PORT serves the console (29.10); --name HOST:PORT[,...]: the names devices reach the relay at, bound into their sign-in (29.4); --store: a directory (DIR by default),
+//       the sync service (SPEC 20.1, 29.4, 29.9); --console-origin https://HOST:PORT serves the console (29.10); --name HOST:PORT[,...]: the names devices reach the relay at, bound into their sign-in (29.4),
+//       required (or --console-origin) unless --insecure-any-name takes any name a device signs; --store: a directory (DIR by default),
 //       postgres://USER:PASSWORD@HOST:PORT/DB, s3://KEY:SECRET@HOST:PORT/BUCKET?region=R, or @FILE holding one
 //   symbolon witness keygen KEYFILE            a witness's signing key; prints its public key
 //   symbolon relay scim-token DIR ORG-ID          a bearer token for ORG-ID's SCIM directory (SPEC 29.7)
@@ -217,7 +218,9 @@ Option(StoreCfg) store_of(Str dir, Str spec, Str store_ca) {
 Str opt(Str flag, Str v) { return if (str_len(v) == 0) { "" } else { " " + flag + " " + v }; }
 
 @requires(network, filesystem, declassify, provision, process, clock)
-Int relay_serve(Str dir, Int port, Str bind, Str cert, Str key, Str ca, Str spec, Str store_ca, Str console, Str names, Str self) {
+Int relay_serve(Str dir, Int port, Str bind, Str cert, Str key, Str ca, Str spec, Str store_ca, Str console, Str names, Bool any_name, Str self) {
+    Str unnamed = relay_names_problem(names, console, any_name);
+    if (str_len(unnamed) > 0) { eprintln("relay: " + unnamed); return 2; }
     Tls t = tls_from(cert, key);
     if (!t.ok) { eprintln("relay: the TLS certificate or key does not load, or they do not match"); return 1; }
     _ = filesystem.create_dir(dir);
@@ -228,7 +231,7 @@ Int relay_serve(Str dir, Int port, Str bind, Str cert, Str key, Str ca, Str spec
     Int lfd = http_listen_at(bind, port);
     if (lfd < 0) { eprintln(f"relay: cannot listen on {port}"); return 1; }
     println(f"relay listening on {bind}:{http_bound_port(lfd)}" + if (t.on) { " (TLS)" } else { "" });
-    if (str_len(names) == 0 && str_len(console) == 0) { eprintln("relay: no --name HOST:PORT: a device's sign-in is not bound to this relay's name"); }
+    if (any_name) { eprintln("relay: --insecure-any-name: a device's sign-in is not bound to this relay's name"); }
     return supervise_children(self + " relay child " + dir + f" {lfd}" + tls_args(cert, key) + opt("--ca", ca) + opt("--store", spec) + opt("--store-ca", store_ca) + opt("--console-origin", console) + opt("--name", names));
 }
 
@@ -489,7 +492,7 @@ Int main() {
     if (a1 == "device" && a2 == "veto" && n == 4) { return device_veto(args.get(3)); }
     if (a1 == "device" && a2 == "recover-release" && n == 4) { return device_recover_release(args.get(3)); }
     if (a1 == "device" && a2 == "recover-finish" && (n == 5 || n == 6)) { return device_recover_finish(args.get(3), args.get(4), if (n == 6) { args.get(5) } else { "" }); }
-    if (a1 == "relay" && a2 == "serve" && positional(3) == 5) { return relay_serve(args.get(3), str_parse_int(args.get(4)), bind_or(flag_arg("--bind", 1, 5)), flag_arg("--tls", 1, 5), flag_arg("--tls", 2, 5), flag_arg("--ca", 1, 5), flag_arg("--store", 1, 5), flag_arg("--store-ca", 1, 5), flag_arg("--console-origin", 1, 5), flag_arg("--name", 1, 5), args.get(0)); }
+    if (a1 == "relay" && a2 == "serve" && positional(3) == 5) { return relay_serve(args.get(3), str_parse_int(args.get(4)), bind_or(flag_arg("--bind", 1, 5)), flag_arg("--tls", 1, 5), flag_arg("--tls", 2, 5), flag_arg("--ca", 1, 5), flag_arg("--store", 1, 5), flag_arg("--store-ca", 1, 5), flag_arg("--console-origin", 1, 5), flag_arg("--name", 1, 5), has_flag("--insecure-any-name", 5), args.get(0)); }
     if (a1 == "relay" && a2 == "scim-token" && positional(3) == 5) { return relay_scim_token(args.get(3), args.get(4), flag_arg("--store", 1, 5), flag_arg("--store-ca", 1, 5)); }
     if (a1 == "relay" && a2 == "child" && positional(3) == 5) { return relay_child(args.get(3), str_parse_int(args.get(4)), flag_arg("--tls", 1, 5), flag_arg("--tls", 2, 5), flag_arg("--ca", 1, 5), flag_arg("--store", 1, 5), flag_arg("--store-ca", 1, 5), flag_arg("--console-origin", 1, 5), flag_arg("--name", 1, 5)); }
     if (a1 == "witness" && a2 == "keygen" && args.count() == 4) { return witness_keygen(args.get(3)); }
