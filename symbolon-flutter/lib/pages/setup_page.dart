@@ -37,6 +37,7 @@ class _SetupPageState extends State<SetupPage> {
   final homeLinkText = TextEditingController();
   HomeLink? home;          // pairing with a box: the device pairs through it after device new
   String? homeName;        // the person the box's invite is for
+  String homeToken = '';   // the pair token the box's setup gave
   bool otherWays = false;
   late final demoUrl = TextEditingController(text: widget.app.settings.demoUrl);
   bool manual = false;
@@ -167,9 +168,16 @@ class _SetupPageState extends State<SetupPage> {
         ca.text = caFile.path;
         home = link;
         homeName = s.name;
+        homeToken = s.pairToken;
         demoPrimes = null;
         step = 1;
       });
+      // A box set up before its keys were sealed and its witnesses moved
+      // off it says so (SPEC 20.5); pass it on, calmly.
+      if (!s.secure && s.reminder.isNotEmpty && mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+            content: Text('${s.reminder} Ask whoever runs the box to secure it.'), duration: const Duration(seconds: 20)));
+      }
     } on HomeError catch (e) {
       fail(e.message);
     }
@@ -208,7 +216,7 @@ class _SetupPageState extends State<SetupPage> {
       final h = home;
       if (h != null) {
         try {
-          await HomeClient(h).pair(made.lines.last);
+          await HomeClient(h).pair(made.lines.last, homeToken);
         } on HomeError catch (e) {
           return fail(e.message);
         }

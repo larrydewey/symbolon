@@ -4,7 +4,8 @@
 // The app connects to https://HOST:PORT and accepts only a server
 // certificate whose SHA-256 is the fingerprint, before the one-time code
 // is sent; the setup it then gets carries the box's CA, which the agent
-// trusts from then on.
+// trusts from then on. The code is spent by the first setup, which gives a
+// pair token: only the device that fetched the setup pairs, once.
 
 import 'dart:convert';
 import 'dart:io';
@@ -42,12 +43,17 @@ class HomeSetup {
   final String cosignerKeys;
   final List<String> witnesses;
   final String caPem;
-  const HomeSetup(this.name, this.relayHost, this.relayPort, this.cosignerKeys, this.witnesses, this.caPem);
+  final String pairToken;   // for pair(): the setup spent the code
+  final bool secure;        // the box's keys are sealed and its witnesses a minority
+  final String reminder;    // what the box says while it is not secured, or ''
+  const HomeSetup(this.name, this.relayHost, this.relayPort, this.cosignerKeys, this.witnesses, this.caPem,
+      {this.pairToken = '', this.secure = false, this.reminder = ''});
 }
 
 class HomeError implements Exception {
   final String message;
-  const HomeError(this.message);
+  final bool retry;   // the box is not ready yet; the code is not spent
+  const HomeError(this.message, {this.retry = false});
   @override
   String toString() => message;
 }
@@ -62,10 +68,10 @@ class HomeClient {
     // it is the one the link names.
     ..badCertificateCallback = (cert, host, port) => host == link.host && port == link.port && HomeLink.fingerprintOf(cert.der) == link.fingerprint;
 
-  Future<String> _call(String method, String path, [String body = '']) async {
+  Future<String> _call(String method, String path, [String body = '', String token = '']) async {
     final c = _client();
     try {
-      final uri = Uri(scheme: 'https', host: link.host, port: link.port, path: path, queryParameters: {'c': link.code});
+      final uri = Uri(scheme: 'https', host: link.host, port: link.port, path: path, queryParameters: {'c': link.code, if (token.isNotEmpty) 't': token});
       final rq = method == 'POST' ? await c.postUrl(uri) : await c.getUrl(uri);
       if (body.isNotEmpty) {
         final b = utf8.encode(body);
@@ -75,6 +81,7 @@ class HomeClient {
       final rs = await rq.close();
       final text = await rs.transform(utf8.decoder).join();
       if (rs.statusCode == 403) throw const HomeError('This invite has been used or has expired. Make a new one on the box.');
+      if (rs.statusCode == 503) throw const HomeError('The box is still getting ready for this invite. Try again in a minute.', retry: true);
       if (rs.statusCode != 200) throw HomeError('The box answered ${rs.statusCode}.');
       return text;
     } on HandshakeException {
@@ -89,13 +96,14 @@ class HomeClient {
   Future<HomeSetup> setup() async {
     final j = jsonDecode(await _call('GET', '/setup')) as Map<String, dynamic>;
     return HomeSetup(j['name'] as String, j['relay_host'] as String, j['relay_port'] as int, j['cosigner_keys'] as String,
-        (j['witnesses'] as List).cast<String>(), j['ca'] as String);
+        (j['witnesses'] as List).cast<String>(), j['ca'] as String,
+        pairToken: j['pair_token'] as String? ?? '', secure: j['secure'] as bool? ?? false, reminder: j['reminder'] as String? ?? '');
   }
 
-  /// Pins this device (its keys from device new) at the person's cosigner;
-  /// spends the code.
-  Future<void> pair(String deviceKeys) async {
-    final j = jsonDecode(await _call('POST', '/pair', deviceKeys)) as Map<String, dynamic>;
+  /// Pins this device (its keys from device new) at the person's cosigner,
+  /// with the token the setup gave; once.
+  Future<void> pair(String deviceKeys, String pairToken) async {
+    final j = jsonDecode(await _call('POST', '/pair', deviceKeys, pairToken)) as Map<String, dynamic>;
     if (j['paired'] != true) throw HomeError('The box did not pair this device: ${j['error'] ?? j}');
   }
 }
