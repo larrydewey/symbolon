@@ -918,15 +918,15 @@ Cosigner refresh_peers(Cosigner c) {
     };
 }
 
-Bool same_keys(List(PartyKeys) a, List(PartyKeys) b, Int i) {
+Bool same_peer_keys(List(PartyKeys) a, List(PartyKeys) b, Int i) {
     if (a.len() != b.len()) { return false; }
     if (i >= a.len()) { return true; }
-    return bytes_eq(a[i].party, b[i].party) && bytes_eq(a[i].auth_key, b[i].auth_key) && bytes_eq(a[i].hpke_key, b[i].hpke_key) && same_keys(a, b, i + 1);
+    return bytes_eq(a[i].party, b[i].party) && bytes_eq(a[i].auth_key, b[i].auth_key) && bytes_eq(a[i].hpke_key, b[i].hpke_key) && same_peer_keys(a, b, i + 1);
 }
 
 @requires(filesystem)
 Cosigner with_known(Cosigner c, List(PartyKeys) ps) {
-    if (same_keys(ps, c.cfg.peers, 0)) { return c; }
+    if (same_peer_keys(ps, c.cfg.peers, 0)) { return c; }
     CosignerConfig nc = with_peers(c.cfg, ps, c.cfg.accept_inception);
     _ = save_cfg(c.dir, nc);
     return Cosigner {.dir = c.dir, .cfg = nc, .root = c.root};
