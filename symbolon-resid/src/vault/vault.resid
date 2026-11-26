@@ -519,6 +519,29 @@ pub Result(VaultState, SymbolonError) vault_accept(VaultState st, List(Int) vaul
     };
 }
 
+// vault_accept, and no fork: a state at the version this device accepted
+// must be the state it accepted (the same Merkle root). A version number
+// alone let a relay serve two devices sibling states at one version (A
+// writes N+1 while B is still served N; B writes its own N+1, which the
+// relay then serves to A): A's change vanished without a word.
+// `accepted_root` is the root accepted at `accepted_version`, [] when the
+// device recorded none (a device from before roots were recorded). The
+// fork is reported only for a state that verifies otherwise, so a relay
+// serving garbage is not called a fork.
+pub Result(VaultState, SymbolonError) vault_accept_seen(VaultState st, List(Int) vault_id, LogHead verified, UInt(64) accepted_version, List(Int) accepted_root) {
+    Result(VaultState, SymbolonError) r = vault_accept(st, vault_id, verified, accepted_version);
+    Bool fork = match r {
+        Err(_) => false,
+        Ok(v) => accepted_root.len() > 0 && v.head.version == accepted_version && !bytes_eq(v.head.merkle_root, accepted_root)
+    };
+    if (fork) { return Err(ErrVaultIntegrity(fork_text((Int)accepted_version))); }
+    return r;
+}
+
+pub Str fork_text(Int n) {
+    return f"vault fork detected (SPEC 18.4): the relay served two different states at version {n}; a change made at that version on another device or on this one was dropped by the relay (a change from another device ends this)";
+}
+
 Result(VaultState, SymbolonError) vault_accept_signed(VaultState st, List(Int) key) {
     VaultHead h = st.head;
     if (!ecdsa_verify_raw(P256, Sha256, key, head_tbs(h), h.sig)) {

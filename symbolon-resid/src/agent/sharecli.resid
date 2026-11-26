@@ -425,16 +425,17 @@ pub Result(VaultState, Str) fetch_coll(Str dir, Ctx x, Roster r, Str cid, Bool a
     List(Int) vid = coll_vid(r.coll_id);
     // The highest version this device saw of the folder, also from its
     // kept copy (vaultcli seen_version): once it saw one, "no items" is
-    // a relay withholding them.
-    Int seen = seen_version(place_local(dir, cid));
+    // a relay withholding them; and the root it accepted at that version,
+    // so another state at that version is refused as a fork (SPEC 18.4).
+    Seen seen = seen_at(place_local(dir, cid));
     Option(List(Int)) b = blob_get(x.ep, place_blob(x.c, cid));
     if (match b { None => true, Some(_) => false }) {
-        return if (seen == 0) { Ok(empty_state(vid, r.owner)) } else { Err(f"the relay has no items for the folder, but this device accepted version {seen}") };
+        return if (seen.version == 0) { Ok(empty_state(vid, r.owner)) } else { Err(f"the relay has no items for the folder, but this device accepted version {seen.version}") };
     }
     VaultState st = need(state_of(b else { [] }), "the folder's items do not decode")?;
     if (!any && !member_in(r, st.head.log_id) && !(is_group_roster(r) && in_org(dir, x, st.head.log_id))) { return Err("the folder's items were signed by someone not in it"); }
     VerifiedHead sh = head_of(x.c, x.vh, st.head.log_id)?;
-    Result(VaultState, SymbolonError) ra = vault_accept(st, vid, sh.head, (UInt(64))seen);
+    Result(VaultState, SymbolonError) ra = vault_accept_seen(st, vid, sh.head, (UInt(64))seen.version, seen.root);
     return match ra {
         Err(e) => Err(err_text(e)),
         Ok(v) => note_accepted(place_local(dir, cid), v)

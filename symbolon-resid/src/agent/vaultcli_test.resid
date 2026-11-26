@@ -151,6 +151,50 @@ test "under the duress PIN the vault reads as the empty subset, never as a wrong
     expect(duress_change(off)).toEqual(unreachable_text());
 }
 
+// ─── Forks (R2A-2, SPEC 18.4) ───────────────────────────────────
+
+@requires(declassify)
+test "vault_accept_seen refuses another root at the accepted version" {
+    VaultState one = state_at(items(), 5);
+    VaultState two = state_at([], 5);
+    List(Int) root1 = one.head.merkle_root;
+    LogHead h = vhead().head;
+    expect(match vault_accept_seen(one, vault_id_of(log_id()), h, 5, root1) { Ok(_) => true, Err(_) => false }).toBeTrue();
+    Str m = match vault_accept_seen(two, vault_id_of(log_id()), h, 5, root1) { Ok(_) => "ok", Err(e) => err_text(e) };
+    expect(m).toEqual(fork_text(5));
+    expect(str_contains(m, "vault fork detected (SPEC 18.4): the relay served two different states at version 5")).toBeTrue();
+    expect(match vault_accept_seen(two, vault_id_of(log_id()), h, 4, root1) { Ok(_) => true, Err(_) => false }).toBeTrue();
+    // No root recorded (an older device): the version rule alone.
+    expect(match vault_accept_seen(two, vault_id_of(log_id()), h, 5, []) { Ok(_) => true, Err(_) => false }).toBeTrue();
+}
+
+@requires(filesystem, declassify)
+test "a device refuses a sibling state at the version it accepted" {
+    Str dir = fresh_dir();
+    VaultState mine = state_at(items(), 3);
+    expect(is_ok(vault_from(dir, config(), vhead(), Some(served_bytes(mine))))).toBeTrue();
+    // The relay now serves another device's state at the same version.
+    Result(VaultState, Str) r = vault_from(dir, config(), vhead(), Some(served_bytes(state_at([], 3))));
+    expect(match r { Ok(_) => "ok", Err(m) => m }).toEqual(fork_text(3));
+    // The same state again is fine, and any later one ends the fork.
+    expect(is_ok(vault_from(dir, config(), vhead(), Some(served_bytes(mine))))).toBeTrue();
+    expect(is_ok(vault_from(dir, config(), vhead(), Some(served_bytes(state_at([], 4)))))).toBeTrue();
+    // vault.version holds the version and the root.
+    expect(str_trim(filesystem.read_all(dir + "/vault.version"))).toEqual("4 " + hex_encode(merkle_root([])));
+    expect(seen_version(dir + "/vault")).toEqual(4);
+    // A state this device kept (its own write) counts as accepted at its version.
+    Str d2 = fresh_dir();
+    _ = keep_copy(d2, vk(), mine);
+    _ = filesystem.write_all(d2 + "/vault.version", "3");
+    expect(is_ok(vault_from(d2, config(), vhead(), Some(served_bytes(state_at([], 3)))))).toBeFalse();
+    // A record without a root, and no copy: accepted, then the root recorded.
+    Str d3 = fresh_dir();
+    _ = filesystem.write_all(d3 + "/vault.version", "3");
+    expect(is_ok(vault_from(d3, config(), vhead(), Some(served_bytes(mine))))).toBeTrue();
+    expect(str_trim(filesystem.read_all(d3 + "/vault.version"))).toEqual("3 " + hex_encode(mine.head.merkle_root));
+    expect(is_ok(vault_from(d3, config(), vhead(), Some(served_bytes(state_at([], 3)))))).toBeFalse();
+}
+
 // ─── subset.enc (D-6) ───────────────────────────────────────────
 
 @requires(filesystem, declassify)

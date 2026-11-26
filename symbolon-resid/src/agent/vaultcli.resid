@@ -3,7 +3,8 @@
 // (blob "vault-<log id>"): items sealed field by field under the vault key,
 // and a head signed by a device's DK over the items' Merkle root, anchored
 // to the verified log. A device accepts a state only through vault_accept
-// and never one older than it accepted before (vault.version, A-14).
+// and never one older than it accepted before (vault.version, A-14), nor
+// another state at the version it accepted (a fork, SPEC 18.4).
 
 import "../types.resid";
 import "../core/log.resid";
@@ -19,6 +20,7 @@ import "serials.resid";
 import "crypto.resid";
 import "word.resid";
 import "cbor.resid";
+import "cose.resid";
 import "httpserv.resid";
 
 pub List(Int) vault_id_of(List(Int) log_id) { return sha256_bytes(utf8("symbolon v1 vault").concat(log_id)); }
@@ -55,7 +57,10 @@ List(Int) cbor_of_vault(VaultState s) { return match to_cbor(s) { Ok(b) => b, Er
 @requires(filesystem)
 pub Int kept_version(Str path) {
     Str s = str_trim(filesystem.read_all(path));
-    return if (str_len(s) == 0) { 0 } else { str_parse_int(s) };
+    if (str_len(s) == 0) { return 0; }
+    // "N", or "N ROOT-HEX" in local.version (seen_at).
+    List(Str) p = str_split(s, " ");
+    return str_parse_int(p[0]);
 }
 
 // The vault as the relay holds it, accepted against the verified log; an
@@ -69,12 +74,12 @@ pub Result(VaultState, Str) fetch_vault(Str dir, DeviceConfig c, VerifiedHead vh
 pub Result(VaultState, Str) vault_from(Str dir, DeviceConfig c, VerifiedHead vh, Option(List(Int)) b) {
     List(Int) vid = vault_id_of(c.log_id);
     Str local = place_local(dir, "");
-    Int seen = seen_version(local);
+    Seen seen = seen_at(local);
     return match b {
-        None => if (seen == 0) { Ok(empty_state(vid, c.log_id)) } else { Err("the relay has no vault, but this device accepted version " + f"{seen}") },
+        None => if (seen.version == 0) { Ok(empty_state(vid, c.log_id)) } else { Err("the relay has no vault, but this device accepted version " + f"{seen.version}") },
         Some(x) => match state_of(x) {
             None => Err("the vault does not decode"),
-            Some(st) => match vault_accept(st, vid, vh.head, (UInt(64))seen) { Ok(v) => note_accepted(local, v), Err(e) => Err(err_text(e)) }
+            Some(st) => match vault_accept_seen(st, vid, vh.head, (UInt(64))seen.version, seen.root) { Ok(v) => note_accepted(local, v), Err(e) => Err(err_text(e)) }
         }
     };
 }
@@ -90,17 +95,41 @@ pub Result(VaultState, Str) vault_from(Str dir, DeviceConfig c, VerifiedHead vh,
 // state refused, never accept an older one.
 @requires(filesystem)
 pub Int seen_version(Str local) {
-    Int a = kept_version(local + ".version");
-    Option(VaultState) kc = state_of(get_file(local + ".cache"));
-    Int k = match kc { None => 0, Some(st) => (Int)st.head.version };
-    return if (k > a) { k } else { a };
+    Seen s = seen_at(local);
+    return s.version;
 }
 
-// After a state is accepted: its version recorded, never lowering it.
+// The highest version seen, with the Merkle root of the state accepted at
+// it (SPEC 18.4: another state at that version is a fork). local.version
+// holds "VERSION ROOT-HEX", or "VERSION" alone as a device wrote it before
+// roots were recorded (root []). The kept copy's head counts when it is
+// the higher, or gives the root when the file has none at its version.
+pub type Seen = { Int version; List(Int) root; };
+
+@requires(filesystem)
+pub Seen seen_at(Str local) {
+    Str s = str_trim(filesystem.read_all(local + ".version"));
+    List(Str) p = str_split(s, " ");
+    Int a = if (str_len(s) == 0) { 0 } else { str_parse_int(p[0]) };
+    List(Int) ar = if (p.len() >= 2 && str_len(p[1]) == 64) { cose_hex_decode(p[1]) } else { [] };
+    Option(VaultState) kc = state_of(get_file(local + ".cache"));
+    Seen k = match kc { None => Seen {.version = 0, .root = []}, Some(st) => Seen {.version = (Int)st.head.version, .root = st.head.merkle_root} };
+    if (k.version > a || (k.version == a && ar.len() == 0)) { return k; }
+    return Seen {.version = a, .root = ar};
+}
+
+// What local.version records for an accepted state.
+pub Str seen_record(VaultState v) { return f"{v.head.version} " + hex_encode(v.head.merkle_root); }
+
+// After a state is accepted: its version and root recorded, never lowering
+// the version (a record of the same version without a root gains one).
 @requires(filesystem)
 pub Result(VaultState, Str) note_accepted(Str local, VaultState v) {
     Int n = (Int)v.head.version;
-    _ = if (n > kept_version(local + ".version")) { filesystem.write_all(local + ".version", f"{n}") } else { true };
+    Str was = str_trim(filesystem.read_all(local + ".version"));
+    Int k = kept_version(local + ".version");
+    Bool record = n > k || (n == k && !str_contains(was, " "));
+    _ = if (record) { filesystem.write_all(local + ".version", seen_record(v)) } else { true };
     return Ok(v);
 }
 
@@ -201,7 +230,7 @@ Int store_vault(Str dir, Opened o, VaultState st) {
     // session yet signs in here.
     Endpoint ep = if (str_len(o.ep.token) > 0) { o.ep } else { relay_session(dir, o.c, o.u) };
     if (!blob_put(ep, place_blob(o.c, o.p.share), cbor_of_vault(st))) { return dfail("the relay refused the vault"); }
-    _ = filesystem.write_all(place_local(dir, o.p.share) + ".version", f"{st.head.version}");
+    _ = filesystem.write_all(place_local(dir, o.p.share) + ".version", seen_record(st));
     _ = keep_place_copy(place_local(dir, o.p.share), o.p.vk, st);
     println(f"vault version {st.head.version}, {st.items.len()} items");
     // A change to a shared folder of an organization member is audited

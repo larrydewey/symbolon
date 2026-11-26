@@ -1466,7 +1466,11 @@ device in the quorum **of the device's own highest verified log head** --
 a device removed since cannot sign an acceptable head, whatever sequence
 it states (A-14) -- the
 version is no lower than any it has accepted, the recomputed root matches,
-and the suite is format version 1's (G6-G8). KDF parameters are never read
+and the suite is format version 1's (G6-G8). A device records the root
+with the version it accepts; a state at that version with another root is
+a fork (the relay served two writers' states at one version, dropping one
+change) and is refused with an error that says so, until a higher version
+arrives. KDF parameters are never read
 from storage.
 
 After a kit recovery (Section 13.2) every device of the recovered quorum is
