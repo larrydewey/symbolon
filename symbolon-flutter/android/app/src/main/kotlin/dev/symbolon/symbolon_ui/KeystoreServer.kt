@@ -46,6 +46,9 @@ object KeystoreServer {
     private val token: String = ByteArray(16).also { SecureRandom().nextBytes(it) }.joinToString("") { "%02x".format(it) }
     private var port = 0
     private var strongBox = false
+    private const val MAX_CONNECTIONS = 8
+    private const val READ_TIMEOUT_MS = 5000
+    private const val MAX_HEADERS = 64
 
     @Synchronized
     fun start(c: Context): String {
@@ -54,10 +57,30 @@ object KeystoreServer {
             // 127.0.0.1, where the agent connects (Android's loopback address is ::1).
             val server = ServerSocket(0, 8, InetAddress.getByName("127.0.0.1"))
             port = server.localPort
+            // Any app on the phone can connect to loopback. A connection
+            // beyond the few the agent needs at once is closed straight
+            // away, and one that does not send its request within 5 s is
+            // dropped, so idle or slow connections cannot pile up threads.
+            // (The timeout covers reading only: a key operation waiting
+            // for the screen lock to be confirmed is not cut short.)
+            val slots = java.util.concurrent.Semaphore(MAX_CONNECTIONS)
             thread(isDaemon = true, name = "symbolon-keystore") {
                 while (true) {
-                    val s = server.accept()
-                    thread(isDaemon = true) { s.use { serve(it) } }
+                    val s = try { server.accept() } catch (_: Exception) { continue }
+                    if (!slots.tryAcquire()) { try { s.close() } catch (_: Exception) {}; continue }
+                    try {
+                        thread(isDaemon = true) {
+                            try {
+                                s.use { it.soTimeout = READ_TIMEOUT_MS; serve(it) }
+                            } catch (_: Exception) {
+                            } finally {
+                                slots.release()
+                            }
+                        }
+                    } catch (_: Throwable) {
+                        slots.release()
+                        try { s.close() } catch (_: Exception) {}
+                    }
                 }
             }
         }
@@ -84,9 +107,11 @@ object KeystoreServer {
         val i = BufferedInputStream(s.getInputStream())
         val request = line(i).split(" ")
         var length = 0
+        var headers = 0
         while (true) {
             val h = line(i)
             if (h.isEmpty()) break
+            if (++headers > MAX_HEADERS) return reply(s, 400, "too many headers".toByteArray())
             if (h.lowercase().startsWith("content-length:")) length = h.substring(15).trim().toIntOrNull() ?: 0
         }
         if (length < 0 || length > 4096) return reply(s, 400, "too long".toByteArray())
