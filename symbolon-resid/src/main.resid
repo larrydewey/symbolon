@@ -146,6 +146,7 @@ import "cose.resid";
 import "wire.resid";
 import "tlswire.resid";
 import "tlskey.resid";
+import "clock.resid";
 
 Int usage() {
     eprintln("usage: symbolon relay|witness|cosigner|device ... (see the header of src/main.resid)");
@@ -183,12 +184,26 @@ Int batch_conns() { return 100; }
 
 Str tls_args(Str cert, Str key) { return if (str_len(cert) == 0) { "" } else { " --tls " + cert + " " + key }; }
 
-@requires(process)
-Int supervise_children(Str cmd) {
+// A child that fails (a crash, a request that ran it out of memory) is
+// replaced after a back-off that doubles from 100 ms to 10 s while
+// children keep failing: one bad request no longer stops the server
+// (R2W-1).
+@requires(process, clock)
+Int supervise_children(Str cmd) { return supervise_from(cmd, 0); }
+
+@requires(process, clock)
+Int supervise_from(Str cmd, Int fails) {
     Int rc = process.run(cmd);
-    if (rc != 0) { eprintln(f"server: a child exited with {rc}; stopping"); return 1; }
-    return supervise_children(cmd);
+    if (rc == 0) { return supervise_from(cmd, 0); }
+    Int wait = restart_delay_ms(fails);
+    eprintln(f"server: a child exited with {rc}; another starts in {wait} ms");
+    _ = clock_sleep_ms(wait);
+    return supervise_from(cmd, fails + 1);
 }
+
+pub Int restart_delay_ms(Int fails) { return if (fails >= 7) { 10000 } else { 100 * pow2(fails) }; }
+
+Int pow2(Int n) { return if (n <= 0) { 1 } else { 2 * pow2(n - 1) }; }
 
 // --store SPEC (net/store.resid): a directory, postgres://... or s3://...;
 // "@FILE" reads it from FILE, so a password is not on a command line.
@@ -201,7 +216,7 @@ Option(StoreCfg) store_of(Str dir, Str spec, Str store_ca) {
 
 Str opt(Str flag, Str v) { return if (str_len(v) == 0) { "" } else { " " + flag + " " + v }; }
 
-@requires(network, filesystem, declassify, provision, process, clock(readonly))
+@requires(network, filesystem, declassify, provision, process, clock)
 Int relay_serve(Str dir, Int port, Str bind, Str cert, Str key, Str ca, Str spec, Str store_ca, Str console, Str names, Str self) {
     Tls t = tls_from(cert, key);
     if (!t.ok) { eprintln("relay: the TLS certificate or key does not load, or they do not match"); return 1; }
@@ -250,7 +265,7 @@ Int witness_keygen(Str keyfile) {
     return 0;
 }
 
-@requires(network, filesystem, clock(readonly), declassify, provision, process)
+@requires(network, filesystem, clock, declassify, provision, process)
 Int witness_serve(Str dir, Int port, Str keyfile, Int offset, Str bind, Str cert, Str key, Str self) {
     Tls t = tls_from(cert, key);
     if (!t.ok) { eprintln("witness: the TLS certificate or key does not load, or they do not match"); return 1; }

@@ -10,6 +10,21 @@
 //                  as the next event of that log; 400 when it does not parse.
 //   POST /time     a 32-byte nonce; answers CBOR [time, r || s] over
 //                  ["symbolon v1 witness time", nonce, time] (SPEC 13.4)
+//   POST /head     a 32-byte nonce || a 32-byte log id; answers CBOR
+//                  [seq, digest, time, r || s] over ["symbolon v1 witness
+//                  head", log, seq, digest, nonce, time] (core/log.resid
+//                  head_message): the highest sequence this witness
+//                  co-signed of the log and the digest it co-signed there;
+//                  digest empty (and seq 0) when it co-signed none (SPEC
+//                  20.3). A relay that hides an event cannot hide it from
+//                  the witnesses that co-signed it (agent/common.resid
+//                  witness_head_check).
+//
+// A /cosign request is at most max_cosign_bytes() and max_cosign_events()
+// events (413 beyond): it is verified whole on every request, and the
+// verifier tries only each party's and each witness's first signature and
+// refuses an event with more entries than could sign it (core/log.resid),
+// so its cost is bounded by its size.
 //
 // The witness co-signs an event only once the log before it verifies (as
 // every agent verifies it, SPEC 8.3) and the event passes every check of
@@ -25,7 +40,8 @@
 // (agent/common.resid verified_events).
 //
 // Files: seen/<log>/<seq>, the digest the witness co-signed there (32
-// bytes) and its answer; written once, never changed. A request re-verifies
+// bytes) and its answer; written once (to a temporary file, then renamed
+// into place, so a write cut short never holds a sequence), never changed. A request re-verifies
 // the log it carries: an agent does the same on every fetch (SPEC 8.4), and
 // it is a few milliseconds per event.
 
@@ -40,6 +56,7 @@ import "ecdsa.resid";
 import "crypto.resid";
 import "cose.resid";
 import "clock.resid";
+import "random.resid";
 
 // `offset` (seconds) is added to the witness's clock: a test witness that
 // claims later times stands for the time passing (a witness majority is
@@ -51,7 +68,12 @@ pub HttpReply witness_handle(Str root, List(Secret(UInt(8))) wpriv, Int offset, 
         Int t = clock_now_seconds() + offset;
         return http_reply_bytes(200, "application/cbor", cbe_bytes(ecdsag_sign_raw(P256, Sha256, wpriv, time_message(r.body, t)), cbe_uint(t, cbe_array(2, []))));
     }
+    if (r.method == "POST" && r.path == "/head") {
+        if (r.body.len() != 64) { return http_reply_status(400); }
+        return witness_head(root, wpriv, offset, r.body[32..64], r.body[0..32]);
+    }
     if (r.method != "POST" || r.path != "/cosign") { return http_reply_status(404); }
+    if (r.body.len() > max_cosign_bytes()) { return http_reply_status(413); }
     Option(CoReq) oq = parse_cosign(r.body);
     return match oq {
         None => http_reply_status(400),
@@ -59,12 +81,45 @@ pub HttpReply witness_handle(Str root, List(Secret(UInt(8))) wpriv, Int offset, 
     };
 }
 
+pub Int max_cosign_bytes() { return 2097152; }
+pub Int max_cosign_events() { return 2048; }
+
+// The highest sequence of log `l` this witness co-signed, and the digest
+// there, signed for `nonce` (POST /head).
+@requires(filesystem, clock(readonly), declassify)
+HttpReply witness_head(Str root, List(Secret(UInt(8))) wpriv, Int offset, List(Int) l, List(Int) nonce) {
+    Str dir = root + "/seen/" + hex_encode(l);
+    Int top = if (filesystem.is_dir(dir)) { highest_seq(filesystem.list_dir(dir), 0, -1) } else { -1 };
+    List(Int) held = if (top < 0) { [] } else { filesystem.read_bytes(dir + "/" + f"{top}") };
+    if (top >= 0 && held.len() < 32) { return http_reply_status(500); }
+    Int seq = if (top < 0) { 0 } else { top };
+    List(Int) d = if (top < 0) { [] } else { held[0..32] };
+    Int t = clock_now_seconds() + offset;
+    List(Int) sig = ecdsag_sign_raw(P256, Sha256, wpriv, head_message(l, seq, d, nonce, t));
+    return http_reply_bytes(200, "application/cbor", cbe_bytes(sig, cbe_uint(t, cbe_bytes(d, cbe_uint(seq, cbe_array(4, []))))));
+}
+
+// The largest decimal name (a sequence file; temporary files start with
+// "."), or `best`.
+Int highest_seq(List(Str) names, Int i, Int best) {
+    if (i >= names.len()) { return best; }
+    Int v = if (decimal(names[i], 0)) { str_parse_int(names[i]) } else { -1 };
+    return highest_seq(names, i + 1, if (v > best) { v } else { best });
+}
+
+Bool decimal(Str s, Int i) {
+    if (str_len(s) == 0 || str_len(s) > 18) { return false; }
+    if (i >= str_len(s)) { return true; }
+    Int c = str_char_at(s, i);
+    return c >= 48 && c <= 57 && decimal(s, i + 1);
+}
+
 type CoReq = { List(Int) l; List(SignedEvent) before; SignedEvent e; };
 
 // [bstr(32) log id, bstr event, ...], at least one event, nothing after.
 Option(CoReq) parse_cosign(List(Int) b) {
     Rd h = rd(b, 0);
-    if (h.major != 4 || h.val < 2) { return None; }
+    if (h.major != 4 || h.val < 2 || h.val > max_cosign_events() + 1) { return None; }
     Option(List(List(Int))) items = byte_strings(b, h.next, h.val, []);
     return match items {
         None => None,
@@ -108,10 +163,12 @@ HttpReply witness_sign(Str root, List(Secret(UInt(8))) wpriv, Int offset, CoReq 
     // The log shown must be the one this witness co-signed, where it did.
     if (!seen_agree(dir, q.before, 0)) { return http_reply_status(409); }
     Int t = clock_now_seconds() + offset;
-    Result(UInt(64), SymbolonError) ok = il_check_next(q.l, q.before, q.e, t, lambda(p) { false });
+    // The time the event was checked at, never earlier than the last
+    // event's (il_check_next), is the time signed (R2W-3).
+    Result(Int, SymbolonError) ok = il_check_next(q.l, q.before, q.e, t, lambda(p) { false });
     return match ok {
         Err(e) => http_reply_text(403, "text/plain", match e { ErrInvalidLog(why) => why, _ => "refused" }),
-        Ok(_) => witness_store(f, dir, wpriv, q.l, seq, d, t)
+        Ok(at) => witness_store(f, dir, wpriv, q.l, seq, d, at)
     };
 }
 
@@ -121,7 +178,13 @@ HttpReply witness_store(Str f, Str dir, List(Secret(UInt(8))) wpriv, List(Int) l
     List(Int) answer = cbe_bytes(sig, cbe_uint(t, cbe_array(2, [])));
     _ = filesystem.create_dir(str_slice(dir, 0, str_len(dir) - 65));
     _ = filesystem.create_dir(dir);
-    if (!filesystem.write_bytes(f, d.concat(answer))) { return http_reply_status(500); }
+    // Whole or not at all (R2W-8): a torn seen/ file would hold the
+    // sequence with no answer to give.
+    Str tmp = dir + "/." + f"{seq}" + ".tmp-" + hex_encode(random_bytes(8));
+    if (!filesystem.write_bytes(tmp, d.concat(answer)) || !filesystem.rename(tmp, f)) {
+        _ = filesystem.remove(tmp);
+        return http_reply_status(500);
+    }
     return http_reply_bytes(200, "application/cbor", answer);
 }
 

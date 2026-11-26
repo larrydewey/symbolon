@@ -141,3 +141,103 @@ test "a witness co-signs a device's veto of a pending kit recovery, and refuses 
     expect(witness_handle(root, wpriv, 0, post("/cosign", cosign_request(l, [[1, 2, 3]]))).status).toEqual(400);
     expect(witness_handle(root, wpriv, 0, post("/cosign", [131, 1, 2, 3])).status).toEqual(400);
 }
+
+@requires(filesystem, clock(readonly), declassify)
+HttpReply ask_at(Str root, List(Secret(UInt(8))) wpriv, Int offset, List(Int) l, List(StoredEvent) shown) {
+    return witness_handle(root, wpriv, offset, post("/cosign", cosign_request(l, raws(shown, 0, []))));
+}
+
+List(EventSig) fake_sigs(Int who, List(Int) msg, Int n, List(EventSig) acc) {
+    if (n == 0) { return acc; }
+    return fake_sigs(who, msg, n - 1, acc.concat([EventSig {.signer = id32(who), .sig = sign(4, msg)}]));
+}
+
+Int answer_time(HttpReply a) { return rd(a.body, 1).val; }
+
+List(SignedEvent) signed_all(List(StoredEvent) xs, Int i, List(SignedEvent) acc) {
+    if (i >= xs.len()) { return acc; }
+    Option(SignedEvent) o = signed_of(xs[i]);
+    return signed_all(xs, i + 1, match o { Some(x) => acc.concat([x]), None => acc });
+}
+
+@requires(filesystem, clock(readonly), declassify)
+Str fresh_root() {
+    Str root = "target/witness-test-" + hex_encode(random_bytes(8));
+    _ = filesystem.create_dir("target");
+    _ = filesystem.create_dir(root);
+    return root;
+}
+
+@requires(filesystem, clock(readonly), declassify)
+test "a witness whose clock is behind the last event co-signs at the last event's time (R2W-3)" {
+    Str root = fresh_root();
+    List(Secret(UInt(8))) wpriv = random_secret(32);
+    List(Int) wpub = ec_public_keyg(P256, wpriv);
+    StoredEvent e0 = ev(e0_payload(wpub), [2, 3]);
+    List(Int) l = dig(e0);
+    HttpReply a0 = ask(root, wpriv, l, [e0]);
+    StoredEvent e0c = with_cosigs(e0, completed(a0, wpub, l, 0, e0));
+    // This witness's clock is now an hour behind E0's witness time.
+    StoredEvent r1 = ev(after(l, 1, e0, kit_recover(4), [id32(51)]), [20]);
+    HttpReply a1 = ask_at(root, wpriv, 0 - 3600, l, [e0c, r1]);
+    expect(answer_verifies(a1, wpub, l, 1, r1)).toBeTrue();
+    expect(answer_time(a1) >= answer_time(a0)).toBeTrue();
+    // And the log with that co-signature verifies (time did not go back).
+    StoredEvent r1c = with_cosigs(r1, completed(a1, wpub, l, 1, r1));
+    List(SignedEvent) es = signed_all([e0c, r1c], 0, []);
+    expect(es.len()).toEqual(2);
+    Result(VerifiedHead, SymbolonError) v = il_verify(l, es, answer_time(a1), lambda(x) { false });
+    expect(match v { Ok(_) => true, Err(_) => false }).toBeTrue();
+}
+
+@requires(filesystem, clock(readonly), declassify)
+test "a witness refuses an event padded with signatures, and requests past its size cap (R2W-1)" {
+    Str root = fresh_root();
+    List(Secret(UInt(8))) wpriv = random_secret(32);
+    List(Int) wpub = ec_public_keyg(P256, wpriv);
+    StoredEvent e0 = ev(e0_payload(wpub), [2, 3]);
+    List(Int) l = dig(e0);
+    // E0 with a thousand bogus entries for device 3 after its real ones.
+    StoredEvent padded = StoredEvent {.encoded = e0.encoded, .sigs = e0.sigs.concat(fake_sigs(3, e0.encoded, 1000, [])), .cosigs = []};
+    expect(ask(root, wpriv, l, [padded]).status).toEqual(403);
+    // Nothing was taken at sequence 0: the real E0 is co-signed.
+    expect(ask(root, wpriv, l, [e0]).status).toEqual(200);
+    List(Int) big = doubled([0], 21).concat([0]);
+    expect(big.len() > max_cosign_bytes()).toBeTrue();
+    expect(witness_handle(root, wpriv, 0, post("/cosign", big)).status).toEqual(413);
+}
+
+List(Int) doubled(List(Int) b, Int k) { return if (k == 0) { b } else { doubled(b.concat(b), k - 1) }; }
+
+@requires(filesystem, clock(readonly), declassify)
+test "a witness answers how far it co-signed a log, signed for the nonce (R2W-5)" {
+    Str root = fresh_root();
+    List(Secret(UInt(8))) wpriv = random_secret(32);
+    List(Int) wpub = ec_public_keyg(P256, wpriv);
+    StoredEvent e0 = ev(e0_payload(wpub), [2, 3]);
+    List(Int) l = dig(e0);
+    List(Int) nonce = random_bytes(32);
+    // Nothing co-signed yet: seq 0, no digest.
+    Option(WitnessHead) h0 = head_answer(witness_handle(root, wpriv, 0, post("/head", nonce.concat(l))).body, wpub, l, nonce);
+    expect(match h0 { Some(h) => h.digest.len() == 0 && h.seq == 0, None => false }).toBeTrue();
+    HttpReply a0 = ask(root, wpriv, l, [e0]);
+    StoredEvent e0c = with_cosigs(e0, completed(a0, wpub, l, 0, e0));
+    StoredEvent r1 = ev(after(l, 1, e0, kit_recover(4), [id32(51)]), [20]);
+    expect(ask(root, wpriv, l, [e0c, r1]).status).toEqual(200);
+    HttpReply hr = witness_handle(root, wpriv, 0, post("/head", nonce.concat(l)));
+    Option(WitnessHead) h1 = head_answer(hr.body, wpub, l, nonce);
+    expect(match h1 { Some(h) => h.seq == 1 && hex_encode(h.digest) == hex_encode(dig(r1)), None => false }).toBeTrue();
+    // Bound to the nonce, the log and the key.
+    expect(match head_answer(hr.body, wpub, l, random_bytes(32)) { Some(_) => true, None => false }).toBeFalse();
+    expect(match head_answer(hr.body, wpub, id32(1), nonce) { Some(_) => true, None => false }).toBeFalse();
+    expect(match head_answer(hr.body, pubk(8), l, nonce) { Some(_) => true, None => false }).toBeFalse();
+    // The relay serves the log only up to 0: this witness says 1, so a
+    // head at 0 is refused (with or without the other witnesses).
+    List(Option(WitnessHead)) hs = [h1, None, Some(WitnessHead {.seq = 0, .digest = dig(e0), .time = 0})];
+    expect(str_len(heads_problem(hs, 3, 0, dig(e0))) > 0).toBeTrue();
+    expect(heads_problem(hs, 3, 1, dig(r1))).toEqual("");
+    // Only sequence files count; no temporary file is left behind (R2W-8).
+    List(Str) names = filesystem.list_dir(root + "/seen/" + hex_encode(l));
+    expect(names.len()).toEqual(2);
+    expect(witness_handle(root, wpriv, 0, post("/head", nonce)).status).toEqual(400);
+}
