@@ -10,6 +10,7 @@
 // layer 8 open: held as public types; with kit-b-<epoch> and
 // kit-half-<epoch>.raw, overwritten and removed once the verified log is at
 // a later epoch it holds a configuration of, epochfiles.resid),
+// aborts.bin (the abort book, SPEC 6.2),
 // state.cbor (the policy state: verified head, sessions, records),
 // kit-half.cbor (its half of the kit's material).
 
@@ -542,6 +543,13 @@ Handled decide(Cosigner c, List(Int) from, SignInvite inv, VerifiedHead vh, List
     // to another budget (an evaluation's) or pass as an authority request.
     if (!bytes_eq(from, inv.requester) || inv.epoch < 0 || inv.kind != (Int)request_sign()) { return Handled {.c = refuse(c, from, inv.session_id), .kept = kept}; }
     _ = prune_old_epochs(c.dir, (Int)vh.head.quorum.epoch);
+    // No session with a party an abort identified, nor after repeated
+    // aborts that identified no one, until a re-share (SPEC 6.2).
+    Result(Int, SymbolonError) mr = may_run(load_aborts(c.dir, vh.head.quorum), inv.signers);
+    if (match mr { Err(_) => true, Ok(_) => false }) {
+        eprintln("cosigner: ALERT: refusing a signing session after an abort (" + match mr { Err(e) => err_text(e), Ok(_) => "" } + ")");
+        return Handled {.c = refuse(c, from, inv.session_id), .kept = kept};
+    }
     CosignRequest req = CosignRequest {.session_id = inv.session_id, .message = inv.message, .epoch = (UInt(32))inv.epoch,
                                        .requester = inv.requester, .kind = (UInt(8))inv.kind, .sig = inv.sig};
     CosignOutcome o = cosign_decide(st, req, policy_now(c, vh));
@@ -592,6 +600,7 @@ Handled run_cosign(Cosigner c, SignInvite inv, Quorum q, CgCtx ctx, List(Got) ea
     Seat(ThState) seat = Seat {.me = me, .st = st.state, .round = 1, .out = st.out, .done = false};
     Run(ThState) r = run_session(relay_of(c.cfg), inv.session_id, [seat], rs, [Cursor {.party = c.cfg.party, .next = c.cfg.mbox_next}], early,
         lambda(t, msgs) { sign_adapt(t, msgs) }, 120);
+    _ = save_aborts(c.dir, record_run(load_aborts(c.dir, q), q, r.fail, r.culprits), q);
     if (str_len(r.fail) > 0) { return Handled {.c = cos_fail(c, "session: " + r.fail), .kept = kept}; }
     println("cosigner: co-signed session " + hex_encode(inv.session_id));
     return Handled {.c = c, .kept = [Kept {.sid = inv.session_id, .st = r.seats[0].st, .peers = rs, .until = clock_now_seconds() + kept_sec()}]};

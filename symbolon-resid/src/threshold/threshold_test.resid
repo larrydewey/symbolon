@@ -90,3 +90,31 @@ test "offline material opens only for its log, epoch and party" {
     expect(other_party).toEqual("refused");
     expect(other_log).toEqual("refused");
 }
+
+test "a session's end goes into the book: a failed check is an abort, a timeout or refusal is none" {
+    Quorum q = quorum_of([party_of(1, party_kind_device()), party_of(3, party_kind_cosigner())], 1);
+    AbortBook named = record_run(abort_book(), q, "aff-g proof failed (seat 1, round 3)", [2]);
+    expect(run_said(named, [idn(1), idn(3)])).toEqual("a signer was identified in an abort");
+    AbortBook t = record_run(record_run(record_run(abort_book(), q, "timed out waiting for a round", []), q, "the cosigner is unreachable", []), q, "timed out waiting for a round", []);
+    expect(t.unidentified).toEqual(0);
+    AbortBook u = record_run(record_run(record_run(abort_book(), q, "Delta shares are inconsistent", []), q, "x", []), q, "y", []);
+    expect(run_said(u, [idn(1), idn(3)])).toEqual("repeated unidentified aborts: stop and alert");
+    expect(record_run(u, q, "", []).unidentified).toEqual(0);
+}
+
+test "the book is kept per log across sessions, and a re-share since it was written lifts what it should" {
+    Quorum q = quorum_of([party_of(1, party_kind_device()), party_of(2, party_kind_device()), party_of(3, party_kind_cosigner())], 4);
+    AbortBook b = record_abort(record_abort(abort_book(), q, cg_fail("bad proof", [2])), q, cg_fail("x", []));
+    List(Int) bytes = abort_book_encode(b, 4);
+    AbortBook same = abort_book_decode(bytes, q);
+    expect(run_said(same, [idn(1), idn(2)])).toEqual("a signer was identified in an abort");
+    expect(same.unidentified).toEqual(1);
+    // Read at epoch 5, with party 2 re-shared out: the ban and the count go.
+    Quorum q5 = quorum_of([party_of(1, party_kind_device()), party_of(3, party_kind_cosigner())], 5);
+    AbortBook later = abort_book_decode(bytes, q5);
+    expect(later.banned.len()).toEqual(0);
+    expect(later.unidentified).toEqual(0);
+    // Nothing kept, or something unreadable, is a fresh book.
+    expect(abort_book_decode([], q).banned.len()).toEqual(0);
+    expect(abort_book_decode([0, 0, 0, 4, 1, 7], q).unidentified).toEqual(0);
+}

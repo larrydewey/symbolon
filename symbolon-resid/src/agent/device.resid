@@ -41,6 +41,7 @@ import "word.resid";
 import "ecdsa.resid";
 import "crypto.resid";
 import "clock.resid";
+import "epochfiles.resid";
 
 Int srk_handle() { return 0x81000110; }
 Int dk_handle() { return 0x81000111; }
@@ -619,6 +620,10 @@ Result(List(Int), Str) run_sign_core(Str dir, DeviceConfig c, List(Secret(UInt(8
     if (cos.id.len() == 0) { return Err("no cosigner in the quorum"); }
     List(List(Int)) signers = [c.party, cos.id];
     if (rsig.len() != 64) { return Err("the device key did not sign the request"); }
+    // No session with a party an abort identified, nor after repeated
+    // aborts that identified no one, until a re-share (SPEC 6.2).
+    Result(Int, SymbolonError) mr = may_run(load_aborts(dir, q), signers);
+    if (match mr { Err(_) => true, Ok(_) => false }) { return Err("signing stopped after an abort: " + match mr { Err(e) => err_text(e), Ok(_) => "" }); }
     Endpoint relay = relay_ep(c);
     Local dev = Local {.party = c.party, .cg = cg_id_of(q, c.party, 0), .hpke_sk = hpke_sk};
     Remote cr = Remote {.party = cos.id, .cg = cg_id_of(q, cos.id, 0), .hpke_pub = cos.hpke_key};
@@ -645,6 +650,7 @@ Result(List(Int), Str) finish_sign(Str dir, DeviceConfig c, Quorum q, List(UInt(
     // where it started: every round's envelope would be fetched twice.
     Int from = if (r.cursors.len() > 0 && r.cursors[0].next > c.mbox_next) { r.cursors[0].next } else { c.mbox_next };
     _ = save_config(dir, with_log(c, c.witnesses, c.log_id, mailbox_end(relay_ep(c), c.party, from), c.peers));
+    _ = save_aborts(dir, record_run(load_aborts(dir, q), q, r.fail, r.culprits), q);
     if (str_len(r.fail) > 0) { return Err("signing: " + r.fail + if (r.culprits.len() > 0) { f" (blames {r.culprits})" } else { "" }); }
     ThState st = r.seats[0].st;
     List(Int) sig = match st { ThSigned(s) => th_sig_raw(s), _ => [] };

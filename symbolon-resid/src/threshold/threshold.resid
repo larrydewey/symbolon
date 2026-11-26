@@ -273,8 +273,12 @@ Result(ThStep, CgFail) th_r7(Ps6 s, BlR2 b, List(CgMsg) in) {
     CgCtx c = ctx_of6(s);
     return match bl_r7_designated(s, in) {
         Err(e) => th_start_abort(s, b, e),
+        // A share that fails the designated party's check names no one:
+        // in blind mode only the designated party checks the shares, against
+        // values its own tweak entered, and no other party can confirm the
+        // blame, so it is an unidentified abort (SPEC 6.2) and bans no one.
         Ok(done) => match bl_finish(c, done.presig, in, b.role) {
-            Err(e) => Err(e),
+            Err(e) => Err(cg_fail(e.why, [])),
             Ok(sig) => Ok(ThStep {.state = ThSigned(sig), .out = []})
         }
     };
@@ -361,6 +365,45 @@ List(List(Int)) still_present(List(List(Int)) banned, Quorum q, Int i, List(List
 // lifts the rule).
 pub AbortBook after_reshare(AbortBook book, Quorum q) {
     return AbortBook {.banned = still_present(book.banned, q, 0, []), .unidentified = 0};
+}
+
+// What a session's end does to the book: a success resets the count of
+// unidentified aborts; a session that failed a protocol check is an abort
+// (identified when it names a party); a session that only timed out or was
+// refused is no abort, since no check failed.
+pub AbortBook record_run(AbortBook book, Quorum q, Str fail, List(Int) culprits) {
+    if (str_len(fail) == 0) { return record_success(book); }
+    if (fail == "timed out waiting for a round" || fail == "the cosigner is unreachable") { return book; }
+    return record_abort(book, q, cg_fail(fail, culprits));
+}
+
+// The book as kept on disk, one per log: the epoch it was last written at
+// (4 bytes, big-endian), the count of unidentified aborts (one byte,
+// capped) and the banned parties' 32-byte ids.
+pub List(Int) abort_book_encode(AbortBook book, UInt(32) epoch) {
+    Int e = (Int)epoch;
+    Int u = if (book.unidentified > 255) { 255 } else { book.unidentified };
+    return [(e >> 24) & 255, (e >> 16) & 255, (e >> 8) & 255, e & 255, u].concat(join_ids(book.banned, 0, []));
+}
+
+List(Int) join_ids(List(List(Int)) ids, Int i, List(Int) acc) {
+    if (i >= ids.len()) { return acc; }
+    return join_ids(ids, i + 1, if (ids[i].len() == 32) { acc.concat(ids[i]) } else { acc });
+}
+
+List(List(Int)) split_ids(List(Int) b, Int at, List(List(Int)) acc) {
+    if (at + 32 > b.len()) { return acc; }
+    return split_ids(b, at + 32, acc.concat([b[at..at + 32]]));
+}
+
+// The book kept for quorum q: none kept (or unreadable) is a fresh book;
+// one written at an earlier epoch has seen a re-share since, so
+// after_reshare applies.
+pub AbortBook abort_book_decode(List(Int) b, Quorum q) {
+    if (b.len() < 5 || (b.len() - 5) % 32 != 0) { return abort_book(); }
+    Int e = (b[0] << 24) | (b[1] << 16) | (b[2] << 8) | b[3];
+    AbortBook book = AbortBook {.banned = split_ids(b, 5, []), .unidentified = b[4]};
+    return if (e < (Int)q.epoch) { after_reshare(book, q) } else { book };
 }
 
 // ============================================================================

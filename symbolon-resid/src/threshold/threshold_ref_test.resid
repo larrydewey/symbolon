@@ -239,3 +239,31 @@ test "a peer that has sent its signature share opens nothing on an abort request
     expect(r.fail).toEqual("");
     expect(peer_opened(r.ps, cg_id_of(quorum(), signers[0], 0), 0)).toEqual(0);
 }
+
+// The peer's signature share, changed on its way to the designated party.
+List(ThMsg) bump_sigma(List(ThMsg) ms, Int i, ListBuf(ThMsg) acc) {
+    if (i >= ms.len()) { return acc.finish(); }
+    ThMsg m = ms[i];
+    return bump_sigma(ms, i + 1, acc.push(match m { ThCg(c) => ThCg(bumped(c)), _ => m }));
+}
+
+CgMsg bumped(CgMsg c) {
+    CgBody b = c.body;
+    return match b { SgB(v) => cg_to(c.from, c.to, SgB(sc_nat_add(v, [1]))), _ => c };
+}
+
+// In blind mode only the designated party checks the signature shares, and
+// against values its own tweak entered: a failed check names no one, so it
+// can never ban the cosigner on the designated party's word (SPEC 6.2).
+@requires(declassify)
+test "a bad signature share at the designated party is an unidentified abort" {
+    List(List(Int)) signers = [[12, 201, 97, 213, 187, 45, 176, 173, 225, 34, 33, 242, 136, 32, 83, 104, 116, 216, 241, 101, 151, 3, 58, 6, 128, 109, 190, 241, 109, 170, 205, 19], [50, 193, 193, 90, 151, 15, 15, 97, 64, 114, 44, 3, 216, 218, 213, 216, 65, 78, 192, 235, 134, 75, 38, 20, 123, 65, 36, 8, 70, 62, 65, 149]];
+    List(UInt(64)) tau = tweak_scalar(chain_code(), "login.example.com", [50, 185, 196, 129, 49, 116, 171, 111, 241, 56, 213, 180, 146, 122, 133, 182]);
+    List(Int) sid = [53, 55, 17, 188, 174, 75, 0, 133, 179, 81, 20, 211, 246, 165, 75, 136, 131, 169, 209, 57, 105, 90, 118, 144, 125, 235, 174, 79, 184, 57, 74, 90];
+    List(Party3) ps = start_all(signers, signers[0], tau, sid, 0, ListBuf());
+    Round r = run(ps, starts_out(ps, 0, []), 5);
+    expect(r.fail).toEqual("");
+    Round last = run(r.ps, bump_sigma(r.out, 0, ListBuf()), 1);
+    expect(last.fail).toEqual("signature failed to verify");
+    expect(last.culprits.len()).toEqual(0);
+}

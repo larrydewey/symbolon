@@ -1,6 +1,8 @@
-// Old-epoch shares go once a newer epoch is in force (SPEC 11.3, C-3).
+// Old-epoch shares go once a newer epoch is in force (SPEC 11.3, C-3); the
+// abort book is kept per log (SPEC 6.2, C-5).
 
 import "../types.resid";
+import "../threshold/threshold.resid";
 import "epochfiles.resid";
 import "crypto.resid";
 
@@ -47,4 +49,18 @@ test "old epochs' shares are removed once the log's epoch is held, and not befor
     // An emptied configuration counts as none.
     _ = filesystem.write_secret(d + "/cg-3.cfg", []);
     expect(prune_old_epochs(d, 3)).toBeFalse();
+}
+
+Party party_of(Int n, UInt(8) kind) {
+    return Party {.id = [n, n, n, n, n, n, n, n, n, n, n, n, n, n, n, n, n, n, n, n, n, n, n, n, n, n, n, n, n, n, n, n], .kind = kind, .auth_key = [], .hpke_key = [], .label = "p", .attestation = NoAttestation};
+}
+
+@requires(filesystem, declassify)
+test "the abort book survives between sessions" {
+    Str d = tmp_dir();
+    Quorum q = Quorum {.parties = [party_of(1, party_kind_device()), party_of(3, party_kind_cosigner())], .t = 2, .root_pubkey = [], .epoch = 2, .transcript_digest = [], .kv_commits = []};
+    expect(load_aborts(d, q).banned.len()).toEqual(0);
+    expect(save_aborts(d, record_run(load_aborts(d, q), q, "bad proof", [1]), q)).toBeTrue();
+    Bool refused = match may_run(load_aborts(d, q), [party_of(1, 0).id, party_of(3, 2).id]) { Ok(_) => false, Err(_) => true };
+    expect(refused).toBeTrue();
 }

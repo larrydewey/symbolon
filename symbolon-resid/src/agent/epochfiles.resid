@@ -1,5 +1,5 @@
-// Files a party keeps per epoch: the old epochs' shares, deleted once a
-// newer epoch is in force (SPEC 11.3).
+// Files a party keeps per epoch and per log: the old epochs' shares, deleted
+// once a newer epoch is in force (SPEC 11.3), and the abort book (SPEC 6.2).
 //
 // Resid's filesystem has no secure delete: a file is overwritten with zeros
 // of its own length and then removed, which leaves whatever the file system
@@ -7,6 +7,7 @@
 // remapping). A secure overwrite-then-unlink belongs in Resid.
 
 import "../types.resid";
+import "../threshold/threshold.resid";
 
 List(Int) zeros(Int n, List(Int) acc) { return if (n <= 0) { acc } else { zeros(n - 1, acc.concat([0])) }; }
 
@@ -49,3 +50,11 @@ Bool wipe_all(List(Str) ps, Int i) {
     Bool ok = wipe_file(ps[i]);
     return wipe_all(ps, i + 1) && ok;
 }
+
+// The abort book of this party's log (SPEC 6.2), as threshold.resid's
+// abort_book_decode reads it for quorum q.
+@requires(filesystem)
+pub AbortBook load_aborts(Str dir, Quorum q) { return abort_book_decode(filesystem.read_bytes(dir + "/aborts.bin"), q); }
+
+@requires(filesystem)
+pub Bool save_aborts(Str dir, AbortBook b, Quorum q) { return filesystem.write_bytes(dir + "/aborts.bin", abort_book_encode(b, q.epoch)); }
