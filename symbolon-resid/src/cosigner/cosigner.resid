@@ -335,3 +335,86 @@ pub Result(CosignerState, SymbolonError) cosigner_update_head(CosignerState s, V
 pub Bool cosigner_in_duress(CosignerState s, Int now) {
     return match window_at(s.duress, s.verified.head.policy, now) { None => false, Some(_) => true };
 }
+
+// ============================================================================
+// What a re-share may deal to (SPEC 8.2, 11.3)
+// ============================================================================
+
+// Why the cosigner may not deal its share in a re-share with this plan, or
+// "" when it may. The cosigner deals before any event approves the
+// re-share, on one device's request, so the plan must be the one the
+// verified log already commits to:
+// - the new parties are the head quorum `q`'s parties less those removed,
+//   in order, then parties proposed (policy-approved, SPEC 8.2), each with
+//   the keys the log holds; a refresh keeps q's parties as they are;
+// - the online new parties receive and the offline ones (kit, guardians)
+//   get wrapped material, by their kinds;
+// - the threshold is kept: degree = t - 1, with t at least 2, so no single
+//   share is the key;
+// - the dealers are distinct parties of the quorum `old_q` dealt from (q
+//   itself, or after a recovery the quorum before it), exactly t of them
+//   (at least t to keep X, at most degree + 1 for the deal to be of that
+//   degree); an offline party deals only in a recovery, where the new
+//   device deals as the kit (SPEC 10.6).
+pub Str reshare_plan_problem(List(Party) np, List(Int) dealers, List(Int) receivers, List(Int) offline, Int degree,
+                             Quorum q, Quorum old_q, List(Party) proposed, List(List(Int)) removed) {
+    Int t = (Int)q.t;
+    if (t < 2 || (Int)old_q.t != t || degree != t - 1) { return "the re-share changes the threshold or makes it below 2"; }
+    if (np.len() > 8 || np.len() < t || !ids_distinct_ps(np, 0)) { return "the new party set is malformed"; }
+    List(Party) keep = survivors(q.parties, removed, 0, []);
+    if (np.len() < keep.len() || !same_parties(np, keep, 0)) { return "the new party set does not keep the quorum less the removed parties"; }
+    if (!all_proposed(np, proposed, keep.len())) { return "a new party was not proposed in the log"; }
+    if (!ints_eq(receivers, kind_ids(np, false, 0, [])) || !ints_eq(offline, kind_ids(np, true, 0, []))) { return "the receivers and offline parties do not follow the parties' kinds"; }
+    if (dealers.len() != t || !dealers_ok(dealers, old_q, old_q.epoch != q.epoch, 0)) { return "the dealers are not t distinct parties of the old quorum"; }
+    return "";
+}
+
+Bool offline_kind(UInt(8) k) { return k == party_kind_kit() || k == party_kind_guardian(); }
+
+Bool same_party(Party a, Party b) {
+    return bytes_eq(a.id, b.id) && a.kind == b.kind && bytes_eq(a.auth_key, b.auth_key) && bytes_eq(a.hpke_key, b.hpke_key);
+}
+
+Bool same_parties(List(Party) np, List(Party) keep, Int i) {
+    if (i >= keep.len()) { return true; }
+    return same_party(np[i], keep[i]) && same_parties(np, keep, i + 1);
+}
+
+List(Party) survivors(List(Party) ps, List(List(Int)) removed, Int i, List(Party) acc) {
+    if (i >= ps.len()) { return acc; }
+    return survivors(ps, removed, i + 1, if (seen(removed, ps[i].id, 0)) { acc } else { acc.concat([ps[i]]) });
+}
+
+Bool all_proposed(List(Party) np, List(Party) proposed, Int i) {
+    if (i >= np.len()) { return true; }
+    Option(Party) p = party_by_id(proposed, np[i].id, 0);
+    Bool ok = match p { None => false, Some(x) => same_party(x, np[i]) };
+    return ok && all_proposed(np, proposed, i + 1);
+}
+
+Bool ids_distinct_ps(List(Party) ps, Int i) {
+    if (i >= ps.len()) { return true; }
+    return !party_from(ps, ps[i].id, i + 1) && ids_distinct_ps(ps, i + 1);
+}
+
+Bool party_from(List(Party) ps, List(Int) id, Int i) { return i < ps.len() && (bytes_eq(ps[i].id, id) || party_from(ps, id, i + 1)); }
+
+// The CGGMP ids (position + 1) of the offline parties, or of the online ones.
+List(Int) kind_ids(List(Party) ps, Bool off, Int i, List(Int) acc) {
+    if (i >= ps.len()) { return acc; }
+    return kind_ids(ps, off, i + 1, if (offline_kind(ps[i].kind) == off) { acc.concat([i + 1]) } else { acc });
+}
+
+Bool ints_eq(List(Int) a, List(Int) b) { return a.len() == b.len() && ints_eq_from(a, b, 0); }
+
+Bool ints_eq_from(List(Int) a, List(Int) b, Int i) { return i >= a.len() || (a[i] == b[i] && ints_eq_from(a, b, i + 1)); }
+
+Bool int_in(List(Int) xs, Int x, Int i) { return i < xs.len() && (xs[i] == x || int_in(xs, x, i + 1)); }
+
+Bool dealers_ok(List(Int) ds, Quorum old_q, Bool recovery, Int i) {
+    if (i >= ds.len()) { return true; }
+    Int d = ds[i];
+    if (d < 1 || d > old_q.parties.len() || int_in(ds, d, i + 1)) { return false; }
+    if (offline_kind(old_q.parties[d - 1].kind) && !recovery) { return false; }
+    return dealers_ok(ds, old_q, recovery, i + 1);
+}

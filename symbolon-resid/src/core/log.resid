@@ -635,6 +635,25 @@ pub List(Party) il_proposed(List(Int) l, List(SignedEvent) events, Int now, Bool
     };
 }
 
+// The membership changes in force at `now` and not yet re-shared: the
+// parties proposed and the parties removed, as il_proposed reads them.
+// None when the log does not verify.
+pub type Membership = { List(Party) proposed; List(List(Int)) removed; };
+
+pub Option(Membership) il_membership(List(Int) l, List(SignedEvent) events, Int now, Bool closure(EventPayload) approvals_ok) {
+    if (events.len() < 1) { return None; }
+    Result(LogState, SymbolonError) s0 = start(events[0], l);
+    return match s0 {
+        Err(_) => None,
+        Ok(a) => match run(a, events, l, approvals_ok, 1) {
+            Err(_) => None,
+            Ok(s1) => if (now < s1.last_time) { None } else { membership_of(settle(s1, now)) }
+        }
+    };
+}
+
+Option(Membership) membership_of(LogState s) { return Some(Membership {.proposed = s.proposed, .removed = s.removed}); }
+
 List(UInt(64)) pending_seqs(List(Pending) ps, Int i, ListBuf(UInt(64)) acc) {
     if (i >= ps.len()) { return acc.finish(); }
     return pending_seqs(ps, i + 1, acc.push(ps[i].seq));

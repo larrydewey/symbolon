@@ -368,12 +368,40 @@ pub Result(Stepped(KgState), CgFail) kg_adapt(KgState st, List(ThMsg) msgs) {
 @requires(filesystem)
 Option(CgConfig) my_cg(Cosigner c) { return cg_at(c, 1); }
 
-// The newest configuration at epoch `e` or before.
+// The configuration a re-share deals from, with the quorum it belongs to:
+// the one of the verified log's epoch; or, when the log is at an epoch that
+// a recovery made (no inception or reshare event carries it, so no party
+// holds shares of it), the one of the epoch before, with that epoch's
+// quorum. Never an older one.
+pub type Dealing = { CgConfig cfg; Quorum old_q; };
+
 @requires(filesystem)
-Option(CgConfig) latest_cg(Cosigner c, Int e) {
-    if (e < 1) { return None; }
-    Option(CgConfig) x = cg_at(c, e);
-    return match x { Some(v) => Some(v), None => latest_cg(c, e - 1) };
+Option(Dealing) dealing_cfg(Cosigner c, Quorum q, List(SignedEvent) es) {
+    Option(CgConfig) cur = cg_at(c, (Int)q.epoch);
+    Option(Quorum) made = quorum_of_epoch(es, q.epoch, 0, None);
+    Option(Quorum) before = if (q.epoch > 0) { quorum_of_epoch(es, q.epoch - 1, 0, None) } else { None };
+    Bool by_recovery = match made { None => true, Some(_) => false };
+    Option(CgConfig) prev = if (by_recovery && q.epoch > 1) { cg_at(c, (Int)q.epoch - 1) } else { None };
+    return match cur {
+        Some(x) => Some(Dealing {.cfg = x, .old_q = q}),
+        None => match prev {
+            None => None,
+            Some(x) => match before { None => None, Some(bq) => Some(Dealing {.cfg = x, .old_q = bq}) }
+        }
+    };
+}
+
+// The quorum an inception or reshare event of `es` gives epoch `e`, the
+// last such.
+Option(Quorum) quorum_of_epoch(List(SignedEvent) es, UInt(32) e, Int i, Option(Quorum) acc) {
+    if (i >= es.len()) { return acc; }
+    EventBody b = es[i].payload.body;
+    Option(Quorum) here = match b {
+        InceptionBody(q, _) => if (q.epoch == e) { Some(q) } else { None },
+        ReshareBody(q) => if (q.epoch == e) { Some(q) } else { None },
+        _ => None
+    };
+    return quorum_of_epoch(es, e, i + 1, match here { Some(x) => Some(x), None => acc });
 }
 
 // The configuration of epoch `e` (the verified log's, when signing).
@@ -616,37 +644,66 @@ pub List(Remote) session_remotes(List(Party) np, List(Int) receivers, List(Int) 
 @requires(network, filesystem, declassify, clock)
 Cosigner on_reshare(Cosigner c, List(Int) from, ReshareInvite inv, List(Got) early, List(List(UInt(64))) primes) {
     if (c.cfg.log_id.len() == 0 || !bytes_eq(inv.log_id, c.cfg.log_id)) { return cos_fail(c, "re-share of another log"); }
-    Result(VerifiedHead, SymbolonError) rv = verified_log_at(relay_of(c.cfg), c.cfg.log_id, local_host(c.dir));
+    List(SignedEvent) es = fetch_log(relay_of(c.cfg), c.cfg.log_id, 0, []);
+    LogNow ln = log_now(c, es);
+    Result(VerifiedHead, SymbolonError) rv = ln.vh;
+    Option(Membership) om = ln.mem;
     return match rv {
         Err(_) => refuse(c, from, inv.session_id),
-        Ok(vh) => reshare_decide(c, from, inv, vh, early, primes)
+        Ok(vh) => match om { None => refuse(c, from, inv.session_id), Some(m) => reshare_decide(c, from, inv, vh, m, es, early, primes) }
     };
 }
 
+// The log verified now (as common's verified_events does it) and the
+// membership changes it holds at that same witness time: a proposal whose
+// delay has not run (still vetoable) is not in force.
+pub type LogNow = { Result(VerifiedHead, SymbolonError) vh; Option(Membership) mem; };
+
+@requires(network, clock(readonly), declassify, filesystem)
+LogNow log_now(Cosigner c, List(SignedEvent) es) {
+    List(Int) l = c.cfg.log_id;
+    if (es.len() == 0) { return LogNow {.vh = Err(ErrInvalidLog("no log at the relay")), .mem = None}; }
+    Int t = last_time(es, policy_of_e0(es));
+    Result(VerifiedHead, SymbolonError) v0 = il_verify(l, es, t, lambda(p) { false });
+    return match v0 {
+        Err(e) => LogNow {.vh = Err(e), .mem = None},
+        Ok(vh0) => log_at(l, es, t, witness_now(witnesses_at(vh0.head.policy.witnesses, local_host(c.dir)), relay_of(c.cfg).ca, random_bytes(32)))
+    };
+}
+
+LogNow log_at(List(Int) l, List(SignedEvent) es, Int t, Int w) {
+    Int now = if (w > t) { w } else { t };
+    return LogNow {.vh = il_verify(l, es, now, lambda(p) { false }), .mem = il_membership(l, es, now, lambda(p) { false })};
+}
+
+// The re-share is checked against the verified log before anything is
+// dealt (SPEC 8.2, 11.3): the device's request alone does not choose who
+// receives the cosigner's share, at what threshold, or with which dealers.
 @requires(network, filesystem, declassify, clock)
-Cosigner reshare_decide(Cosigner c, List(Int) from, ReshareInvite inv, VerifiedHead vh, List(Got) early, List(List(UInt(64))) primes) {
+Cosigner reshare_decide(Cosigner c, List(Int) from, ReshareInvite inv, VerifiedHead vh, Membership mem, List(SignedEvent) es, List(Got) early, List(List(UInt(64))) primes) {
     CosignerState st = load_state(c, vh);
     Quorum q = vh.head.quorum;
     if (!bytes_eq(from, inv.requester) || inv.epoch != (Int)q.epoch + 1) { return refuse(c, from, inv.session_id); }
+    CgConfig none = CgConfig {.id = 0, .threshold = 0, .ecdsa = [], .elgamal = [], .p = [], .q = [], .rid = [], .chain_key = [], .public = []};
+    Dealing d = dealing_cfg(c, q, es) else { Dealing {.cfg = none, .old_q = q} };
+    Str bad = if (d.cfg.id == 0 || d.cfg.id != pos1(d.old_q.parties, c.cfg.party, 0)) { "no configuration of the epoch to deal from" }
+        else { reshare_plan_problem(inv.new_parties, inv.dealers, inv.receivers, inv.offline, inv.degree, q, d.old_q, mem.proposed, mem.removed) };
+    if (str_len(bad) > 0) { eprintln("cosigner: re-share refused: " + bad); return refuse(c, from, inv.session_id); }
     CosignRequest req = CosignRequest {.session_id = inv.session_id, .message = reshare_message(inv), .epoch = q.epoch, .requester = inv.requester, .kind = request_reshare(), .sig = inv.sig};
     CosignOutcome o = cosign_decide(st, req, policy_now(c, vh));
     return match o {
         Refuse(s, _) => refused_saved(c, from, inv.session_id, s),
-        Proceed(s) => run_reshare(c, inv, q, s, early, primes)
+        Proceed(s) => run_reshare(c, inv, q, d.cfg, s, early, primes)
     };
 }
 
 @requires(network, filesystem, declassify, clock)
-Cosigner run_reshare(Cosigner c, ReshareInvite inv, Quorum q, CosignerState s, List(Got) early, List(List(UInt(64))) primes) {
+Cosigner run_reshare(Cosigner c, ReshareInvite inv, Quorum q, CgConfig old, CosignerState s, List(Got) early, List(List(UInt(64))) primes) {
     _ = filesystem.write_bytes(c.dir + "/state.cbor", cbor_of_state(s));
     Int new_id = pos1(inv.new_parties, c.cfg.party, 0);
-    // The share dealt from: the newest configuration held (after a
-    // recovery the current epoch has none yet), at its own x-coordinate.
-    Option(CgConfig) old = latest_cg(c, (Int)q.epoch);
-    List(CgConfig) olds = match old { Some(x) => [x], None => [] };
-    Int old_id = match old { Some(x) => x.id, None => 0 };
-    RsCtx rc = RsCtx {.self = if (has_int(inv.receivers, new_id, 0)) { new_id } else { 0 }, .old_self = if (has_int(inv.dealers, old_id, 0)) { old_id } else { 0 },
-        .dealers = inv.dealers, .receivers = inv.receivers, .offline = inv.offline, .degree = inv.degree, .old = olds, .root = q.root_pubkey,
+    // The share dealt from (dealing_cfg), at its own x-coordinate.
+    RsCtx rc = RsCtx {.self = if (has_int(inv.receivers, new_id, 0)) { new_id } else { 0 }, .old_self = if (has_int(inv.dealers, old.id, 0)) { old.id } else { 0 },
+        .dealers = inv.dealers, .receivers = inv.receivers, .offline = inv.offline, .degree = inv.degree, .old = [old], .root = q.root_pubkey,
         .session_id = inv.session_id, .seed = random_bytes(32), .primes = primes};
     return match rs_start(rc) {
         Err(e) => cos_fail(c, "re-share start: " + e.why),
@@ -699,6 +756,7 @@ Cosigner sign_reshare_event(Cosigner c, List(Int) from, EventPayload p, List(Int
         ReshareBody(nq) => str_len(e) > 0 && f"{nq.epoch}" == e
             && bytes_eq(nq.transcript_digest, get_file(c.dir + "/pending-" + e + ".transcript"))
             && bytes_eq(ids_of(nq.parties, 0, []), get_file(c.dir + "/pending-" + e + ".parties"))
+            && event_is_invite(nq, invite_of(get_file(c.dir + "/pending-" + e + ".invite")))
             && opt_is(p.log_id, c.cfg.log_id),
         _ => false
     };
@@ -717,6 +775,19 @@ Cosigner sign_reshare_event(Cosigner c, List(Int) from, EventPayload p, List(Int
     CosignerConfig nc = with_peers(c.cfg, ks, c.cfg.accept_inception);
     _ = save_cfg(c.dir, nc);
     return Cosigner {.dir = c.dir, .cfg = nc, .root = c.root};
+}
+
+// The reshare event's quorum is the one the cosigner dealt to: the same
+// parties with the same keys and kinds, and the threshold the deal's
+// degree makes.
+pub Bool event_is_invite(Quorum nq, Option(ReshareInvite) oi) {
+    return match oi { None => false, Some(inv) => (Int)nq.t == inv.degree + 1 && same_keys(nq.parties, inv.new_parties, 0) };
+}
+
+Bool same_keys(List(Party) a, List(Party) b, Int i) {
+    if (a.len() != b.len()) { return false; }
+    if (i >= a.len()) { return true; }
+    return bytes_eq(a[i].id, b[i].id) && a[i].kind == b[i].kind && bytes_eq(a[i].auth_key, b[i].auth_key) && bytes_eq(a[i].hpke_key, b[i].hpke_key) && same_keys(a, b, i + 1);
 }
 
 List(PartyKeys) keys_of_parties(List(Party) ps, Int i, List(PartyKeys) acc) {
