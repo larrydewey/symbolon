@@ -4,6 +4,7 @@
 import 'dart:async';
 import 'dart:io';
 
+import 'package:flutter/foundation.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:flutter/services.dart';
 
@@ -179,27 +180,42 @@ void toast(BuildContext context, String m) => ScaffoldMessenger.of(context).show
 const clipboardKeep = Duration(seconds: 30);
 Timer? _clearClipboard;
 
-/// Copies [value] and says so. A [secret] is marked sensitive (Android 13+
-/// keeps it out of the clipboard preview and the keyboard's suggestions) and
-/// is cleared after [clipboardKeep], unless something else was copied since.
+/// Whether copies go through the Android side (`copy` on symbolon/platform).
+/// Tests set it; null means Platform.isAndroid.
+@visibleForTesting
+bool? debugClipboardAndroid;
+
+/// Copies [value] and says so. A [secret] is marked sensitive and cleared
+/// after [clipboardKeep].
+///
+/// On Android every copy is made natively. Android 10+ lets an app in the
+/// background write the clipboard but not read it, so a clear that first
+/// reads the clipboard back (to see whether the secret is still there) never
+/// clears once the principal has gone to the app the secret was for. The
+/// native side marks a secret sensitive (kept out of the copy preview and
+/// the keyboard's suggestions, where the system honours it), schedules the
+/// clear itself and clears without reading; any later copy made in this app
+/// cancels it. Elsewhere the clipboard can be read from the background, so
+/// the clear leaves the clipboard alone if something else was copied since.
 Future<void> copyText(BuildContext context, String label, String value, {bool secret = false}) async {
   HapticFeedback.selectionClick();
-  var marked = false;
-  if (secret && Platform.isAndroid) {
+  var native = false;
+  if (debugClipboardAndroid ?? Platform.isAndroid) {
     try {
-      marked = await const MethodChannel('symbolon/platform').invokeMethod<bool>('copySensitive', value) ?? false;
+      native = await const MethodChannel('symbolon/platform').invokeMethod<bool>('copy', {'value': value, 'secret': secret}) ?? false;
     } on PlatformException {
-      marked = false;
+      native = false;
     } on MissingPluginException {
-      marked = false;
+      native = false;
     }
   }
-  if (!marked) await Clipboard.setData(ClipboardData(text: value));
+  if (!native) await Clipboard.setData(ClipboardData(text: value));
+  _clearClipboard?.cancel();
+  _clearClipboard = null;
   if (!context.mounted) return;
   if (!secret) return toast(context, '$label copied');
-  _clearClipboard?.cancel();
   // Not under flutter test, whose fake clock would see the timer outlive the test.
-  if (!Platform.environment.containsKey('FLUTTER_TEST')) {
+  if (!native && !Platform.environment.containsKey('FLUTTER_TEST')) {
     _clearClipboard = Timer(clipboardKeep, () async {
       final now = await Clipboard.getData(Clipboard.kTextPlain);
       if (now?.text == value) await Clipboard.setData(const ClipboardData(text: ''));

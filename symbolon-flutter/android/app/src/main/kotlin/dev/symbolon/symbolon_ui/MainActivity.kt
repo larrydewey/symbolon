@@ -109,18 +109,11 @@ class MainActivity : FlutterFragmentActivity() {
                 }
                 "installedApps" -> if (Build.VERSION.SDK_INT < 26) result.success(emptyList<Any>())
                     else Thread { val a = AutofillCore.installedApps(this); runOnUiThread { result.success(a) } }.start()
-                // A secret for the clipboard, marked sensitive: Android 13+
-                // then keeps it out of the copy preview and the keyboard's
-                // clipboard suggestions. False before 13 (the Dart side copies).
-                "copySensitive" -> {
-                    if (Build.VERSION.SDK_INT >= 33) {
-                        val clip = android.content.ClipData.newPlainText("Symbolon", call.arguments as String)
-                        clip.description.extras = android.os.PersistableBundle().apply {
-                            putBoolean(android.content.ClipDescription.EXTRA_IS_SENSITIVE, true)
-                        }
-                        (getSystemService(android.content.Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager).setPrimaryClip(clip)
-                        result.success(true)
-                    } else result.success(false)
+                // Every copy (widgets.dart copyText). A secret is marked
+                // sensitive and cleared after 30 s (SPEC 22.2), see Clip.
+                "copy" -> {
+                    Clip.copy(this, call.argument<String>("value") ?: "", call.argument<Boolean>("secret") == true)
+                    result.success(true)
                 }
                 // What the organization's device management set (res/xml/app_restrictions.xml).
                 "managedConfig" -> {
@@ -181,6 +174,48 @@ class MainActivity : FlutterFragmentActivity() {
                 else -> result.notImplemented()
             }
         }
+    }
+}
+
+/**
+ * The app's clipboard copies. Android 10+ lets an app in the background
+ * write the clipboard but not read it, so the clear is scheduled here and
+ * does not read the clipboard first: 30 s after a secret is copied, the
+ * clipboard is cleared, whatever it then holds, unless this app copied
+ * something else meanwhile. (A copy made in another app within those 30 s
+ * is cleared too; leaving the secret there is worse.)
+ */
+object Clip {
+    private val main = android.os.Handler(android.os.Looper.getMainLooper())
+    private var clear: Runnable? = null
+    const val KEEP_MS = 30_000L
+
+    fun copy(c: android.content.Context, value: String, secret: Boolean) {
+        val app = c.applicationContext
+        val cm = app.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+        val clip = android.content.ClipData.newPlainText("Symbolon", value)
+        // Keeps it out of the copy preview and the keyboard's clipboard
+        // suggestions: the platform constant from Android 13, the same key
+        // before (honoured by some keyboards and OEM builds).
+        if (secret && Build.VERSION.SDK_INT >= 24) {
+            clip.description.extras = android.os.PersistableBundle().apply {
+                putBoolean(if (Build.VERSION.SDK_INT >= 33) android.content.ClipDescription.EXTRA_IS_SENSITIVE else "android.content.extra.IS_SENSITIVE", true)
+            }
+        }
+        clear?.let { main.removeCallbacks(it) }
+        clear = null
+        cm.setPrimaryClip(clip)
+        if (!secret) return
+        val r = Runnable {
+            clear = null
+            try {
+                if (Build.VERSION.SDK_INT >= 28) cm.clearPrimaryClip()
+                else cm.setPrimaryClip(android.content.ClipData.newPlainText("", ""))
+            } catch (_: Exception) {
+            }
+        }
+        clear = r
+        main.postDelayed(r, KEEP_MS)
     }
 }
 
