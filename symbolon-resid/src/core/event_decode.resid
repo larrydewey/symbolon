@@ -293,6 +293,11 @@ RBody r_body(List(Int) b, Int p) {
     if (k.v == 5 && n == 1) { return RBody {.v = Some(RotateRecoveryBody), .next = k.next}; }
     if (k.v == 6 && n == 2) { return r_recover(b, k.next); }
     if (k.v == 7 && n == 2) { RU s = r_uint(b, k.next); return if (s.next < 0) { no_body() } else { RBody {.v = Some(VetoBody((UInt(64))s.v)), .next = s.next} }; }
+    if (k.v == 11 && n == 3) {
+        RB id = r_bytes(b, k.next);
+        RB hk = if (id.next < 0) { id } else { r_cose_key(b, id.next) };
+        return if (id.next < 0 || hk.next < 0) { no_body() } else { RBody {.v = Some(PartyKeyBody(id.v, hk.v)), .next = hk.next} };
+    }
     if (k.v == 10 && n == 2) { RU s = r_uint(b, k.next); return if (s.next < 0 || s.v > 255) { no_body() } else { RBody {.v = Some(MigrateBody((UInt(8))s.v)), .next = s.next} }; }
     return no_body();
 }

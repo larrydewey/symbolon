@@ -100,7 +100,10 @@ type EventBody =
   | RotateRecoveryBody
   | RecoverBody(RecoverBodyInner)
   | VetoBody(UInt(64))
-  | MigrateBody(UInt(8));
+  | MigrateBody(UInt(8))
+  // [11, party-id, hpke-key] (SPEC 8.1): a device's new share-transport
+  // key, signed by that device's own authentication key.
+  | PartyKeyBody(List(Int), List(Int));
 
 type EventPayload = {
     Option(List(Int)) log_id;                // None only in event 0

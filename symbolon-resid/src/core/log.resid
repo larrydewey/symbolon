@@ -427,6 +427,14 @@ LogState apply_effect(LogState s, EventBody body, List(Int) event_digest, List(L
             .proposed = [], .removed = [], .pending = s.pending,
             .vetoes = 0, .prev_digest = s.prev_digest, .next_seq = s.next_seq,
             .last_time = s.last_time, .last_cosigs = s.last_cosigs },
+        PartyKeyBody(id, k) => LogState {
+            .quorum = Quorum {
+                .parties = with_hpke(s.quorum.parties, id, k, 0, ListBuf()), .t = s.quorum.t, .root_pubkey = s.quorum.root_pubkey,
+                .epoch = s.quorum.epoch, .transcript_digest = s.quorum.transcript_digest, .kv_commits = s.quorum.kv_commits },
+            .policy = s.policy, .recovery_digests = s.recovery_digests,
+            .proposed = s.proposed, .removed = s.removed, .pending = s.pending,
+            .vetoes = s.vetoes, .prev_digest = s.prev_digest, .next_seq = s.next_seq,
+            .last_time = s.last_time, .last_cosigs = s.last_cosigs },
         _ => s
     };
 }
@@ -573,6 +581,30 @@ Result(LogState, SymbolonError) do_rotate(LogState s, SignedEvent e, List(Int) d
     return authority(s, e, dig, false, dev_sigs);
 }
 
+// party-key (SPEC 8.1, 8.2): a device of the quorum, not removed, names a
+// new share-transport (HPKE) key for itself, signed by its own
+// authentication key. It takes effect at once: it changes where others
+// wrap to this device, not who signs, recovers or holds a share, and
+// whoever holds the device's DK and its profile already reads everything
+// the old key opened.
+Result(LogState, SymbolonError) do_party_key(LogState s, SignedEvent e, List(Int) id, List(Int) k) {
+    Option(Party) op = party_by_id(s.quorum.parties, id, 0);
+    Party p = op else { Party {.id = [], .kind = 0, .auth_key = [], .hpke_key = [], .label = "", .attestation = NoAttestation} };
+    if (p.id.len() == 0 || p.kind != party_kind_device()) { return refuse("party-key for a party that is not a device of the quorum"); }
+    if (has_bytes(s.removed, id, 0)) { return refuse("party-key for a removed party"); }
+    if (!key_ok(k)) { return refuse("party-key with a bad key"); }
+    if (bytes_eq(k, p.hpke_key)) { return refuse("party-key that changes nothing"); }
+    if (!signed_by_key(e.sigs, p.auth_key, e.encoded, 0)) { return refuse("party-key not signed by that device"); }
+    return Ok(apply_effect(s, e.payload.body, [], e.payload.next_recovery_key_digests));
+}
+
+List(Party) with_hpke(List(Party) ps, List(Int) id, List(Int) k, Int i, ListBuf(Party) acc) {
+    if (i >= ps.len()) { return acc.finish(); }
+    Party p = ps[i];
+    Party q = if (bytes_eq(p.id, id)) { Party {.id = p.id, .kind = p.kind, .auth_key = p.auth_key, .hpke_key = k, .label = p.label, .attestation = p.attestation} } else { p };
+    return with_hpke(ps, id, k, i + 1, acc.push(q));
+}
+
 Result(LogState, SymbolonError) do_reshare(LogState s, SignedEvent e, List(Int) dig, Quorum nq) {
     if (!quorum_ok(nq)) { return refuse("malformed quorum"); }
     if (!bytes_eq(nq.root_pubkey, s.quorum.root_pubkey)) { return refuse("reshare changed the root key"); }
@@ -664,7 +696,8 @@ Result(LogState, SymbolonError) apply_body(LogState s, SignedEvent e, List(Int) 
         MigrateBody(_) => refuse("unsupported suite"),
         ReshareBody(nq) => do_reshare(s, e, dig, nq),
         RecoverBody(r) => do_recover(s, e, dig, r, approvals_ok),
-        VetoBody(target) => do_veto(s, dev_sigs, target)
+        VetoBody(target) => do_veto(s, dev_sigs, target),
+        PartyKeyBody(id, k) => do_party_key(s, e, id, k)
     };
 }
 

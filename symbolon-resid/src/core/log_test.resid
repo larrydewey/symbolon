@@ -1,5 +1,7 @@
 import "../types.resid";
 import "log.resid";
+import "event.resid";
+import "event_decode.resid";
 import "hash.resid";
 import "ecdsa.resid";
 import "crypto.resid";
@@ -493,4 +495,52 @@ test "a log is frozen only when no digest can still get a majority at the sequen
     expect(freeze_problem([wh(7, 1), wh(8, 2), wh(7, 3)], 3, 7)).toEqual("");
     // Five witnesses, 2 + 2 + 1 at 9: none can reach 3.
     expect(str_len(freeze_problem([wh(9, 1), wh(9, 1), wh(9, 2), wh(9, 2), wh(9, 3)], 5, 9)) > 0).toBeTrue();
+}
+
+// ─── party-key (SPEC 8.1, 8.2) ───────────────────────────────────
+
+List(Int) hpke_of(Result(VerifiedHead, SymbolonError) r, Int n) {
+    return match r { Ok(v) => hpke_in(v.head.quorum.parties, id32(n), 0), Err(_) => [] };
+}
+
+List(Int) hpke_in(List(Party) ps, List(Int) id, Int i) {
+    if (i >= ps.len()) { return []; }
+    if (bytes_eq(ps[i].id, id)) { return ps[i].hpke_key; }
+    return hpke_in(ps, id, i + 1);
+}
+
+test "a device names a new transport key for itself, signed by its own key" {
+    List(Int) l = log_id();
+    SignedEvent ev = next(1, 1, enc(0), PartyKeyBody(id32(2), pubk(20)), [2], 2000);
+    Result(VerifiedHead, SymbolonError) r = il_verify(l, [e0([2, 3]), ev], 2000, lambda(x) { false });
+    expect(ok(r)).toBeTrue();
+    // At once, not delayed; the other device's key stays.
+    expect(pending_n(r)).toEqual(0);
+    expect(hpke_of(r, 2)).toEqual(pubk(20));
+    expect(hpke_of(r, 3)).toEqual(pubk(3));
+}
+
+test "a party-key signed by another device, or for an unknown party, or unchanged, is refused" {
+    List(Int) l = log_id();
+    // Device 3 cannot move device 2's transport key (it would redirect wraps).
+    expect(ok(il_verify(l, [e0([2, 3]), next(1, 1, enc(0), PartyKeyBody(id32(2), pubk(20)), [3], 2000)], 2000, lambda(x) { false }))).toBeFalse();
+    expect(ok(il_verify(l, [e0([2, 3]), next(1, 1, enc(0), PartyKeyBody(id32(5), pubk(20)), [2], 2000)], 2000, lambda(x) { false }))).toBeFalse();
+    expect(ok(il_verify(l, [e0([2, 3]), next(1, 1, enc(0), PartyKeyBody(id32(2), pubk(2)), [2], 2000)], 2000, lambda(x) { false }))).toBeFalse();
+    expect(ok(il_verify(l, [e0([2, 3]), next(1, 1, enc(0), PartyKeyBody(id32(2), [4, 1, 2]), [2], 2000)], 2000, lambda(x) { false }))).toBeFalse();
+}
+
+Bool is_key_body(Option(EventPayload) d, List(Int) id, List(Int) key) {
+    return match d { None => false, Some(x) => key_body(x.body, id, key) };
+}
+
+Bool key_body(EventBody b, List(Int) id, List(Int) key) {
+    return match b { PartyKeyBody(i, k) => bytes_eq(i, id) && bytes_eq(k, key), _ => false };
+}
+
+test "a party-key event encodes as [11, party-id, COSE_Key] and decodes back" {
+    EventPayload p = EventPayload {.log_id = Some(id32(1)), .sequence = 3, .predecessor_digest = Some(id32(2)), .suite = 1,
+                                   .body = PartyKeyBody(id32(2), pubk(20)), .next_recovery_key_digests = [id32(50)], .advisory_time = 7};
+    List(Int) b = payload_cbor(p) else { [] };
+    expect(b.len() > 0).toBeTrue();
+    expect(is_key_body(payload_decode(b), id32(2), pubk(20))).toBeTrue();
 }
