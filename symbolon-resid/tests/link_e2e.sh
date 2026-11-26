@@ -6,9 +6,10 @@
 # its CA from the first, makes itself, and joins: the identity re-shares to
 # four parties and the second device reads the first one's vault.
 # Refused: a connection without the code's key (the new device keeps
-# waiting), a link-add with another code's key, and a wrong PIN on the
-# existing device, which stops before the new one acts. A first attempt cut
-# short is retried, using the device it made.
+# waiting), a link-add with another code's key, a wrong PIN on the
+# existing device, which stops before the new one acts, a link on the
+# command line or to a public address, and a fingerprint not confirmed. A
+# first attempt not confirmed is retried, using the device it made.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 BIN="${BIN:-$PWD/target/symbolon}"
@@ -89,23 +90,32 @@ s.settimeout(15); print(repr(s.recv(100)))
 PY
 # A link-add with the right address but another code's key.
 BAD=$(printf '%s' "$LINK" | sed 's/&s=.*/\&s=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/')
-printf '2468\n' | run 300 "$BIN" device link-add "$W/dev" "$BAD" > "$W/badadd.log" 2>&1 && fail "link-add with another code's key succeeded"
+printf '%s\n2468\ny\n' "$BAD" | run 300 "$BIN" device link-add "$W/dev" > "$W/badadd.log" 2>&1 && fail "link-add with another code's key succeeded"
 grep -q "did not answer with this code's key" "$W/badadd.log" || fail "bad key: $(cat "$W/badadd.log")"
 # A wrong PIN on the existing device stops before anything is sent.
-printf '9999\n' | run 300 "$BIN" device link-add "$W/dev" "$LINK" > "$W/badpin.log" 2>&1 && fail "link-add with a wrong PIN succeeded"
+printf '%s\n9999\ny\n' "$LINK" | run 300 "$BIN" device link-add "$W/dev" > "$W/badpin.log" 2>&1 && fail "link-add with a wrong PIN succeeded"
 grep -q "wrong PIN" "$W/badpin.log" || fail "wrong PIN: $(cat "$W/badpin.log")"
+# The link on the command line, where any process can read its secret, and
+# a link naming an address outside the local network: refused at once.
+run 30 "$BIN" device link-add "$W/dev" "$LINK" < /dev/null > "$W/argv.log" 2>&1 && fail "link-add took the link on the command line"
+grep -q "on standard input" "$W/argv.log" || fail "link on argv: $(cat "$W/argv.log")"
+PUB=$(printf '%s' "$LINK" | sed 's/a=127.0.0.1/a=8.8.8.8/')
+printf '%s\n2468\ny\n' "$PUB" | run 30 "$BIN" device link-add "$W/dev" > "$W/pub.log" 2>&1 && fail "link-add took a link to a public address"
+grep -q "outside the local network" "$W/pub.log" || fail "public link: $(cat "$W/pub.log")"
 [ "$(grep -c 'without this code' "$W/linknew.log")" -ge 2 ] || fail "the new device did not refuse the strangers: $(cat "$W/linknew.log")"
 kill -0 $LN 2>/dev/null || fail "the new device stopped waiting: $(cat "$W/linknew.log")"
-echo "refused: a stranger's offer, another code's key, a wrong PIN; the new device kept waiting"
+echo "refused: a stranger's offer, another code's key, a wrong PIN, a link on the command line or to a public address; the new device kept waiting"
 
-# A first attempt cut short: the old device stops right after sending its
-# offer; the new one makes itself, answers, and waits to join until it too
-# is stopped. A retry must use that device again, with its PIN.
-printf '2468\n' | run 300 "$BIN" device link-add "$W/dev" "$LINK" > "$W/cut.log" 2>&1 &
-for _ in $(seq 300); do grep -q "waiting for the new device" "$W/cut.log" && break; sleep 0.1; done
-pkill -f -- "[l]ink-add $W/dev " ; sleep 0.5
+# A first attempt not confirmed: the old device shows the new one's
+# fingerprint and the person answers no; the new one has made itself,
+# answered, and waits to join until it too is stopped. A retry must use
+# that device again, with its PIN.
+printf '%s\n2468\nn\n' "$LINK" | run 300 "$BIN" device link-add "$W/dev" > "$W/cut.log" 2>&1 && fail "link-add went on without the fingerprint confirmed"
+grep -q "not confirmed" "$W/cut.log" || fail "an unconfirmed fingerprint: $(cat "$W/cut.log")"
 for _ in $(seq 300); do grep -q "joining the identity" "$W/linknew.log" && break; sleep 0.1; done
 grep -q "joining the identity" "$W/linknew.log" || fail "the first attempt did not get as far as joining: $(cat "$W/linknew.log")"
+FP1=$(sed -n 's/^fingerprint //p' "$W/linknew.log"); FP2=$(sed -n 's/^fingerprint //p' "$W/cut.log")
+[ -n "$FP1" ] && [ "$FP1" = "$FP2" ] || fail "the two devices show different fingerprints: '$FP1' '$FP2'"
 pkill -f -- "[l]ink-new $W/dev2 " ; wait $LN 2>/dev/null
 [ -s "$W/dev2/config.cbor" ] || fail "the first attempt left no device"
 printf '2222\n\n' | run 120 "$BIN" device link-new "$W/dev2" --host 127.0.0.1 --unprotected --fast-kdf > "$W/retrypin.log" 2>&1 && fail "a retry with another PIN started"
@@ -114,11 +124,12 @@ printf '1111\n\n' | run 1800 "$BIN" device link-new "$W/dev2" --host 127.0.0.1 -
 for _ in $(seq 100); do grep -q '^link ' "$W/linknew.log" && break; sleep 0.1; done
 LINK=$(sed -n 's/^link //p' "$W/linknew.log")
 [ -n "$LINK" ] || fail "no code on the retry: $(cat "$W/linknew.log")"
-echo "a first attempt cut short after the new device made itself; the retry shows a new code (another PIN refused)"
+echo "a first attempt not confirmed (both devices showed one fingerprint) after the new device made itself; the retry shows a new code (another PIN refused)"
 
 echo "linking (re-share with fresh Paillier keys; a few minutes)..."
-printf '2468\n' | run 1800 "$BIN" device link-add "$W/dev" "$LINK" --primes "$W/devrs.primes" > "$W/linkadd.log" 2>&1 || fail "link-add: $(tail -5 "$W/linkadd.log")"
+printf '%s\n2468\ny\n' "$LINK" | run 1800 "$BIN" device link-add "$W/dev" --primes "$W/devrs.primes" > "$W/linkadd.log" 2>&1 || fail "link-add: $(tail -5 "$W/linkadd.log")"
 wait $LN || fail "link-new: $(tail -5 "$W/linknew.log")"
+[ "$(sed -n 's/^fingerprint //p' "$W/linkadd.log")" = "$(sed -n 's/^fingerprint //p' "$W/linknew.log")" ] || fail "the fingerprints differ"
 grep -q "using this device, made by an earlier try, against 127.0.0.1:$RP" "$W/linknew.log" || fail "the retry did not use the device the first attempt made: $(cat "$W/linknew.log")"
 grep -q "BEGIN CERTIFICATE" "$W/dev2/config.cbor" 2>/dev/null || python3 -I -c "import sys; sys.exit(0 if b'BEGIN CERTIFICATE' in open(sys.argv[1],'rb').read() else 1)" "$W/dev2/config.cbor" || fail "the new device did not take the relay's CA"
 run 120 "$BIN" device status "$W/dev2" > "$W/status2.log" 2>&1 || fail "status (second): $(cat "$W/status2.log")"

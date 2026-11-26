@@ -6,13 +6,19 @@
 //   symbolon device link-new DIR [--host H[,H...]] [--unprotected|--keystore] [--fast-kdf] [--primes FILE]
 //       on the new device; the PIN and duress PIN on stdin. Listens on
 //       every interface and prints "link symbolon://link?a=HOSTS&p=PORT&s=SECRET"
-//       (the QR's content; HOSTS from --host, the app's network addresses),
-//       waits for the other device, makes this device against the relay it
-//       names (device new), answers with this device's keys, and joins.
-//   symbolon device link-add DIR LINK [--primes FILE]
-//       on a device that has the identity; the PIN on stdin. Reaches the new
-//       device at one of the link's addresses, sends the relay, its CA and
-//       this device's keys, takes the new device's keys and enrolls it.
+//       (the QR's content; HOSTS from --host, the app's network addresses,
+//       each a local one: link_host_ok), waits for the other device, makes
+//       this device against the relay it names (device new), prints
+//       "fingerprint F" (link_fingerprint of its keys, for the person to
+//       compare), answers with this device's keys, and joins.
+//   symbolon device link-add DIR [--primes FILE]
+//       on a device that has the identity; on stdin the link (it carries
+//       the code's secret, so never on the command line), then the PIN,
+//       then the answer to the confirmation. Reaches the new device at one
+//       of the link's addresses, sends the relay, its CA and this device's
+//       keys, takes the new device's keys, prints "fingerprint F" for
+//       them, and enrolls it only when the next line is "y" (the person
+//       saw the same F on the new device).
 //
 // The exchange, one TCP connection, text lines:
 //   offer   SYMBOLON-LINK 1 / relay HOST PORT / ca HEX / keys HEX / mac HEX / end
@@ -22,9 +28,20 @@
 // lines, and over "symbolon v1 link accept\n", the offer's mac and the
 // accept's lines. Nothing in the exchange is secret (a relay address, a
 // certificate, public keys); the macs make sure each side takes the other's
-// keys and not those of whoever else is on the network. A connection whose
-// mac does not check is dropped and the new device keeps waiting, for at
-// most ten minutes and twenty tries.
+// keys and not those of whoever else is on the network.
+//
+// The secret authenticates the two ends to each other, not to the person:
+// a link made by someone else and pasted or scanned here would enroll that
+// someone's device. Hence (SPEC 11.1 step 2, 11.5): a link names only
+// local addresses (loopback, RFC 1918, 100.64/10, link-local, fc00::/7,
+// `.local`), so the two devices must share a network, and both show the
+// new device's fingerprint, which the person confirms on the adding device
+// before anything secret leaves it.
+//
+// A connection whose mac does not check is dropped and the new device
+// keeps waiting, for at most ten minutes; a peer address (an IPv6 /64)
+// with three such connections is not read again, so one stranger on the
+// network cannot end the wait.
 
 import "../types.resid";
 import "../core/log.resid";
@@ -73,10 +90,78 @@ Bool chars_ok(Str s, Int i) {
     if (!str_contains("abcdefghijklmnopqrstuvwxyz0123456789.-:ABCDEFGHIJKLMNOPQRSTUVWXYZ", str_slice(s, i, i + 1))) { return false; }
     return chars_ok(s, i + 1);
 }
-Bool hosts_ok(List(Str) hs, Int i) {
+// Each a local address (link_host_ok): the hosts a link may name.
+pub Bool hosts_ok(List(Str) hs, Int i) {
     if (i >= hs.len()) { return true; }
-    if (!host_ok(hs[i])) { return false; }
+    if (!link_host_ok(hs[i])) { return false; }
     return hosts_ok(hs, i + 1);
+}
+
+// A host a link may name: one reachable only on a network the two devices
+// share. IPv4 loopback (127/8), RFC 1918 (10/8, 172.16/12, 192.168/16),
+// shared address space (100.64/10: Tailscale and carrier NAT) and
+// link-local (169.254/16); IPv6 loopback (::1), link-local (fe80::/10)
+// and unique local (fc00::/7); "localhost" and mDNS names (*.local). Any
+// other name or address, which could be anywhere on the internet, is
+// refused.
+pub Bool link_host_ok(Str h0) {
+    if (!host_ok(h0)) { return false; }
+    Str h = str_to_lower(h0);
+    if (h == "localhost" || (str_len(h) > 6 && str_ends_with(h, ".local") && !str_contains(h, ":"))) { return true; }
+    if (str_contains(h, ":")) { return v6_local(h); }
+    List(Int) q = v4_of(h);
+    if (q.len() != 4) { return false; }
+    return q[0] == 127 || q[0] == 10 || (q[0] == 172 && q[1] >= 16 && q[1] <= 31) || (q[0] == 192 && q[1] == 168)
+        || (q[0] == 100 && q[1] >= 64 && q[1] <= 127) || (q[0] == 169 && q[1] == 254);
+}
+
+// A dotted IPv4 address's four numbers, or [].
+List(Int) v4_of(Str h) {
+    List(Str) p = str_split(h, ".");
+    if (p.len() != 4) { return []; }
+    return octets(p, 0, []);
+}
+List(Int) octets(List(Str) p, Int i, List(Int) acc) {
+    if (i >= p.len()) { return acc; }
+    if (str_len(p[i]) < 1 || str_len(p[i]) > 3 || !digits(p[i], 0)) { return []; }
+    Int v = str_parse_int(p[i]);
+    if (v > 255) { return []; }
+    return octets(p, i + 1, acc.concat([v]));
+}
+Bool digits(Str s, Int i) {
+    if (i >= str_len(s)) { return true; }
+    if (!str_contains("0123456789", str_slice(s, i, i + 1))) { return false; }
+    return digits(s, i + 1);
+}
+
+// IPv6 (no zone): ::1, or a first group in fe80::/10 or fc00::/7.
+Bool v6_local(Str h) {
+    if (!v6_chars(h, 0)) { return false; }
+    if (h == "::1") { return true; }
+    List(Str) g = str_split(h, ":");
+    Str g0 = if (g.len() > 2) { g[0] } else { "" };
+    if (str_len(g0) != 4) { return false; }
+    Str a = str_slice(g0, 0, 2);
+    Str b = str_slice(g0, 2, 3);
+    return a == "fc" || a == "fd" || (a == "fe" && str_contains("89ab", b));
+}
+Bool v6_chars(Str s, Int i) {
+    if (i >= str_len(s)) { return true; }
+    if (!str_contains("0123456789abcdef:", str_slice(s, i, i + 1))) { return false; }
+    return v6_chars(s, i + 1);
+}
+
+// What the person compares on the two devices before the new one is
+// enrolled (SPEC 11.1 step 2): 8 groups of 4 hex digits of SHA-256 over a
+// label and the new device's keys (its party id, DK_N and transport key,
+// as cbor_of_keys writes them), 128 bits.
+pub Str link_fingerprint(List(Int) keys) {
+    Str h = hex_encode(sha256_bytes(utf8("symbolon v1 device fingerprint").concat(keys)));
+    return fp_hex(h, 0, "");
+}
+Str fp_hex(Str h, Int g, Str acc) {
+    if (g >= 8) { return acc; }
+    return fp_hex(h, g + 1, acc + (if (g > 0) { " " } else { "" }) + str_slice(h, 4 * g, 4 * g + 4));
 }
 
 /// The link in a scanned code, or None.
@@ -178,33 +263,61 @@ List(Int) read_until_end(Int fd, List(Int) acc) {
 Bool nap(Int ms) { _ = clock.sleep_ns(ms * 1000000); return true; }
 
 // The first connection whose offer checks: its fd and the offer, or fd -1
-// after `tries` tenths of a second or `bad` failed offers.
+// once the monotonic clock passes `until` (ns). `bad` holds the peer of
+// each connection whose offer did not check (peer_key); a peer with
+// bad_per_peer() of them is closed unread from then on, so a stranger on
+// the network can neither end the wait nor keep the new device busy.
 pub type Took = { Int fd; Offer o; };
 
 Offer no_offer() { return Offer {.relay_host = "", .relay_port = 0, .ca = "", .keys = [], .mac = ""}; }
 
+pub Int bad_per_peer() { return 3; }
+
+// Who a connection is from, for counting its failures, from
+// resid_tcp_peer's [n, address (n bytes), port]: an IPv4 address (also
+// when mapped into IPv6), or an IPv6 address's /64 (one host has a whole
+// /64 to choose from). "" when the system does not say.
+pub Str peer_key(List(Int) p) {
+    if (p.len() < 1 || p[0] < 1 || p.len() < 1 + p[0]) { return ""; }
+    List(Int) a = p[1..1 + p[0]];
+    if (a.len() == 16 && hex_encode(a[0..12]) == "00000000000000000000ffff") { return hex_encode(a[12..16]); }
+    return hex_encode(if (a.len() == 16) { a[0..8] } else { a });
+}
+
+pub Bool peer_refused(List(Str) bad, Str who) { return count_of(bad, who, 0, 0) >= bad_per_peer(); }
+
+Int count_of(List(Str) xs, Str x, Int i, Int acc) {
+    if (i >= xs.len()) { return acc; }
+    return count_of(xs, x, i + 1, if (xs[i] == x) { acc + 1 } else { acc });
+}
+
 @requires(network, clock)
-Took take_offer(Int lfd, List(Int) secret, Int tries, Int bad) {
-    if (tries <= 0 || bad >= 20) { return Took {.fd = -1, .o = no_offer()}; }
+Took take_offer(Int lfd, List(Int) secret, Int until, List(Str) bad) {
+    if (clock.monotonic_ns() > until) { return Took {.fd = -1, .o = no_offer()}; }
     Int c = resid_tcp_accept_now(lfd);
     if (c < 0) {
         _ = nap(100);
-        return take_offer(lfd, secret, tries - 1, bad);
+        return take_offer(lfd, secret, until, bad);
+    }
+    Str who = peer_key(resid_tcp_peer(c));
+    if (peer_refused(bad, who)) {
+        _ = resid_tcp_close(c);
+        return take_offer(lfd, secret, until, bad);
     }
     _ = resid_tcp_deadline(c, 10000);
     List(Int) b = read_until_end(c, []);
     Option(Offer) oo = offer_of(http_text(b, 0, b.len()), secret);
     return match oo {
-        None => drop_and_retry(lfd, c, secret, tries, bad),
+        None => drop_and_retry(lfd, c, secret, until, bad.concat([who])),
         Some(o) => Took {.fd = c, .o = o}
     };
 }
 
 @requires(network, clock)
-Took drop_and_retry(Int lfd, Int c, List(Int) secret, Int tries, Int bad) {
+Took drop_and_retry(Int lfd, Int c, List(Int) secret, Int until, List(Str) bad) {
     _ = resid_tcp_close(c);
     eprintln("device: a connection without this code's key was refused");
-    return take_offer(lfd, secret, tries - 1, bad + 1);
+    return take_offer(lfd, secret, until, bad);
 }
 
 // ============================================================================
@@ -225,13 +338,14 @@ pub Int link_new(Str dir, Str hosts, Bool unprotected, Bool keystore, Bool fast,
     if (dpin == pin) { return dfail("the duress PIN must differ from the PIN"); }
     if (made && unlock_dir(dir, pc, pin).kind != 1) { return dfail("wrong PIN (this device was made by an earlier try: use the PIN chosen then)"); }
     List(Str) hs = if (str_len(hosts) == 0) { [] } else { str_split(hosts, ",") };
-    if (!hosts_ok(hs, 0)) { return dfail("--host takes addresses separated by commas"); }
+    if (hs.len() == 0 || hs.len() > 8) { return dfail("--host takes this device's addresses on the local network (1 to 8, separated by commas)"); }
+    if (!hosts_ok(hs, 0)) { return dfail("--host takes local network addresses only (private, link-local, Tailscale or .local), separated by commas"); }
     Int lfd = resid_tcp_listen_at("0.0.0.0", 0);
     if (lfd < 0) { return dfail("cannot listen for the other device"); }
     List(Int) secret = random_bytes(32);
-    println("link " + link_text(if (hs.len() == 0) { ["-"] } else { hs }, resid_tcp_bound_port(lfd), secret));
+    println("link " + link_text(hs, resid_tcp_bound_port(lfd), secret));
     println("device: waiting for the other device to scan the code");
-    Took t = take_offer(lfd, secret, 6000, 0);
+    Took t = take_offer(lfd, secret, clock.monotonic_ns() + 600 * 1000000000, []);
     _ = resid_tcp_close(lfd);
     if (t.fd < 0) { return dfail("no device answered the code"); }
     Option(PartyKeys) ok = keys_of_cbor(t.o.keys);
@@ -247,6 +361,9 @@ pub Int link_new(Str dir, Str hosts, Bool unprotected, Bool keystore, Bool fast,
     Option(DeviceConfig) oc = load_config(dir);
     DeviceConfig c = oc else { return_cfg() };
     List(Int) mine = cbor_of_keys(PartyKeys {.party = c.party, .auth_key = c.dk_pub, .hpke_key = c.hpke_pub});
+    // The other device shows the same and asks its person to compare.
+    println("fingerprint " + link_fingerprint(mine));
+    eprintln("device: your other device will show this device's code: " + link_fingerprint(mine) + "; confirm there only if it is the same");
     Bool sent = resid_tcp_send_bin(t.fd, utf8(accept_text(secret, t.o.mac, mine)));
     _ = resid_tcp_close(t.fd);
     if (!sent) { return dfail("cannot answer the other device"); }
@@ -271,11 +388,31 @@ Int connect_any(List(Str) hs, Int port, Int i) {
     return connect_any(hs, port, i + 1);
 }
 
+// `device link-add DIR`: the link is the first line on standard input (it
+// carries the code's secret: never on the command line, where every
+// process on the machine can read it).
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+pub Int link_add_cmd(Str dir, Str primes_file) {
+    Str text = read_pin();
+    Int r = link_add(dir, text, primes_file);
+    return r;
+}
+
+// Whether the person confirmed the fingerprint: "y" or "yes" on the next
+// line of standard input; anything else, or none, is a no.
+pub Bool confirmed(Str answer) {
+    Str a = str_to_lower(str_trim(answer));
+    return a == "y" || a == "yes";
+}
+
 @requires(filesystem, network, device, declassify, clock, provision, environment)
 pub Int link_add(Str dir, Str text, Str primes_file) {
     Option(Link) ol = link_of(text);
     Link l = ol else { Link {.hosts = [], .port = 0, .secret = []} };
-    if (l.port == 0) { return dfail("that is not a Symbolon device code (it starts with symbolon://link?)"); }
+    if (l.port == 0) {
+        if (str_starts_with(str_trim(text), "symbolon://link?")) { return dfail("that code is malformed or names an address outside the local network (both devices must be on the same network)"); }
+        return dfail("that is not a Symbolon device code (it starts with symbolon://link?)");
+    }
     Option(DeviceConfig) oc = load_config(dir);
     DeviceConfig c = oc else { return_cfg() };
     if (c.log_id.len() == 0) { return dfail("this device has no identity to add a device to"); }
@@ -297,10 +434,16 @@ pub Int link_add(Str dir, Str text, Str primes_file) {
     List(Int) theirs = accept_keys(http_text(b, 0, b.len()), l.secret, omac);
     if (theirs.len() == 0) { return dfail("the new device did not answer with this code's key"); }
     Option(PartyKeys) ok = keys_of_cbor(theirs);
-    return match ok {
-        None => dfail("the new device's keys are malformed"),
-        Some(nk) => added(dir, c, nk, pin, primes_file)
-    };
+    PartyKeys nk = ok else { PartyKeys {.party = [], .auth_key = [], .hpke_key = []} };
+    if (nk.party.len() == 0) { return dfail("the new device's keys are malformed"); }
+    // The code's secret says only that the keys come from whoever made the
+    // code; the person says it is the device in front of them (SPEC 11.1
+    // step 2). Nothing secret has left this device yet.
+    println("fingerprint " + link_fingerprint(theirs));
+    eprintln("device: the new device shows its code: " + link_fingerprint(theirs) + "; is it the same? (y/N)");
+    if (!confirmed(read_pin())) { return dfail("not added: the new device's code was not confirmed"); }
+    Int r = added(dir, c, nk, pin, primes_file);
+    return r;
 }
 
 @requires(filesystem, network, device, declassify, clock, provision, environment)

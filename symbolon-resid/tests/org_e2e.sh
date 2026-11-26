@@ -198,7 +198,8 @@ read -r ICODE IID < <(pin device org invite "$A" carol@acme.example Carol "$GID"
 pin device org join "$C" "$ORG" "$FOUNDER" 0123456789abcdef0123456789abcdef > "$W/badcode.log" 2>&1 && fail "the relay took an answer with a wrong code: $(cat "$W/badcode.log")"
 pin device org sync "$A" > "$W/isync0.log" 2>&1 || fail "sync after a wrong code: $(cat "$W/isync0.log")"
 grep -q "^joined" "$W/isync0.log" && fail "a wrong code let carol in"
-pin device org join "$C" "$ORG" "$FOUNDER" "$ICODE" > "$W/ijoin.log" 2>&1 || fail "carol answers the invite: $(cat "$W/ijoin.log")"
+# The code on standard input ("-"), as the app gives it: not on the command line.
+printf '%s\n2468\n' "$ICODE" | run 300 "$BIN" device org join "$C" "$ORG" "$FOUNDER" - > "$W/ijoin.log" 2>&1 || fail "carol answers the invite: $(cat "$W/ijoin.log")"
 grep -qx "$ORG $(hx Acme) pending" "$W/ijoin.log" || fail "carol answers the invite: $(cat "$W/ijoin.log")"
 pin device org join "$B" "$ORG" "$FOUNDER" "$ICODE" > "$W/ijoin2.log" 2>&1
 pin device org sync "$A" > "$W/isync.log" 2>&1 || fail "sync with an answered invite: $(cat "$W/isync.log")"

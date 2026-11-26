@@ -1,0 +1,84 @@
+// Adding a device by QR code (link.resid, SPEC 11.5): a link names only
+// local addresses, both devices show one fingerprint of the new device's
+// keys and the adding one goes on only on a "y", and a stranger's bad
+// offers are counted per peer, not against the wait.
+
+import "link.resid";
+import "crypto.resid";
+
+Bool none_l(Option(Link) x) { return match x { None => true, Some(_) => false }; }
+
+Str secret_b64() { return "BrguIqWoJ_1jXqSOfF25e00tD8Hx8MlNKhZuGRcttAc"; }
+Bool takes(Str hosts) { return !none_l(link_of("symbolon://link?a=" + hosts + "&p=40123&s=" + secret_b64())); }
+
+test "a link names only addresses on a network the two devices share" {
+    // Loopback, RFC 1918, 100.64/10 (Tailscale), link-local, ULA, mDNS.
+    expect(takes("127.0.0.1")).toBeTrue();
+    expect(takes("10.1.2.3")).toBeTrue();
+    expect(takes("172.16.0.1,172.31.255.254")).toBeTrue();
+    expect(takes("192.168.1.20")).toBeTrue();
+    expect(takes("100.64.0.1,100.127.255.255")).toBeTrue();
+    expect(takes("169.254.10.10")).toBeTrue();
+    expect(takes("::1")).toBeTrue();
+    expect(takes("fe80::1c2b:3cff:fe4d:5e6f")).toBeTrue();
+    expect(takes("fd12:3456:789a::1")).toBeTrue();
+    expect(takes("FC00::1")).toBeTrue();
+    expect(takes("laptop.local")).toBeTrue();
+    expect(takes("localhost")).toBeTrue();
+    // Anything that could be anywhere on the internet: refused, also as
+    // one of several.
+    expect(takes("8.8.8.8")).toBeFalse();
+    expect(takes("192.168.1.20,203.0.113.7")).toBeFalse();
+    expect(takes("172.32.0.1")).toBeFalse();
+    expect(takes("172.15.0.1")).toBeFalse();
+    expect(takes("100.128.0.1")).toBeFalse();
+    expect(takes("100.63.0.1")).toBeFalse();
+    expect(takes("192.169.1.1")).toBeFalse();
+    expect(takes("attacker.example.com")).toBeFalse();
+    expect(takes("local")).toBeFalse();
+    expect(takes("evil.local.example.com")).toBeFalse();
+    expect(takes("2001:db8::1")).toBeFalse();
+    expect(takes("fec0::1")).toBeFalse();
+    expect(takes("::ffff:192.168.1.1")).toBeFalse();
+    expect(takes("10.0.0.256")).toBeFalse();
+    expect(takes("10.0.0")).toBeFalse();
+    expect(takes("-")).toBeFalse();
+    expect(link_host_ok("192.168.0.4")).toBeTrue();
+    expect(link_host_ok("relay.example.com")).toBeFalse();
+}
+
+test "both devices show one fingerprint of the new device's keys; another key shows another" {
+    List(Int) k = [161, 1, 2, 3, 4, 5];
+    Str f = link_fingerprint(k);
+    expect(str_len(f)).toEqual(39);
+    expect(str_split(f, " ").len()).toEqual(8);
+    expect(f).toEqual(link_fingerprint([161, 1, 2, 3, 4, 5]));
+    expect(f == link_fingerprint([161, 1, 2, 3, 4, 6])).toBeFalse();
+    // SHA-256("symbolon v1 device fingerprint" || keys), its first 16 bytes.
+    expect(str_replace(f, " ", "")).toEqual(str_slice(hex_encode(sha256_bytes(utf8("symbolon v1 device fingerprint").concat(k))), 0, 32));
+}
+
+test "the adding device goes on only on y or yes" {
+    expect(confirmed("y")).toBeTrue();
+    expect(confirmed("Yes ")).toBeTrue();
+    expect(confirmed("")).toBeFalse();
+    expect(confirmed("n")).toBeFalse();
+    expect(confirmed("no")).toBeFalse();
+    expect(confirmed("yes please")).toBeFalse();
+}
+
+test "bad offers are counted per peer: one stranger is shut out, the others are still heard" {
+    Str a = peer_key([4, 192, 168, 1, 7, 156, 64]);
+    Str b = peer_key([4, 192, 168, 1, 8, 156, 64]);
+    expect(a).toEqual("c0a80107");
+    // An IPv4 address mapped into IPv6 counts as itself; IPv6 by its /64.
+    expect(peer_key([16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 255, 255, 192, 168, 1, 7, 1, 2])).toEqual(a);
+    expect(peer_key([16, 254, 128, 0, 0, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 1, 2])).toEqual(peer_key([16, 254, 128, 0, 0, 0, 0, 0, 0, 9, 9, 9, 9, 9, 9, 9, 9, 1, 2]));
+    expect(peer_key([])).toEqual("");
+    expect(peer_refused([], a)).toBeFalse();
+    expect(peer_refused([a, a], a)).toBeFalse();
+    expect(peer_refused([a, a, a], a)).toBeTrue();
+    expect(peer_refused([a, a, a], b)).toBeFalse();
+    // Bad offers from two peers, two each: neither is shut out.
+    expect(peer_refused([a, b, a, b], b)).toBeFalse();
+}

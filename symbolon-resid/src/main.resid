@@ -84,7 +84,7 @@
 //   symbolon device ssh new|import|list|sign|delete ...   SSH keys in the vault (src/agent/sshcli.resid)
 //   symbolon device ssh ca-new|cas|certify|renew|certs|refresh ...   the SSH certificate authority (SPEC 16.1.2)
 //   symbolon device link-new DIR [--host H,...] [...]   a new device: shows a code (QR) for an existing one (SPEC 11.5)
-//   symbolon device link-add DIR LINK          adds the device whose code was scanned
+//   symbolon device link-add DIR               adds the device whose code was scanned (stdin: the link, the PIN, y)
 //   symbolon device key add|list|remove DIR [NAME]   security keys as a second factor (SPEC 9.4)
 //   symbolon device key fills DIR keys|any       PIN on stdin; whether fills need a security key (SPEC 22.7)
 //       With SYMBOLON_FILL set (the fill window's request), vault list, show and code are a fill:
@@ -388,7 +388,8 @@ Int org_command(Int n) {
     Str c = args.get(3);
     Str d = args.get(4);
     if (c == "new" && n == 6) { return org_new(d, args.get(5)); }
-    if (c == "join" && (n == 7 || n == 8)) { return org_join(d, args.get(5), args.get(6), if (n == 8) { args.get(7) } else { "" }); }
+    // An invite code is a bearer secret: "-" reads it from standard input (its first line, before the PIN).
+    if (c == "join" && (n == 7 || n == 8)) { Str code = if (n == 8) { if (args.get(7) == "-") { read_pin() } else { args.get(7) } } else { "" }; return org_join(d, args.get(5), args.get(6), code); }
     if (c == "invite" && (n == 7 || n == 8)) { return org_invite(d, args.get(5), args.get(6), if (n == 8) { args.get(7) } else { "" }); }
     if (c == "show" && n == 5) { return org_show(d); }
     if (c == "members" && n == 5) { return org_members(d); }
@@ -476,7 +477,9 @@ Int main_cmd() {
     if (a1 == "device" && a2 == "ssh" && args.get(3) == "certs" && n == 5) { return ssh_certs(args.get(4)); }
     if (a1 == "device" && a2 == "ssh" && args.get(3) == "refresh" && n == 5) { return ssh_refresh(args.get(4)); }
     if (a1 == "device" && a2 == "link-new" && n >= 4) { return link_new(args.get(3), flag_arg("--host", 1, 4), has_flag("--unprotected", 4), has_flag("--keystore", 4), has_flag("--fast-kdf", 4), flag_arg("--primes", 1, 4)); }
-    if (a1 == "device" && a2 == "link-add" && n >= 5) { return link_add(args.get(3), args.get(4), flag_arg("--primes", 1, 5)); }
+    // The link carries the code's secret: on standard input, never on the command line.
+    if (a1 == "device" && a2 == "link-add" && n >= 5 && str_starts_with(args.get(4), "symbolon:")) { eprintln("device: give the link on standard input (its first line, then the PIN), not on the command line"); return 2; }
+    if (a1 == "device" && a2 == "link-add" && n >= 4) { return link_add_cmd(args.get(3), flag_arg("--primes", 1, 4)); }
     if (a1 == "device" && a2 == "key" && args.get(3) == "add" && n == 6) { return key_add(args.get(4), args.get(5)); }
     if (a1 == "device" && a2 == "key" && args.get(3) == "list" && n == 5) { return key_list(args.get(4)); }
     if (a1 == "device" && a2 == "key" && args.get(3) == "list" && n == 6 && args.get(5) == "--pin") { return key_list_pin(args.get(4)); }
