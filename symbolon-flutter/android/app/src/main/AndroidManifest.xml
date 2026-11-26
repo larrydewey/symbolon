@@ -22,7 +22,13 @@
         android:protectionLevel="signature|knownSigner"
         android:knownCerts="@array/ssh_agent_callers"
         android:label="Use Symbolon's SSH keys" />
+    <!-- No backup and no transfer to a new phone of anything the app keeps
+         (the device's key share, the agent's state): res/xml/backup_rules.xml
+         and data_extraction_rules.xml exclude everything as well. -->
     <application
+        android:allowBackup="false"
+        android:fullBackupContent="@xml/backup_rules"
+        android:dataExtractionRules="@xml/data_extraction_rules"
         android:label="Symbolon"
         android:extractNativeLibs="true"
         android:usesCleartextTraffic="true"
