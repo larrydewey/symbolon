@@ -216,6 +216,20 @@ grep -q "^invite $(hx erin@acme.example) [0-9a-f]\{32\} [0-9a-f]\{32\}$" "$W/dsy
 grep -q "^removed" "$W/dsync.log" && fail "directory sync removed someone listed: $(cat "$W/dsync.log")"
 pin device org sync "$A" > "$W/dsync2.log" 2>&1 || fail "directory sync again"
 grep -q "^invite" "$W/dsync2.log" && fail "erin was invited twice: $(cat "$W/dsync2.log")"
+# The directory (unsigned, served by the relay) only takes away on its own:
+# an addition is printed and applied only with --yes and its hash (R3U-4).
+scim -X PATCH --data "{\"Operations\":[{\"op\":\"add\",\"path\":\"members\",\"value\":[{\"value\":\"$UB\"}]}]}" "$RELAY/scim/v2/Groups/$SG" > /dev/null || fail "SCIM add bob"
+pin device org sync "$A" > "$W/dsyncadd.log" 2>&1 || fail "directory sync with an addition: $(cat "$W/dsyncadd.log")"
+grep -qx "add $(hx Engineering) $BLOG $(hx bob-ext)" "$W/dsyncadd.log" || fail "the addition was not shown: $(cat "$W/dsyncadd.log")"
+ADDH=$(awk '/^confirm / {print $2}' "$W/dsyncadd.log")
+run 120 "$BIN" device org groups "$A" | grep -q " $(hx Engineering) 1$" || fail "the directory added bob without confirmation: $(run 120 "$BIN" device org groups "$A")"
+pin device org sync "$A" --yes 0000000000000000000000000000000000000000000000000000000000000000 > "$W/dsyncbad.log" 2>&1 || fail "sync with another hash"
+run 120 "$BIN" device org groups "$A" | grep -q " $(hx Engineering) 1$" || fail "another hash added bob"
+pin device org sync "$A" --yes "$ADDH" > "$W/dsyncyes.log" 2>&1 || fail "sync --yes: $(cat "$W/dsyncyes.log")"
+run 120 "$BIN" device org groups "$A" | grep -q " $(hx Engineering) 2$" || fail "the confirmed addition was not made: $(run 120 "$BIN" device org groups "$A")"
+scim -X PATCH --data "{\"Operations\":[{\"op\":\"remove\",\"path\":\"members[value eq \\\"$UB\\\"]\"}]}" "$RELAY/scim/v2/Groups/$SG" > /dev/null || fail "SCIM remove bob"
+pin device org sync "$A" > "$W/dsyncrm.log" 2>&1 || fail "sync after the directory took bob out: $(cat "$W/dsyncrm.log")"
+run 120 "$BIN" device org groups "$A" | grep -q " $(hx Engineering) 1$" || fail "a removal needed confirmation: $(cat "$W/dsyncrm.log")"
 scim -X PATCH --data '{"schemas":["urn:ietf:params:scim:api:messages:2.0:PatchOp"],"Operations":[{"op":"Replace","path":"active","value":"False"}]}' "$RELAY/scim/v2/Users/$UC" | grep -q '"active":false' || fail "SCIM deactivate"
 [ "$(code -H "Authorization: Bearer $(tok "$C")" "$RELAY/blob/org-$ORG")" = 403 ] || fail "carol's session still read the organization after its directory turned her off"
 run 120 "$BIN" device org show "$C" > /dev/null 2>&1 && fail "carol still reads the organization"
@@ -347,7 +361,11 @@ login() {   # DIR ORIGIN -> status of the login
         --data "{\"credentialId\":\"$(b64u "$WCID")\",\"authenticatorData\":\"$(b64u "$ad")\",\"clientDataJSON\":\"$(b64u "$(printf '%s' "$cj" | od -An -tx1 | tr -d ' \n')")\",\"signature\":\"$(b64u "$sig")\"}" "$RELAY/console/$ORG/login"
 }
 [ "$(login "$A" "$RELAY")" = 403 ] || fail "a passkey no device approved signed in to the console"
-pin device org console-key "$A" "$CCODE" > "$W/ckey.log" 2>&1 || fail "console-key: $(cat "$W/ckey.log")"
+# The fingerprint the console shows (SHA-256 of the public key, 16 hex digits).
+CFPR=$(python3 -c 'import hashlib,sys; print(hashlib.sha256(bytes.fromhex(sys.argv[1])).hexdigest()[:16])' "$WPUB")
+pin device org console-key "$A" "$CCODE" 0000000000000000 > "$W/ckeybad.log" 2>&1 && fail "a passkey was approved under another fingerprint"
+printf '2468\nn\n' | run 300 "$BIN" device org console-key "$A" "$CCODE" > "$W/ckeyno.log" 2>&1 && fail "a passkey was approved without a yes"
+pin device org console-key "$A" "$CCODE" "$CFPR" > "$W/ckey.log" 2>&1 || fail "console-key: $(cat "$W/ckey.log")"
 [ "$(login "$A" "https://evil.example")" = 403 ] || fail "an assertion for another origin signed in"
 [ "$(login "$A" "$RELAY")" = 200 ] || fail "console login: $(cat "$W/clogin.json")"
 curl -sS -b "$W/jar" --cacert "$W/box/tls/ca.pem" "$RELAY/console/$ORG/state" > "$W/cstate.json"
@@ -356,7 +374,11 @@ curl -sS -b "$W/jar" --cacert "$W/box/tls/ca.pem" -X POST -H 'Content-Type: appl
 CHID=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["id"])' "$W/cchange.json") || fail "console change: $(cat "$W/cchange.json")"
 run 120 "$BIN" device org show "$A" | grep -q "max_offline_days=7" && fail "a console change took effect without a device"
 run 120 "$BIN" device org changes "$A" | grep -q "^$CHID policy .* pending" || fail "org changes: $(run 120 "$BIN" device org changes "$A")"
-pin device org approve "$A" "$CHID" > "$W/approve.log" 2>&1 || fail "approve: $(cat "$W/approve.log")"
+# Approval names the change as shown: its hash (R3U-2).
+CHH=$(run 120 "$BIN" device org changes "$A" | grep "^$CHID " | cut -d' ' -f1-6 | tr -d '\n' | sha256sum | cut -c1-64)
+pin device org approve "$A" "$CHID" 0000000000000000000000000000000000000000000000000000000000000000 > "$W/approvebad.log" 2>&1 && fail "a change was approved under another hash"
+run 120 "$BIN" device org show "$A" | grep -q "max_offline_days=7" && fail "a change was made under another hash"
+pin device org approve "$A" "$CHID" "$CHH" > "$W/approve.log" 2>&1 || fail "approve: $(cat "$W/approve.log")"
 run 120 "$BIN" device org show "$A" | grep -q "max_offline_days=7" || fail "the approved change did not take effect"
 curl -sS -b "$W/jar" --cacert "$W/box/tls/ca.pem" "$RELAY/console/$ORG/state" | grep -q '"status":"done"' || fail "the console does not show the change done"
 echo "console: a passkey the admin's device approved signs in at the relay; a change queued there takes effect only when the device signs it"

@@ -51,7 +51,10 @@ invite's directory id, name and groups.
 routine:
 
 1. adds the people who answered invites;
-2. applies the company directory (see [Directory](/symbolon/org/directory/));
+2. applies the company directory (see [Directory](/symbolon/org/directory/)):
+   removals at once; anyone the directory would add to a group, or a new
+   group, is listed with a `confirm HASH` line and added only by
+   `org sync DIR --yes HASH` (the app asks);
 3. checks devices' platform attestation (see [Policy](/symbolon/org/policy/#attestation));
 4. gives a new key to every group folder someone left, and key wraps to
    anyone new.

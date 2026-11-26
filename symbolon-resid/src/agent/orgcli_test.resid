@@ -1,0 +1,77 @@
+// What an administrator's device takes from the relay for the organization
+// (src/agent/orgcli.resid): console changes (R3U-2), the company
+// directory's group additions (R3U-4), console passkeys (R3U-6).
+
+import "../types.resid";
+import "orgtypes.resid";
+import "orgcli.resid";
+import "common.resid";
+import "../vault/vault.resid";
+import "cose.resid";
+import "crypto.resid";
+import "hash.resid";
+
+List(Int) lg(Int n) { return sha256_bytes([n]); }
+List(Int) gid(Int n) { return sha256_bytes([100 + n])[0..16]; }
+
+OrgMember mem(Int n, Str ext) {
+    return OrgMember {.log_id = lg(n), .label = "p", .ext_id = ext};
+}
+
+OrgGroup grp(Int n, Str name, List(List(Int)) ms) { return OrgGroup {.group_id = gid(n), .name = name, .members = ms}; }
+
+Int count_in(List(OrgGroup) gs, Int n) {
+    Int at = gidx(gs, gid(n), 0);
+    return if (at < 0) { -1 } else { gs[at].members.len() };
+}
+
+Int gidx(List(OrgGroup) gs, List(Int) id, Int i) {
+    if (i >= gs.len()) { return -1; }
+    return if (hex_encode(gs[i].group_id) == hex_encode(id)) { i } else { gidx(gs, id, i + 1) };
+}
+
+test "the console is told an invite's id, never its code" {
+    // before: approve posted "CODE ID" to the relay's /done, and the relay
+    // could answer the invite itself
+    Str code = "00112233445566778899aabbccddeeff";
+    Str id = "ffeeddccbbaa99887766554433221100";
+    expect(told_of("invite", code + " " + id)).toEqual("made " + id);
+    expect(str_contains(told_of("invite", code + " " + id), code)).toBeFalse();
+    expect(told_of("invite", "garbage")).toEqual("made");
+    expect(told_of("policy", "done")).toEqual("done");
+}
+
+test "a change is approved only as it was shown" {
+    List(Str) shown = str_split("0123456789abcdef0123456789abcdef policy 6d61785f6f66666c696e655f64617973 37 - " + hex_encode(lg(1)) + " pending -", " ");
+    List(Str) swapped = str_split("0123456789abcdef0123456789abcdef policy 6d61785f6f66666c696e655f64617973 30 - " + hex_encode(lg(1)) + " pending -", " ");
+    List(Str) later = str_split("0123456789abcdef0123456789abcdef policy 6d61785f6f66666c696e655f64617973 37 - " + hex_encode(lg(1)) + " done 646f6e65 " + hex_encode(lg(2)), " ");
+    Str d = change_digest(shown);
+    expect(str_len(d)).toEqual(64);
+    expect(d).toEqual(hex_encode(sha256_bytes(utf8(str_join(shown[0..6], " ")))));
+    // the relay swapping the arguments under the same id: another hash
+    expect(change_digest(swapped) == d).toBeFalse();
+    // its status and result are not part of it
+    expect(change_digest(later)).toEqual(d);
+    expect(said_yes("y\n")).toBeTrue();
+    expect(said_yes("YES")).toBeTrue();
+    expect(said_yes("")).toBeFalse();
+    expect(said_yes("n")).toBeFalse();
+}
+
+test "the directory takes people out of groups at once but adds only when confirmed" {
+    List(OrgMember) ms = [mem(1, "a"), mem(2, "b"), mem(3, "")];
+    List(OrgGroup) was = [grp(1, "Eng", [lg(1), lg(2)]), grp(2, "Ops", [lg(3)])];
+    // the directory: Eng loses 2 and gains 3; a new group Sales with 1
+    List(OrgGroup) full = [grp(1, "Eng", [lg(1), lg(3)]), grp(2, "Ops", [lg(3)]), grp(3, "Sales", [lg(1)])];
+    List(OrgGroup) r = removals_only(was, full, 0, ListBuf());
+    expect(count_in(r, 1)).toEqual(1);
+    expect(hex_encode(r[0].members[0])).toEqual(hex_encode(lg(1)));
+    expect(count_in(r, 2)).toEqual(1);
+    expect(count_in(r, 3)).toEqual(-1);
+    List(Str) adds = additions(was, full, ms, 0, ListBuf());
+    expect(str_join(adds, ";")).toEqual("add " + hex_encode(utf8("Eng")) + " " + hex_encode(lg(3)) + " -;new " + hex_encode(utf8("Sales")) + ";add " + hex_encode(utf8("Sales")) + " " + hex_encode(lg(1)) + " " + hex_encode(utf8("a")));
+    expect(str_len(additions_digest(adds))).toEqual(64);
+    expect(additions_digest(adds) == additions_digest(adds[0..1])).toBeFalse();
+    // nothing added: nothing to confirm
+    expect(additions(was, r, ms, 0, ListBuf()).len()).toEqual(0);
+}

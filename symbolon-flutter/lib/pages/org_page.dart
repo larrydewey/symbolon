@@ -1,5 +1,7 @@
+import 'dart:convert';
 import 'dart:io';
 
+import 'package:crypto/crypto.dart';
 import 'package:material_ui/material_ui.dart';
 
 import '../app.dart';
@@ -58,7 +60,10 @@ class ConsoleChange {
   final String kind;
   final List<String> args;
   final String status;
-  const ConsoleChange(this.id, this.kind, this.args, this.status);
+  /// SHA-256 of the change as listed ("ID KIND A-HEX B-HEX C-HEX BY"): what is shown is what
+  /// `org approve` runs, or nothing.
+  final String hash;
+  const ConsoleChange(this.id, this.kind, this.args, this.status, this.hash);
 
   static String _t(String h) {
     if (h == '-') return '';
@@ -72,7 +77,8 @@ class ConsoleChange {
   static ConsoleChange? parse(String line) {
     final p = line.trim().split(' ');
     if (p.length != 8 || p[0].length != 32) return null;
-    return ConsoleChange(p[0], p[1], [_t(p[2]), _t(p[3]), _t(p[4])].where((a) => a.isNotEmpty).toList(), p[6]);
+    final hash = sha256.convert(utf8.encode(p.sublist(0, 6).join(' '))).toString();
+    return ConsoleChange(p[0], p[1], [_t(p[2]), _t(p[3]), _t(p[4])].where((a) => a.isNotEmpty).toList(), p[6], hash);
   }
 
   String get title => '$kind ${args.join(' ')}'.trim();
@@ -266,12 +272,41 @@ class _OrgPageState extends State<OrgPage> {
       toast(context, friendlyError(r));
       return;
     }
-    await showOutput(context, 'Synced', r.lines.isEmpty ? 'Nothing to change.' : r.lines.join('\n'));
+    // The directory comes from the relay, unsigned: what it would add is shown and needs a yes.
+    final adds = r.lines.where((l) => l.startsWith('add ') || l.startsWith('new ')).toList();
+    final confirm = r.lines.where((l) => l.startsWith('confirm ')).map((l) => l.substring(8).trim()).firstOrNull;
+    final rest = r.lines.where((l) => !l.startsWith('add ') && !l.startsWith('new ') && !l.startsWith('confirm ')).toList();
+    await showOutput(context, 'Synced', rest.isEmpty ? 'Nothing to change.' : rest.join('\n'));
+    if (adds.isNotEmpty && confirm != null && mounted) {
+      final ok = await showDialog<bool>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: const Text('The directory adds to groups'),
+          content: SingleChildScrollView(child: Text('Apply these only if you expect them:\n\n${adds.map(_addition).join('\n')}')),
+          actions: [
+            TextButton(onPressed: () => Navigator.of(ctx).pop(false), child: const Text('Not now')),
+            FilledButton(key: const Key('org-sync-add'), onPressed: () => Navigator.of(ctx).pop(true), child: const Text('Apply')),
+          ],
+        ),
+      );
+      if (ok == true && mounted) {
+        final r2 = await app.withPin(context, (p) => runTask(context, 'Applying the additions', () => app.cli.orgSync(app.dir, p, yes: confirm), usually: 'a minute'));
+        if (r2 != null && mounted) toast(context, r2.ok ? 'Applied.' : friendlyError(r2));
+      }
+    }
     load();
   }
 
+  static String _addition(String l) {
+    final p = l.split(' ');
+    final group = p.length > 1 ? ConsoleChange._t(p[1]) : '';
+    if (p[0] == 'new') return 'new group $group';
+    final who = p.length > 3 && p[3] != '-' ? ConsoleChange._t(p[3]) : (p.length > 2 ? p[2].substring(0, 12) : '');
+    return '$who to $group';
+  }
+
   Future<void> approve(ConsoleChange c) async {
-    final r = await app.withPin(context, (p) => runTask(context, 'Signing ${c.kind}', () => app.cli.orgApprove(app.dir, c.id, p), usually: 'a minute'));
+    final r = await app.withPin(context, (p) => runTask(context, 'Signing ${c.kind}', () => app.cli.orgApprove(app.dir, c.id, c.hash, p), usually: 'a minute'));
     if (r == null || !mounted) return;
     if (!r.ok) {
       toast(context, friendlyError(r));
@@ -283,13 +318,15 @@ class _OrgPageState extends State<OrgPage> {
 
   Future<void> consoleKey() async {
     final code = TextEditingController();
+    final fpr = TextEditingController();
     final ok = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
         title: const Text('Approve a console passkey'),
         content: Column(mainAxisSize: MainAxisSize.min, children: [
-          const Text('The console shows a code after you register a passkey there. Approve only a code you see on your own screen.'),
+          const Text('The console shows a code and a fingerprint after you register a passkey there. Approve only what you see on your own screen.'),
           TextField(key: const Key('org-console-code'), controller: code, decoration: const InputDecoration(labelText: 'Code')),
+          TextField(key: const Key('org-console-fingerprint'), controller: fpr, decoration: const InputDecoration(labelText: 'Fingerprint')),
         ]),
         actions: [
           TextButton(onPressed: () => Navigator.of(ctx).pop(false), child: const Text('Cancel')),
@@ -297,8 +334,13 @@ class _OrgPageState extends State<OrgPage> {
         ],
       ),
     );
+    final f = fpr.text.replaceAll(' ', '').trim().toLowerCase();
     if (ok != true || code.text.trim().isEmpty || !mounted) return;
-    final r = await app.withPin(context, (p) => runTask(context, 'Approving', () => app.cli.orgConsoleKey(app.dir, code.text.trim(), p), usually: 'a few seconds'));
+    if (f.length != 16) {
+      toast(context, 'Type the fingerprint the console shows (16 characters).');
+      return;
+    }
+    final r = await app.withPin(context, (p) => runTask(context, 'Approving', () => app.cli.orgConsoleKey(app.dir, code.text.trim(), f, p), usually: 'a few seconds'));
     if (r != null && mounted) toast(context, r.ok ? 'Approved: sign in at the console.' : friendlyError(r));
   }
 

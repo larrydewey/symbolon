@@ -3710,8 +3710,13 @@ name and groups, good for 14 days by witness time, signed by their
 device. The invite code is 16 random bytes; it is a key: the record holds
 the P-256 public key of `SHA-256("symbolon v1 invite key" || code)` and
 `id` is the first 16 bytes of `SHA-256("symbolon v1 invite" ||
-public_key)`. The code reaches the person through the company (work
-e-mail, device management, the console). Their device runs `org join ORG
+public_key)`. The code is shown only on the device that made the invite
+and reaches the person through the company (work e-mail, device
+management, in person), never through the server: an invite queued at the
+console (29.10) is made on the approving device, which prints the code,
+and the console is told only the invite's id and "made" (R3U-2; before,
+the device posted "CODE ID" back to the console, so the server held a
+code it could answer itself). Their device runs `org join ORG
 FOUNDER CODE`: it verifies the governance chain (29.1), signs with the
 code's key `"symbolon v1 accept" || org_id || log_id`, and stores the
 answer `accept-<org>-<id>`, also signed by one of its devices. Neither the
@@ -3915,7 +3920,15 @@ changes act in two ways:
   organization's group of each directory group's name to the members it
   lists (making the group when there is none), signs one new membership
   record, invites each directory user who is neither a member nor
-  invited (29.3), and re-keys the group folders people left. An
+  invited (29.3), and re-keys the group folders people left. The
+  directory is served by the relay and not signed, so on its own it only
+  takes away (R3U-4): members taken out of groups are taken out at once,
+  but a member put into a group, or a new group, is printed (`add
+  NAME-HEX LOG EXT-HEX`, `new NAME-HEX`, then `confirm HASH`) and
+  applied only by `org sync DIR --yes HASH`, HASH being SHA-256 of
+  exactly those lines, so a directory changed between the two runs adds
+  nothing (the app shows the additions and asks). A sync queued at the
+  console applies removals only. An
   organization may run `org sync` on a schedule on a dedicated admin
   device (an automation administrator): an identity of its own, listed
   as an admin, whose devices hold the group folders' keys like any
@@ -4027,11 +4040,16 @@ administrators sign in with a passkey:
 - A browser registers a passkey at the console (ES256); the relay keeps it
   waiting for a day and shows a short code (the first 8 hex digits of the
   credential id's SHA-256). The administrator's own device approves that
-  code (`org console-key`, or the app): it recomputes the code from each
-  waiting credential id itself (the relay's pairing of code and key is not
-  taken on its word), refuses when more than one waiting passkey has the
-  code, shows the key's fingerprint (the first 16 hex digits of SHA-256 of
-  the public key, as the browser can show it) and signs a record binding the
+  code (`org console-key DIR CODE [FINGERPRINT]`, or the app): it
+  recomputes the code from each waiting credential id itself (the relay's
+  pairing of code and key is not taken on its word), refuses when more
+  than one waiting passkey has the code, refuses a passkey whose RP ID is
+  not the host of the relay the device knows, shows the key's fingerprint
+  (the first 16 hex digits of SHA-256 of the public key, which the console
+  page computes from the key the browser made and shows beside the code)
+  and approves only once the fingerprint is confirmed: given (the app asks
+  the person to type the one the console shows) or answered y on standard
+  input after the PIN (R3U-6). It then signs a record binding the
   credential and its public key to their log (`conkey-<org>-<id>`), which
   the relay stores only from that device's session and only for a passkey
   waiting with the same key. Waiting passkeys older than a day are removed
@@ -4050,9 +4068,16 @@ people, groups) and the changes queued there. It changes nothing signed:
 a change made in the console (invite, add to or remove from a group,
 remove a person, a policy setting, a sync) is queued, and takes effect only
 when an owner's or administrator's device approves it (`org changes`, `org
-approve`, or the app's list): the device shows the change, signs it as it
-would its own, and tells the console the result; the relay records which
-administrator's log did (a ninth field, "BY-DONE", after the result). The
+approve DIR ID [HASH]`, or the app's list): the device shows the change,
+signs it as it would its own, and tells the console the result; the relay
+records which administrator's log did (a ninth field, "BY-DONE", after
+the result). The relay serves the change again at approval, so the
+approval names it (R3U-2): HASH is SHA-256 of the change's fixed fields
+as listed, `ID KIND A-HEX B-HEX C-HEX BY`, which the app computes from
+the change it showed; a change served differently under that id is
+refused. Without HASH the device prints the change and its hash and asks
+y/N on standard input after the PIN. For an invite the console is told
+`made ID`; the code is printed on the device only (29.3). The
 server holds no administrator key.
 
 `org console DIR PORT` also serves a read-only page on the

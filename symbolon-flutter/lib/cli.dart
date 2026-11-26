@@ -327,7 +327,10 @@ class SymbolonCli {
       run(['device', 'org', 'invite', dir, ext, name, if (groups.isNotEmpty) groups], input: [pin], timeout: const Duration(minutes: 5));
 
   /// Adds those who answered invites, applies the company directory, re-keys group folders people left.
-  Future<CliResult> orgSync(String dir, String pin) => run(['device', 'org', 'sync', dir], input: [pin], timeout: const Duration(minutes: 30));
+  /// The directory's group additions are printed ("add ...", "new ...", then "confirm HASH") and applied
+  /// only when [yes] is that HASH, after the person confirmed them.
+  Future<CliResult> orgSync(String dir, String pin, {String yes = ''}) =>
+      run(['device', 'org', 'sync', dir, if (yes.isNotEmpty) ...['--yes', yes]], input: [pin], timeout: const Duration(minutes: 30));
 
   /// Escrows a work folder this person owns to the organization's recovery key.
   Future<CliResult> orgEscrow(String dir, String id, String pin) => run(['device', 'org', 'escrow', dir, id], input: [pin], timeout: const Duration(minutes: 5));
@@ -335,11 +338,15 @@ class SymbolonCli {
   /// "ID KIND A-HEX B-HEX C-HEX BY STATUS RESULT-HEX" per change queued at the relay's console (no PIN).
   Future<CliResult> orgChanges(String dir) => run(['device', 'org', 'changes', dir], timeout: const Duration(minutes: 5));
 
-  /// Makes a change queued at the console, signed on this device.
-  Future<CliResult> orgApprove(String dir, String id, String pin) => run(['device', 'org', 'approve', dir, id], input: [pin], timeout: const Duration(minutes: 30));
+  /// Makes a change queued at the console, signed on this device; [hash] is the SHA-256 of the change
+  /// as shown ("ID KIND A-HEX B-HEX C-HEX BY"), so the relay cannot swap it after it was shown.
+  Future<CliResult> orgApprove(String dir, String id, String hash, String pin) =>
+      run(['device', 'org', 'approve', dir, id, hash], input: [pin], timeout: const Duration(minutes: 30));
 
-  /// Approves the passkey waiting at the console with [code], for this administrator.
-  Future<CliResult> orgConsoleKey(String dir, String code, String pin) => run(['device', 'org', 'console-key', dir, code], input: [pin], timeout: const Duration(minutes: 5));
+  /// Approves the passkey waiting at the console with [code], for this administrator, once [fingerprint]
+  /// (as the console shows it) matches its key.
+  Future<CliResult> orgConsoleKey(String dir, String code, String fingerprint, String pin) =>
+      run(['device', 'org', 'console-key', dir, code, fingerprint], input: [pin], timeout: const Duration(minutes: 5));
 
   // ─── Shared folders ─────────────────────────────────────────────────
 

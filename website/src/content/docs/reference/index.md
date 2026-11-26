@@ -100,12 +100,12 @@ Each takes a last `--share ID` to work in a shared folder.
 | `device org add\|remove\|role DIR …` | people and roles |
 | `device org group new\|add\|remove DIR …` / `folder new DIR NAME GROUPS` | groups and group folders |
 | `device org policy DIR KEY VALUE` | the policy (an owner) |
-| `device org sync DIR` | invites, directory, attestation, re-keys |
+| `device org sync DIR [--yes HASH]` | invites, directory, attestation, re-keys |
 | `device org attest DIR` | this TPM device's attestation, in two steps |
 | `device org recovery on DIR K DELAY ADMINS [--short-delay]` / `recovery off DIR` | opt-in recovery |
 | `device org escrow DIR FOLDER` / `recover request\|approve\|open DIR FOLDER` | work-folder recovery |
 | `device org audit DIR` / `export DIR [--https URL --token T] [--syslog H:P --ca F]` | the audit log |
-| `device org console DIR PORT` / `console-key DIR CODE` / `changes DIR` / `approve DIR ID` | consoles |
+| `device org console DIR PORT` / `console-key DIR CODE [FINGERPRINT]` / `changes DIR` / `approve DIR ID [HASH]` | consoles |
 
 ## Servers
 

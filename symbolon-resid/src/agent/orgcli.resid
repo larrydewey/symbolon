@@ -577,24 +577,26 @@ Result(List(List(Int)), Str) group_ids(List(OrgGroup) gs, List(Str) ids, Int i, 
     return group_ids(gs, ids, i + 1, acc.push(cose_hex_decode(ids[i])));
 }
 
-// `org sync DIR`: per group folder, "ID ok" when everyone holding its key
-// is still one of its people (adding wraps for new people), "ID rekeyed N"
-// after giving it a new key because N people left, "ID - WHY-HEX" when it
-// cannot.
+// `org sync DIR [--yes HASH]`: per group folder, "ID ok" when everyone
+// holding its key is still one of its people (adding wraps for new
+// people), "ID rekeyed N" after giving it a new key because N people
+// left, "ID - WHY-HEX" when it cannot. The directory's group additions
+// are applied only with --yes and the HASH the run before printed for
+// exactly those additions (directory_sync).
 @requires(filesystem, network, device, declassify, clock, provision, environment)
-pub Int org_sync(Str dir) { return done(sync(dir)); }
+pub Int org_sync(Str dir, Str yes) { return done(sync(dir, yes)); }
 
 @requires(filesystem, network, device, declassify, clock, provision, environment)
-Result(Int, Str) sync(Str dir) {
+Result(Int, Str) sync(Str dir, Str yes) {
     OrgCtx o0 = org_unlocked(dir)?;
-    return sync_in(dir, o0);
+    return sync_in(dir, o0, yes);
 }
 
 @requires(filesystem, network, device, declassify, clock, provision, environment)
-Result(Int, Str) sync_in(Str dir, OrgCtx o0) {
+Result(Int, Str) sync_in(Str dir, OrgCtx o0, Str yes) {
     Int ok = admin_only(o0)?;
     OrgCtx o1 = admit(dir, o0)?;
-    OrgCtx o2 = directory_sync(dir, o1)?;
+    OrgCtx o2 = directory_sync(dir, o1, yes)?;
     OrgCtx o = attest_sync(dir, o2)?;
     List(Str) wraps = blob_list(o.x.ep, "wrap-");
     return Ok(sync_all(dir, o, wraps, ids_of(blob_list(o.x.ep, "gfolder-"), 0, ListBuf()), 0));
@@ -685,9 +687,16 @@ Bool clear_admits(Ctx x, List(Admit) ads, Int i) {
 // administrator must lose the role first. Prints "removed LOG EXT-HEX",
 // "kept LOG EXT-HEX administrator", "group NAME-HEX N", "invite
 // USERNAME-HEX CODE ID".
+//
+// The directory is what the relay serves, unsigned, so it may take away
+// but not give on its own (R3U-4): removals are applied at once; additions
+// (a member put into a group, a new group) are printed, "add NAME-HEX LOG
+// EXT-HEX" and "new NAME-HEX", then "confirm HASH", and applied only by a
+// run given `yes` = that HASH (SHA-256 of exactly those lines), so a relay
+// that changes the directory between the two runs adds nothing.
 
 @requires(filesystem, network, device, declassify, clock, environment)
-Result(OrgCtx, Str) directory_sync(Str dir, OrgCtx o) {
+Result(OrgCtx, Str) directory_sync(Str dir, OrgCtx o, Str yes) {
     HttpOut r = http_call_ep(o.x.ep, "GET", "/directory/" + hex_encode(o.st.org.org_id), []);
     if (r.status == 404) { return Ok(o); }
     if (r.status != 200) { return Err(f"the relay did not give the directory ({r.status})"); }
@@ -696,7 +705,13 @@ Result(OrgCtx, Str) directory_sync(Str dir, OrgCtx o) {
     List(DirGroup) dgs = dir_groups(lines, 0, ListBuf());
     List(OrgMember) kept = still_listed(o.st, us, 0, ListBuf());
     List(OrgGroup) gs0 = drop_gone(o.st.org.groups, kept, 0, ListBuf());
-    List(OrgGroup) gs = set_groups(gs0, dgs, us, kept, 0);
+    List(OrgGroup) full = set_groups(gs0, dgs, us, kept, 0);
+    List(Str) adds = additions(gs0, full, kept, 0, ListBuf());
+    Str digest = additions_digest(adds);
+    Bool take = adds.len() > 0 && yes == digest;
+    List(OrgGroup) gs = if (take) { full } else { removals_only(gs0, full, 0, ListBuf()) };
+    _ = if (adds.len() > 0 && !take) { said_additions(adds, digest, yes) } else { 0 };
+    _ = said_groups(o.st.org.groups, gs, 0);
     Bool changed = kept.len() != o.st.org.members.len() || !same_groups(o.st.org.groups, gs, 0);
     OrgCtx o2 = if (changed) { stored_again(dir, o, kept, gs)? } else { o };
     List(Str) pending = invited(o2, blob_list(o2.x.ep, "invite-" + hex_encode(o2.st.org.org_id) + "-"), 0, ListBuf());
@@ -761,8 +776,72 @@ List(OrgGroup) set_groups(List(OrgGroup) gs, List(DirGroup) dgs, List(DirUser) u
     Int at = group_named(gs, dgs[i].display, 0);
     List(OrgGroup) next = if (at >= 0) { replace_group(gs, OrgGroup {.group_id = gs[at].group_id, .name = gs[at].name, .members = want}, 0, ListBuf()) }
                           else { gs.concat([OrgGroup {.group_id = sha256_bytes(utf8("symbolon v1 directory group").concat(utf8(dgs[i].display)))[0..16], .name = dgs[i].display, .members = want}]) };
-    if (at < 0 || !same_logs(gs[at].members, want)) { println("group " + hex_encode(utf8(dgs[i].display)) + f" {want.len()}"); }
     return set_groups(next, dgs, us, ms, i + 1);
+}
+
+// "group NAME-HEX N" for each group of `gs` that is new or whose people
+// changed from `was`.
+Int said_groups(List(OrgGroup) was, List(OrgGroup) gs, Int i) {
+    if (i >= gs.len()) { return 0; }
+    Int at = group_with_id(was, gs[i].group_id, 0);
+    if (at < 0 || !same_logs(was[at].members, gs[i].members)) { println("group " + hex_encode(utf8(gs[i].name)) + f" {gs[i].members.len()}"); }
+    return said_groups(was, gs, i + 1);
+}
+
+Int group_with_id(List(OrgGroup) gs, List(Int) id, Int i) {
+    if (i >= gs.len()) { return -1; }
+    if (bytes_eq(gs[i].group_id, id)) { return i; }
+    return group_with_id(gs, id, i + 1);
+}
+
+// What `full` adds to `was`: "new NAME-HEX" for a group that is not in
+// `was`, "add NAME-HEX LOG EXT-HEX" for each person put into a group.
+pub List(Str) additions(List(OrgGroup) was, List(OrgGroup) full, List(OrgMember) ms, Int i, ListBuf(Str) acc) {
+    if (i >= full.len()) { return acc.finish(); }
+    OrgGroup g = full[i];
+    Int at = group_with_id(was, g.group_id, 0);
+    List(List(Int)) before = if (at < 0) { [] } else { was[at].members };
+    ListBuf(Str) a1 = if (at < 0) { acc.push("new " + hex_encode(utf8(g.name))) } else { acc };
+    return additions(was, full, ms, i + 1, added_people(g, before, ms, 0, a1));
+}
+
+ListBuf(Str) added_people(OrgGroup g, List(List(Int)) before, List(OrgMember) ms, Int i, ListBuf(Str) acc) {
+    if (i >= g.members.len()) { return acc; }
+    List(Int) l = g.members[i];
+    Int mi = member_index(ms, l, 0);
+    Str ext = if (mi >= 0) { ms[mi].ext_id } else { "" };
+    return added_people(g, before, ms, i + 1, if (has_log(before, l)) { acc } else { acc.push("add " + hex_encode(utf8(g.name)) + " " + hex_encode(l) + " " + (if (str_len(ext) == 0) { "-" } else { hex_encode(utf8(ext)) })) });
+}
+
+pub Str additions_digest(List(Str) adds) { return hex_encode(sha256_bytes(utf8(str_join(adds, "\n")))); }
+
+// The groups of `was` with only what `full` takes away: no one added, no
+// new group.
+pub List(OrgGroup) removals_only(List(OrgGroup) was, List(OrgGroup) full, Int i, ListBuf(OrgGroup) acc) {
+    if (i >= was.len()) { return acc.finish(); }
+    OrgGroup g = was[i];
+    Int at = group_with_id(full, g.group_id, 0);
+    List(List(Int)) keep = if (at < 0) { g.members } else { logs_in(g.members, full[at].members, 0, ListBuf()) };
+    return removals_only(was, full, i + 1, acc.push(OrgGroup {.group_id = g.group_id, .name = g.name, .members = keep}));
+}
+
+List(List(Int)) logs_in(List(List(Int)) xs, List(List(Int)) ys, Int i, ListBuf(List(Int)) acc) {
+    if (i >= xs.len()) { return acc.finish(); }
+    return logs_in(xs, ys, i + 1, if (has_log(ys, xs[i])) { acc.push(xs[i]) } else { acc });
+}
+
+Int said_additions(List(Str) adds, Str digest, Str yes) {
+    _ = print_lines(adds, 0);
+    if (str_len(yes) > 0) { eprintln("device: the directory's additions are not the ones confirmed (the relay changed them?): nothing was added"); }
+    println("confirm " + digest);
+    eprintln("device: the directory adds the above; they are applied only by: org sync DIR --yes " + digest);
+    return 0;
+}
+
+Int print_lines(List(Str) ls, Int i) {
+    if (i >= ls.len()) { return 0; }
+    println(ls[i]);
+    return print_lines(ls, i + 1);
 }
 
 Int group_named(List(OrgGroup) gs, Str name, Int i) {
@@ -1251,17 +1330,26 @@ List(Str) frames(Str org, List(Str) lines, Int i, ListBuf(Str) acc) {
 
 
 // ─── The relay's console, from this device (SPEC 29.10) ─────────
-// `org console-key DIR CODE`: approves the passkey waiting at the console
-// with this code, for this owner or administrator. `org changes DIR`:
+// `org console-key DIR CODE [FINGERPRINT]`: approves the passkey waiting at
+// the console with this code, for this owner or administrator, once the
+// key's fingerprint (as the console shows it) is confirmed: given (the app
+// asks the person to type what the console shows) or answered y/N on
+// standard input after the PIN. Its RP ID must be this device's relay
+// host: the relay names it, and a passkey for another site's RP ID is not
+// one this console checks. `org changes DIR`:
 // "ID KIND A-HEX B-HEX C-HEX BY STATUS RESULT-HEX" per change queued at the
-// console. `org approve DIR ID`: makes that change, signed here, and tells
-// the console what came of it.
+// console. `org approve DIR ID [HASH]`: makes that change, signed here,
+// and tells the console what came of it. HASH is change_digest of the
+// change as it was shown (the app passes it); without it the change is
+// shown and confirmed y/N on standard input after the PIN. The relay
+// serves the change, so what is run is bound to what was approved
+// (R3U-2): another change under that id is refused.
 
 @requires(filesystem, network, device, declassify, clock, provision, environment)
-pub Int org_console_key(Str dir, Str code) { return done(console_key(dir, code)); }
+pub Int org_console_key(Str dir, Str code, Str fpr) { return done(console_key(dir, code, fpr)); }
 
 @requires(filesystem, network, device, declassify, clock, provision, environment)
-Result(Int, Str) console_key(Str dir, Str code) {
+Result(Int, Str) console_key(Str dir, Str code, Str fpr) {
     OrgCtx o = org_unlocked(dir)?;
     Int ok = admin_only(o)?;
     HttpOut r = http_call_ep(o.x.ep, "GET", "/console/" + hex_encode(o.st.org.org_id) + "/pending", []);
@@ -1272,7 +1360,14 @@ Result(Int, Str) console_key(Str dir, Str code) {
     List(Str) p = ps[0];
     // The person at the console sees the same fingerprint for the passkey
     // they registered; the code alone names the credential, not its key.
-    println("passkey " + key_fingerprint(cose_hex_decode(p[2])));
+    Str fp = key_fingerprint(cose_hex_decode(p[2]));
+    println("passkey " + fp + " for " + p[3]);
+    if (p[3] != o.x.c.relay_host) { return Err("the passkey is for " + p[3] + ", not this device's relay " + o.x.c.relay_host); }
+    if (str_len(fpr) > 0 && no_spaces(str_to_lower(fpr)) != no_spaces(fp)) { return Err("the console's fingerprint is not this passkey's: nothing was approved"); }
+    if (str_len(fpr) == 0) {
+        println("Is this the fingerprint the console shows? [y/N]");
+        if (!said_yes(read_pin())) { return Err("not approved"); }
+    }
     OrgConsoleKey k0 = OrgConsoleKey {.org_id = o.st.org.org_id, .cred_id = cose_hex_decode(p[1]), .public_key = cose_hex_decode(p[2]), .rp_id = p[3], .log_id = o.x.c.log_id,
                                       .log_sequence = o.x.vh.head.sequence, .signer = o.x.c.party, .sig = []};
     List(Int) sig = dk_sign(o.x.c, o.x.u.real, o.x.u.st, conkey_tbs(k0))?;
@@ -1296,13 +1391,30 @@ Result(Int, Str) changes(Str dir) {
 }
 
 @requires(filesystem, network, device, declassify, clock, provision, environment)
-pub Int org_approve(Str dir, Str id) { return done(approve(dir, id)); }
+pub Int org_approve(Str dir, Str id, Str hash) { return done(approve(dir, id, hash)); }
+
+// SHA-256 (hex) of a change as the relay lists it, over its fixed fields
+// "ID KIND A-HEX B-HEX C-HEX BY" (not its status or result).
+pub Str change_digest(List(Str) p) { return if (p.len() < 6) { "" } else { hex_encode(sha256_bytes(utf8(str_join(p[0..6], " ")))) }; }
+
+// What the console is told of a change once made: never an invite's code
+// (the relay could answer the invite with it); the code is printed here,
+// for the person to be given another way.
+pub Str told_of(Str kind, Str result) {
+    if (kind != "invite") { return result; }
+    List(Str) p = str_split(result, " ");
+    return if (p.len() == 2) { "made " + p[1] } else { "made" };
+}
+
+// A y/N answer from standard input: true only for "y" or "yes".
+pub Bool said_yes(Str line) { Str a = str_to_lower(str_trim(line)); return a == "y" || a == "yes"; }
 
 Str unhex_s(Str s) { List(Int) b = if (s == "-") { [] } else { cose_hex_decode(s) }; return http_text(b, 0, b.len()); }
 
 @requires(filesystem, network, device, declassify, clock, provision, environment)
-Result(Int, Str) approve(Str dir, Str id) {
+Result(Int, Str) approve(Str dir, Str id, Str hash) {
     if (!share_id_ok(id)) { return Err("a change id is 32 hex digits"); }
+    if (str_len(hash) > 0 && (str_len(hash) != 64 || !hex_len_ok(hash))) { return Err("a change's hash is 64 hex digits"); }
     OrgCtx o = org_unlocked(dir)?;
     Int ok = admin_only(o)?;
     Str org = hex_encode(o.st.org.org_id);
@@ -1312,14 +1424,32 @@ Result(Int, Str) approve(Str dir, Str id) {
     if (p.len() != 8 && p.len() != 9) { return Err("no such change"); }
     if (p[6] != "pending") { return Err("the change is " + p[6]); }
     println("change " + p[1] + " " + unhex_s(p[2]) + " " + unhex_s(p[3]) + " " + unhex_s(p[4]) + " queued by " + str_slice(p[5], 0, 12));
+    Str d = change_digest(p);
+    if (str_len(hash) > 0 && hash != d) { return Err("the relay serves another change under this id than the one shown: nothing was done"); }
+    if (str_len(hash) == 0) {
+        println("hash " + d);
+        println("Approve this change? [y/N]");
+        if (!said_yes(read_pin())) { return Err("not approved"); }
+    }
     Result(Str, Str) res = run_change(dir, o, p[1], unhex_s(p[2]), unhex_s(p[3]), unhex_s(p[4]));
-    Str told = match res { Ok(t) => t, Err(m) => "refused: " + m };
+    Str told = match res { Ok(t) => told_of(p[1], t), Err(m) => "refused: " + m };
     _ = http_call_ep(o.x.ep, "POST", "/console/" + org + "/done/" + id, utf8(told));
     _ = audit(dir, o.x, o.st.org.org_id, "member", id, "console change " + p[1] + ": " + told);
-    return match res { Ok(t) => Ok(say_ok(t)), Err(m) => Err(m) };
+    return match res { Ok(t) => Ok(say_ok(p[1], t)), Err(m) => Err(m) };
 }
 
-Int say_ok(Str t) { println(t); return 0; }
+// An invite's "CODE ID": shown on this device only, to be given to the
+// person another way than the relay.
+Int say_ok(Str kind, Str t) {
+    if (kind != "invite") { println(t); return 0; }
+    println("invite " + t);
+    eprintln("device: give the code to the person yourself (in person, by phone); the console is not told it");
+    return 0;
+}
+
+Str no_spaces(Str s) { return str_join(str_split(s, " "), ""); }
+
+Bool hex_len_ok(Str s) { return cose_hex_decode(s).len() * 2 == str_len(s); }
 
 List(Str) change_with(List(Str) lines, Str id, Int i) {
     if (i >= lines.len()) { return []; }
@@ -1335,7 +1465,7 @@ Result(Str, Str) run_change(Str dir, OrgCtx o, Str kind, Str a, Str b, Str c) {
         return make_invite(dir, o, a, b, gs);
     }
     Int n = if (kind == "group-add" || kind == "group-remove") { group_set_in(dir, o, a, b, kind == "group-add")? } else {
-        if (kind == "remove") { remove_in(dir, o, a)? } else { if (kind == "policy") { set_policy_in(dir, o, a, b)? } else { if (kind == "sync") { sync_in(dir, o)? } else { -1 } } } };
+        if (kind == "remove") { remove_in(dir, o, a)? } else { if (kind == "policy") { set_policy_in(dir, o, a, b)? } else { if (kind == "sync") { sync_in(dir, o, "")? } else { -1 } } } };
     return if (n < 0) { Err("unknown change " + kind) } else { Ok("done") };
 }
 

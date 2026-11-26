@@ -382,7 +382,7 @@ Int org_command(Int n) {
     if (c == "remove" && n == 6) { return org_remove(d, args.get(5)); }
     if (c == "role" && n == 7) { return org_role(d, args.get(5), args.get(6)); }
     if (c == "policy" && n == 7) { return org_policy(d, args.get(5), args.get(6)); }
-    if (c == "sync" && n == 5) { return org_sync(d); }
+    if (c == "sync" && (n == 5 || (n == 7 && args.get(5) == "--yes"))) { return org_sync(d, if (n == 7) { args.get(6) } else { "" }); }
     // `org recovery on DIR K DELAY ADMINS`, `org recovery off DIR`, `org escrow DIR CID`, `org recover request|approve|open DIR CID`
     if (c == "recovery" && d == "on" && (n == 9 || (n == 10 && args.get(9) == "--short-delay"))) { return org_recovery(args.get(5), "on", args.get(6), args.get(7), args.get(8), n == 10); }
     if (c == "recovery" && d == "off" && n == 6) { return org_recovery(args.get(5), "off", "", "", "", false); }
@@ -391,9 +391,9 @@ Int org_command(Int n) {
     if (c == "audit" && n == 5) { return org_audit(d); }
     if (c == "attest" && n >= 5 && n <= 7) { return org_attest(d, if (n >= 6) { args.get(5) } else { "" }, if (n == 7) { args.get(6) } else { "" }); }
     if (c == "console" && n == 6) { return org_console(d, str_parse_int(args.get(5))); }
-    if (c == "console-key" && n == 6) { return org_console_key(d, args.get(5)); }
+    if (c == "console-key" && (n == 6 || n == 7)) { return org_console_key(d, args.get(5), if (n == 7) { args.get(6) } else { "" }); }
     if (c == "changes" && n == 5) { return org_changes(d); }
-    if (c == "approve" && n == 6) { return org_approve(d, args.get(5)); }
+    if (c == "approve" && (n == 6 || n == 7)) { return org_approve(d, args.get(5), if (n == 7) { args.get(6) } else { "" }); }
     if (c == "export" && positional(3) == 5) { return org_export(d, flag_arg("--https", 1, 5), flag_arg("--token", 1, 5), flag_arg("--syslog", 1, 5), flag_arg("--ca", 1, 5)); }
     // `org group new DIR NAME`, `org group add|remove DIR GROUP LOG`, `org folder new DIR NAME GROUPS`
     if (c == "group" && d == "new" && n == 7) { return org_group_new(args.get(5), args.get(6)); }
