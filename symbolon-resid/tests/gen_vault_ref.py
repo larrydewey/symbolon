@@ -47,6 +47,16 @@ def seal(vk, vid, iid, ver, kind, f, pt):
     ik = item_key(vk, vid, iid)
     return AESGCM(field_key(ik, f, ver)).encrypt(field_nonce(ik, f, ver), pt, aad(vid, iid, ver, kind, f))
 
+# Format 2 (every seal now): a random 16-byte salt in front, as the HKDF salt
+# of the field key and the nonce; the aad array is led by 2.
+def field_key2(ik, salt, f, ver): return hkdf(ik, salt, b'symbolon v2 field' + f.encode() + ver.to_bytes(8, 'big'), 32)
+def field_nonce2(ik, salt, f, ver): return hkdf(ik, salt, b'symbolon v2 nonce' + f.encode() + ver.to_bytes(8, 'big'), 12)
+def aad2(vid, iid, ver, kind, f): return arr([uint(2), bstr(vid), bstr(iid), uint(ver), tstr(kind), tstr(f)])
+
+def seal2(vk, vid, iid, ver, kind, f, pt, salt):
+    ik = item_key(vk, vid, iid)
+    return salt + AESGCM(field_key2(ik, salt, f, ver)).encrypt(field_nonce2(ik, salt, f, ver), pt, aad2(vid, iid, ver, kind, f))
+
 def item_cbor(iid, ver, kind, fields, duress, handling):
     names = sorted(fields)
     m = head(5, 6) + uint(1) + bstr(iid) + uint(2) + uint(ver) + uint(3) + tstr(kind)
@@ -109,6 +119,12 @@ r, s = decode_dss_signature(dk.sign(tbs, ec.ECDSA(hashes.SHA256())))
 sig = r.to_bytes(32, 'big') + s.to_bytes(32, 'big')
 bad_sig = bytearray(sig); bad_sig[10] ^= 1
 
+# Format 2 ciphertexts of the same plaintexts, each under its own salt (drawn
+# after everything above, so the format 1 values stay as they were).
+for it in items:
+    it['salts'] = {f: rb(16) for f in sorted(it['plain'])}
+    it['cts2'] = {f: seal2(vk, vid, it['iid'], it['ver'], it['kind'], f, it['plain'][f], it['salts'][f]) for f in sorted(it['plain'])}
+
 
 out = '''// The Resid vault (src/vault/vault.resid) against an independent
 // implementation of SPEC Section 18: HKDF, AES-GCM and ECDSA from Python's
@@ -133,7 +149,7 @@ List(Int) opened(List(Secret(UInt(8))) b) {
     return widen_u8(declassify(secret_join(b), "test compares to the reference plaintext"), 0, ListBuf());
 }
 
-List(Int) vault_key_bytes() { return ''' + RT(vk) + '''; }
+List(Secret(UInt(8))) vault_key_bytes() { return secret_bytes(''' + RT(vk) + '''); }
 List(Int) vault_id() { return ''' + L(vid) + '''; }
 
 Bool has_all(List(FieldPlain) got, Int i) { return true; }
@@ -159,7 +175,7 @@ for k, it in enumerate(items):
     out += f'''
 @requires(declassify)
 test "item {k}: the reference ciphertexts open to the reference plaintexts" {{
-    List(Secret(UInt(8))) vk = secret_bytes(vault_key_bytes());
+    List(Secret(UInt(8))) vk = vault_key_bytes();
     Result(List(FieldPlain), SymbolonError) r = item_open(vk, vault_id(), ref_item_{k}());
     List(FieldPlain) got = r else {{ [] }};
     expect(got.len()).toEqual({len(it["plain"])});
@@ -179,18 +195,52 @@ List(Int) field_named_at(List(FieldPlain) fs, Str name, Int i) {
 }
 '''
 for k, it in enumerate(items):
+    fields2 = ', '.join(f'{S(f)}: {L(c)}' for f, c in sorted(it['cts2'].items()))
+    hp = f'Some({S(it["handling"])})' if it['handling'] is not None else 'None'
+    out += f'''
+Item ref_item2_{k}() {{
+    return Item {{
+        .id = {L(it["iid"])}, .version = {it["ver"]}, .kind = {S(it["kind"])},
+        .fields = {{{fields2}}},
+        .in_duress_subset = {str(it["duress"]).lower()}, .handling_policy = {hp} }};
+}}
+
+@requires(declassify)
+test "item {k}: format 2 sealing under the reference salts gives the reference ciphertexts" {{
+    List(Secret(UInt(8))) ik = item_key(vault_key_bytes(), vault_id(), {L(it["iid"])});
+'''
+    for f in sorted(it['plain']):
+        out += f'    expect(hx(field_seal_salted(ik, {L(it["salts"][f])}, vault_id(), {L(it["iid"])}, {it["ver"]}, {S(it["kind"])}, {S(f)}, secret_bytes({RT(it["plain"][f])})))).toEqual("{it["cts2"][f].hex()}");\n'
+    out += f'''}}
+
+@requires(declassify)
+test "item {k}: the format 2 reference ciphertexts open to the reference plaintexts" {{
+    Result(List(FieldPlain), SymbolonError) r = item_open(vault_key_bytes(), vault_id(), ref_item2_{k}());
+    List(FieldPlain) got = r else {{ [] }};
+    expect(got.len()).toEqual({len(it["plain"])});
+'''
+    for f, p in sorted(it['plain'].items()):
+        out += f'    expect(hx(field_named(got, {S(f)}))).toEqual("{p.hex()}");\n'
+    out += '}\n'
     plain_fields = ', '.join(f'FieldPlain {{.name = {S(f)}, .value = secret_bytes({RT(p)})}}' for f, p in sorted(it['plain'].items()))
     out += f'''
 @requires(declassify)
-test "item {k}: sealing the reference plaintexts gives the reference ciphertexts" {{
-    List(Secret(UInt(8))) vk = secret_bytes(vault_key_bytes());
+test "item {k}: sealing twice gives other ciphertexts, both opening to the plaintexts" {{
+    List(Secret(UInt(8))) vk = vault_key_bytes();
     List(FieldPlain) plain = [{plain_fields}];
-    Result(Item, SymbolonError) r = item_seal(vk, vault_id(), {L(it["iid"])}, {it["ver"]}, {S(it["kind"])}, plain, {str(it["duress"]).lower()}, {f'Some({S(it["handling"])})' if it["handling"] is not None else 'None'});
-    Item sealed = r else {{ ref_item_{k}() }};
-    expect(r_ok(r)).toBeTrue();
-    expect(hx(item_cbor(sealed))).toEqual("{it["cb"].hex()}");
-}}
+    Item a = item_seal(vk, vault_id(), {L(it["iid"])}, {it["ver"]}, {S(it["kind"])}, plain, {str(it["duress"]).lower()}, {hp}) else {{ ref_item_{k}() }};
+    Item b = item_seal(vk, vault_id(), {L(it["iid"])}, {it["ver"]}, {S(it["kind"])}, plain, {str(it["duress"]).lower()}, {hp}) else {{ ref_item_{k}() }};
+    expect(hx(item_cbor(a)) == hx(item_cbor(b))).toBeFalse();
+    expect(hx(item_cbor(a)) == hx(item_cbor(ref_item_{k}()))).toBeFalse();
+    List(FieldPlain) ga = item_open(vk, vault_id(), a) else {{ [] }};
+    List(FieldPlain) gb = item_open(vk, vault_id(), b) else {{ [] }};
+    expect(ga.len()).toEqual({len(it["plain"])});
+    expect(gb.len()).toEqual({len(it["plain"])});
 '''
+    for f, p in sorted(it['plain'].items()):
+        out += f'    expect(hx(field_named(ga, {S(f)}))).toEqual("{p.hex()}");\n'
+        out += f'    expect(hx(field_named(gb, {S(f)}))).toEqual("{p.hex()}");\n'
+    out += '}\n'
 out += '''
 Bool r_ok(Result(Item, SymbolonError) r) { return match r { Ok(_) => true, Err(_) => false }; }
 

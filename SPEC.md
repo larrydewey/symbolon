@@ -1385,9 +1385,18 @@ vault_key : 32 random bytes per vault, wrapped to each device party's DEK and,
             for recovery, under the kit's split key k_K (Section 10.6), never to the kit alone
             while a cosigner exists
 item_key  = HKDF(vault_key, vault_id, "symbolon v1 item" || item_id, 32)   ; standard tier; protected items: 18.10
-field_key = HKDF(item_key, nil, "symbolon v1 field" || field_name || u64(item_version), 32)
-nonce     = HKDF(item_key, nil, "symbolon v1 nonce" || field_name || u64(item_version), 12)
+salt      = 16 random bytes, drawn for every field each time it is sealed
+field_key = HKDF(item_key, salt, "symbolon v2 field" || field_name || u64(item_version), 32)
+nonce     = HKDF(item_key, salt, "symbolon v2 nonce" || field_name || u64(item_version), 12)
 ```
+
+Format 1, which agents wrote before, had no salt (`HKDF(item_key, nil,
+"symbolon v1 field" || ...)`, likewise `"symbolon v1 nonce"`). Neither the
+item id (from the name) nor the version is unique over time -- an item
+deleted and written again restarts at version 1, imports and shared-folder
+copies seal at version 1, a relay that rolls a vault back makes a device
+reuse a version -- so format 1 could seal two plaintexts under one key and
+nonce. Agents seal only format 2 and still open format 1.
 
 ### 18.2 Items
 
@@ -1418,8 +1427,12 @@ An item's folder is the sealed field `folder`, its levels joined by `/`
 
 ### 18.3 Encryption
 
-`aad = CBOR([1, vault_id, item_id, item_version, kind, field_name])`;
-`ct = AES-256-GCM(field_key, nonce, plaintext, aad)`.
+`aad = CBOR([2, vault_id, item_id, item_version, kind, field_name])`;
+`ct = salt || AES-256-GCM(field_key, nonce, plaintext, aad)`. A reader
+tries format 2 (the first 16 bytes as the salt) and, when that does not
+authenticate, format 1 (`aad` led by 1, `ct` the AEAD output alone); the
+two use different labels and `aad`, so bytes of one never open as the
+other.
 
 ### 18.4 The vault head
 

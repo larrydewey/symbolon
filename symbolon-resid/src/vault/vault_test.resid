@@ -81,6 +81,36 @@ test "another vault id does not open" {
     expect(is_ok_p(item_open(vk(5), rep(8, 32), it))).toBeFalse();
 }
 
+List(Int) xor_at(List(Int) a, List(Int) b, Int from, Int n) {
+    if (n <= 0 || from + n > a.len() || from + n > b.len()) { return []; }
+    return [a[from] ^ b[from]].concat(xor_at(a, b, from + 1, n - 1));
+}
+
+@requires(declassify)
+Item sealed_secret(Str s) {
+    return item_seal(vk(5), vid(), iid(1), 1, "password", [FieldPlain {.name = "secret", .value = secret_bytes(utf8(s))}], false, None) else { fail_item() };
+}
+
+// put X, delete X, put X again: the same item id (from the name) and the
+// same version 1. The two ciphertexts must not share a key and nonce: their
+// XOR, at the AEAD output's start in either format, is not the plaintexts'.
+@requires(declassify)
+test "an item written again at the same id and version reuses no key and nonce" {
+    Item a = sealed_secret("hunter2");
+    Item b = sealed_secret("letmein");
+    List(Int) ca = a.fields["secret"] else { [] };
+    List(Int) cb = b.fields["secret"] else { [] };
+    List(Int) px = xor_at(utf8("hunter2"), utf8("letmein"), 0, 7);
+    expect(hex_encode(xor_at(ca, cb, 0, 7)) == hex_encode(px)).toBeFalse();
+    expect(hex_encode(xor_at(ca, cb, 16, 7)) == hex_encode(px)).toBeFalse();
+    // The same plaintext twice: other ciphertexts, both opening.
+    Item c = sealed_secret("hunter2");
+    expect(hex_encode(c.fields["secret"] else { [] }) == hex_encode(ca)).toBeFalse();
+    expect(first_byte(item_open(vk(5), vid(), a), "secret")).toEqual(104);
+    expect(first_byte(item_open(vk(5), vid(), c), "secret")).toEqual(104);
+    expect(first_byte(item_open(vk(5), vid(), b), "secret")).toEqual(108);
+}
+
 @requires(declassify)
 test "reencrypt moves to the new key and bumps the version" {
     Item it = make(1, 5);
@@ -94,14 +124,16 @@ test "reencrypt moves to the new key and bumps the version" {
 
 @requires(declassify)
 test "merkle proofs verify and tampering fails" {
+    // Sealing draws a fresh salt, so each item is sealed once and reused.
     List(Item) items = [make(3, 5), make(1, 5), make(2, 5), make(4, 5), make(5, 5)];
     List(Int) root = merkle_root(items);
     Option(List(ProofStep)) p = merkle_proof(items, iid(4));
-    expect(match p { Some(pr) => merkle_verify(root, make(4, 5), pr), None => false }).toBeTrue();
-    expect(match p { Some(pr) => merkle_verify(root, make(2, 5), pr), None => true }).toBeFalse();
-    List(Int) other = merkle_root([make(3, 5), make(1, 5), make(2, 5), make(4, 6), make(5, 5)]);
+    expect(match p { Some(pr) => merkle_verify(root, items[3], pr), None => false }).toBeTrue();
+    expect(match p { Some(pr) => merkle_verify(root, items[2], pr), None => true }).toBeFalse();
+    expect(match p { Some(pr) => merkle_verify(root, make(4, 5), pr), None => true }).toBeFalse();
+    List(Int) other = merkle_root([items[0], items[1], items[2], make(4, 6), items[4]]);
     expect(other == root).toBeFalse();
-    expect(merkle_root([make(3, 5), make(1, 5), make(2, 5), make(4, 5), make(5, 5)]) == root).toBeTrue();
+    expect(merkle_root([items[4], items[1], items[3], items[2], items[0]]) == root).toBeTrue();
 }
 
 @requires(declassify)

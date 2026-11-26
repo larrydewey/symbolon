@@ -77,9 +77,35 @@ List(Secret(UInt(8))) field_nonce(List(Secret(UInt(8))) ik, Str field, UInt(64) 
     return hkdf_secret(nil, ik, utf8("symbolon v1 nonce").concat(utf8(field)).concat(u64be(version)), 12);
 }
 
+// Format 2 (every seal since format 1 was found to repeat): a fresh random
+// 16-byte salt per sealed field, stored in front of the AEAD output, goes
+// into the HKDF salt of both the field key and the nonce. Format 1 derived
+// them from (item_key, field, version) alone, and neither the item id
+// (HMAC of the name) nor the version is unique over time: an item deleted
+// and written again under the same name starts at version 1 again, an
+// import or a shared-folder copy seals at version 1, and a relay that
+// rolls the vault back makes the device reuse a version. Each of those
+// sealed two plaintexts under one AES-GCM key and nonce, which gives the
+// relay their XOR and GHASH's key (forgeries). With the salt the (key,
+// nonce) pair repeats only if two 128-bit draws collide.
+pub Int seal_salt_len() { return 16; }
+
+List(Secret(UInt(8))) field_key2(List(Secret(UInt(8))) ik, List(Int) salt, Str field, UInt(64) version) {
+    return hkdf_secret(secret_bytes(salt), ik, utf8("symbolon v2 field").concat(utf8(field)).concat(u64be(version)), 32);
+}
+
+List(Secret(UInt(8))) field_nonce2(List(Secret(UInt(8))) ik, List(Int) salt, Str field, UInt(64) version) {
+    return hkdf_secret(secret_bytes(salt), ik, utf8("symbolon v2 nonce").concat(utf8(field)).concat(u64be(version)), 12);
+}
+
 // aad = CBOR([1, vault_id, item_id, item_version, kind, field_name])
 pub List(Int) field_aad(List(Int) vault_id, List(Int) item_id, UInt(64) version, Str kind, Str field) {
-    List(Int) a = cbe_uint(1, cbe_array(6, []));
+    return field_aad_v(1, vault_id, item_id, version, kind, field);
+}
+
+// Format 2's aad: the same array, led by 2.
+List(Int) field_aad_v(Int fmt, List(Int) vault_id, List(Int) item_id, UInt(64) version, Str kind, Str field) {
+    List(Int) a = cbe_uint(fmt, cbe_array(6, []));
     List(Int) b = cbe_bytes(vault_id, a);
     List(Int) c = cbe_bytes(item_id, b);
     List(Int) d = cbe_uint((Int)version, c);
@@ -96,12 +122,22 @@ pub List(Int) field_seal(List(Secret(UInt(8))) vault_key, List(Int) vault_id, Li
     return field_seal_ik(item_key(vault_key, vault_id, item_id), vault_id, item_id, version, kind, field, plaintext);
 }
 
-// Under a given item key: item_key (18.1) or pitem_key (18.10.2).
+// Under a given item key: item_key (18.1) or pitem_key (18.10.2). Always
+// format 2, under a salt drawn here.
 @requires(declassify)
 pub List(Int) field_seal_ik(List(Secret(UInt(8))) ik, List(Int) vault_id, List(Int) item_id, UInt(64) version, Str kind, Str field, List(Secret(UInt(8))) plaintext) {
-    List(Secret(UInt(8))) ct = aes_gcmg_seal_ivb(field_key(ik, field, version), field_nonce(ik, field, version), plaintext,
-                                       field_aad(vault_id, item_id, version, kind, field));
-    return ints_of(declassify(secret_join(ct), "AEAD output is public"), 0, ListBuf());
+    return field_seal_salted(ik, random_bytes(seal_salt_len()), vault_id, item_id, version, kind, field, plaintext);
+}
+
+// Format 2 under a given salt: salt || AES-256-GCM(field_key2, nonce2,
+// plaintext, aad led by 2). Only field_seal_ik and the reference tests
+// call it; a salt that is not 16 bytes seals nothing.
+@requires(declassify)
+pub List(Int) field_seal_salted(List(Secret(UInt(8))) ik, List(Int) salt, List(Int) vault_id, List(Int) item_id, UInt(64) version, Str kind, Str field, List(Secret(UInt(8))) plaintext) {
+    if (salt.len() != seal_salt_len()) { return []; }
+    List(Secret(UInt(8))) ct = aes_gcmg_seal_ivb(field_key2(ik, salt, field, version), field_nonce2(ik, salt, field, version), plaintext,
+                                       field_aad_v(2, vault_id, item_id, version, kind, field));
+    return salt.concat(ints_of(declassify(secret_join(ct), "AEAD output is public"), 0, ListBuf()));
 }
 
 @requires(declassify)
@@ -109,10 +145,22 @@ pub Result(List(Secret(UInt(8))), SymbolonError) field_open(List(Secret(UInt(8))
     return field_open_ik(item_key(vault_key, vault_id, item_id), vault_id, item_id, version, kind, field, ct);
 }
 
+// A field of either format: format 2 when the bytes open as salt || AEAD
+// output under the salted key, else format 1 (sealed before format 2).
+// Both are authenticated under keys only the vault key gives, with
+// different labels and aad, so bytes of one format never open as the other.
 @requires(declassify)
 pub Result(List(Secret(UInt(8))), SymbolonError) field_open_ik(List(Secret(UInt(8))) ik, List(Int) vault_id, List(Int) item_id, UInt(64) version, Str kind, Str field, List(Int) ct) {
-    Option(List(Secret(UInt(8)))) pt = aes_gcmg_decrypt_ivb(field_key(ik, field, version), field_nonce(ik, field, version), ct,
-                                                  field_aad(vault_id, item_id, version, kind, field));
+    Int n = seal_salt_len();
+    Option(List(Secret(UInt(8)))) p2 = if (ct.len() < n + 16) { None } else {
+        aes_gcmg_decrypt_ivb(field_key2(ik, ct[0..n], field, version), field_nonce2(ik, ct[0..n], field, version), ct[n..ct.len()],
+                             field_aad_v(2, vault_id, item_id, version, kind, field))
+    };
+    Option(List(Secret(UInt(8)))) pt = match p2 {
+        Some(p) => Some(p),
+        None => aes_gcmg_decrypt_ivb(field_key(ik, field, version), field_nonce(ik, field, version), ct,
+                                     field_aad(vault_id, item_id, version, kind, field))
+    };
     return match pt {
         Some(p) => Ok(p),
         None => Err(ErrVaultIntegrity("field authentication failed: " + field))
