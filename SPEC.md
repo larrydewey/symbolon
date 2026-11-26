@@ -430,6 +430,7 @@ event-body =
   / [7, target-seq: uint]                    ; veto
   / [8] / [9]                               ; reserved (draft 1 duress events; never used, A-05)
   / [10, new-suite: uint]                    ; migrate
+  / [11, party-id, hpke-key: pubkey]         ; party-key: a device's new share-transport key
 
 recover-body = [
   path: uint,                                ; 1 kit, 2 guardians
@@ -453,6 +454,16 @@ recover-body = [
 - `reshare`: signatures from every party that took part in the re-share
   (Section 11.3), at least `t` of the old quorum.
 - `recover`: Section 13. `veto`: Section 13.4.
+- `party-key`: a signature by the authentication key (DK) of the party it
+  names, which MUST be a device of the current quorum that is not
+  removed; the key MUST be a P-256 point other than the party's current
+  `hpke_key`. It takes effect at once (no delay, no other device's
+  signature) and replaces that party's field 4 in the quorum; the epoch
+  does not change. It moves where others wrap to the device, not who
+  signs, recovers or holds a share, and whoever holds the device's DK and
+  profile already reads what the old key opened; another device cannot
+  move it (that would redirect the device's wraps). A device uses it to
+  retire a transport key someone else may hold (Section 9.2).
 - Field 6 MUST hold the digests of the recovery keys a future `recover`
   may reveal; a revealed key whose digest is not in the predecessor's field
   6 is invalid.
@@ -574,6 +585,44 @@ it can write the duress blob without being able to read it. A device
 without a duress PIN rewrites its random second blob on the same schedule,
 so the pattern of writes does not reveal whether a duress profile exists
 (A-21).
+
+The duress profile has a share-transport (HPKE) key of its own: a random
+32-byte seed in the profile (the field the device's share would take),
+whose public key the real profile registers with the cosigner beside the
+duress sub-key (`duress.pub`, 65 + 65 bytes; a device without a duress
+PIN registers keys no one holds). It MUST NOT hold the device's own
+transport key, nor anything it can be derived from: that key opens every
+folder-key wrap (Section 19), kit half (Section 10.6) and enrolment or
+re-share envelope addressed to the device, so whoever is given the duress
+PIN would read every shared folder (D-4).
+
+The device's transport key is `HPKE-DeriveKeyPair(HKDF(DEK, "symbolon v2
+device hpke", 32))` (suite 16,1,2), from a label the duress profile never
+had. Devices made before 2026-11 used `"symbolon v1 device hpke"` and put
+that same seed in the duress profile. On such a device every command
+reminds the principal, on standard error (and `device status` with a
+`security-update due` line), to run `device security-update DIR` (the
+PIN, then the duress PIN or an empty line), which under the PIN only:
+
+1. re-seals the duress profile with a fresh transport seed (everything
+   else in it unchanged; same blob size) and registers its key with the
+   cosigner first, so the old profile works until the new one is in
+   place; without a duress PIN, the second blob, the slot, `dshare` and
+   the registered keys become decoys as on a device made without one;
+2. publishes a `party-key` event (Section 8.1) naming the v2 key, signed
+   by the DK, and records it in the device's configuration;
+3. makes every collection's wraps again (Section 19.2).
+
+The reminder depends only on whether the device directory holds the file
+`security-update` (written by `device new` and at the end of the update),
+never on the PIN entered, so it reads the same under the PIN, the duress
+PIN or none: it tells a coercer only that the device predates the update,
+which every such device shows, with or without a duress PIN. Under the
+duress PIN `device security-update` fails as any change does under duress
+(Section 14.3). Residual risk: a copy of the old duress blob taken before
+the update still opens with the duress PIN and holds the v1 key, which
+opens what was addressed to v1 before it was replaced (wraps not yet made
+again, envelopes the relay still keeps); nothing made after the update.
 
 ### 9.3 Lock
 
@@ -1008,7 +1057,17 @@ Unlocking with the duress PIN:
    can tell from the DK. Nothing is written to the identity log or the
    sync service that would differ from a normal unlock, because a visible
    duress record could be seen by the coercer and endanger the principal
-   (A-05);
+   (A-05). Its envelopes carry the device's party id but are sealed
+   (HPKE mode_auth) with the duress profile's own transport key (Section
+   9.2), which the cosigner tries after the device's: the relay sees the
+   same sender, recipient and sizes. The cosigner answers every request
+   under the key it came under (the signing session's rounds, a refusal,
+   alert settings), so the duress profile reads its answers and the real
+   profile's key is never needed. Under a duress transport key the
+   cosigner takes only signing sessions, beacons, alert-setting requests
+   and end-duress messages, never a duress-key registration (which it
+   takes under the device's own key only), a kit release, an event
+   signature or a re-share;
 3. otherwise behaves like a normal unlock, with identical timing,
    interface and network pattern.
 
@@ -1025,6 +1084,9 @@ message signed by `policy[1]` devices other than the duress device, or
   refused: the duress profile holds the subset's tweaks but not the chain
   code (Section 9.2);
 - the principal's chosen contacts are alerted (Section 14.4).
+- the duress profile cannot change what the cosigner knows it by: the
+  cosigner takes a duress-key registration only under the device's own
+  transport key, which the duress profile does not hold (Section 9.2).
 
 Refusals during duress MUST look like ordinary transient failures (the
 same errors and timing as an unreachable cosigner), so the coercer cannot
@@ -1509,7 +1571,9 @@ deletion without a head proving it.
 
 The duress profile holds its own vault key covering only items with
 field 5 set, re-encrypted under it, so the duress device cannot decrypt
-anything else.
+anything else. It holds no key that opens what is addressed to the
+device (Section 9.2): shared collections open under the duress PIN only
+from the `.dkey` records the real profile sealed to it (Section 19.2).
 
 ### 18.6 Rotation
 
@@ -1951,6 +2015,15 @@ learns no names but the people's own.
   device that holds the key may add the wraps a member's newer devices
   lack (an enrolment, a recovery); wraps are authenticated by mode_auth
   and the sender check above, not by the roster.
+- Wraps go to each device's transport key in its verified log head and
+  are sent with the sender's current one. A device that moved to a new
+  key (`party-key`, Section 9.2) opens wraps with the new key and then,
+  under the PIN only, with its v1 key, until they are made again; its
+  wraps made with v1 no longer authenticate (the sender check uses the
+  key in the log), so it makes every collection's wraps again, to every
+  member's devices, in the update and then each time it opens a
+  collection still listed in `rewrap.todo`. Until then a member whose
+  wrap it made reads that collection from their kept copy.
 - The collection's vault head is signed by a device of anyone in the
   current roster; the device checks it against that person's verified log
   (Section 18.4, with that log in place of its own) and keeps the highest
