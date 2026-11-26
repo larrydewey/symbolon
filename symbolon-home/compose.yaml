@@ -1,14 +1,38 @@
 # Symbolon Home. First run (once): see README.md.
+#
+# HOME_ADDR is required: the one address your devices reach the box at (the
+# LAN address, or a WireGuard / Tailscale one). The ports are published on
+# it only, never on every interface:
+#   HOME_ADDR=192.168.1.20 docker compose up -d
+# (or put HOME_ADDR=... in a .env file next to this one).
+#
+# HOME_PASSPHRASE_FILE: the file holding the passphrase the box's keys are
+# sealed to, when the box has no TPM. Keep it OFF the disk that holds
+# ./data and out of its backups (a USB stick you mount at start, a
+# separate encrypted volume): the data folder and the passphrase together
+# are the household's identities.
 services:
   symbolon-home:
     image: symbolon-home
     restart: unless-stopped
     volumes:
       - ./data:/data
-    # Publish only on the address your devices use: the LAN address, or a
-    # WireGuard / Tailscale one, e.g. "192.168.1.20:47100-47104:47100-47104".
     ports:
-      - "47100-47104:47100-47104"
+      - "${HOME_ADDR:?set HOME_ADDR to the address your devices reach this box at, e.g. 192.168.1.20}:47100-47104:47100-47104"
+    secrets:
+      - symbolon_home_passphrase
+    # With a TPM 2.0 the keys are sealed to it instead of a passphrase:
+    # pass the TPM in (and give the container the group that owns it).
+    # devices:
+    #   - /dev/tpmrm0
+    # group_add:
+    #   - tss
     # The agent recurses deeply; the default 8 MB stack is not enough.
     ulimits:
       stack: -1
+    # The unsealed keys live in memory only (/dev/shm, a tmpfs), while the
+    # box runs.
+    shm_size: 64m
+secrets:
+  symbolon_home_passphrase:
+    file: ${HOME_PASSPHRASE_FILE:-/dev/null}

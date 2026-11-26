@@ -115,4 +115,4 @@ Each takes a last `--share ID` to work in a shared folder.
 | `relay scim-token DIR ORG-ID [--store SPEC]` | a SCIM bearer token |
 | `witness keygen KEYFILE` / `witness serve DIR PORT KEYFILE [--tls CERT KEY]` | a witness |
 | `cosigner new DIR RELAY-HOST RELAY-PORT` / `pair DIR DEVICE-KEYS` / `serve DIR` | a cosigner |
-| `home init DIR HOST… [--ports BASE] [--bind ADDR]` / `home invite DIR NAME` / `home serve DIR` | Symbolon Home |
+| `home init DIR HOST… --witness H:P:KEY --witness H:P:KEY [--witness-ca F] [--ports BASE] [--bind ADDR] [--seal tpm\|passphrase] [--passphrase-file F]` / `home secure DIR [--witness …]` / `home status DIR` / `home witness-cert DIR HOST OUTDIR` / `home invite DIR NAME` / `home serve DIR [--passphrase-file F] [--run DIR]` | Symbolon Home |

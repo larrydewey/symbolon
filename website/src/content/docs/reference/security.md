@@ -37,9 +37,13 @@ Appendix A.
 
 ## Relied on
 
-- **Witnesses** that are independent of your relay. Symbolon Home runs its
-  witnesses on the same box for now, so a household's box vouches for its
-  own log; independent public witnesses are planned.
+- **Witnesses** that are independent of your relay. Symbolon Home runs one
+  witness on the box and needs at least two outside it, so the box alone is
+  never a majority (a box set up before that runs all three until it is
+  secured).
+- **Symbolon Home's sealed keys**: a copy of the box's disk is useless
+  without its TPM or passphrase; with them, plus a person's recovery kit,
+  it is that person's identity.
 - **Fingerprints compared out of band** when you share a folder, so a relay
   cannot slip in a key of its own.
 - **Your recovery kit**, kept somewhere safe and offline.

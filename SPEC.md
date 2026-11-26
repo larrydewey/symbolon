@@ -212,6 +212,19 @@ P-256 base point, `q` its order.
   the log to another relay is a `set-policy` the current relay must claim
   (Section 20.4).
 
+### 3.4 Symbolon Home
+
+A household box (Section 20.5) holds every principal's cosigner and one
+witness. Against a thief of the box's disk or of a backup of its data
+folder (A6 for the box), the keys are sealed to the box's TPM or a
+passphrase: without them the copy gives nothing. The box running is out
+of scope as a single compromise: it is the cosigner, one of `t`. The box
+is never a majority of a principal's witnesses, except for principals
+paired on a box set up before Section 20.5's rules, which the box and the
+app report until they are moved; for them, a stolen running box with a
+principal's recovery kit can also fake the witnesses' time. Data folder,
+passphrase and a recovery kit together are a principal's identity.
+
 ---
 
 ## 4. Security goals
@@ -2525,12 +2538,14 @@ stalls the log (Section 3.3).
 
 ### 20.5 Symbolon Home
 
-A household MAY run every service on one box it owns (a NAS, a small
-computer): the relay, a cosigner per principal, and pairing. The box
-makes its own certificate authority (P-256, 20 years) and a server
+A household MAY run its services on one box it owns (a NAS, a small
+computer): the relay, a cosigner per principal, one witness, and pairing.
+The box makes its own certificate authority (P-256, 20 years) and a server
 certificate under it (10 years) for the names and addresses its devices
-use; no public CA or domain is involved. A principal is invited with a
-one-time code (128 bits, a week) that the box shows as a QR code:
+use; no public CA or domain is involved. It listens on one address (the
+first it is set up for, unless told another; a container publishes its
+ports on one host address only). A principal is invited with a one-time
+code (128 bits, a day) that the box shows as a QR code:
 
 ```
 symbolon://pair?h=HOST&p=PORT&c=CODE&f=BASE64URL(SHA-256(server certificate DER))
@@ -2538,20 +2553,48 @@ symbolon://pair?h=HOST&p=PORT&c=CODE&f=BASE64URL(SHA-256(server certificate DER)
 
 The device connects to `https://HOST:PORT` and MUST accept only a server
 certificate whose SHA-256 is `f`, before sending the code, so a network
-attacker can neither read the code nor pose as the box. `GET /setup?c=`
-returns the relay, the principal's cosigner keys, the witnesses and the
-box's CA certificate, which the agent then trusts for TLS (Section 20.2);
-`POST /pair?c=` with the keys `device new` printed pins the device at the
-principal's cosigner as the inception party (Section 11.1 step 2, the
-out-of-band comparison being the QR code) and spends the code. The box
-keeps each cosigner's key on its disk; whoever holds the box and one of a
-principal's devices still needs the device's PIN (Section 9.1).
+attacker can neither read the code nor pose as the box. The link is a
+bearer secret: whoever uses it first pairs as the principal, and the
+interface says so. `GET /setup?c=` returns the relay, the principal's
+cosigner keys, the witnesses, the box's CA certificate (and a hosted
+witness's, when one is used), which the agent then trusts for TLS (Section
+20.2), and a fresh pair token; the box spends the code at that first
+request, with an exclusive create, so the setup is given once. `POST
+/pair?c=&t=` with that token and the keys `device new` printed pins the
+device at the principal's cosigner as the inception party (Section 11.1
+step 2, the out-of-band comparison being the QR code), once.
 
-Interim deviation: the box runs the policy's three witnesses itself, so
-they are not independent operators (Section 20.3): the box could present
-a forked log to devices that have no other contact. Independent public
-witnesses (an append-only public log for heads, signed public time for
-delays) replace them; until then the interface states it.
+**Witnesses outside the box.** The box runs fewer than a majority of the
+witnesses it gives a principal: one, with at least two outside it (a
+household computer running a witness, with a certificate under the box's
+CA, or a hosted witness), named when the box is set up. So the box alone
+can neither co-sign an event nor answer a head for a log (Section 20.3).
+The rule is checked at setup (`on_box * 2 < total`); the witnesses a
+principal was given are recorded with their cosigner.
+
+**Keys at rest.** The box seals every key it holds, the cosigners' (their
+root keys, shares, kit halves, vault OPRF shares, duress keys), its
+witness's, its CA's and its server certificate's, under one box key
+(AES-256-GCM), and seals the box key to the box's TPM (a TPM-held HMAC key
+over a salt), or, without one, to a passphrase (Argon2id). The box key is
+unsealed into memory (a tmpfs) when the box starts and nowhere else; a
+cosigner that cannot reach it neither reads nor writes a secret file. A
+copy of the disk or of the box's data folder alone does not sign; with
+the TPM or the passphrase it holds every principal's cosigner, and with a
+principal's recovery kit as well, that principal's identity (t parties,
+Section 3.3). Setup recommends a kit passphrase (Section 10.6) for that
+reason. Whoever holds the running box and one of a principal's devices
+still needs the device's PIN (Section 9.1).
+
+**Boxes set up before these rules** keep their keys unsealed and run all
+three witnesses. They keep working; `home serve`, `home invite`, the
+setup the app reads (`secure`, `reminder`) and `home status` say so until
+`home secure` seals the keys and names witnesses outside the box for
+principals invited from then on. Principals paired earlier stay on the
+box's three witnesses (the box alone a majority, able to present a forked
+log to devices with no other contact) until a set-policy from their
+devices moves them, which this version cannot make; the reminder names
+them (Section 3.4).
 
 ---
 
