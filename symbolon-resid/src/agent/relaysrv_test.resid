@@ -4,7 +4,13 @@
 // one writes another person's or another folder's records.
 
 import "relaysrv.resid";
+import "../types.resid";
+import "../core/log.resid";
+import "../core/event.resid";
 import "../net/store.resid";
+import "../net/s3.resid";
+import "state.resid";
+import "hash.resid";
 import "orgtypes.resid";
 import "orgcore.resid";
 import "sharetypes.resid";
@@ -74,12 +80,15 @@ OrgPolicy tpolicy() {
 // administrators (delay `delay`), `members` everyone. The relay reads
 // these as stored (it checked them when they were written).
 @requires(filesystem, network, clock(readonly), declassify)
-Str put_org(Store s, TDev owner, List(List(Int)) rec, Int delay, List(List(Int)) members) {
+Str put_org(Store s, TDev owner, List(List(Int)) rec, Int delay, List(List(Int)) members) { Str id = put_org_g(s, owner, rec, delay, members, []); return id; }
+
+@requires(filesystem, network, clock(readonly), declassify)
+Str put_org_g(Store s, TDev owner, List(List(Int)) rec, Int delay, List(List(Int)) members, List(OrgGroup) groups) {
     List(Int) id = random_bytes(16);
     OrgRecovery r = OrgRecovery {.on = rec.len() > 0, .public_key = [], .threshold = 1, .admins = rec, .delay_sec = delay, .since = (UInt(64))1, .owner = owner.log};
     OrgGov g = OrgGov {.org_id = id, .version = (UInt(64))1, .founder = owner.log, .nonce = random_bytes(16), .name = "org", .owners = [owner.log], .admins = [], .policy = tpolicy(),
                        .recovery = r, .log_sequence = (UInt(64))0, .signer_log = owner.log, .signer = owner.party, .sig = []};
-    Org o = Org {.org_id = id, .version = (UInt(64))1, .gov_version = (UInt(64))1, .members = org_members(members, 0, ListBuf()), .groups = [], .attested = [],
+    Org o = Org {.org_id = id, .version = (UInt(64))1, .gov_version = (UInt(64))1, .members = org_members(members, 0, ListBuf()), .groups = groups, .attested = [],
                  .log_sequence = (UInt(64))0, .signer_log = owner.log, .signer = owner.party, .sig = []};
     _ = st_put(s, "blob/" + gov_blob(id, (UInt(64))1), cb(to_cbor(g)));
     _ = st_put(s, "blob/" + org_blob(id), cb(to_cbor(o)));
@@ -481,4 +490,428 @@ test "a console code names only the passkey it is computed from" {
     expect(pending_matching([forged, good], code, 0, ListBuf()).len()).toEqual(1);
     expect(pending_matching([good, good], code, 0, ListBuf()).len()).toEqual(2);
     expect(str_len(key_fingerprint(cose_hex_decode(pk)))).toEqual(19);
+}
+
+// ─── Round 2 (R2R) ──────────────────────────────────────────────
+
+// R2R-1: listing someone as a member of an organization one founded is no
+// consent: their household folder does not become its group folder.
+@requires(filesystem, network, clock(readonly), declassify)
+test "an administrator cannot take a member's household folder for a group folder" {
+    Store s = tmp_store();
+    TDev a = tdev();
+    TDev h = tdev();
+    Str org = put_org(s, a, [], 0, [a.log, h.log]);
+    List(Int) cid = random_bytes(16);
+    _ = st_put(s, "blob/roster-" + hex_encode(cid), roster_bytes(cid, h, []));
+    GroupFolder f0 = GroupFolder {.coll_id = cid, .version = (UInt(64))1, .org_id = cose_hex_decode(org), .groups = [], .name_ct = [], .deleted = false,
+                                  .log_sequence = (UInt(64))0, .signer_log = a.log, .signer = a.party, .sig = []};
+    GroupFolder f = gfolder_signed(f0, tsign(a, gfolder_tbs(f0)));
+    expect(refused(may_write(s, "gfolder-" + hex_encode(cid), cb(to_cbor(f)), twho(a)))).toBeTrue();
+    // items with no roster are someone's too
+    List(Int) cid2 = random_bytes(16);
+    _ = st_put(s, "blob/coll-" + hex_encode(cid2), [1]);
+    GroupFolder g0 = GroupFolder {.coll_id = cid2, .version = (UInt(64))1, .org_id = cose_hex_decode(org), .groups = [], .name_ct = [], .deleted = false,
+                                  .log_sequence = (UInt(64))0, .signer_log = a.log, .signer = a.party, .sig = []};
+    GroupFolder g1 = gfolder_signed(g0, tsign(a, gfolder_tbs(g0)));
+    expect(refused(may_write(s, "gfolder-" + hex_encode(cid2), cb(to_cbor(g1)), twho(a)))).toBeTrue();
+}
+
+// A real log for the relay to verify (as relaysrv_log_test.resid): E0 with
+// devices 2 and 3, co-signed by witnesses 7 and 8; `w1` the first
+// witness's URL.
+List(Int) lpriv(Int n) { return [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, n]; }
+List(Int) lpub(Int n) { return ec_public_key(P256, lpriv(n)); }
+List(Int) lsign(Int n, List(Int) msg) { return ecdsa_raw_of(P256, ecdsa_sign_digest(P256, Sha256, lpriv(n), hash_bytes(Sha256, msg))); }
+List(Int) lid(Int n) { return sha256_bytes([n]); }
+
+Party ldev(Int n) { return Party {.id = lid(n), .kind = party_kind_device(), .auth_key = lpub(n), .hpke_key = lpub(n), .label = "d", .attestation = NoAttestation}; }
+
+StoredEvent log_e0(Str w1) {
+    Policy pol = Policy {.device_sigs_for_authority = 2, .recovery_delay_sec = 86400, .guardians = [], .guardian_threshold = 0,
+                         .witnesses = [WitnessRef {.url = w1, .key = lpub(7)}, WitnessRef {.url = "w2", .key = lpub(8)}, WitnessRef {.url = "w3", .key = lpub(11)}],
+                         .duress_window_sec = 3600, .cosigner_policy = NoCosignerPolicy};
+    Quorum q = Quorum {.parties = [ldev(2), ldev(3)], .t = 2, .root_pubkey = lpub(9), .epoch = 0, .transcript_digest = lid(99), .kv_commits = []};
+    EventPayload p = EventPayload {.log_id = None, .sequence = 0, .predecessor_digest = None, .suite = 1, .body = InceptionBody(q, pol),
+                                   .next_recovery_key_digests = [sha256_bytes(lpub(20))], .advisory_time = 0};
+    List(Int) enc = payload_cbor(p) else { [] };
+    List(Int) l = sha256_bytes(enc);
+    List(WitnessCosignature) cs = [WitnessCosignature {.log_id = l, .sequence = 0, .digest = l, .witness_key = lpub(7), .signature = lsign(7, witness_message(l, 0, l)), .witness_time = 1000},
+                                   WitnessCosignature {.log_id = l, .sequence = 0, .digest = l, .witness_key = lpub(8), .signature = lsign(8, witness_message(l, 0, l)), .witness_time = 1000}];
+    return StoredEvent {.encoded = enc, .sigs = [EventSig {.signer = lid(2), .sig = lsign(2, enc)}, EventSig {.signer = lid(3), .sig = lsign(3, enc)}], .cosigs = cs};
+}
+
+// The log stored at the relay; its id.
+@requires(filesystem, network, clock(readonly), declassify)
+List(Int) put_log(Store s, Str w1) {
+    StoredEvent e0 = log_e0(w1);
+    List(Int) l = sha256_bytes(e0.encoded);
+    _ = st_put(s, "log/" + hex_encode(l) + "/0", cbor_of_event(e0));
+    return l;
+}
+
+// R2R-2: a session whose device is not a device of its log (removed) is
+// deleted when the relay checks the log again: not checked again per
+// request.
+@requires(filesystem, network, clock(readonly), declassify)
+test "a session for a device that is no longer one of its log's is deleted" {
+    Store s = tmp_store();
+    RelayCfg g = cfg_of(s, "");
+    List(Int) l = put_log(s, "w1");
+    TDev d2 = TDev {.log = l, .party = lid(2), .priv = lpriv(2), .pub = lpub(2)};
+    TDev gone = TDev {.log = l, .party = lid(5), .priv = lpriv(5), .pub = lpub(5)};
+    Str t2 = tsession(s, d2, 0);
+    Str tg = tsession(s, gone, 0);
+    Str kg = "auth/tok-" + hex_encode(sha256_bytes(utf8(tg)));
+    Str k2 = "auth/tok-" + hex_encode(sha256_bytes(utf8(t2)));
+    Str n = "card-" + hex_encode(l);
+    expect(relay_serve_handle(g, treq("PUT", "/blob/" + n, tg, [1])).status).toEqual(401);
+    expect(absent(s, kg)).toBeTrue();
+    // a device of the log: its session now names the log's length
+    expect(relay_serve_handle(g, treq("PUT", "/blob/" + n, t2, [2])).status).toEqual(200);
+    expect(str_ends_with(str_trim(st_read_text(s, k2)), " 1")).toBeTrue();
+}
+
+Str sign_in_body(Str chal, List(Int) l, Int party, Int key, Str name) {
+    List(Int) c = cose_hex_decode(chal);
+    return chal + " " + hex_encode(l) + " " + hex_encode(lid(party)) + " " + hex_encode(lsign(key, relay_auth_message(name, c))) + " " + name;
+}
+
+// R2R-2: a failed sign-in makes the relay connect nowhere: the witnesses a
+// log names are asked only once a device's signature over the challenge
+// verified (and that spends the challenge).
+@requires(filesystem, network, clock(readonly), declassify)
+test "a failed sign-in costs no outbound connection" {
+    Int lfd = resid_tcp_listen_at("127.0.0.1", 0);
+    Int port = resid_tcp_bound_port(lfd);
+    Store s = tmp_store();
+    RelayCfg g = cfg_of(s, "");
+    List(Int) l = put_log(s, f"127.0.0.1:{port}");
+    HttpReply c = relay_serve_handle(g, get("/auth/challenge"));
+    Str chal = http_text(c.body, 0, c.body.len());
+    // signed by a key that is not device 2's
+    expect(relay_serve_handle(g, treq("POST", "/auth", "", utf8(sign_in_body(chal, l, 2, 5, "relay.test:443")))).status).toEqual(403);
+    // a party that is not a device of the log
+    expect(relay_serve_handle(g, treq("POST", "/auth", "", utf8(sign_in_body(chal, l, 5, 5, "relay.test:443")))).status).toEqual(403);
+    expect(resid_tcp_accept_now(lfd) < 0).toBeTrue();
+    _ = resid_tcp_close(lfd);
+    // a log whose witnesses do not answer: device 2 signs in once per challenge
+    List(Int) l2 = put_log(s, "w1");
+    HttpReply c2 = relay_serve_handle(g, get("/auth/challenge"));
+    Str chal2 = http_text(c2.body, 0, c2.body.len());
+    expect(relay_serve_handle(g, treq("POST", "/auth", "", utf8(sign_in_body(chal2, l2, 2, 5, "relay.test:443")))).status).toEqual(403);
+    expect(relay_serve_handle(g, treq("POST", "/auth", "", utf8(sign_in_body(chal2, l2, 2, 2, "relay.test:443")))).status).toEqual(200);
+    expect(relay_serve_handle(g, treq("POST", "/auth", "", utf8(sign_in_body(chal2, l2, 2, 2, "relay.test:443")))).status).toEqual(403);
+}
+
+List(Int) filled(Int n, Int v, ListBuf(Int) acc) { return if (n <= 0) { acc.finish() } else { filled(n - 1, v, acc.push(v)) }; }
+
+// R2R-3: anyone may post to a mailbox, but one recipient is sent at most
+// so much, and a message is at most 1 MiB.
+@requires(filesystem, network, clock(readonly), declassify)
+test "a mailbox takes messages of at most 1 MiB, and so many per recipient at a time" {
+    Store s = tmp_store();
+    RelayCfg g = cfg_of(s, "");
+    Str to = hex_encode(random_bytes(32));
+    expect(relay_serve_handle(g, treq("POST", "/mbox/" + to, "", filled(1048577, 120, ListBuf()))).status).toEqual(413);
+    expect(relay_serve_handle(g, treq("POST", "/mbox/" + to, "", [1])).status).toEqual(200);
+    Int now = clock_now_seconds();
+    _ = st_text(s, "mboxq/" + to, f"{now} 256 100");
+    expect(relay_serve_handle(g, treq("POST", "/mbox/" + to, "", [2])).status).toEqual(429);
+    _ = st_text(s, "mboxq/" + to, f"{now} 1 67108800");
+    expect(relay_serve_handle(g, treq("POST", "/mbox/" + to, "", filled(200, 121, ListBuf()))).status).toEqual(429);
+    // another recipient, or a window that has passed: taken
+    expect(relay_serve_handle(g, treq("POST", "/mbox/" + hex_encode(random_bytes(32)), "", [2])).status).toEqual(200);
+    _ = st_text(s, "mboxq/" + to, f"{now - 4000} 256 67108800");
+    expect(relay_serve_handle(g, treq("POST", "/mbox/" + to, "", [3])).status).toEqual(200);
+    List(Str) q = str_split(st_read_text(s, "mboxq/" + to), " ");
+    expect(q.len()).toEqual(3);
+    expect(str_parse_int(q[0]) >= now).toBeTrue();
+    expect(q[1]).toEqual("1");
+    expect(q[2]).toEqual("1");
+}
+
+@requires(filesystem, network, clock(readonly), declassify)
+Int put_alerts(RelayCfg g, Str l, Int i, Int n, Int ok) {
+    if (i >= n) { return ok; }
+    Int st = relay_serve_handle(g, treq("PUT", "/blob/alrt-" + l + f"-{1700000000 + i}-" + hex_encode(random_bytes(4)), "", [1, 2, 3])).status;
+    return put_alerts(g, l, i + 1, n, ok + (if (st == 200) { 1 } else { 0 }));
+}
+
+// R2R-3: the relay cannot tell a cosigner's sealed alert from junk, so at
+// most 64 wait for one person; their devices remove what they read.
+@requires(filesystem, network, clock(readonly), declassify)
+test "at most 64 alerts wait for one log, and its devices remove them" {
+    Store s = tmp_store();
+    RelayCfg g = cfg_of(s, "");
+    TDev a = tdev();
+    Str l = hex_encode(a.log);
+    expect(put_alerts(g, l, 0, 64, 0)).toEqual(64);
+    Str extra = "alrt-" + l + "-1800000000-0a0b0c0d";
+    expect(relay_serve_handle(g, treq("PUT", "/blob/" + extra, "", [9])).status).toEqual(429);
+    // another person's alerts are not affected
+    expect(put_alerts(g, hex_encode(random_bytes(32)), 0, 1, 0)).toEqual(1);
+    // someone else cannot remove them; a device of the log can
+    List(Str) names = st_list(s, "blob/alrt-" + l + "-", "", 100);
+    Str first = str_slice(names[0], 5, str_len(names[0]));
+    expect(relay_serve_handle(g, treq("PUT", "/blob/" + first, "", [])).status).toEqual(401);
+    expect(relay_serve_handle(g, treq("PUT", "/blob/" + first, tsession(s, tdev(), 0), [])).status).toEqual(403);
+    expect(relay_serve_handle(g, treq("PUT", "/blob/" + first, tsession(s, a, 0), [])).status).toEqual(200);
+    expect(absent(s, "blob/" + first)).toBeTrue();
+    expect(relay_serve_handle(g, treq("PUT", "/blob/" + extra, "", [9])).status).toEqual(200);
+}
+
+// R2R-4: the relay counts governance versions from a pointer it keeps,
+// not by reading every version from the first.
+@requires(filesystem, network, clock(readonly), declassify)
+test "governance versions are counted from the head pointer" {
+    Store s = tmp_store();
+    TDev o = tdev();
+    Str org = put_org(s, o, [], 0, [o.log]);
+    // stored before the pointer: counted, and the pointer written
+    expect(gov_count(s, org, 0)).toEqual(1);
+    expect(st_read_text(s, "orggovhead/" + org)).toEqual("1");
+    // a version stored through the relay moves it
+    expect(stored_reply(s, "orggov-" + org + "-2", [1]).status).toEqual(200);
+    expect(st_read_text(s, "orggovhead/" + org)).toEqual("2");
+    _ = st_put(s, "blob/orggov-" + org + "-3", [1]);
+    _ = st_text(s, "orggovhead/" + org, "3");
+    // from the pointer on: the first versions are not read again
+    expect(st_delete(s, "blob/orggov-" + org + "-1")).toBeTrue();
+    expect(gov_count(s, org, 0)).toEqual(3);
+}
+
+@requires(filesystem, network, clock(readonly), declassify)
+Int put_many(Store s, Str prefix, Int i, Int n) {
+    if (i >= n) { return n; }
+    _ = st_put(s, "blob/" + prefix + f"{i:zero, width 5}", [1]);
+    return put_many(s, prefix, i + 1, n);
+}
+
+// R2R-4: an anonymous listing scans one page of the store: nobody reads
+// an organization's names, so there is nothing to look further for.
+@requires(filesystem, network, clock(readonly), declassify)
+test "an anonymous listing scans one page of the store" {
+    Store s = tmp_store();
+    RelayCfg g = cfg_of(s, "");
+    _ = put_many(s, "attev-" + hex_encode(random_bytes(16)) + "-", 0, 4096);
+    _ = st_put(s, "blob/attz", [1]);
+    HttpReply r = relay_serve_handle(g, get("/list/att"));
+    expect(r.status).toEqual(200);
+    expect(http_text(r.body, 0, r.body.len())).toEqual("");
+    HttpReply r2 = relay_serve_handle(g, get("/list/attz"));
+    expect(http_text(r2.body, 0, r2.body.len())).toEqual("attz");
+}
+
+List(Int) wraps_with(List(Int) cid, List(Int) member, List(ShareWrap) ws) {
+    WrapSet w = WrapSet {.coll_id = cid, .roster_version = (UInt(64))1, .member = member, .wraps = ws};
+    return cb(to_cbor(w));
+}
+
+ShareWrap a_wrap(TDev from) { return ShareWrap {.to = random_bytes(16), .from_log = from.log, .from_party = from.party, .enc = random_bytes(4), .ct = random_bytes(4)}; }
+
+// R2R-5: in a household folder a member writes their own wraps and only
+// adds to another member's; the owner writes anyone's.
+@requires(filesystem, network, clock(readonly), declassify)
+test "a folder member cannot replace another member's key wraps" {
+    Store s = tmp_store();
+    TDev o = tdev();
+    TDev m = tdev();
+    TDev n = tdev();
+    List(Int) cid = random_bytes(16);
+    Str c = hex_encode(cid);
+    _ = st_put(s, "blob/roster-" + c, roster_bytes(cid, o, [m.log, n.log]));
+    Str wn = "wrap-" + hex_encode(n.log) + "-" + c;
+    ShareWrap w1 = a_wrap(o);
+    _ = st_put(s, "blob/" + wn, wraps_with(cid, n.log, [w1]));
+    // replaced, or emptied, by another member: refused
+    expect(refused(may_write(s, wn, wraps_with(cid, n.log, [a_wrap(m)]), twho(m)))).toBeTrue();
+    expect(refused(may_write(s, wn, wraps_with(cid, n.log, []), twho(m)))).toBeTrue();
+    // a wrap added for a device of theirs (SPEC 19): taken
+    expect(may_write(s, wn, wraps_with(cid, n.log, [w1, a_wrap(m)]), twho(m))).toEqual("");
+    // their own, and the owner: any
+    expect(may_write(s, wn, wraps_with(cid, n.log, []), twho(n))).toEqual("");
+    expect(may_write(s, wn, wraps_with(cid, n.log, [a_wrap(o)]), twho(o))).toEqual("");
+    // no wraps there yet: only the owner or the person
+    Str wo = "wrap-" + hex_encode(o.log) + "-" + c;
+    expect(refused(may_write(s, wo, wraps_with(cid, o.log, [a_wrap(m)]), twho(m)))).toBeTrue();
+}
+
+// R2R-5: in a group folder only an owner or administrator writes the
+// roster, another person's leave record or their wraps.
+@requires(filesystem, network, clock(readonly), declassify)
+test "a group folder's people do not write its roster or each other's records" {
+    Store s = tmp_store();
+    TDev a = tdev();
+    TDev b = tdev();
+    TDev c = tdev();
+    List(Int) gid = random_bytes(16);
+    Str org = put_org_g(s, a, [], 0, [a.log, b.log, c.log], [OrgGroup {.group_id = gid, .name = "eng", .members = [b.log, c.log]}]);
+    List(Int) cid = random_bytes(16);
+    Str k = hex_encode(cid);
+    GroupFolder f0 = GroupFolder {.coll_id = cid, .version = (UInt(64))1, .org_id = cose_hex_decode(org), .groups = [gid], .name_ct = [], .deleted = false,
+                                  .log_sequence = (UInt(64))0, .signer_log = a.log, .signer = a.party, .sig = []};
+    _ = st_put(s, "blob/gfolder-" + k, cb(to_cbor(f0)));
+    expect(may_write(s, "coll-" + k, [1], twho(b))).toEqual("");
+    expect(refused(may_write(s, "roster-" + k, roster_bytes(cid, b, []), twho(b)))).toBeTrue();
+    expect(refused(may_write(s, "leave-" + k + "-" + hex_encode(c.log), [1], twho(b)))).toBeTrue();
+    expect(may_write(s, "leave-" + k + "-" + hex_encode(b.log), [1], twho(b))).toEqual("");
+    Str wc = "wrap-" + hex_encode(c.log) + "-" + k;
+    ShareWrap w1 = a_wrap(a);
+    _ = st_put(s, "blob/" + wc, wraps_with(cid, c.log, [w1]));
+    expect(refused(may_write(s, wc, wraps_with(cid, c.log, [a_wrap(b)]), twho(b)))).toBeTrue();
+    expect(may_write(s, wc, wraps_with(cid, c.log, [w1, a_wrap(b)]), twho(b))).toEqual("");
+    // the administrator: all of it
+    expect(may_write(s, "roster-" + k, roster_bytes(cid, a, []), twho(a))).toEqual("");
+    expect(may_write(s, "leave-" + k + "-" + hex_encode(c.log), [], twho(a))).toEqual("");
+    expect(may_write(s, wc, wraps_with(cid, c.log, [a_wrap(a)]), twho(a))).toEqual("");
+}
+
+Str b64url(List(Int) b) { return str_replace(str_replace(str_replace(base64_encode(b), "+", "-"), "/", "_"), "=", ""); }
+
+@requires(filesystem, network, clock(readonly), declassify)
+Int put_pending(Store s, Str org, Int i, Int n) {
+    if (i >= n) { return n; }
+    _ = st_text(s, "console/" + org + "/pend-" + hex_encode(random_bytes(16)), "c " + hex_encode(random_bytes(16)) + " " + hex_encode(random_bytes(65)) + f" relay.test {clock_now_seconds()}");
+    return put_pending(s, org, i + 1, n);
+}
+
+// R2R-6: anyone may make passkeys wait at the console, up to 32 a day; an
+// administrator clears them.
+@requires(filesystem, network, clock(readonly), declassify)
+test "an administrator clears the passkeys waiting at the console" {
+    Store s = tmp_store();
+    TDev o = tdev();
+    Str org = put_org(s, o, [], 0, [o.log]);
+    RelayCfg g = cfg_of(s, "https://relay.test:8443");
+    _ = put_pending(s, org, 0, 32);
+    List(Int) pt = [4].concat(random_bytes(64));
+    Str body = "{\"credentialId\":\"" + b64url(random_bytes(32)) + "\",\"publicKey\":\"" + b64url([48, 89].concat(pt)) + "\"}";
+    expect(relay_serve_handle(g, treq("POST", "/console/" + org + "/register", "", utf8(body))).status).toEqual(429);
+    expect(relay_serve_handle(g, treq("DELETE", "/console/" + org + "/pending", "", [])).status).toEqual(401);
+    expect(relay_serve_handle(g, treq("DELETE", "/console/" + org + "/pending", tsession(s, tdev(), 0), [])).status).toEqual(403);
+    expect(relay_serve_handle(g, treq("DELETE", "/console/" + org + "/pending", tsession(s, o, 0), [])).status).toEqual(200);
+    expect(relay_serve_handle(g, treq("POST", "/console/" + org + "/register", "", utf8(body))).status).toEqual(200);
+}
+
+// R2R-7: a write-once name is written once even when two writers both
+// passed may_write.
+@requires(filesystem, network, clock(readonly), declassify)
+test "governance versions, audit events, answers and requests are written once" {
+    Store s = tmp_store();
+    List(Str) names = ["orggov-" + hex_encode(random_bytes(16)) + "-1", "audit-x", "accept-x", "recreq-" + hex_encode(random_bytes(16)) + "-" + hex_encode(random_bytes(16))];
+    expect(stored_reply(s, names[0], [1]).status).toEqual(200);
+    expect(stored_reply(s, names[0], [2]).status).toEqual(409);
+    expect(st_bytes(s, "blob/" + names[0])).toEqual([1]);
+    expect(stored_reply(s, names[1], [1]).status).toEqual(200);
+    expect(stored_reply(s, names[1], [2]).status).toEqual(409);
+    expect(st_bytes(s, "blob/" + names[1])).toEqual([1]);
+    expect(stored_reply(s, names[2], [1]).status).toEqual(200);
+    expect(stored_reply(s, names[2], [2]).status).toEqual(409);
+    expect(stored_reply(s, names[3], [1]).status).toEqual(200);
+    expect(stored_reply(s, names[3], [2]).status).toEqual(409);
+    expect(st_bytes(s, "blob/" + names[3])).toEqual([1]);
+    // cleared (an empty body, where may_write allows it): written again
+    expect(stored_reply(s, names[3], []).status).toEqual(200);
+    expect(absent(s, "blob/" + names[3])).toBeTrue();
+    expect(stored_reply(s, names[3], [3]).status).toEqual(200);
+    expect(st_bytes(s, "blob/" + names[3])).toEqual([3]);
+}
+
+// R2R-8: a directory store: a deleted name can be written once again; a
+// claim left by a writer that died long ago does not hold the name.
+@requires(filesystem, network, clock(readonly), declassify)
+test "a directory store frees a name on delete and after a stale claim" {
+    Store s = tmp_store();
+    expect(st_put_new(s, "log/cd/0", [1])).toEqual(1);
+    expect(st_delete(s, "log/cd/0")).toBeTrue();
+    expect(filesystem.exists(dir_of(s) + "/log/cd/.0.claim")).toBeFalse();
+    expect(st_put_new(s, "log/cd/0", [2])).toEqual(1);
+    expect(st_bytes(s, "log/cd/0")).toEqual([2]);
+    // a claim from long ago with nothing beside it
+    _ = filesystem.write_bytes(dir_of(s) + "/log/cd/.1.claim", utf8("1000"));
+    expect(st_put_new(s, "log/cd/1", [3])).toEqual(1);
+    expect(st_bytes(s, "log/cd/1")).toEqual([3]);
+    // a claim from now still holds it
+    _ = filesystem.write_bytes(dir_of(s) + "/log/cd/.2.claim", utf8(f"{clock_now_seconds()}"));
+    expect(st_put_new(s, "log/cd/2", [4])).toEqual(0);
+    // st_put replaces whole
+    expect(st_put(s, "blob/x", [5, 6])).toBeTrue();
+    expect(st_put(s, "blob/x", [7])).toBeTrue();
+    expect(st_bytes(s, "blob/x")).toEqual([7]);
+    expect(st_list(s, "blob/", "", 10)).toEqual(["blob/x"]);
+}
+
+// R2R-9: a relay is not started unbound to its name by mistake.
+test "a relay needs its names unless it is told to take any" {
+    expect(str_len(relay_names_problem("", "", false)) > 0).toBeTrue();
+    expect(relay_names_problem("relay.example:443", "", false)).toEqual("");
+    expect(relay_names_problem("", "https://relay.example:8443", false)).toEqual("");
+    expect(relay_names_problem("", "", true)).toEqual("");
+}
+
+// A fake S3 that says 200 to everything (If-None-Match ignored) until it
+// is asked for /stop.
+HttpTurn(Int, Int) fake_s3(Int n, HttpRequest r) {
+    return HttpTurn { .state = if (r.path == "/stop") { -1 } else { n + 1 }, .out = Whole(http_reply_text(200, "application/xml", "<ListBucketResult></ListBucketResult>")) };
+}
+
+HttpStep(Int) fake_tick(Int a, Int k) { return http_step_end(k, []); }
+
+@requires(network)
+Int stop_fake(Int port) {
+    Int fd = resid_tcp_connect("127.0.0.1", port);
+    _ = resid_tcp_send(fd, "GET /stop HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    Str all = resid_tcp_recv_all(fd);
+    _ = resid_tcp_close(fd);
+    return str_len(all);
+}
+
+// R2R-10: an S3 store that does not refuse a second write of a key with
+// If-None-Match: * is not used.
+@requires(filesystem, network, clock(readonly), declassify)
+test "a relay refuses an S3 store that does not keep objects write-once" {
+    Int lfd = http_listen_at("127.0.0.1", 0);
+    Int port = http_bound_port(lfd);
+    HttpLimits lim = HttpLimits { .head_max = 8192, .body_max = 65536, .requests_max = 100, .request_ms = 5000, .reply_ms = 5000, .open_max = 64 };
+    HttpTurn(Int, Int) closure(Int, HttpRequest) h = lambda(a, r) { fake_s3(a, r) };
+    HttpStep(Int) closure(Int, Int) t = lambda(a, k) { fake_tick(a, k) };
+    Bool closure(Int) keep = lambda(a) { a >= 0 };
+    Result(HttpLoopEnd(Int), RegionError) srv = spawn (network(readonly)) {
+        return http_state_loop_until(lfd, 0, h, t, keep, lim, 0);
+    };
+    S3Cfg c = S3Cfg {.host = "127.0.0.1", .port = port, .ca = "", .bucket = "b", .region = "us-east-1", .key_id = "k", .secret = "s"};
+    Str why = store_prepare(S3(c));
+    Int stopped = stop_fake(port);
+    HttpLoopEnd(Int) end = srv else { HttpLoopEnd { .accepted = -1, .state = -1 } };
+    _ = resid_tcp_close(lfd);
+    expect(why).toEqual("the bucket does not refuse a second write of an object with If-None-Match: * (write-once objects would not be)");
+    expect(stopped >= 0).toBeTrue();
+    expect(end.state).toEqual(-1);
+}
+
+HttpRequest creq(Str path, Str cookie) {
+    Map(Str, Str) none = {};
+    return HttpRequest { .method = "GET", .target = path, .path = path, .query = "", .version = "HTTP/1.1", .headers = none.insert("cookie", cookie), .body = [], .keep_alive = false, .ok = true, .status = 0 };
+}
+
+// R2R-11: a console session lasts while the passkey it was opened with is
+// approved, and is found only under its own cookie name.
+@requires(filesystem, network, clock(readonly), declassify)
+test "withdrawing a console passkey ends its sessions" {
+    Store s = tmp_store();
+    TDev o = tdev();
+    Str org = put_org(s, o, [], 0, [o.log]);
+    RelayCfg g = cfg_of(s, "https://relay.test:8443");
+    List(Int) cred = random_bytes(32);
+    OrgConsoleKey k = OrgConsoleKey {.org_id = cose_hex_decode(org), .cred_id = cred, .public_key = lpub(2), .rp_id = "relay.test", .log_id = o.log, .log_sequence = (UInt(64))0, .signer = o.party, .sig = []};
+    _ = st_put(s, "blob/" + conkey_blob(cose_hex_decode(org), cred), cb(to_cbor(k)));
+    Str t = hex_encode(random_bytes(32));
+    _ = st_text(s, "auth/con-" + hex_encode(sha256_bytes(utf8(t))), org + " " + hex_encode(o.log) + f" {clock_now_seconds() + 3600} " + hex_encode(cred));
+    expect(relay_serve_handle(g, creq("/console/" + org + "/state", "a=1; symcon=" + t)).status).toEqual(200);
+    // a cookie of another name that ends in "symcon"
+    expect(relay_serve_handle(g, creq("/console/" + org + "/state", "xsymcon=" + t)).status).toEqual(401);
+    // the passkey withdrawn (as conkey_write allows an administrator)
+    _ = st_put(s, "blob/" + conkey_blob(cose_hex_decode(org), cred), []);
+    expect(relay_serve_handle(g, creq("/console/" + org + "/state", "symcon=" + t)).status).toEqual(401);
 }

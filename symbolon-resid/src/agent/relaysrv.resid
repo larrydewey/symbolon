@@ -72,6 +72,17 @@ List(Str) nonblank(List(Str) xs, Int i, ListBuf(Str) acc) {
     return nonblank(xs, i + 1, if (str_len(t) > 0) { acc.push(t) } else { acc });
 }
 
+// Why a relay may not start with these names; "" when it may. With no
+// --name and no console origin, a device's sign-in would not be bound to
+// this relay (a relay it signs in to could pass its challenge on and sign
+// in elsewhere as it): only --insecure-any-name, said in so many words,
+// starts such a relay.
+pub Str relay_names_problem(Str names, Str console, Bool any_name) {
+    if (any_name) { return ""; }
+    Str probe = str_trim(names) + str_trim(console);
+    return if (str_len(probe) == 0) { "no --name HOST:PORT[,...]: give the names devices reach this relay at (or --insecure-any-name to take any)" } else { "" };
+}
+
 // Whether a device may sign `name` in to this relay.
 pub Bool name_ok(RelayCfg g, Str name) {
     List(Str) ns = relay_names(g);
@@ -149,16 +160,22 @@ pub Who who_of(RelayCfg g, Store root, HttpRequest r) {
 }
 
 // The log again, verified: the token's device still a device of it with
-// the same key; the token then names the log's new length.
+// the same key; the token then names the log's new length, so the log is
+// not verified again until it grows. When the verified log says the party
+// is no longer that device (removed, or another key), the token is
+// deleted: it is never good again, and a removed device's requests cost
+// no further verification. A log that does not verify (or is not there:
+// a store that does not answer) only refuses this request.
 @requires(filesystem, network, clock(readonly), declassify)
 Who still_device(RelayCfg g, Store root, Str k, Who w, Str until) {
     List(SignedEvent) evs = log_dir(root, w.log, (UInt(64))0, []);
     Result(VerifiedHead, SymbolonError) rv = verified_events(w.log, evs, g.ca, "");
-    Bool ok = match rv {
-        Err(_) => false,
-        Ok(vh) => match device_party(vh.head.quorum.parties, w.party, 0) { None => false, Some(d) => bytes_eq(d.auth_key, w.key) }
+    Int verdict = match rv {
+        Err(_) => 0,
+        Ok(vh) => match device_party(vh.head.quorum.parties, w.party, 0) { None => -1, Some(d) => if (bytes_eq(d.auth_key, w.key)) { 1 } else { -1 } }
     };
-    if (!ok) { return nobody(); }
+    if (verdict < 0) { _ = st_delete(root, k); }
+    if (verdict <= 0) { return nobody(); }
     _ = st_text(root, k, hex_encode(w.log) + " " + hex_encode(w.party) + " " + hex_encode(w.key) + " " + until + f" {evs.len()}");
     return w;
 }
@@ -226,6 +243,13 @@ HttpReply challenge(Store root) {
     return if (c.len() == 32) { http_reply_text(200, "text/plain", hex_encode(c)) } else { http_reply_status(500) };
 }
 
+// A sign-in costs the relay no outbound connection until it is known to be
+// a device's: the stored log is verified offline first, at its own last
+// witness time, to find the device's key; the signature is checked and the
+// challenge spent; only then are the log's witnesses asked the time and the
+// log verified at it (a removal that has taken effect since then counts).
+// A failed attempt never makes the relay connect to the witness URLs a log
+// names, and each challenge buys at most one such round.
 @requires(filesystem, network, clock(readonly), declassify)
 HttpReply sign_in(RelayCfg g, Store root, HttpRequest r) {
     List(Str) p = str_split(str_trim(http_body_text(r)), " ");
@@ -234,20 +258,35 @@ HttpReply sign_in(RelayCfg g, Store root, HttpRequest r) {
     if (!challenge_good(challenge_key(root), "relay", cose_hex_decode(p[0]), clock_now_seconds())) { return http_reply_status(403); }
     List(Int) l = cose_hex_decode(p[1]);
     List(SignedEvent) evs = log_dir(root, l, (UInt(64))0, []);
-    Result(VerifiedHead, SymbolonError) rv = verified_events(l, evs, g.ca, "");
-    return match rv {
+    if (evs.len() == 0) { return http_reply_status(403); }
+    Int t = last_time(evs, policy_of_e0(evs));
+    Result(VerifiedHead, SymbolonError) v0 = il_verify(l, evs, t, lambda(x) { false });
+    return match v0 {
         Err(_) => http_reply_status(403),
-        Ok(vh) => signed_in(root, vh, l, evs.len(), cose_hex_decode(p[2]), str_to_lower(p[4]), cose_hex_decode(p[0]), cose_hex_decode(p[3]))
+        Ok(vh) => signed_in(g, root, vh, l, evs, t, cose_hex_decode(p[2]), str_to_lower(p[4]), cose_hex_decode(p[0]), cose_hex_decode(p[3]))
     };
 }
 
 @requires(filesystem, network, clock(readonly), declassify)
-HttpReply signed_in(Store root, VerifiedHead vh, List(Int) l, Int len, List(Int) party, Str name, List(Int) chal, List(Int) sig) {
+HttpReply signed_in(RelayCfg g, Store root, VerifiedHead vh, List(Int) l, List(SignedEvent) evs, Int t, List(Int) party, Str name, List(Int) chal, List(Int) sig) {
     Option(Party) d = device_party(vh.head.quorum.parties, party, 0);
     return match d {
         None => http_reply_status(403),
-        Some(x) => if (ecdsa_verify_raw(P256, Sha256, x.auth_key, auth_message(name, chal), sig) && challenge_spend(root, "relay", chal)) { issue(root, l, x, len) } else { http_reply_status(403) }
+        Some(x) => if (ecdsa_verify_raw(P256, Sha256, x.auth_key, auth_message(name, chal), sig) && challenge_spend(root, "relay", chal)) { witnessed(g, root, vh, l, evs, t, x) } else { http_reply_status(403) }
     };
+}
+
+// The log verified at the witnesses' time now: the device still one of
+// its devices, with the same key.
+@requires(filesystem, network, clock(readonly), declassify)
+HttpReply witnessed(RelayCfg g, Store root, VerifiedHead vh, List(Int) l, List(SignedEvent) evs, Int t, Party x) {
+    Int now = witness_now(witnesses_at(vh.head.policy.witnesses, ""), g.ca, random_bytes(32));
+    Result(VerifiedHead, SymbolonError) rv = il_verify(l, evs, if (now > t) { now } else { t }, lambda(y) { false });
+    Bool still = match rv {
+        Err(_) => false,
+        Ok(vh2) => match device_party(vh2.head.quorum.parties, x.id, 0) { None => false, Some(y) => bytes_eq(y.auth_key, x.auth_key) }
+    };
+    return if (still) { issue(root, l, x, evs.len()) } else { http_reply_status(403) };
 }
 
 @requires(filesystem, network, clock(readonly), declassify)
@@ -309,10 +348,27 @@ pub List(SignedEvent) log_dir(Store root, List(Int) l, UInt(64) seq, List(Signed
 @requires(filesystem, network, clock(readonly), declassify)
 List(Int) stored(Store root, Str name) { return st_bytes(root, "blob/" + name); }
 
-// The number of governance versions stored for `id` (hex).
+// The number of governance versions stored for `id` (hex), from at least
+// `n`. Versions are written once and in order, so the relay keeps a
+// pointer to the latest, "orggovhead/<id>", moved when a version is stored:
+// counting reads the pointer's version and the one after it (a pointer
+// one behind, from two relays storing at once, is walked on and moved),
+// not every version from the first. With no pointer (versions stored
+// before it), or one naming a version not there, the versions are counted
+// from `n` and the pointer written.
 @requires(filesystem, network, clock(readonly), declassify)
 pub Int gov_count(Store root, Str id, Int n) {
-    return if (stored(root, "orggov-" + id + "-" + f"{n + 1}").len() > 0) { gov_count(root, id, n + 1) } else { n };
+    Str h = str_trim(st_read_text(root, "orggovhead/" + id));
+    Int at = if (dec_ok(h, 0)) { str_parse_int(h) } else { 0 };
+    Bool good = at > n && stored(root, "orggov-" + id + "-" + f"{at}").len() > 0;
+    Int c = gov_walk(root, id, if (good) { at } else { n });
+    if (c != at && c > 0) { _ = st_text(root, "orggovhead/" + id, f"{c}"); }
+    return c;
+}
+
+@requires(filesystem, network, clock(readonly), declassify)
+Int gov_walk(Store root, Str id, Int n) {
+    return if (stored(root, "orggov-" + id + "-" + f"{n + 1}").len() > 0) { gov_walk(root, id, n + 1) } else { n };
 }
 
 @requires(filesystem, network, clock(readonly), declassify)
@@ -324,17 +380,101 @@ pub Option(OrgState) relay_org(Store root, Str id) {
     return match g { None => None, Some(gv) => match o { None => None, Some(ov) => Some(OrgState {.gov = gv, .org = ov}) } };
 }
 
+// ─── What one request has read of an organization ───────────────
+// A listing asks may_read of up to list_scan() pages of names, most of
+// them about the same few organizations and folders; each organization's
+// state (its governance head, membership record, the caller's suspension,
+// its directory) and each group folder record is read once per request
+// and kept here, not once per name.
+
+// The caller `w` in organization `id`: its state, whether `w` is a member
+// not suspended there, and an owner or administrator (attested where the
+// policy asks); the directory's groups and users once a folder needed them.
+pub type OrgSeen = { Str id; Option(OrgState) st; Bool member; Bool admin; Bool dirs; List(DirGroup) dgs; List(DirUser) us; };
+pub type FolderSeen = { Str cid; Option(GroupFolder) f; Bool any; };
+pub type Seen = { List(OrgSeen) orgs; List(FolderSeen) folders; };
+
+pub Seen seen_none() { return Seen {.orgs = [], .folders = []}; }
+
+type SeenOrg = { OrgSeen o; Seen s; };
+type SeenFolder = { FolderSeen f; Seen s; };
+type ReadOk = { Bool ok; Seen s; };
+
 @requires(filesystem, network, clock(readonly), declassify)
-Bool in_org(Store root, Str id, Who w) {
-    if (!w.on || !hex_len(id, 32)) { return false; }
-    return match relay_org(root, id) { None => false, Some(st) => member_index(st.org.members, w.log, 0) >= 0 && !suspended_in(root, id, w.log) };
+OrgSeen org_seen_new(Store root, Str id, Who w) {
+    if (!w.on || !hex_len(id, 32)) { return OrgSeen {.id = id, .st = None, .member = false, .admin = false, .dirs = false, .dgs = [], .us = []}; }
+    Option(OrgState) ost = relay_org(root, id);
+    Bool m = match ost { None => false, Some(st) => member_index(st.org.members, w.log, 0) >= 0 };
+    Bool member = m && !suspended_in(root, id, w.log);
+    Bool admin = member && match ost { None => false, Some(st) => is_admin(st.gov, w.log) && att_ok(st, w) };
+    return OrgSeen {.id = id, .st = ost, .member = member, .admin = admin, .dirs = false, .dgs = [], .us = []};
+}
+
+Option(OrgSeen) org_seen_at(List(OrgSeen) os, Str id, Int i) {
+    if (i >= os.len()) { return None; }
+    return if (os[i].id == id) { Some(os[i]) } else { org_seen_at(os, id, i + 1) };
 }
 
 @requires(filesystem, network, clock(readonly), declassify)
-Bool admin_of(Store root, Str id, Who w) {
-    if (!w.on || !hex_len(id, 32)) { return false; }
-    return match relay_org(root, id) { None => false, Some(st) => member_index(st.org.members, w.log, 0) >= 0 && is_admin(st.gov, w.log) && att_ok(st, w) && !suspended_in(root, id, w.log) };
+SeenOrg org_seen(Store root, Str id, Who w, Seen s) {
+    // Nobody is in no organization: nothing read, nothing to keep.
+    if (!w.on) { return SeenOrg {.o = org_seen_new(root, id, w), .s = s}; }
+    Option(OrgSeen) got = org_seen_at(s.orgs, id, 0);
+    return match got {
+        Some(o) => SeenOrg {.o = o, .s = s},
+        None => seen_org_kept(org_seen_new(root, id, w), s)
+    };
 }
+
+// At most the last 64 organizations are kept, so a listing of names of many
+// organizations costs a bounded search per name (and reads one again).
+SeenOrg seen_org_kept(OrgSeen o, Seen s) {
+    List(OrgSeen) keep = if (s.orgs.len() >= 64) { s.orgs[1..s.orgs.len()] } else { s.orgs };
+    return SeenOrg {.o = o, .s = Seen {.orgs = keep.concat([o]), .folders = s.folders}};
+}
+
+// The same, with the directory read (once) when the organization has one.
+@requires(filesystem, network, clock(readonly), declassify)
+SeenOrg org_seen_dirs(Store root, Str id, Who w, Seen s) {
+    SeenOrg so = org_seen(root, id, w, s);
+    if (so.o.dirs || !so.o.member || !scim_on(root, id)) { return so; }
+    OrgSeen o = OrgSeen {.id = so.o.id, .st = so.o.st, .member = so.o.member, .admin = so.o.admin, .dirs = true, .dgs = all_groups(root, id), .us = all_users(root, id)};
+    return SeenOrg {.o = o, .s = Seen {.orgs = org_seen_put(so.s.orgs, o, 0, ListBuf()), .folders = so.s.folders}};
+}
+
+List(OrgSeen) org_seen_put(List(OrgSeen) os, OrgSeen o, Int i, ListBuf(OrgSeen) acc) {
+    if (i >= os.len()) { return acc.finish(); }
+    return org_seen_put(os, o, i + 1, acc.push(if (os[i].id == o.id) { o } else { os[i] }));
+}
+
+Option(FolderSeen) folder_seen_at(List(FolderSeen) fs, Str cid, Int i) {
+    if (i >= fs.len()) { return None; }
+    return if (fs[i].cid == cid) { Some(fs[i]) } else { folder_seen_at(fs, cid, i + 1) };
+}
+
+// The group folder record of `cid`, if any (`any`: something is stored
+// under the name, whether or not it decodes).
+@requires(filesystem, network, clock(readonly), declassify)
+SeenFolder folder_seen(Store root, Str cid, Seen s) {
+    Option(FolderSeen) got = folder_seen_at(s.folders, cid, 0);
+    return match got {
+        Some(f) => SeenFolder {.f = f, .s = s},
+        None => folder_seen_kept(root, cid, stored(root, "gfolder-" + cid), s)
+    };
+}
+
+// At most the last 64 folders are kept, as organizations above.
+SeenFolder folder_seen_kept(Store root, Str cid, List(Int) b, Seen s) {
+    FolderSeen f = FolderSeen {.cid = cid, .f = gfolder_of(b), .any = b.len() > 0};
+    List(FolderSeen) keep = if (s.folders.len() >= 64) { s.folders[1..s.folders.len()] } else { s.folders };
+    return SeenFolder {.f = f, .s = Seen {.orgs = s.orgs, .folders = keep.concat([f])}};
+}
+
+@requires(filesystem, network, clock(readonly), declassify)
+Bool in_org(Store root, Str id, Who w) { return org_seen_new(root, id, w).member; }
+
+@requires(filesystem, network, clock(readonly), declassify)
+Bool admin_of(Store root, Str id, Who w) { return org_seen_new(root, id, w).admin; }
 
 // The org id in "audit-<org>-...", "invite-<org>-...", "accept-<org>-...".
 Str org_part(Str name, Int at) { return if (str_len(name) >= at + 32) { str_slice(name, at, at + 32) } else { "" }; }
@@ -354,14 +494,24 @@ pub Str folder_of(Str n) {
 // that is not a group folder (a household's shared folders keep the
 // plain relay's rules: their records are signed, their items sealed).
 @requires(filesystem, network, clock(readonly), declassify)
-Bool folder_person(Store root, Str cid, Who w) {
-    List(Int) b = stored(root, "gfolder-" + cid);
-    if (b.len() == 0) { return true; }
-    if (!w.on) { return false; }
-    return match gfolder_of(b) {
-        None => false,
-        Some(f) => match relay_org(root, hex_encode(f.org_id)) { None => false, Some(st) => person_in(folder_people(st, f.groups), w.log, 0) && directory_allows(root, st, f.groups, w.log) && att_ok(st, w) && !suspended_in(root, hex_encode(f.org_id), w.log) }
+Bool folder_person(Store root, Str cid, Who w) { return folder_person_in(root, cid, w, seen_none()).ok; }
+
+@requires(filesystem, network, clock(readonly), declassify)
+ReadOk folder_person_in(Store root, Str cid, Who w, Seen s0) {
+    SeenFolder sf = folder_seen(root, cid, s0);
+    if (!sf.f.any) { return ReadOk {.ok = true, .s = sf.s}; }
+    if (!w.on) { return ReadOk {.ok = false, .s = sf.s}; }
+    Option(GroupFolder) of = sf.f.f;
+    return match of {
+        None => ReadOk {.ok = false, .s = sf.s},
+        Some(f) => group_person(root, f, w, org_seen_dirs(root, hex_encode(f.org_id), w, sf.s))
     };
+}
+
+ReadOk group_person(Store root, GroupFolder f, Who w, SeenOrg so) {
+    Option(OrgState) ost = so.o.st;
+    Bool ok = so.o.member && match ost { None => false, Some(st) => person_in(folder_people(st, f.groups), w.log, 0) && directory_allows(so.o, st, f.groups, w.log) && att_ok(st, w) };
+    return ReadOk {.ok = ok, .s = so.s};
 }
 
 // The company directory can only take away (SPEC 29.7): an owner or
@@ -369,13 +519,11 @@ Bool folder_person(Store root, Str cid, Who w) {
 // that the directory does not contradict: a directory group of the same
 // name that does not list them takes that group away at once, before an
 // administrator's device signs the change.
-@requires(filesystem, network, clock(readonly), declassify)
-Bool directory_allows(Store root, OrgState st, List(List(Int)) gids, List(Int) l) {
-    Str org = hex_encode(st.org.org_id);
-    if (is_admin(st.gov, l) || !scim_on(root, org)) { return true; }
+Bool directory_allows(OrgSeen o, OrgState st, List(List(Int)) gids, List(Int) l) {
+    if (is_admin(st.gov, l) || !o.dirs) { return true; }
     Int mi = member_index(st.org.members, l, 0);
     if (mi < 0) { return false; }
-    return any_group_ok(st.org.groups, gids, l, st.org.members[mi].ext_id, all_groups(root, org), all_users(root, org), 0);
+    return any_group_ok(st.org.groups, gids, l, st.org.members[mi].ext_id, o.dgs, o.us, 0);
 }
 
 Bool any_group_ok(List(OrgGroup) gs, List(List(Int)) gids, List(Int) l, Str ext, List(DirGroup) dgs, List(DirUser) us, Int i) {
@@ -402,29 +550,39 @@ Bool person_in(List(Member) ms, List(Int) l, Int i) {
 }
 
 @requires(filesystem, network, clock(readonly), declassify)
-pub Bool may_read(Store root, Str name, Who w) {
-    if (str_starts_with(name, "orggov-")) { return w.on; }
-    if (str_starts_with(name, "org-")) { return in_org(root, str_slice(name, 4, str_len(name)), w); }
-    if (str_starts_with(name, "audit-")) { return admin_of(root, org_part(name, 6), w); }
-    if (str_starts_with(name, "escrow-")) { return escrow_read(root, name, w); }
-    if (str_starts_with(name, "conkey-")) { return admin_of(root, org_part(name, 7), w); }
-    if (str_starts_with(name, "attev-") || str_starts_with(name, "attresp-") || str_starts_with(name, "attchal-")) { return in_org(root, org_part(name, str_index_of(name, "-", 0) + 1), w); }
-    if (str_starts_with(name, "recreq-")) { return in_org(root, org_part(name, 7), w); }
-    if (str_starts_with(name, "recat-")) { return in_org(root, org_part(name, 6), w); }
-    if (str_starts_with(name, "invite-") || str_starts_with(name, "accept-")) { return admin_of(root, org_part(name, 7), w); }
+pub Bool may_read(Store root, Str name, Who w) { return may_read_in(root, name, w, seen_none()).ok; }
+
+// may_read, with what this request has already read (`s`) and what it read now.
+@requires(filesystem, network, clock(readonly), declassify)
+ReadOk may_read_in(Store root, Str name, Who w, Seen s) {
+    if (str_starts_with(name, "orggov-")) { return ReadOk {.ok = w.on, .s = s}; }
+    if (str_starts_with(name, "org-")) { return member_read(org_seen(root, str_slice(name, 4, str_len(name)), w, s)); }
+    if (str_starts_with(name, "audit-")) { return admin_read(org_seen(root, org_part(name, 6), w, s)); }
+    if (str_starts_with(name, "escrow-")) { return escrow_read_in(root, name, w, org_seen(root, org_part(name, 7), w, s)); }
+    if (str_starts_with(name, "conkey-")) { return admin_read(org_seen(root, org_part(name, 7), w, s)); }
+    if (str_starts_with(name, "attev-") || str_starts_with(name, "attresp-") || str_starts_with(name, "attchal-")) { return member_read(org_seen(root, org_part(name, str_index_of(name, "-", 0) + 1), w, s)); }
+    if (str_starts_with(name, "recreq-")) { return member_read(org_seen(root, org_part(name, 7), w, s)); }
+    if (str_starts_with(name, "recat-")) { return member_read(org_seen(root, org_part(name, 6), w, s)); }
+    if (str_starts_with(name, "invite-") || str_starts_with(name, "accept-")) { return admin_read(org_seen(root, org_part(name, 7), w, s)); }
     if (str_starts_with(name, "gfolder-")) {
-        return match gfolder_of(stored(root, name)) { None => w.on, Some(f) => in_org(root, hex_encode(f.org_id), w) };
+        SeenFolder sf = folder_seen(root, str_slice(name, 8, str_len(name)), s);
+        Option(GroupFolder) of = sf.f.f;
+        return match of { None => ReadOk {.ok = w.on, .s = sf.s}, Some(f) => member_read(org_seen(root, hex_encode(f.org_id), w, sf.s)) };
     }
     Str cid = folder_of(name);
-    return str_len(cid) == 0 || folder_person(root, cid, w);
+    return if (str_len(cid) == 0) { ReadOk {.ok = true, .s = s} } else { folder_person_in(root, cid, w, s) };
 }
+
+ReadOk member_read(SeenOrg so) { return ReadOk {.ok = so.o.member, .s = so.s}; }
+ReadOk admin_read(SeenOrg so) { return ReadOk {.ok = so.o.admin, .s = so.s}; }
 
 // Why `w` may not store `body` as `name`; "" when it may.
 @requires(filesystem, network, clock(readonly), declassify)
 pub Str may_write(Store root, Str name, List(Int) body, Who w) {
     // A cosigner's sealed alert for its person: the cosigner has no
-    // sign-in, so an alert is written once, never replaced (handle).
-    if (str_starts_with(name, "alrt-")) { return alert_write(name, body); }
+    // sign-in, so an alert is written once, never replaced (handle); a
+    // device of that person's log removes it (an empty body).
+    if (str_starts_with(name, "alrt-")) { return alert_write(root, name, body, w); }
     if (!w.on) { return "sign in first"; }
     if (str_starts_with(name, "recat-")) { return "only the relay writes when it took a request"; }
     if (str_starts_with(name, "orggov-")) { return gov_write(root, name, body, w); }
@@ -458,13 +616,26 @@ pub Str log_named(Str n) {
 
 pub Int max_alert() { return 65536; }
 
+pub Str alerts_full() { return "too many alerts wait for this person"; }
+
+// At most this many alerts wait for one log at once.
+pub Int max_alerts() { return 64; }
+
 // "alrt-<log>-<time>-<8 hex>": an alert a cosigner sealed (HPKE mode_auth
 // from its key, which the person's devices check) to its person's alert
-// keys.
-pub Str alert_write(Str name, List(Int) body) {
+// keys. The relay cannot tell a cosigner's alert from anyone else's: HPKE
+// mode_auth is checked only by the recipient, and a cosigner has no
+// sign-in or key the relay could check a signature with; so what anyone
+// can make it keep for one log is bounded: max_alerts() of max_alert()
+// bytes. A cosigner keeps an alert the relay refuses and sends it again
+// later; the person's devices remove what they have read.
+@requires(filesystem, network, clock(readonly), declassify)
+pub Str alert_write(Store root, Str name, List(Int) body, Who w) {
     List(Str) p = str_split(name, "-");
     if (p.len() != 4 || !hex_len(p[1], 64) || !dec_ok(p[2], 0) || !hex_len(p[3], 8)) { return "not an alert's name"; }
-    if (body.len() == 0 || body.len() > max_alert()) { return "an alert is 1 to 65536 bytes"; }
+    if (body.len() == 0) { return if (w.on && p[1] == hex_encode(w.log)) { "" } else { "only a device of that log removes its alerts" }; }
+    if (body.len() > max_alert()) { return "an alert is 1 to 65536 bytes"; }
+    if (st_list(root, "blob/alrt-" + p[1] + "-", "", max_alerts()).len() >= max_alerts()) { return alerts_full(); }
     return "";
 }
 
@@ -476,9 +647,18 @@ pub Str alert_write(Str name, List(Int) body) {
 // people). Wraps for an id with no roster yet (a folder being made, a
 // recovery share) are their writer's: only the device's log that wrote
 // them first replaces them.
+//
+// "wrap-<log>-<cid>" holds the folder key wrapped to the devices of <log>:
+// the owner (an owner or administrator, in a group folder) writes anyone's,
+// a person their own; another of the folder's people only adds to what is
+// stored for that person at the same roster version (a wrap for a device
+// they added since, SPEC 19), never takes a wrap away or replaces one, so
+// no one in a folder locks another out of it. In a group folder the roster
+// is written only by an owner or administrator, and a word that someone
+// left only by them or by an owner or administrator.
 @requires(filesystem, network, clock(readonly), declassify)
 Str folder_write(Store root, Str name, Str cid, List(Int) body, Who w) {
-    if (stored(root, "gfolder-" + cid).len() > 0) { return if (folder_person(root, cid, w)) { "" } else { "not one of the group folder's people" }; }
+    if (stored(root, "gfolder-" + cid).len() > 0) { return group_write(root, name, cid, body, w); }
     Option(Roster) ro = relay_roster_of(stored(root, "roster-" + cid));
     if (str_starts_with(name, "roster-")) {
         return match relay_roster_of(body) {
@@ -493,9 +673,53 @@ Str folder_write(Store root, Str name, Str cid, List(Int) body, Who w) {
         return if (who == hex_encode(w.log) || (body.len() == 0 && owner)) { "" } else { "only the member, or the owner clearing it, writes that" };
     }
     return match ro {
-        Some(r) => if (bytes_eq(r.owner, w.log) || member_of(r.members, w.log, 0)) { "" } else { "not one of the folder's people" },
+        Some(r) => if (bytes_eq(r.owner, w.log)) { "" } else { if (member_of(r.members, w.log, 0)) { wrap_by_person(root, name, body, w) } else { "not one of the folder's people" } },
         None => if (str_starts_with(name, "wrap-")) { first_wrapper(stored(root, name), body, w) } else { "no such folder" }
     };
+}
+
+// A group folder: its people write its items; see folder_write for the rest.
+@requires(filesystem, network, clock(readonly), declassify)
+Str group_write(Store root, Str name, Str cid, List(Int) body, Who w) {
+    if (!folder_person(root, cid, w)) { return "not one of the group folder's people"; }
+    Bool admin = match gfolder_of(stored(root, "gfolder-" + cid)) { None => false, Some(f) => admin_of(root, hex_encode(f.org_id), w) };
+    if (admin) { return ""; }
+    if (str_starts_with(name, "roster-")) { return "only an owner or administrator writes a group folder's roster"; }
+    if (str_starts_with(name, "leave-")) { return if (str_slice(name, 39, 103) == hex_encode(w.log)) { "" } else { "only the person, or an owner or administrator, writes that" }; }
+    return wrap_by_person(root, name, body, w);
+}
+
+// One of a folder's people, not its owner (or an administrator): items, and
+// wraps as folder_write says.
+@requires(filesystem, network, clock(readonly), declassify)
+Str wrap_by_person(Store root, Str name, List(Int) body, Who w) {
+    if (!str_starts_with(name, "wrap-")) { return ""; }
+    Str to = str_slice(name, 5, 69);
+    if (to == hex_encode(w.log)) { return ""; }
+    return if (wraps_added(relay_wraps_of(stored(root, name)), relay_wraps_of(body), to)) { "" } else { "only the owner replaces another person's wraps; others only add to them" };
+}
+
+// `next` keeps every wrap of `prev`, for the same person and roster version.
+Bool wraps_added(Option(WrapSet) prev, Option(WrapSet) next, Str to) {
+    return match prev {
+        None => false,
+        Some(p) => match next {
+            None => false,
+            Some(n) => hex_encode(n.member) == to && bytes_eq(n.member, p.member) && bytes_eq(n.coll_id, p.coll_id) && n.roster_version == p.roster_version && keeps_all(p.wraps, n.wraps, 0)
+        }
+    };
+}
+
+Bool keeps_all(List(ShareWrap) old, List(ShareWrap) now, Int i) {
+    if (i >= old.len()) { return true; }
+    return has_wrap(now, old[i], 0) && keeps_all(old, now, i + 1);
+}
+
+Bool has_wrap(List(ShareWrap) ws, ShareWrap x, Int i) {
+    if (i >= ws.len()) { return false; }
+    ShareWrap y = ws[i];
+    Bool same = bytes_eq(y.to, x.to) && bytes_eq(y.from_log, x.from_log) && bytes_eq(y.from_party, x.from_party) && bytes_eq(y.enc, x.enc) && bytes_eq(y.ct, x.ct);
+    return same || has_wrap(ws, x, i + 1);
 }
 
 Bool member_of(List(Member) ms, List(Int) l, Int i) { return i < ms.len() && (bytes_eq(ms[i].log_id, l) || member_of(ms, l, i + 1)); }
@@ -580,14 +804,17 @@ Str gfolder_ok(Store root, Str name, GroupFolder f, Who w) {
 
 // A folder id someone else's household folder already has is not taken
 // for a group folder (that would turn its people out): the first record
-// of an id wins. A roster of the signer or of a member of the
-// organization is the organization's own.
+// of an id wins. Only a roster whose owner signed the group folder record
+// becomes a group folder: being listed as a member of an organization is
+// no consent (anyone founding an organization may list anyone), so a
+// member's household folder is never taken by an administrator. Items
+// with no roster are someone's too: refused.
 @requires(filesystem, network, clock(readonly), declassify)
 Str unclaimed(Store root, Str cid, GroupFolder f) {
     Option(Roster) ro = relay_roster_of(stored(root, "roster-" + cid));
     Bool ours = match ro {
         None => stored(root, "coll-" + cid).len() == 0,
-        Some(r) => bytes_eq(r.owner, f.signer_log) || match relay_org(root, hex_encode(f.org_id)) { None => false, Some(st) => member_index(st.org.members, r.owner, 0) >= 0 }
+        Some(r) => bytes_eq(r.owner, f.signer_log)
     };
     return if (ours) { "" } else { "a folder of this id is someone else's" };
 }
@@ -629,15 +856,19 @@ Bool code_ok(Store root, OrgAccept a) {
 // only with a request of their own whose delay has passed by this relay's
 // clock, a second line behind the approving devices' witness time (SPEC 29.8).
 @requires(filesystem, network, clock(readonly), declassify)
-Bool escrow_read(Store root, Str name, Who w) {
-    Str org = org_part(name, 7);
-    if (!in_org(root, org, w)) { return false; }
+ReadOk escrow_read_in(Store root, Str name, Who w, SeenOrg so) {
+    return ReadOk {.ok = so.o.member && escrow_open(root, name, w, so.o), .s = so.s};
+}
+
+@requires(filesystem, network, clock(readonly), declassify)
+Bool escrow_open(Store root, Str name, Who w, OrgSeen o) {
+    Str org = o.id;
+    Option(OrgState) ost = o.st;
     Option(OrgEscrow) oe = escrow_of(stored(root, name));
     if (match oe { None => true, Some(e) => bytes_eq(e.owner, w.log) }) { return true; }
     Str cid = str_slice(name, 40, str_len(name));
     List(Int) qb = stored(root, "recreq-" + str_slice(name, 7, str_len(name)));
     Option(OrgRecoveryRequest) oq = recreq_of(qb);
-    Option(OrgState) ost = relay_org(root, org);
     // The delay runs from when this relay took the request (it refuses one
     // whose own time is not now), never from the requester's word alone.
     Int got = received_at(root, cose_hex_decode(org), cid, qb);
@@ -645,7 +876,7 @@ Bool escrow_read(Store root, Str name, Who w) {
         None => false,
         Some(q) => match ost {
             None => false,
-            Some(st) => got > 0 && rec_admin(root, org, w) && bytes_eq(q.requester, w.log) && clock_now_seconds() >= recovery_opens(q.time, got, st.gov.recovery.delay_sec)
+            Some(st) => got > 0 && st.gov.recovery.on && has_log(st.gov.recovery.admins, w.log) && bytes_eq(q.requester, w.log) && clock_now_seconds() >= recovery_opens(q.time, got, st.gov.recovery.delay_sec)
         }
     };
 }
@@ -769,6 +1000,7 @@ HttpReply handle(RelayCfg g, Store root, HttpRequest r) {
     }
     if (r.method == "PUT") {
         Str why = may_write(root, name, r.body, w);
+        if (why == alerts_full()) { return http_reply_text(429, "text/plain", why); }
         if (str_len(why) > 0) { return http_reply_text(denied, "text/plain", why); }
         if (r.body.len() > max_body()) { return http_reply_status(413); }
         return stored_reply(root, name, r.body);
@@ -776,20 +1008,43 @@ HttpReply handle(RelayCfg g, Store root, HttpRequest r) {
     return http_reply_status(404);
 }
 
-// Stores a write may_write allowed: an alert once (409 when the name is
-// taken); a recovery request with the time this relay took it.
+// Names that are a history, or a request or answer that stands until it
+// is cleared: an alert, a governance version, an audit event, an answer
+// to an invite, a recovery request. may_write checked that the name is
+// free, but two writers can both pass that check; the write itself is
+// write-once (st_put_new), so only one lands and the other gets 409.
+pub Bool write_once(Str name) {
+    return str_starts_with(name, "alrt-") || str_starts_with(name, "orggov-") || str_starts_with(name, "audit-") || str_starts_with(name, "accept-") || str_starts_with(name, "recreq-");
+}
+
+// Stores a write may_write allowed: a write-once name once (409 when it is
+// taken; an empty body, where may_write allows one, removes it so it can
+// be written again); a recovery request with the time this relay took it;
+// a governance version with the organization's head pointer.
 @requires(filesystem, network, clock(readonly), declassify)
 pub HttpReply stored_reply(Store root, Str name, List(Int) body) {
-    if (str_starts_with(name, "alrt-")) {
+    if (write_once(name) && body.len() == 0) { return http_reply_status(if (st_delete(root, "blob/" + name)) { 200 } else { 500 }); }
+    if (write_once(name)) {
         Int n = st_put_new(root, "blob/" + name, body);
-        return http_reply_status(if (n == 1) { 200 } else { if (n == 0) { 409 } else { 500 } });
+        if (n != 1) { return http_reply_status(if (n == 0) { 409 } else { 500 }); }
+    } else {
+        if (!st_put(root, "blob/" + name, body)) { return http_reply_status(500); }
     }
-    if (!st_put(root, "blob/" + name, body)) { return http_reply_status(500); }
-    if (str_starts_with(name, "recreq-") && body.len() > 0) {
+    if (str_starts_with(name, "recreq-")) {
         Int got = st_put_new(root, "blob/" + recat_blob(cose_hex_decode(org_part(name, 7)), str_slice(name, 40, str_len(name)), body), utf8(f"{clock_now_seconds()}"));
         if (got < 0) { return http_reply_status(500); }
     }
+    if (str_starts_with(name, "orggov-")) { _ = gov_head_moved(root, name); }
     return http_reply_status(200);
+}
+
+// After "orggov-<id>-<n>" is stored: the head pointer names n (or later).
+@requires(filesystem, network, clock(readonly), declassify)
+Bool gov_head_moved(Store root, Str name) {
+    Str id = org_part(name, 7);
+    Str v = str_slice(name, 40, str_len(name));
+    if (!hex_len(id, 32) || !dec_ok(v, 0)) { return false; }
+    return gov_count(root, id, 0) >= str_parse_int(v);
 }
 
 Int max_body() { return 16781312; }
@@ -816,8 +1071,12 @@ HttpReply plain(Store root, HttpRequest r, List(Str) p) {
     Str who = seg_at(p, 2);
     if (str_len(who) > 128 || !hex_ok(who, 0)) { return http_reply_status(404); }
     if (kind == "mbox" && r.method == "POST" && p.len() == 3) {
-        if (r.body.len() == 0 || r.body.len() > max_body()) { return http_reply_status(413); }
-        return mbox_put_at(root, who, mbox_next(root, who), r.body, 0);
+        if (r.body.len() == 0 || r.body.len() > max_mbox()) { return http_reply_status(413); }
+        Str q = mbox_quota(root, who, r.body.len(), clock_now_seconds());
+        if (str_len(q) == 0) { return http_reply_status(429); }
+        HttpReply rep = mbox_put_at(root, who, mbox_next(root, who), r.body, 0);
+        if (rep.status == 200) { _ = st_text(root, "mboxq/" + who, q); }
+        return rep;
     }
     if (p.len() != 4 || !dec_ok(p[3], 0)) { return http_reply_status(404); }
     Str k = kind + "/" + who + "/" + f"{str_parse_int(p[3])}";
@@ -846,6 +1105,34 @@ Bool next_event_ok(Store root, Str who, Int seq, List(Int) body) {
         None => false,
         Some(e) => log_next_ok(l, log_dir(root, l, (UInt(64))0, []), e, seq)
     };
+}
+
+// A mailbox message is one HPKE envelope of one Packet (net/proto.resid).
+// The largest a device or cosigner sends is a re-share's announcement
+// (threshold/rsmsg.resid RsAnnMsg: a 2048-bit Paillier modulus, Pedersen
+// parameters and the mod and prm proofs, 80 rounds of 2048-bit numbers
+// each: about 120 KiB in CBOR) or a cosigner's evaluation log (a week of
+// entries); 1 MiB leaves room over both. Anyone may post (a device being
+// enrolled has no sign-in), so what one recipient can be sent is bounded
+// too: at most mbox_window_count() messages and mbox_window_bytes() bytes
+// per recipient in any mbox_window_secs() (429 beyond). A multi-party
+// session sends each party a few batches per round, far below either.
+pub Int max_mbox() { return 1048576; }
+pub Int mbox_window_secs() { return 600; }
+pub Int mbox_window_count() { return 256; }
+pub Int mbox_window_bytes() { return 67108864; }
+
+// "mboxq/<to>": "START COUNT BYTES", the window the recipient's messages
+// are counted in. The window as it would be with one more message of `n`
+// bytes; "" when that is over the quota.
+@requires(filesystem, network, clock(readonly), declassify)
+Str mbox_quota(Store root, Str to, Int n, Int now) {
+    List(Str) p = str_split(str_trim(st_read_text(root, "mboxq/" + to)), " ");
+    Bool cur = p.len() == 3 && dec_ok(p[0], 0) && dec_ok(p[1], 0) && dec_ok(p[2], 0) && str_parse_int(p[0]) <= now && str_parse_int(p[0]) + mbox_window_secs() > now;
+    Int start = if (cur) { str_parse_int(p[0]) } else { now };
+    Int count = (if (cur) { str_parse_int(p[1]) } else { 0 }) + 1;
+    Int bytes = (if (cur) { str_parse_int(p[2]) } else { 0 }) + n;
+    return if (count > mbox_window_count() || bytes > mbox_window_bytes()) { "" } else { f"{start} {count} {bytes}" };
 }
 
 // Where to start looking for a mailbox's next free index: "mboxn/<to>",
@@ -880,28 +1167,34 @@ HttpReply directory_reply(Store root, Str org, Who w) {
 @requires(filesystem, network, clock(readonly), declassify)
 HttpReply listed(Store root, Str prefix, Str after, Who w) {
     if (!blob_ok(prefix, 0)) { return http_reply_status(404); }
-    List(Str) names = list_page(root, prefix, if (str_len(after) == 0) { "" } else { "blob/" + after }, w, 0, []);
+    List(Str) names = list_page(root, prefix, if (str_len(after) == 0) { "" } else { "blob/" + after }, w, 0, [], seen_none());
     return http_reply_text(200, "text/plain", str_join(names, "\n"));
 }
 
-// Store pages of max_listed() keys at a time, at most list_scan() keys in
-// all per request, until a page of readable names is full.
-pub Int list_scan() { return 8; }
+// Store pages of max_listed() keys at a time, at most list_scan(w) pages
+// per request, until a page of readable names is full: eight for a
+// signed-in device, one for anyone else (nobody reads an organization's
+// or a group folder's names, so there is nothing to look further for).
+pub Int list_scan(Who w) { return if (w.on) { 8 } else { 1 }; }
+
+type Readable = { List(Str) names; Seen s; };
 
 @requires(filesystem, network, clock(readonly), declassify)
-List(Str) list_page(Store root, Str prefix, Str from, Who w, Int round, List(Str) acc) {
+List(Str) list_page(Store root, Str prefix, Str from, Who w, Int round, List(Str) acc, Seen s) {
     List(Str) keys = st_list(root, "blob/" + prefix, from, max_listed());
-    List(Str) got = acc.concat(readable(root, keys, w, 0, ListBuf()));
+    Readable rd = readable(root, keys, w, 0, ListBuf(), s);
+    List(Str) got = acc.concat(rd.names);
     if (got.len() >= max_listed()) { return got[0..max_listed()]; }
-    if (keys.len() < max_listed() || round + 1 >= list_scan()) { return got; }
-    return list_page(root, prefix, keys[keys.len() - 1], w, round + 1, got);
+    if (keys.len() < max_listed() || round + 1 >= list_scan(w)) { return got; }
+    return list_page(root, prefix, keys[keys.len() - 1], w, round + 1, got, rd.s);
 }
 
 @requires(filesystem, network, clock(readonly), declassify)
-List(Str) readable(Store root, List(Str) keys, Who w, Int i, ListBuf(Str) acc) {
-    if (i >= keys.len()) { return acc.finish(); }
+Readable readable(Store root, List(Str) keys, Who w, Int i, ListBuf(Str) acc, Seen s) {
+    if (i >= keys.len()) { return Readable {.names = acc.finish(), .s = s}; }
     Str n = str_slice(keys[i], 5, str_len(keys[i]));
-    return readable(root, keys, w, i + 1, if (may_read(root, n, w)) { acc.push(n) } else { acc });
+    ReadOk r = may_read_in(root, n, w, s);
+    return readable(root, keys, w, i + 1, if (r.ok) { acc.push(n) } else { acc }, r.s);
 }
 
 // ─── The console (SPEC 29.10) ───────────────────────────────────
@@ -920,6 +1213,8 @@ List(Str) readable(Store root, List(Str) keys, Who w, Int i, ListBuf(Str) acc) {
 //   GET  /console/<org>/state           the organization (session)
 //   POST /console/<org>/change          {"kind","a","b","c"}: a change to approve (session)
 //   GET  /console/<org>/pending         "CODE CRED-HEX PUB-HEX RP" per waiting passkey (device session)
+//   DELETE /console/<org>/pending       clears the waiting passkeys, which anyone may add up to
+//                                       pending_max() of a day (device session)
 //   GET  /console/<org>/changes         "ID KIND A-HEX B-HEX C-HEX BY STATUS" (device session)
 //   POST /console/<org>/done/<id>       the change done, the body its result (device session)
 
@@ -963,20 +1258,29 @@ Str rp_of(Str origin) {
     return if (c < 0) { h } else { str_slice(h, 0, c) };
 }
 
-// The console session from the cookie: [org, log hex], or [].
+// The value of the cookie named exactly `name` in a Cookie header; "".
+pub Str cookie_named(Str header, Str name) { return cookie_in(str_split(header, ";"), name + "=", 0); }
+
+Str cookie_in(List(Str) xs, Str pre, Int i) {
+    if (i >= xs.len()) { return ""; }
+    Str c = str_trim(xs[i]);
+    return if (str_starts_with(c, pre)) { str_slice(c, str_len(pre), str_len(c)) } else { cookie_in(xs, pre, i + 1) };
+}
+
+// The console session from the cookie: [org, log hex], or []. A session
+// is "ORG LOG UNTIL CRED": it lasts while the passkey it was opened with
+// (CRED, its credential id) is still approved: withdrawing the passkey
+// ends every session opened with it. (A session from before, without
+// CRED, is not taken: its holder signs in again.)
 @requires(filesystem, network, clock(readonly), declassify)
 List(Str) con_session(Store root, HttpRequest r) {
-    Str ck = http_header(r, "cookie");
-    Int at = str_index_of(ck, "symcon=", 0);
-    if (at < 0) { return []; }
-    Str t0 = str_slice(ck, at + 7, str_len(ck));
-    Int semi = str_index_of(t0, ";", 0);
-    Str t = if (semi < 0) { t0 } else { str_slice(t0, 0, semi) };
+    Str t = cookie_named(http_header(r, "cookie"), "symcon");
     if (!hex_len(t, 64)) { return []; }
     List(Str) p = str_split(str_trim(st_read_text(root, "auth/con-" + hex_encode(sha256_bytes(utf8(t))))), " ");
-    if (p.len() != 3 || str_parse_int(p[2]) < clock_now_seconds()) { return []; }
+    if (p.len() != 4 || !dec_ok(p[2], 0) || str_parse_int(p[2]) < clock_now_seconds() || !hex_len(p[0], 32) || !hex_ok(p[3], 0)) { return []; }
     List(Int) l = cose_hex_decode(p[1]);
-    if (!hex_len(p[0], 32) || suspended_in(root, p[0], l)) { return []; }
+    Bool key = match conkey_of(stored(root, conkey_blob(cose_hex_decode(p[0]), cose_hex_decode(p[3])))) { None => false, Some(k) => bytes_eq(k.log_id, l) && bytes_eq(k.cred_id, cose_hex_decode(p[3])) };
+    if (!key || suspended_in(root, p[0], l)) { return []; }
     // Still an owner or administrator now.
     return match relay_org(root, p[0]) { None => [], Some(st) => if (is_admin(st.gov, l) && member_index(st.org.members, l, 0) >= 0) { p[0..2] } else { [] } };
 }
@@ -1002,12 +1306,21 @@ HttpReply console_handle(RelayCfg g, Store root, HttpRequest r) {
     Who w = who_of(g, root, r);
     if (!admin_of(root, org, w)) { return http_reply_status(if (w.on) { 403 } else { 401 }); }
     if (what == "pending" && r.method == "GET") { return http_reply_text(200, "text/plain", str_join(pend_lines(root, st_list(root, "console/" + org + "/pend-", "", 4096), 0, ListBuf()), "\n")); }
+    if (what == "pending" && r.method == "DELETE") { return http_reply_status(if (deleted_all(root, st_list(root, "console/" + org + "/pend-", "", 4096), 0)) { 200 } else { 500 }); }
     if (what == "changes" && r.method == "GET") { return http_reply_text(200, "text/plain", str_join(change_lines(root, st_list(root, "console/" + org + "/change-", "", 4096), 0, ListBuf()), "\n")); }
     if (what == "done" && r.method == "POST" && p.len() == 5 && hex_len(p[4], 32)) { return con_done(root, org, p[4], w, r); }
     return http_reply_status(404);
 }
 
 pub Int pending_max() { return 32; }
+
+// Removes every key of `ks`.
+@requires(filesystem, network, clock(readonly), declassify)
+Bool deleted_all(Store root, List(Str) ks, Int i) {
+    if (i >= ks.len()) { return true; }
+    Bool d = st_delete(root, ks[i]);
+    return deleted_all(root, ks, i + 1) && d;
+}
 
 @requires(filesystem, network, clock(readonly), declassify)
 HttpReply con_register(RelayCfg g, Store root, Str org, HttpRequest r) {
@@ -1054,18 +1367,18 @@ HttpReply con_login(RelayCfg g, Store root, Str org, HttpRequest r) {
         None => json_reply(403, "{\"error\":\"this passkey is not approved for the console\"}"),
         Some(k) => if (!fresh || !shape || !bytes_eq(k.cred_id, cid) || !bytes_eq(k.org_id, cose_hex_decode(org))) { json_reply(403, "{\"error\":\"the assertion is not for this console or challenge\"}") } else {
             if (!ecdsa_verify_raw(P256, Sha256, k.public_key, ad.concat(sha256_bytes(cdj)), sig)) { json_reply(403, "{\"error\":\"the signature does not verify\"}") } else {
-                if (!challenge_spend(root, "console", chal)) { json_reply(403, "{\"error\":\"the challenge was used already\"}") } else { con_open(root, org, k.log_id) } } }
+                if (!challenge_spend(root, "console", chal)) { json_reply(403, "{\"error\":\"the challenge was used already\"}") } else { con_open(root, org, k.log_id, k.cred_id) } } }
     };
 }
 
 @requires(filesystem, network, clock(readonly), declassify)
-HttpReply con_open(Store root, Str org, List(Int) l) {
+HttpReply con_open(Store root, Str org, List(Int) l, List(Int) cred) {
     Option(OrgState) ost = relay_org(root, org);
     Bool admin = match ost { None => false, Some(st) => is_admin(st.gov, l) && member_index(st.org.members, l, 0) >= 0 };
     if (!admin || suspended_in(root, org, l)) { return json_reply(403, "{\"error\":\"not an owner or administrator\"}"); }
     _ = prune_auth(root);
     Str t = hex_encode(random_bytes(32));
-    if (!st_text(root, "auth/con-" + hex_encode(sha256_bytes(utf8(t))), org + " " + hex_encode(l) + f" {clock_now_seconds() + 28800}")) { return json_reply(500, "{}"); }
+    if (!st_text(root, "auth/con-" + hex_encode(sha256_bytes(utf8(t))), org + " " + hex_encode(l) + f" {clock_now_seconds() + 28800} " + hex_encode(cred))) { return json_reply(500, "{}"); }
     return http_with_header(json_reply(200, "{\"ok\":true}"), "Set-Cookie", "symcon=" + t + "; Path=/console/; HttpOnly; Secure; SameSite=Strict; Max-Age=28800");
 }
 
