@@ -76,7 +76,7 @@ printf '2468\n' | run 300 "$BIN" device key add "$W/dev" main > "$W/add.log" 2>&
 [ "$(printf '2468\n' | run 30 "$BIN" device key list "$W/dev" --pin)" = "$(printf main | od -v -An -tx1 | tr -d ' \n')" ] || fail "key list"
 [ "$(printf '1357\n' | run 30 "$BIN" device key list "$W/dev" --pin)" = "$(printf main | od -v -An -tx1 | tr -d ' \n')" ] || fail "key list under the duress PIN"
 run 30 "$BIN" device key list "$W/dev" > /dev/null 2>&1 && fail "the key list was shown without the PIN"
-[ "$(stat -c %s "$W/dev/profile_a")" = 12432 ] && [ "$(stat -c %s "$W/dev/profile_b")" = 12432 ] && [ ! -e "$W/dev/security-keys" ] || fail "the profile files are not of format 2"
+[ "$(stat -c %s "$W/dev/profile_a")" = 20737 ] && [ "$(stat -c %s "$W/dev/profile_b")" = 20737 ] && [ ! -e "$W/dev/security-keys" ] || fail "the profile files are not of format 2"
 grep -q main "$W/dev/profile_a" "$W/dev/profile_b" && fail "a key's name is readable in the profile files"
 [ "$(get before)" = secret-0 ] || fail "vault get with the key: $(cat "$W/get.err")"
 put after secret-1 || fail "vault put with the key: $(cat "$W/put.log")"

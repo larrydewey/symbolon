@@ -100,6 +100,17 @@ Str file_of(Str dir, DeviceConfig c, Str pin) {
     return hex_encode(get_file(profile_file(dir, o.which)));
 }
 
+// The sealed parts (header, list, blob) of the file of the profile PIN
+// `pin` opens: all but its update slot, which a change under the other PIN
+// writes.
+@requires(filesystem, device, declassify, provision, network, environment)
+Str sealed_of(Str dir, DeviceConfig c, Str pin) {
+    Found f = find_own(dir, c, stretch(c, pin_bytes(pin)), true);
+    OwnList o = f.o;
+    List(Int) b = get_file(profile_file(dir, o.which));
+    return if (b.len() == profile_file_len()) { hex_encode(b[0..sealed_len()]) } else { "" };
+}
+
 // Which files a device directory has, with their sizes.
 @requires(filesystem)
 Str shape(Str dir) { return shape_of(dir, ["profile_a", "profile_b", "blob_a", "blob_b", "blob_a.k", "blob_b.k", "security-keys", "security-keys.view", "slot", "duress.pub", "security-update"], 0, ""); }
@@ -117,7 +128,7 @@ test "under the duress PIN a PIN change takes: the new PIN is the duress PIN, th
     DeviceConfig c = made(dir);
     Unlocked r0 = unlock_dir(dir, c, "1111");
     Unlocked d0 = unlock_dir(dir, c, "2222");
-    Str realf = file_of(dir, c, "1111");
+    Str realf = sealed_of(dir, c, "1111");
     Str sh = shape(dir);
     expect(device_pin_with(dir, c, "2222", "3333")).toEqual(0);
     Unlocked d1 = unlock_dir(dir, c, "3333");
@@ -128,7 +139,7 @@ test "under the duress PIN a PIN change takes: the new PIN is the duress PIN, th
     Unlocked r1 = unlock_dir(dir, c, "1111");
     expect(r1.kind).toEqual(1);
     expect(real_bytes(r1)).toEqual(real_bytes(r0));
-    expect(file_of(dir, c, "1111")).toEqual(realf);
+    expect(sealed_of(dir, c, "1111")).toEqual(realf);
     expect(shape(dir)).toEqual(sh);
     // The new PIN is the duress PIN everywhere: the real PIN cannot take
     // it, but can take the old one now; a key list opens under it.
@@ -186,7 +197,7 @@ test "a key added under the duress PIN is asked for at the next duress unlock, o
     Str dir = fresh_dir();
     DeviceConfig c = made(dir);
     Unlocked r0 = unlock_dir(dir, c, "1111");
-    Str realf = file_of(dir, c, "1111");
+    Str realf = sealed_of(dir, c, "1111");
     expect(add_key(dir, c, "2222", 0, "coerced", 6)).toEqual(0);
     // The duress unlock asks for it now: without it nothing opens (no
     // authenticator answers here), with its touch the duress profile does.
@@ -197,7 +208,7 @@ test "a key added under the duress PIN is asked for at the next duress unlock, o
     // The real profile: no key asked for, its file as it was, and the
     // duress key's touch gives nothing that opens it.
     expect(unlock_dir(dir, c, "1111").kind).toEqual(1);
-    expect(file_of(dir, c, "1111")).toEqual(realf);
+    expect(sealed_of(dir, c, "1111")).toEqual(realf);
     Found fd = find_own(dir, c, stretch(c, pin_bytes("2222")), true);
     OwnList od = fd.o;
     List(Secret(UInt(8))) wd = list_w_for(od.list, cred_of(6), out_of(6));
@@ -209,7 +220,7 @@ test "a key added under the duress PIN is asked for at the next duress unlock, o
     expect(unlock_dir(dir, c, "2222").kind).toEqual(2);
     expect(names_under(dir, c, "2222")).toEqual("");
     expect(real_bytes(unlock_dir(dir, c, "1111"))).toEqual(real_bytes(r0));
-    expect(file_of(dir, c, "1111")).toEqual(realf);
+    expect(sealed_of(dir, c, "1111")).toEqual(realf);
 }
 
 @requires(filesystem, device, declassify, provision, network, environment, clock)

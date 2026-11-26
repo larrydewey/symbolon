@@ -241,10 +241,12 @@ Option(Party) party_in(List(Party) ps, List(Int) id, Int i) {
 //     give the old W, which `via` turns into the new one (no key needs a
 //     touch now). A key added under the duress PIN later is sealed to the
 //     new W alone, so it never opens the real profile;
-//   - without a duress PIN, the other file is random bytes;
+//   - without a duress PIN, the other file is random bytes (and an update
+//     slot to a key no one holds, as every profile file has one);
 //   - on a TPM, the device key moves to an authValue from the DEK (it no
-//     longer moves with the PIN), and which unlock key is the real one
-//     becomes random in the configuration.
+//     longer moves with the PIN), which unlock key is the real one becomes
+//     random in the configuration, and both unlock keys move to a random
+//     pair of handles (place_unlock_keys), so the handles no longer say.
 // The old files are removed. Each step can run again.
 @requires(filesystem, network, device, declassify, clock, provision, environment)
 Int keys_update(Str dir, DeviceConfig c0, Unlocked u, Str dpin, Bool dropped) {
@@ -258,6 +260,10 @@ Int keys_update(Str dir, DeviceConfig c0, Unlocked u, Str dpin, Bool dropped) {
     DeviceConfig c2 = oc2 else { c };
     Result(Int, Str) d = dk_to_v2(dir, c2, u);
     if (match d { Err(_) => true, Ok(_) => false }) { return dfail(match d { Err(m) => m, Ok(_) => "" }); }
+    Option(DeviceConfig) oc3 = load_config(dir);
+    DeviceConfig c3 = oc3 else { c2 };
+    Result(Int, Str) pl = place_unlock_keys(dir, c3, u, dpin, dropped);
+    if (match pl { Err(_) => true, Ok(_) => false }) { return dfail(match pl { Err(m) => m, Ok(_) => "" }); }
     _ = filesystem.remove(dir + "/blob_a");
     _ = filesystem.remove(dir + "/blob_b");
     _ = filesystem.remove(dir + "/blob_a.k");
@@ -299,27 +305,18 @@ pub Result(Int, Str) to_format2(Str dir, DeviceConfig c, Unlocked u, Str dpin, B
     List(Secret(UInt(8))) wd = random_secret(32);
     List(Secret(UInt(8))) lr = random_secret(32);
     List(Secret(UInt(8))) ld = random_secret(32);
+    List(Secret(UInt(8))) sr = random_secret(32);
+    List(Secret(UInt(8))) sd = random_secret(32);
     List(Secret(UInt(8))) none = [];
-    KeyList rl = KeyList {.w = if (keyed) { none } else { wr }, .salt = salt, .via = [], .mine = if (real_on_a) { "a" } else { "b" }, .peer_l = ld, .peer_w = wd, .keys = ks.keys};
+    KeyList rl = KeyList {.w = if (keyed) { none } else { wr }, .salt = salt, .via = [], .mine = if (real_on_a) { "a" } else { "b" }, .peer_l = ld, .peer_w = wd, .keys = ks.keys,
+                          .sk = sr, .peer_pk = slot_pub(sd)};
     KeyList dl = KeyList {.w = if (keyed) { none } else { wd }, .salt = salt, .via = if (keyed) { seal_via(wd, u.wrap) } else { [] }, .mine = if (real_on_a) { "b" } else { "a" },
-                          .peer_l = none, .peer_w = none, .keys = ks.keys};
-    List(Int) rfile_h = seal_hdr(u.ukey, lr);
-    List(Int) rfile_l = seal_list(lr, rl);
-    List(Int) rfile_b = seal_wblob(wr, rw, rb);
-    if (rfile_l.len() == 0) { return Err("too many security keys for one list; remove one first"); }
-    // "b" first: profile_a marks format 2.
-    Bool ok = if (rw == "b") {
-        put_profile(dir, rw, rfile_h, rfile_l, rfile_b) && put_duress_file(dir, dw, has, kd, ld, dl, wd, db)
-    } else {
-        put_duress_file(dir, dw, has, kd, ld, dl, wd, db) && put_profile(dir, rw, rfile_h, rfile_l, rfile_b)
-    };
-    return if (ok) { Ok(0) } else { Err("cannot write the profile files") };
-}
-
-@requires(filesystem, declassify)
-Bool put_duress_file(Str dir, Str dw, Bool has, List(Secret(UInt(8))) kd, List(Secret(UInt(8))) ld, KeyList dl, List(Secret(UInt(8))) wd, List(Int) db) {
-    if (!has) { return put_decoy_profile(dir, dw); }
-    return put_profile(dir, dw, seal_hdr(kd, ld), seal_list(ld, dl), seal_wblob(wd, dw, db));
+                          .peer_l = none, .peer_w = none, .keys = ks.keys, .sk = sd, .peer_pk = slot_pub(sr)};
+    List(Int) rf = own_file(u.ukey, lr, rl, wr, rw, rb);
+    if (rf.len() == 0) { return Err("too many security keys for one list; remove one first"); }
+    List(Int) df = if (has) { own_file(kd, ld, dl, wd, dw, db) } else { decoy_file(rl.peer_pk) };
+    // The other first: profile_a marks format 2.
+    return if (put_new_pair(dir, rw, rf, df)) { Ok(0) } else { Err("cannot write the profile files") };
 }
 
 // TPM: the device key made before format 2 (its authValue the stretched
@@ -332,4 +329,83 @@ Result(Int, Str) dk_to_v2(Str dir, DeviceConfig c, Unlocked u) {
     if (!save_config(dir, with_handles(c, dk_v2_handle(), c.tpm_unlock_a, c.tpm_unlock_b))) { return Err("cannot store the configuration (the device key is at its new handle: run the update again)"); }
     _ = tpm_evict(c.tpm_dk);
     return Ok(0);
+}
+
+// TPM (SPEC 9.1): before format 2 the real profile's unlock key was in
+// tpm_unlock_a's handle family (0x81000112, or 0x81000212 after a PIN
+// change) and the other's in tpm_unlock_b's, so the handles said which is
+// real; to_format2 swapped the configuration fields at random but not the
+// handles. Both keys move here to a random pair of the four pool handles,
+// so the exposure ends with the update: the real one under the PIN and the
+// duress one under the duress PIN, each with its authValue as it was;
+// without a duress PIN the other key, whose authValue no one knows and on
+// which no profile depends (its file is random), is replaced by a new one
+// under a random authValue. After each move the configuration names the
+// new handle before the old one is evicted, so a cut leaves a device that
+// opens, and running the update again moves them again.
+@requires(filesystem, device, declassify, provision, network, environment)
+Result(Int, Str) place_unlock_keys(Str dir, DeviceConfig c, Unlocked u, Str dpin, Bool dropped) {
+    if (c.unprotected || on_keystore(c)) { return Ok(0); }
+    Bool has = str_len(dpin) > 0;
+    if (!has && !dropped && u.real.duress_hpke_pub.len() == 65) { return Err("this device has a duress PIN: give it second (it is kept)"); }
+    Bool real_on_a = own_on_a(dir, c, u);
+    List(Secret(UInt(8))) dst = if (has) { stretch(c, pin_bytes(dpin)) } else { random_secret(32) };
+    if (has) {
+        List(Secret(UInt(8))) kd = unlock_key_at(c, dst, !real_on_a);
+        OwnList od = if (kd.len() == 32) { open_own(dir, kd) } else { no_own() };
+        KeyList dl = od.list;
+        if (od.which == "" || dl.peer_l.len() == 32) { return Err("that is not this device's duress PIN (an empty line if it has none); nothing changed"); }
+    }
+    List(Int) pool = unlock_pool();
+    Int i = (random_bytes(1)[0] & 255) % 4;
+    Int j = (i + 1 + (random_bytes(1)[0] & 255) % 3) % 4;
+    Int hr = if (real_on_a) { c.tpm_unlock_a } else { c.tpm_unlock_b };
+    Int hd = if (real_on_a) { c.tpm_unlock_b } else { c.tpm_unlock_a };
+    List(List(Int)) moves = placement(pool, hr, hd, pool[i], pool[j]);
+    Result(DeviceConfig, Str) r = run_moves(dir, c, u.st, dst, has, real_on_a, moves, 0);
+    Result(Int, Str) out = match r { Ok(_) => Ok(0), Err(m) => Err(m) };
+    return out;
+}
+
+// The moves that take the real profile's unlock key from `hr` to `tr` and
+// the other's from `hd` to `td` (tr != td, all in `pool`), each to a handle
+// free at its time: [from, to, 0 for the real key or 1 for the other].
+pub List(List(Int)) placement(List(Int) pool, Int hr, Int hd, Int tr, Int td) {
+    if (tr == hd && td == hr) {
+        List(Int) free = pool_others(pool, hr, hd, 0, ListBuf());
+        Int t = if (free.len() > 0) { free[0] } else { 0 };
+        return [[hr, t, 0], [hd, hr, 1], [t, hd, 0]];
+    }
+    if (tr == hd) { return [[hd, td, 1], [hr, tr, 0]]; }
+    List(List(Int)) first = if (tr == hr) { [] } else { [[hr, tr, 0]] };
+    List(List(Int)) second = if (td == hd) { [] } else { [[hd, td, 1]] };
+    return first.concat(second);
+}
+
+List(Int) pool_others(List(Int) pool, Int x, Int y, Int i, ListBuf(Int) acc) {
+    if (i >= pool.len()) { return acc.finish(); }
+    return pool_others(pool, x, y, i + 1, if (pool[i] == x || pool[i] == y) { acc } else { acc.push(pool[i]) });
+}
+
+// Each move: the key persistent at its new handle (moved under its own
+// authValue, or for a decoy made afresh), the configuration naming it, the
+// old handle evicted.
+@requires(filesystem, device, declassify, provision, network, environment)
+Result(DeviceConfig, Str) run_moves(Str dir, DeviceConfig c, List(Secret(UInt(8))) st, List(Secret(UInt(8))) dst, Bool has, Bool real_on_a, List(List(Int)) ms, Int i) {
+    if (i >= ms.len()) { return Ok(c); }
+    List(Int) m = ms[i];
+    Int from = m[0];
+    Int to = m[1];
+    Bool real = m[2] == 0;
+    if (real || has) {
+        moved_key(from, to, if (real) { st } else { dst }, if (real) { st } else { dst })?;
+    } else {
+        _ = tpm_evict(to);
+        if (!make_unlock_key(to, random_secret(32))) { return Err("TPM: cannot make the unlock key"); }
+    }
+    Bool on_a = if (real) { real_on_a } else { !real_on_a };
+    DeviceConfig n = with_handles(c, c.tpm_dk, if (on_a) { to } else { c.tpm_unlock_a }, if (on_a) { c.tpm_unlock_b } else { to });
+    if (!save_config(dir, n)) { return Err("cannot store the configuration (run the update again)"); }
+    _ = tpm_evict(from);
+    return run_moves(dir, n, st, dst, has, real_on_a, ms, i + 1);
 }

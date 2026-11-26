@@ -6,14 +6,17 @@
 // and changes its own profile's keys only:
 // - under the real PIN, a key added or removed is added to or removed from
 //   both lists (the real profile holds the duress profile's list key and
-//   W), so the duress profile asks for the same keys as the real one, as a
-//   coerced principal expects;
+//   W, and sends the duress list through its update slot), so the duress
+//   profile asks for the same keys as the real one, as a coerced principal
+//   expects;
 // - under the duress PIN (SPEC 14.2), the change is made to the duress
 //   profile's list alone: a key added there is asked for at the next
 //   duress unlock (its touch gives the duress profile's W, never the real
 //   one's), and one removed is not. The real profile and its keys are not
 //   touched.
-// The output is the same under either PIN.
+// The output is the same under either PIN, and so are the writes: both
+// profile files, a then b, the changing profile's whole and the other's
+// update slot (fidokey write_change, SPEC 14.2).
 
 import "../duress/duress.resid";
 import "../vault/vault.resid";
@@ -80,43 +83,32 @@ List(Str) names_of(List(SecKey) ks, Int i, List(Str) acc) {
 @requires(filesystem, declassify)
 OwnList own_list(Str dir, Unlocked u) { OwnList o = open_own(dir, u.ukey); return o; }
 
-// The profile file with its list `nl` (sealed under its L), header and
-// blob as they are. False when the list does not fit or the file cannot
-// be written.
+// A key change's writes (fidokey write_change): the profile's file sealed
+// afresh with its list `nl`, its header and blob as they are under the
+// same keys; in the other file the slot alone, carrying under the real PIN
+// the duress profile's list `next`. One pattern under either PIN, with or
+// without a duress PIN (SPEC 14.2).
 @requires(filesystem, declassify)
-Bool write_list(Str dir, OwnList o, KeyList nl) {
-    List(Int) f = get_file(profile_file(dir, o.which));
-    List(Int) body = seal_list(o.l, nl);
-    return body.len() == list_len() && put_profile(dir, o.which, hdr_part(f), body, wblob_part(f));
+Bool write_list(Str dir, Unlocked u, OwnList o, KeyList nl, Option(KeyList) next) {
+    List(Int) blob = read_blob(dir, o.which, u.wrap);
+    if (blob.len() != blob_len()) { return false; }
+    Bool ok = write_change(dir, o, nl, u.ukey, u.wrap, blob, next);
+    return ok;
 }
 
-Str other_file(Str which) { return if (which == "a") { "b" } else { "a" }; }
-
-// A real change carried to the duress profile's list (`nl`, sealed under
-// the L the real list holds for it), its header and blob as they are.
-@requires(filesystem, declassify)
-Bool peer_write(Str dir, Unlocked u, OwnList o, KeyList nl) {
-    Str other = other_file(o.which);
-    List(Int) f = get_file(profile_file(dir, other));
-    List(Int) body = seal_list(o.list.peer_l, nl);
-    return body.len() == list_len() && put_profile(dir, other, hdr_part(f), body, wblob_part(f));
+// The duress profile's list with key `name` (credential `cred_id`) sealing
+// its W (`dw`, the real list's peer_w) in place of any of that name or
+// credential.
+@requires(declassify)
+KeyList duress_with_key(KeyList dl, Str name, List(Int) cred_id, List(Int) cred_point, List(Secret(UInt(8))) out, List(Secret(UInt(8))) dw) {
+    List(SecKey) dks = keys_without_cred(keys_without_name(dl.keys, name, 0, ListBuf()), cred_id, 0, ListBuf()).concat([key_entry(name, cred_id, cred_point, out, dw)]);
+    KeyList n = list_with_keys(dl, dks, dw);
+    return n;
 }
 
-// No duress profile's list to change: without a duress PIN the other file
-// is random bytes, written again as a duress profile's would be; with one
-// whose list the real one cannot read (it never happens), it is left.
-@requires(filesystem)
-Bool peer_none(Str dir, Unlocked u, OwnList o) {
-    if (u.real.duress_hpke_pub.len() != 65) { return put_decoy_profile(dir, other_file(o.which)); }
-    return true;
-}
-
-// The duress profile's list, as the real one reads it; None without one.
-@requires(filesystem, declassify)
-Option(KeyList) peer_list(Str dir, Unlocked u, OwnList o) {
-    if (u.real.duress_hpke_pub.len() != 65) { return None; }
-    Option(KeyList) l = open_list(o.list.peer_l, get_file(profile_file(dir, other_file(o.which))));
-    return l;
+KeyList duress_without_key(KeyList dl, List(Int) cred_id, List(Secret(UInt(8))) dw) {
+    KeyList n = list_with_keys(dl, keys_without_cred(dl.keys, cred_id, 0, ListBuf()), dw);
+    return n;
 }
 
 // `device key add DIR NAME`: the PIN; then the key is touched to make its
@@ -159,14 +151,12 @@ pub Int key_add_commit(Str dir, DeviceConfig c, Unlocked u, Str name, List(Int) 
     OwnList o = own_list(dir, u);
     if (o.which == "" || u.wrap.len() != 32) { return dfail("wrong PIN, or no enrolled key present"); }
     List(SecKey) ks = keys_without_name(o.list.keys, name, 0, ListBuf()).concat([key_entry(name, cred_id, cred_point, out, u.wrap)]);
-    if (!write_list(dir, o, list_with_keys(o.list, ks, u.wrap))) { return dfail("cannot write " + profile_file(dir, o.which) + " (at most a few keys fit)"); }
-    if (u.kind == 1) {
-        Option(KeyList) pl = peer_list(dir, u, o);
-        KeyList dl = pl else { no_list() };
-        List(SecKey) dks = keys_without_cred(keys_without_name(dl.keys, name, 0, ListBuf()), cred_id, 0, ListBuf()).concat([key_entry(name, cred_id, cred_point, out, o.list.peer_w)]);
-        Bool fine = match pl { None => peer_none(dir, u, o), Some(_) => peer_write(dir, u, o, list_with_keys(dl, dks, o.list.peer_w)) };
-        if (!fine) { return dfail("cannot write " + profile_file(dir, other_file(o.which))); }
-    }
+    KeyList ol = o.list;
+    // Under the real PIN, the duress profile's list with the key too (None
+    // under the duress PIN, and without a duress PIN).
+    Option(KeyList) pl = duress_list(dir, o);
+    Option(KeyList) next = match pl { None => None, Some(dl) => Some(duress_with_key(dl, name, cred_id, cred_point, out, ol.peer_w)) };
+    if (!write_list(dir, u, o, list_with_keys(ol, ks, u.wrap), next)) { return dfail("cannot write " + profile_file(dir, o.which) + " (at most a few keys fit)"); }
     println("security key " + name + " added; this device now opens only with it (or another enrolled key) present");
     return 0;
 }
@@ -226,13 +216,10 @@ pub Int key_remove_commit(Str dir, Unlocked u, Str name) {
     SecKey k = x else { SecKey {.name = "", .cred_id = [], .cred_point = [], .sealed = []} };
     if (str_len(k.name) == 0 || u.wrap.len() != 32) { return dfail("no key named " + name); }
     List(SecKey) rest = keys_without_name(o.list.keys, name, 0, ListBuf());
-    if (!write_list(dir, o, list_with_keys(o.list, rest, u.wrap))) { return dfail("cannot write " + profile_file(dir, o.which)); }
-    if (u.kind == 1) {
-        Option(KeyList) pl = peer_list(dir, u, o);
-        KeyList dl = pl else { no_list() };
-        Bool fine = match pl { None => peer_none(dir, u, o), Some(_) => peer_write(dir, u, o, list_with_keys(dl, keys_without_cred(dl.keys, k.cred_id, 0, ListBuf()), o.list.peer_w)) };
-        if (!fine) { return dfail("cannot write " + profile_file(dir, other_file(o.which))); }
-    }
+    KeyList ol = o.list;
+    Option(KeyList) pl = duress_list(dir, o);
+    Option(KeyList) next = match pl { None => None, Some(dl) => Some(duress_without_key(dl, k.cred_id, ol.peer_w)) };
+    if (!write_list(dir, u, o, list_with_keys(ol, rest, u.wrap), next)) { return dfail("cannot write " + profile_file(dir, o.which)); }
     println("security key " + name + " removed" + if (rest.len() == 0) { "; this device opens with the PIN alone" } else { "" });
     return 0;
 }

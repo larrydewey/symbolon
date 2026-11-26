@@ -373,3 +373,40 @@ test "the cosigner knows a duress profile by its own transport key, only for wha
     expect(duress_transports_of(c).len()).toEqual(0);
     expect(duress_keys_of(c).len()).toEqual(1);
 }
+
+// The TPM unlock keys' new handles (place_unlock_keys; the TPM itself is
+// checked by reading only): for every target pair, each move goes to a
+// handle free at its time, and the keys end where they were sent.
+Str placed(List(Int) pool, Int hr, Int hd, Int tr, Int td) {
+    List(List(Int)) ms = placement(pool, hr, hd, tr, td);
+    Str s = walk(ms, 0, hr, hd);
+    return s;
+}
+
+Str walk(List(List(Int)) ms, Int i, Int r, Int d) {
+    if (i >= ms.len()) { return f"{r} {d}"; }
+    List(Int) m = ms[i];
+    if (m[1] == r || m[1] == d) { return "onto a taken handle"; }
+    if (m[2] == 0 && m[0] != r) { return "not the real key's handle"; }
+    if (m[2] == 1 && m[0] != d) { return "not the other key's handle"; }
+    return walk(ms, i + 1, if (m[2] == 0) { m[1] } else { r }, if (m[2] == 1) { m[1] } else { d });
+}
+
+Int bad_placements(List(Int) pool, Int hr, Int hd, Int i, Int n) {
+    if (i >= 16) { return n; }
+    Int tr = pool[i / 4];
+    Int td = pool[i % 4];
+    Bool ok = tr == td || placed(pool, hr, hd, tr, td) == f"{tr} {td}";
+    return bad_placements(pool, hr, hd, i + 1, if (ok) { n } else { n + 1 });
+}
+
+test "the unlock keys move to any pair of pool handles without one landing on the other" {
+    List(Int) pool = unlock_pool();
+    expect(bad_placements(pool, pool[0], pool[2], 0, 0)).toEqual(0);
+    expect(bad_placements(pool, pool[1], pool[2], 0, 0)).toEqual(0);
+    expect(bad_placements(pool, pool[0], pool[3], 0, 0)).toEqual(0);
+    expect(bad_placements(pool, pool[2], pool[0], 0, 0)).toEqual(0);
+    // A swap goes through a free handle.
+    expect(placement(pool, pool[0], pool[2], pool[2], pool[0]).len()).toEqual(3);
+    expect(placed(pool, pool[0], pool[2], pool[2], pool[0])).toEqual(f"{pool[2]} {pool[0]}");
+}

@@ -560,7 +560,8 @@ profiles, so the configuration, the handles and the Keystore aliases do
 not say. A PIN change, under either PIN, gives that profile's unlock key
 its new authValue (TPM2_ObjectChangeAuth) and moves it to a free handle of
 the four, chosen at random; its HMAC output does not depend on the
-authValue, so the profile files stay as they are. The
+authValue, so the profiles' keys stay as they are (both files are written
+again all the same, as every change writes them, Section 9.4). The
 optional PCR term MUST use `PolicyAuthorize` over signed policies, never
 raw PCR values: a firmware or kernel update must not make the blob
 unsealable. A blob that does fail to unseal is recovered through another
@@ -641,9 +642,13 @@ PIN, then the duress PIN or an empty line), which under the PIN only:
 3. makes every collection's wraps again (Section 19.2);
 4. moves the profiles to format 2 (Section 9.4): each profile in its own
    file with its own sealed key list and wrap key; in the TPM profile the
-   DK gets its authValue from the DEK and the unlock-key fields are
-   swapped at random. The old profile files and `security-keys` are
-   removed. A device that ran steps 1-3 before (its `security-update`
+   DK gets its authValue from the DEK, the unlock-key fields are swapped
+   at random, and both unlock keys move to a random pair of the four
+   handles (the real one under the PIN, the duress one under the duress
+   PIN, each keeping its authValue; without a duress PIN the other is
+   replaced by a new key under a random authValue), so that from the end
+   of the update the handles do not say which is real. The old profile
+   files and `security-keys` are removed. A device that ran steps 1-3 before (its `security-update`
    file without `keys-v2`) runs this step alone.
 
 The reminder depends only on whether the device directory holds the file
@@ -676,20 +681,43 @@ touched, besides the PIN, before a device opens its profiles
   credential.
 - **Profile files (format 2).** Each profile is one file, `profile_a` or
   `profile_b` (which one is real is random and not recorded), always
-  12432 bytes, with or without keys and with or without a duress PIN:
+  20737 bytes, with or without keys and with or without a duress PIN:
   `hdr` (60: a random 32-byte list key L sealed with AES-256-GCM under
   `HKDF(unlock_key, "symbolon v1 key list")`), `list` (8220: the
-  profile's key list, padded to 8192 bytes, under L) and `wblob` (4152:
+  profile's key list, padded to 8192 bytes, under L), `wblob` (4152:
   the profile's blob of Section 9.2 under the profile's own random wrap
-  key W). The list holds the `hmac-secret` salt, which unlock key is the
-  profile's, and per enrolled key its name, credential ID, public key and
-  W sealed under HKDF(O); with no key enrolled, W itself. The real
-  profile's list also holds the other profile's L and W, so the
-  principal's key changes reach the duress profile (below). A device
-  without a duress PIN has random bytes in the other file, written again
-  whenever a real key change would write a duress profile's. Every
-  write of a profile file replaces it whole (a new file, renamed), so a
-  PIN change or a key change is all or nothing.
+  key W) and `slot` (8305: the profile's update slot, below). The list
+  holds the `hmac-secret` salt, which unlock key is the profile's, the
+  seed of the profile's own slot key pair P (HPKE, suite 16,1,2), the
+  other profile's slot public key, and per enrolled key its name,
+  credential ID, public key and W sealed under HKDF(O); with no key
+  enrolled, W itself. The real profile's list also holds the other
+  profile's L and W, so the principal's key changes reach the duress
+  profile (below). A device without a duress PIN has random bytes in the
+  other file's first three parts and a slot sealed to a key no one holds.
+  Every write of a profile file replaces it whole (a new file, synced to
+  disk, renamed over the old one, the directory synced), so a PIN change
+  or a key change is all or nothing for each file.
+- **Update slot.** The last part of each file is an HPKE (base mode,
+  info `"symbolon v1 profile update slot"`) ciphertext to that profile's
+  P of 32 + 8192 bytes: either zeros (empty), or the profile's L followed
+  by its whole key list as it is to be. Every key or PIN change, under
+  either PIN, writes both files, `profile_a` then `profile_b`: the
+  changing profile's file with all four parts sealed afresh (its header
+  and list under fresh IVs, its blob re-wrapped, its own slot empty), and
+  the other file with its slot alone replaced, its other parts copied as
+  they were. Under the real PIN the slot written carries the duress
+  profile's list as it is to be (a key added or removed there too, or the
+  list as it is, so that a pending one is not lost); under the duress PIN,
+  and on a device without one, it is empty. When the duress profile is
+  opened, its list is the slot's when the slot opens under its P and
+  starts with its L (only the real profile, which holds that L, can write
+  one), and its next change writes that list into its own file and empties
+  its slot; nothing is written at an opening. The real profile takes
+  nothing from its slot: the duress profile holds the real profile's slot
+  public key, not its L or W, so it can fill the real profile's slot (and
+  must, to write as the real profile writes) but neither read nor alter
+  anything the real profile holds.
 - **Sealing.** Adding a key seals the profile's W under the new key's O
   in the profile's list and takes W itself out of it; W does not change
   (the profile's contents do not either, so a fresh W would protect
@@ -709,7 +737,8 @@ touched, besides the PIN, before a device opens its profiles
   still needs the key.
 - **Under either PIN.** A key added or removed under the real PIN is
   added to or removed from both lists (the duress profile's sealed to its
-  own W), so the duress PIN asks for the same keys: a coerced principal
+  own W, through its update slot), so the duress PIN asks for the same
+  keys: a coerced principal
   hands over the key with the PIN, and the duress profile behaves as in
   Section 9.2. Under the duress PIN the change is made to the duress
   profile's list alone (Section 14.2); its keys never give the real
@@ -1140,10 +1169,11 @@ security key (9.4) and changing the PIN (`device pin`) work under the
 duress PIN as under the real one, on the duress profile: they print the
 same, and what they change lasts, for the duress profile only.
 
-- A PIN change re-seals the duress profile (its header and blob, in one
-  file write) under the new PIN's unlock key; in TPM mode it gives the
-  duress unlock key the new authValue and moves it to a free handle, as a
-  real change does with the real one's (Section 9.1). From then on the
+- A PIN change re-seals the duress profile (its header, and in the
+  unprotected and Keystore profiles its blob) under the new PIN's unlock
+  key; in TPM mode it gives the duress unlock key the new authValue and
+  moves it to a free handle, as a real change does with the real one's
+  (Section 9.1). From then on the
   new PIN is the duress PIN everywhere and the old one opens nothing. The
   real profile, its PIN, its file and the DK are not touched.
 - A key added goes into the duress profile's list with the duress
@@ -1158,25 +1188,42 @@ same, and what they change lasts, for the duress profile only.
   choose another", which does not name it. Under the duress PIN, a new PIN
   that opens the real profile cannot be refused without telling it, nor
   taken (it would open two profiles): the change is acted (the same work,
-  the profile's file written again with fresh IVs, in TPM mode its unlock
-  key moved with its authValue as it was, and "PIN changed"), and the
-  duress PIN stays what it was.
+  both profile files written as a change writes them, in TPM mode its
+  unlock key moved with its authValue as it was, and "PIN changed"), and
+  the duress PIN stays what it was.
 - The files have one shape: two profile files of one size, no other key
   file, with or without a duress PIN, keys or changes. The configuration
   holds the same fields whichever profile is real, and a PIN change under
   either PIN moves one unlock-key handle.
+- The writes have one pattern (Section 9.4, update slot): every key or
+  PIN change, under either PIN and with or without a duress PIN, writes
+  `profile_a` then `profile_b`, each whole (a new file, synced, renamed,
+  the directory synced), of the same size; in one of them every part
+  changes, in the other only the update slot, an HPKE ciphertext of one
+  size whether it carries a list (a real change) or nothing (a duress
+  change). A copy of the files before and after a change made under the
+  duress PIN therefore looks like one made under the real PIN, and the
+  real profile still opens exactly as it did (the duress profile can
+  write only the real file's slot, which the real profile does not read).
 
-Residual risk: a copy of the device's files from before and after a
-change shows which files changed: a key change under the real PIN writes
-both profile files, one under the duress PIN writes one (a PIN change
-writes one under either), and the copies do not show which profile a
-file is. A new duress PIN equal to the real one is acted, so the old
+Residual risk: which file was written whole says which profile made a
+change; within one before-and-after pair that is the coercer's own (or,
+on a device without a duress PIN, the only) profile, but copies taken
+over a period in which the coercer changed nothing can show the other
+file written whole, which happens only on a device with a live second
+profile (a device without a duress PIN rewrites its random file's slot
+alone). Changes to the real profile alone (an enrolment, a recovery, the
+security update) rewrite its file without the slot pattern; they are
+refused under the duress PIN (Section 14.3). Under the duress PIN the
+duress profile can read its own slot, so a real key change it has not
+yet taken in is visible to whoever holds the duress PIN, as the key it
+asks for is. A new duress PIN equal to the real one is acted, so the old
 duress PIN still opens the duress profile. On a device made before format
 2 (Section 9.4), until `device security-update`: the key list is in the
 clear, a key change under the duress PIN is refused as needing the
-update (as under the real PIN), and in TPM mode a real PIN change moves
-the DK as well; until the first PIN change after the update, the unlock
-keys' handles of such a TPM device show which is real.
+update (as under the real PIN), in TPM mode a real PIN change moves the
+DK as well, and the unlock keys' handles show which is real; the update
+moves both to a random pair of handles (Section 9.2, step 4).
 
 ### 14.3 Containment
 
