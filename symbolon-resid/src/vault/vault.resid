@@ -129,31 +129,84 @@ pub List(Int) field_seal_ik(List(Secret(UInt(8))) ik, List(Int) vault_id, List(I
     return field_seal_salted(ik, random_bytes(seal_salt_len()), vault_id, item_id, version, kind, field, plaintext);
 }
 
-// Format 2 under a given salt: salt || AES-256-GCM(field_key2, nonce2,
-// plaintext, aad led by 2). Only field_seal_ik and the reference tests
-// call it; a salt that is not 16 bytes seals nothing.
+// Format 2 under a given salt: header || salt || AES-256-GCM(field_key2,
+// nonce2, plaintext, aad led by 2). Only field_seal_ik and the reference
+// tests call it; a salt that is not 16 bytes seals nothing.
 @requires(declassify)
 pub List(Int) field_seal_salted(List(Secret(UInt(8))) ik, List(Int) salt, List(Int) vault_id, List(Int) item_id, UInt(64) version, Str kind, Str field, List(Secret(UInt(8))) plaintext) {
     if (salt.len() != seal_salt_len()) { return []; }
     List(Secret(UInt(8))) ct = aes_gcmg_seal_ivb(field_key2(ik, salt, field, version), field_nonce2(ik, salt, field, version), plaintext,
                                        field_aad_v(2, vault_id, item_id, version, kind, field));
-    return salt.concat(ints_of(declassify(secret_join(ct), "AEAD output is public"), 0, ListBuf()));
+    return field_header(2).concat(salt).concat(ints_of(declassify(secret_join(ct), "AEAD output is public"), 0, ListBuf()));
 }
+
+// ─── The format marker (SPEC 18.3) ──────────────────────────────
+// Every field sealed since format 1 starts with a header: the four bytes
+// "SYMF" and the format number. A reader looks at the header first: a
+// format it knows opens as that format; a header naming a format it does
+// not know is a field a newer agent wrote, which it reports as such
+// (ErrNewerFormat: "saved by a newer Symbolon"), never as tampering, and
+// never rewrites. A field with no header is format 1, which has none.
+// Format 1 bytes are AEAD output, so they start with "SYMF" by chance with
+// probability 2^-32; a reader therefore tries format 1 before it calls a
+// field newer, and such a field still opens.
+//
+// The marker is not authenticated by the field's own AEAD (a reader that
+// does not know a format cannot check it), but every byte of an item is
+// under the vault head's Merkle root, which a device of the quorum signs
+// (18.4): the relay cannot turn a field into a "newer" one.
+pub List(Int) field_magic() { return [83, 89, 77, 70]; }
+pub Int field_header_len() { return 5; }
+pub List(Int) field_header(Int fmt) { return field_magic().concat([fmt]); }
+
+// The format a field's bytes name: 1 without a header, else the header's number.
+pub Int field_format(List(Int) ct) {
+    if (ct.len() < field_header_len()) { return 1; }
+    if (ct[0] != 83 || ct[1] != 89 || ct[2] != 77 || ct[3] != 70) { return 1; }
+    return ct[4];
+}
+
+// Formats this agent reads: 1 (no header) and 2.
+pub Bool format_known(Int f) { return f == 1 || f == 2; }
+
+// Whether a field was written by a newer agent, in a format this one does
+// not know (by its header alone: see field_format).
+pub Bool field_is_newer(List(Int) ct) { return !format_known(field_format(ct)); }
+
+Bool any_newer(Item it, List(Str) names, Int i) {
+    if (i >= names.len()) { return false; }
+    if (field_is_newer(it.fields[names[i]] else { [] })) { return true; }
+    return any_newer(it, names, i + 1);
+}
+
+// Whether any field of the item is in a format this agent does not know:
+// such an item is shown as present but locked, and never sealed again.
+pub Bool item_is_newer(Item it) { Bool b = any_newer(it, it.fields.keys(), 0); return b; }
+
+pub Bool is_newer_err(SymbolonError e) { return match e { ErrNewerFormat(_) => true, _ => false }; }
+
+// What a person is told about such an item, everywhere.
+pub Str newer_text() { return "This item was saved by a newer Symbolon; update to open it."; }
 
 @requires(declassify)
 pub Result(List(Secret(UInt(8))), SymbolonError) field_open(List(Secret(UInt(8))) vault_key, List(Int) vault_id, List(Int) item_id, UInt(64) version, Str kind, Str field, List(Int) ct) {
     return field_open_ik(item_key(vault_key, vault_id, item_id), vault_id, item_id, version, kind, field, ct);
 }
 
-// A field of either format: format 2 when the bytes open as salt || AEAD
-// output under the salted key, else format 1 (sealed before format 2).
-// Both are authenticated under keys only the vault key gives, with
-// different labels and aad, so bytes of one format never open as the other.
+// A field of any format this agent knows, by its header (see field_format):
+// format 2 when the header says 2 and the rest opens as salt || AEAD output
+// under the salted key, else format 1 (sealed before format 2). Both are
+// authenticated under keys only the vault key gives, with different labels
+// and aad, so bytes of one format never open as the other. A header naming
+// a format this agent does not know: ErrNewerFormat, not a failed
+// authentication.
 @requires(declassify)
 pub Result(List(Secret(UInt(8))), SymbolonError) field_open_ik(List(Secret(UInt(8))) ik, List(Int) vault_id, List(Int) item_id, UInt(64) version, Str kind, Str field, List(Int) ct) {
+    Int f = field_format(ct);
+    Int h = field_header_len();
     Int n = seal_salt_len();
-    Option(List(Secret(UInt(8)))) p2 = if (ct.len() < n + 16) { None } else {
-        aes_gcmg_decrypt_ivb(field_key2(ik, ct[0..n], field, version), field_nonce2(ik, ct[0..n], field, version), ct[n..ct.len()],
+    Option(List(Secret(UInt(8)))) p2 = if (f != 2 || ct.len() < h + n + 16) { None } else {
+        aes_gcmg_decrypt_ivb(field_key2(ik, ct[h..h + n], field, version), field_nonce2(ik, ct[h..h + n], field, version), ct[h + n..ct.len()],
                              field_aad_v(2, vault_id, item_id, version, kind, field))
     };
     Option(List(Secret(UInt(8)))) pt = match p2 {
@@ -163,7 +216,7 @@ pub Result(List(Secret(UInt(8))), SymbolonError) field_open_ik(List(Secret(UInt(
     };
     return match pt {
         Some(p) => Ok(p),
-        None => Err(ErrVaultIntegrity("field authentication failed: " + field))
+        None => Err(if (format_known(f)) { ErrVaultIntegrity("field authentication failed: " + field) } else { ErrNewerFormat(field) })
     };
 }
 
@@ -287,6 +340,38 @@ pub Result(List(FieldPlain), SymbolonError) item_open_listing(List(Secret(UInt(8
     return popen_fields(ik, none, vault_id, it, sort(it.fields.keys()), 0, ListBuf());
 }
 
+// What a listing shows of an item (18.3): the fields that open under
+// vault_key alone (as item_open_listing), and whether some field is in a
+// format a newer agent wrote. Such an item is listed as present but
+// locked, with whatever of it opens (its name, when that is in a format
+// this agent knows); any other failure is the item's failure, as before.
+pub type Listed = { List(FieldPlain) fields; Bool newer; };
+
+@requires(declassify)
+pub Result(Listed, SymbolonError) item_open_listed(List(Secret(UInt(8))) vault_key, List(Int) vault_id, Item it) {
+    List(Secret(UInt(8))) ik = item_key(vault_key, vault_id, it.id);
+    Bool prot = item_is_protected(it);
+    Result(Bool, SymbolonError) m = if (prot) { check_marker(ik, vault_id, it) } else { Ok(true) };
+    Bool mnew = match m { Ok(_) => false, Err(e) => is_newer_err(e) };
+    if (match m { Ok(_) => false, Err(_) => !mnew }) { return match m { Ok(_) => Err(ErrInternal("")), Err(e) => Err(e) }; }
+    Result(Listed, SymbolonError) r = lfields(ik, prot, vault_id, it, sort(it.fields.keys()), 0, ListBuf(), mnew);
+    return r;
+}
+
+@requires(declassify)
+Result(Listed, SymbolonError) lfields(List(Secret(UInt(8))) ik, Bool prot, List(Int) vault_id, Item it, List(Str) names, Int i, ListBuf(FieldPlain) acc, Bool newer) {
+    if (i >= names.len()) { return Ok(Listed {.fields = acc.finish(), .newer = newer}); }
+    Str name = names[i];
+    if (name == "protected" || (prot && !field_is_standard_tier(name))) { return lfields(ik, prot, vault_id, it, names, i + 1, acc, newer); }
+    Result(List(Secret(UInt(8))), SymbolonError) r = field_open_ik(ik, vault_id, it.id, it.version, it.kind, name, it.fields[name] else { [] });
+    return match r {
+        Ok(p) => lfields(ik, prot, vault_id, it, names, i + 1, acc.push(FieldPlain {.name = name, .value = p}), newer),
+        Err(e) => if (is_newer_err(e)) { lfields(ik, prot, vault_id, it, names, i + 1, acc, true) } else { listed_fail(acc, e) }
+    };
+}
+
+Result(Listed, SymbolonError) listed_fail(ListBuf(FieldPlain) acc, SymbolonError e) { acc.discard(); return Err(e); }
+
 // 18.10.6 rotation: a new vault_key changes pitem_key but not y, so the
 // caller derives both pitem_keys from the same y.
 @requires(declassify)
@@ -312,8 +397,12 @@ pub Result(Item, SymbolonError) item_unprotect(List(Secret(UInt(8))) vault_key, 
 // An item written again with new fields: the next version of `old` (or
 // version 1), in the same tier, with its duress flag and handling policy.
 // A protected item needs its pitem_key (pik); a standard one ignores pik.
+// An item a newer agent wrote a field of (18.3) is never sealed again:
+// its fields would be lost or, kept as they are, would no longer open at
+// the next version. It stays as it is, byte for byte.
 @requires(declassify)
 pub Result(Item, SymbolonError) item_reseal(List(Secret(UInt(8))) vault_key, List(Secret(UInt(8))) pik, List(Int) vault_id, Option(Item) old, List(Int) item_id, Str kind, List(FieldPlain) fs) {
+    if (match old { None => false, Some(x) => item_is_newer(x) }) { return Err(ErrNewerFormat("")); }
     return match old {
         None => item_seal(vault_key, vault_id, item_id, (UInt(64))1, kind, fs, false, None),
         Some(x) => if (item_is_protected(x)) {

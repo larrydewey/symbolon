@@ -190,6 +190,52 @@ test "a duress online read writes the copy's files, and never spoils the real co
     expect(match kept_place_copy(d1 + "/vault", vk()) { None => false, Some(_) => true }).toBeTrue();
 }
 
+// ─── Items a newer agent wrote (SPEC 18.3) ──────────────────────
+
+// "note" as a newer agent might write it: its name in format 2, its secret
+// in format 7, which this agent does not know.
+@requires(declassify)
+Item newer_item() {
+    List(Int) id = item_id_of(vk(), "note");
+    Item it = item_seal(vk(), vault_id_of(log_id()), id, 4, "password", [FieldPlain {.name = "name", .value = secret_bytes(utf8("note"))}], false, None) else {
+        Item {.id = [], .version = 0, .kind = "", .fields = {}, .in_duress_subset = false, .handling_policy = None} };
+    return Item {.id = it.id, .version = it.version, .kind = it.kind, .fields = it.fields.insert("secret", [83, 89, 77, 70, 7].concat(rep(66, 48))),
+                 .in_duress_subset = false, .handling_policy = None};
+}
+
+Str reseal_err(Result(Item, Str) r) { return match r { Ok(_) => "ok", Err(m) => m }; }
+Str open_err(Result(List(FieldPlain), Str) r) { return match r { Ok(_) => "ok", Err(m) => m }; }
+
+@requires(filesystem, network, device, declassify, clock, environment)
+test "an item a newer agent wrote opens to the update message and survives a re-save byte for byte" {
+    Item nw = newer_item();
+    List(Int) before = item_cbor(nw);
+    Option(List(Int)) b3 = Some(served_bytes(state_at(items().concat([nw]), 3)));
+    Str dir = fresh_dir();
+    Result(VaultState, Str) r3 = vault_from(dir, config(), vhead(), b3);
+    expect(is_ok(r3)).toBeTrue();
+    VaultState s3 = r3 else { state_at([], 0) };
+    Item got = item_by_id(s3.items, nw.id, 0) else { items()[0] };
+    // Opening it says to update, and nothing about tampering.
+    expect(open_err(open_full(dir, None, vk(), vault_id_of(log_id()), got))).toEqual("This item was saved by a newer Symbolon; update to open it.");
+    // Writing it again (vault put / set of the same name) is refused with
+    // the same message; the item is left as it is.
+    List(FieldPlain) fs = [FieldPlain {.name = "name", .value = secret_bytes(utf8("note"))}, FieldPlain {.name = "secret", .value = secret_bytes(utf8("new"))}];
+    expect(reseal_err(reseal_item(dir, None, vk(), vault_id_of(log_id()), Some(got), got.id, "password", fs))).toEqual("This item was saved by a newer Symbolon; update to open it.");
+    // A re-save of the vault (another item changed) carries it byte for byte.
+    List(Int) mid = item_id_of(vk(), "mail");
+    Item mail = item_by_id(s3.items, mid, 0) else { items()[0] };
+    Item mail2 = reseal_item(dir, None, vk(), vault_id_of(log_id()), Some(mail), mid, "password",
+        [FieldPlain {.name = "name", .value = secret_bytes(utf8("mail"))}, FieldPlain {.name = "secret", .value = secret_bytes(utf8("changed"))}]) else { mail };
+    expect(mail2.version).toEqual(2);
+    List(Item) next = without_item(s3.items, mid, 0, ListBuf()).concat([mail2]);
+    Result(VaultState, Str) r4 = vault_from(dir, config(), vhead(), Some(served_bytes(state_at(next, 4))));
+    expect(is_ok(r4)).toBeTrue();
+    VaultState s4 = r4 else { state_at([], 0) };
+    expect(s4.items.len()).toEqual(2);
+    expect(hex_encode(item_cbor(item_by_id(s4.items, nw.id, 0) else { mail }))).toEqual(hex_encode(before));
+}
+
 // ─── Forks (R2A-2, SPEC 18.4) ───────────────────────────────────
 
 @requires(declassify)

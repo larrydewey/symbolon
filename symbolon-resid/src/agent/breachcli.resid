@@ -78,7 +78,7 @@ Result(BreachTally, Str) breach_items(BreachSvc s, View v, Int i, BreachTally t)
 @requires(declassify)
 Result(List(FieldPlain), Str) breach_open(View v, Item it) {
     Result(List(FieldPlain), SymbolonError) r = item_open(v.vk, v.vid, it);
-    return match r { Ok(x) => Ok(x), Err(_) => Err("item " + hex_encode(it.id) + " does not open") };
+    return match r { Ok(x) => Ok(x), Err(e) => Err("item " + hex_encode(it.id) + if (is_newer_err(e)) { " was saved by a newer Symbolon; update to check it" } else { " does not open" }) };
 }
 
 @requires(filesystem, network, device, declassify, clock, provision, environment)

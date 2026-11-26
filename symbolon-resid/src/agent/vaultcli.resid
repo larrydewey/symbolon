@@ -437,28 +437,36 @@ pub Int vault_list(Str dir, Int form) {
 pub Int list_items(View v, Int form, Int i) {
     if (i >= v.st.items.len()) { return 0; }
     // Listing needs only the standard tier (18.10.2): a protected item's
-    // name, type, folder and site open under vault_key alone.
-    Result(List(FieldPlain), SymbolonError) r = item_open_listing(v.vk, v.vid, v.st.items[i]);
-    _ = match r { Err(e) => dfail(err_text(e)), Ok(fs) => print_entry(fs, v.st.items[i].fields.contains("secret"), form, item_is_protected(v.st.items[i])) };
+    // name, type, folder and site open under vault_key alone. An item a
+    // newer agent wrote fields of (SPEC 18.3) is listed, locked, with
+    // what of it opens.
+    Result(Listed, SymbolonError) r = item_open_listed(v.vk, v.vid, v.st.items[i]);
+    _ = match r { Err(e) => dfail(err_text(e)), Ok(l) => print_entry(l.fields, v.st.items[i].fields.contains("secret"), form, item_is_protected(v.st.items[i]), l.newer || item_is_newer(v.st.items[i])) };
     return list_items(v, form, i + 1);
 }
 
+// An item a newer agent wrote (SPEC 18.3): its name when that opens, else
+// a stand-in; the plain listings add " (newer)", the long one a flag.
 @requires(declassify)
-Int print_entry(List(FieldPlain) fs, Bool has_secret, Int form, Bool prot) {
+Int print_entry(List(FieldPlain) fs, Bool has_secret, Int form, Bool prot, Bool newer) {
     Str t = type_of(fs, has_secret);
     Str name = field_text(fs, "name");
-    if (form == 0) { println(name); return 0; }
-    if (form == 1) { println(t + " " + name); return 0; }
+    Str shown = if (str_len(name) == 0 && newer) { "(an item saved by a newer Symbolon)" } else { name + if (newer) { " (newer)" } else { "" } };
+    if (form == 0) { println(shown); return 0; }
+    if (form == 1) { println(t + " " + shown); return 0; }
     Str d = if (t == "login") { field_text(fs, "origin") } else { if (t == "card") { last4(field_text(fs, "number")) } else { if (t == "passkey") { field_text(fs, "rp_id") } else { "" } } };
     Str f = field_text(fs, "folder");
     // A login's linked apps (SPEC 22.6 item 8), "PACKAGE CERT-SHA256" lines,
     // as a fifth column when there are any: public, like the site.
     Str a = if (t == "login") { field_text(fs, "apps") } else { "" };
     // A protected item (SPEC 18.10) says so in a sixth column, "protected",
-    // after the apps ("-" when there are none).
-    Str apps = if (str_len(a) == 0) { if (prot) { " -" } else { "" } } else { " " + hex_encode(utf8(a)) };
-    println(t + " " + hex_encode(utf8(name)) + " " + (if (str_len(d) == 0) { "-" } else { hex_encode(utf8(d)) }) + " " + (if (str_len(f) == 0) { "-" } else { hex_encode(utf8(f)) })
-            + apps + (if (prot) { " protected" } else { "" }));
+    // after the apps ("-" when there are none); an item a newer agent wrote
+    // (18.3) has "newer" there ("protected,newer" when both), and its name
+    // is "-" when that did not open.
+    Str flags = if (prot && newer) { "protected,newer" } else { if (prot) { "protected" } else { if (newer) { "newer" } else { "" } } };
+    Str apps = if (str_len(a) == 0) { if (str_len(flags) > 0) { " -" } else { "" } } else { " " + hex_encode(utf8(a)) };
+    println(t + " " + (if (str_len(name) == 0) { "-" } else { hex_encode(utf8(name)) }) + " " + (if (str_len(d) == 0) { "-" } else { hex_encode(utf8(d)) }) + " " + (if (str_len(f) == 0) { "-" } else { hex_encode(utf8(f)) })
+            + apps + (if (str_len(flags) > 0) { " " + flags } else { "" }));
     return 0;
 }
 

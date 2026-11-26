@@ -1492,7 +1492,9 @@ item id (from the name) nor the version is unique over time -- an item
 deleted and written again restarts at version 1, imports and shared-folder
 copies seal at version 1, a relay that rolls a vault back makes a device
 reuse a version -- so format 1 could seal two plaintexts under one key and
-nonce. Agents seal only format 2 and still open format 1.
+nonce. Agents seal only format 2 and still open format 1; how a reader
+tells them apart, and what it does with a format it does not know, is
+18.3.
 
 ### 18.2 Items
 
@@ -1524,11 +1526,60 @@ An item's folder is the sealed field `folder`, its levels joined by `/`
 ### 18.3 Encryption
 
 `aad = CBOR([2, vault_id, item_id, item_version, kind, field_name])`;
-`ct = salt || AES-256-GCM(field_key, nonce, plaintext, aad)`. A reader
-tries format 2 (the first 16 bytes as the salt) and, when that does not
-authenticate, format 1 (`aad` led by 1, `ct` the AEAD output alone); the
-two use different labels and `aad`, so bytes of one never open as the
+`ct = "SYMF" || 0x02 || salt || AES-256-GCM(field_key, nonce, plaintext, aad)`.
+Format 1 (`aad` led by 1, `ct` the AEAD output alone) has no header.
+The two use different labels and `aad`, so bytes of one never open as the
 other.
+
+**The format marker.** Every field a format after 1 seals starts with the
+five-byte header `"SYMF" || format` (one byte). A reader looks at it
+first:
+
+1. header naming 2: open as format 2; if that fails, try format 1 (a
+   format 1 field starts with the header by chance with probability
+   2^-32);
+2. no header: format 1;
+3. a header naming a format the reader does not know, and the bytes do not
+   open as format 1: the field was written by a newer agent. The item is
+   **present but locked**: listings show it (with whatever of it opens,
+   its name when that is in a known format, and the flag `newer` in `vault
+   list --long`'s sixth column, beside or instead of `protected`);
+   opening it says exactly "This item was saved by a newer Symbolon;
+   update to open it." It is never reported as an authentication failure
+   or tampering, never dropped, and never sealed again: a change to that
+   item (`vault put`/`set` of its name, edit, protect, re-key, a shared
+   folder's re-key) is refused with the same message, and every re-save
+   of the vault carries it byte for byte. (Kept bytes would not open at
+   a higher version, since the version is in the key and `aad`; so the
+   item is kept whole or not at all.) A fill never offers it.
+
+Any format change after this one MUST change only field bytes behind a
+new header number: an item's CBOR keys are fixed (the Merkle leaf is over
+exactly the six of 18.2), and an agent drops keys it does not know.
+
+The marker is outside the field's AEAD (a reader that does not know a
+format cannot check it), but every byte of an item is under the vault
+head's Merkle root, which a device of the quorum signs (18.4): the relay
+cannot make a field read as "newer" (nor turn "tampered" into "update").
+
+**Agents before the marker (0.13.0 and older).** They know format 1 only
+and cannot be changed; a field of format 2 (with or without the header)
+fails their AEAD. What they do with it, from their code: `vault list` (and
+the app's vault screen) writes "device: field authentication failed:
+FIELD" to standard error for each such item, leaves it out, and exits 0,
+so the app shows the vault without it and says nothing; `vault get`,
+`show`, `code`, fills, edits, `protect`/`unprotect` fail with "field
+authentication failed: FIELD", which the app shows as an error; the breach
+check fails ("item ... does not open"); removing a member of a shared
+folder fails ("an item does not open under the folder's key"); scans for
+imported passkeys skip it. They do not crash, and a re-save of the vault
+carries the item unchanged (the head and Merkle root are over its bytes).
+The one loss: `vault put`/`set` of the same name replaces an item without
+opening it, so a person on such an agent who re-creates a login that
+seems missing overwrites the newer item. Residual risk, until every device
+of an identity runs an agent with the marker: update every device; a
+format 1 fallback for writing is not offered, as it would bring back the
+key and nonce reuse that format 2 ends.
 
 ### 18.4 The vault head
 

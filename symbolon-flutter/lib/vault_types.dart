@@ -146,30 +146,44 @@ class CustomField {
   }
 }
 
+/// What the app says of an item a newer Symbolon saved (SPEC 18.3): it is
+/// there, locked, until this device's agent is updated. Never "damaged".
+const newerItemText = 'This item was saved by a newer Symbolon; update to open it.';
+
 /// An item as the vault list shows it (`vault list --long`).
 class VaultItem {
-  final String name;
+  final String name;       // "" for an item a newer Symbolon saved whose name this agent cannot read
   final String type;
   final String detail;     // a login's origin, a card's last four digits
   final String folder;     // "" when in no folder; levels joined by "/"
   final String apps;       // a login's linked Android apps: "PACKAGE CERT-SHA256" lines (SPEC 22.6 item 8)
   final bool protected;    // in the protected tier: opening it needs the cosigner (SPEC 18.10)
-  const VaultItem(this.name, this.type, {this.detail = '', this.folder = '', this.apps = '', this.protected = false});
+  final bool newer;        // saved by a newer Symbolon in a format this agent cannot read (SPEC 18.3): shown, locked
+  const VaultItem(this.name, this.type, {this.detail = '', this.folder = '', this.apps = '', this.protected = false, this.newer = false});
+
+  /// The name to show: the item's, or what stands in for one this agent cannot read.
+  String get title => name.isNotEmpty ? name : 'Saved by a newer Symbolon';
 
   ItemType get kind => typeOf(type);
 
   /// The linked apps, each (package, certificate SHA-256 in hex).
   List<(String, String)> get appLinks => appLinksOf(apps);
 
-  /// "TYPE NAME-HEX DETAIL-HEX [FOLDER-HEX [APPS-HEX [protected]]]"; null for a line that is not one.
+  /// "TYPE NAME-HEX DETAIL-HEX [FOLDER-HEX [APPS-HEX [FLAGS]]]", FLAGS
+  /// being "protected", "newer" or "protected,newer"; the name is "-" for
+  /// an item a newer Symbolon saved whose name does not open. Null for a
+  /// line that is not one.
   static VaultItem? parse(String line) {
     final p = line.trim().split(' ');
     if (p.length < 3 || p.length > 6) return null;
-    if (p.length == 6 && p[5] != 'protected') return null;
+    final flags = p.length == 6 ? p[5].split(',') : const <String>[];
+    if (flags.any((f) => f != 'protected' && f != 'newer')) return null;
+    final newer = flags.contains('newer');
+    if (p[1] == '-' && !newer) return null;
     String un(String h) => h == '-' ? '' : unhex(h);
     try {
-      return VaultItem(unhex(p[1]), p[0],
-          detail: un(p[2]), folder: p.length >= 4 ? un(p[3]) : '', apps: p.length >= 5 ? un(p[4]) : '', protected: p.length == 6);
+      return VaultItem(un(p[1]), p[0],
+          detail: un(p[2]), folder: p.length >= 4 ? un(p[3]) : '', apps: p.length >= 5 ? un(p[4]) : '', protected: flags.contains('protected'), newer: newer);
     } on FormatException {
       return null;
     }

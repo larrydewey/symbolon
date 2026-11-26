@@ -504,7 +504,8 @@ pub Str err_text(SymbolonError e) {
         ErrInvalidLog(s) => "log: " + s, ErrInvalidSignature(s) => "signature: " + s, ErrQuorumNotMet(h, n) => f"quorum {h}/{n}",
         ErrStaleEpoch(h, c) => f"epoch {h}/{c}", ErrVaultIntegrity(s) => s, ErrPolicyViolation(s) => s, ErrDuressContainment(s) => s,
         ErrRecoveryFailed(s) => s, ErrRotationFailed(s) => s, ErrAttestationFailed(s) => s, ErrCapabilityDenied(s) => s,
-        ErrNetwork(s) => s, ErrStorage(s) => s, ErrHardware(s) => s, ErrInternal(s) => s
+        ErrNetwork(s) => s, ErrStorage(s) => s, ErrHardware(s) => s, ErrInternal(s) => s,
+        ErrNewerFormat(_) => newer_text()
     };
 }
 

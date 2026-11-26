@@ -184,7 +184,8 @@ class _AutofillPageState extends State<AutofillPage> {
       });
       return;
     }
-    final items = [for (final l in res.lines) VaultItem.parse(l)].whereType<VaultItem>().toList();
+    // An item a newer Symbolon saved (SPEC 18.3) cannot be opened here: never offered.
+    final items = [for (final l in res.lines) VaultItem.parse(l)].whereType<VaultItem>().where((i) => !i.newer).toList();
     final found = r.wantsCard ? items.where((i) => i.type == 'card').toList() : items.where((i) => r.fits(i, verifiedHosts)).toList();
     found.sort((a, b) => a.name.compareTo(b.name));
     pin.clear();

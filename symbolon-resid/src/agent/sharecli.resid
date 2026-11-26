@@ -929,7 +929,7 @@ List(Member) without_member(List(Member) ms, List(Int) l, Int i, ListBuf(Member)
 pub Result(List(Item), Str) reseal(List(Secret(UInt(8))) old, List(Secret(UInt(8))) key, List(Int) vid, List(Item) items, Int i, ListBuf(Item) acc) {
     if (i >= items.len()) { return Ok(acc.finish()); }
     Result(List(FieldPlain), SymbolonError) rf = item_open(old, vid, items[i]);
-    Result(Item, Str) rs = match rf { Err(_) => Err("an item does not open under the folder's key"), Ok(fs) => sealed_again(key, vid, fs) };
+    Result(Item, Str) rs = match rf { Err(e) => Err(if (is_newer_err(e)) { "an item of this folder was saved by a newer Symbolon; update to change who shares it" } else { "an item does not open under the folder's key" }), Ok(fs) => sealed_again(key, vid, fs) };
     return match rs {
         Err(m) => fail_items(acc, m),
         Ok(it) => reseal(old, key, vid, items, i + 1, acc.push(it))

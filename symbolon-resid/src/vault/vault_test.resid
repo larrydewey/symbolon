@@ -102,13 +102,72 @@ test "an item written again at the same id and version reuses no key and nonce" 
     List(Int) cb = b.fields["secret"] else { [] };
     List(Int) px = xor_at(utf8("hunter2"), utf8("letmein"), 0, 7);
     expect(hex_encode(xor_at(ca, cb, 0, 7)) == hex_encode(px)).toBeFalse();
-    expect(hex_encode(xor_at(ca, cb, 16, 7)) == hex_encode(px)).toBeFalse();
+    expect(hex_encode(xor_at(ca, cb, field_header_len() + 16, 7)) == hex_encode(px)).toBeFalse();
     // The same plaintext twice: other ciphertexts, both opening.
     Item c = sealed_secret("hunter2");
     expect(hex_encode(c.fields["secret"] else { [] }) == hex_encode(ca)).toBeFalse();
     expect(first_byte(item_open(vk(5), vid(), a), "secret")).toEqual(104);
     expect(first_byte(item_open(vk(5), vid(), c), "secret")).toEqual(104);
     expect(first_byte(item_open(vk(5), vid(), b), "secret")).toEqual(108);
+}
+
+// ─── Fields a newer agent wrote (SPEC 18.3) ─────────────────────
+
+// The login of make(n, 5) with its password replaced by what a newer agent
+// would write: the header naming format 9, then bytes this agent cannot read.
+@requires(declassify)
+Item with_future_password(Int n) {
+    Item it = make(n, 5);
+    return Item {.id = it.id, .version = it.version, .kind = it.kind, .fields = it.fields.insert("password", field_header(9).concat(rep(171, 40))),
+                 .in_duress_subset = false, .handling_policy = None};
+}
+
+Bool newer_err(Result(List(FieldPlain), SymbolonError) r) { return match r { Ok(_) => false, Err(e) => is_newer_err(e) }; }
+Bool newer_err_i(Result(Item, SymbolonError) r) { return match r { Ok(_) => false, Err(e) => is_newer_err(e) }; }
+Bool integrity_err(Result(List(FieldPlain), SymbolonError) r) { return match r { Ok(_) => false, Err(e) => match e { ErrVaultIntegrity(_) => true, _ => false } }; }
+
+@requires(declassify)
+test "a field in a format a newer agent wrote opens to the update message, never as tampering" {
+    Item it = with_future_password(1);
+    expect(item_is_newer(it)).toBeTrue();
+    expect(item_is_newer(make(1, 5))).toBeFalse();
+    Result(List(FieldPlain), SymbolonError) r = item_open(vk(5), vid(), it);
+    expect(newer_err(r)).toBeTrue();
+    expect(integrity_err(r)).toBeFalse();
+    expect(newer_text()).toEqual("This item was saved by a newer Symbolon; update to open it.");
+    // The listing shows the item, locked, with what of it opens.
+    Result(Listed, SymbolonError) l = item_open_listed(vk(5), vid(), it);
+    expect(match l { Ok(x) => x.newer, Err(_) => false }).toBeTrue();
+    expect(match l { Ok(x) => first_of(x.fields, "user", 0), Err(_) => -1 }).toEqual(97);
+    expect(match item_open_listed(vk(5), vid(), make(1, 5)) { Ok(x) => x.newer, Err(_) => true }).toBeFalse();
+    // A format 2 field changed in transit is still a failed authentication.
+    List(Int) ct = make(1, 5).fields["password"] else { [] };
+    Item bad = Item {.id = it.id, .version = it.version, .kind = it.kind, .fields = it.fields.insert("password", ct[0..ct.len() - 1].concat([ct[ct.len() - 1] ^ 1])),
+                     .in_duress_subset = false, .handling_policy = None};
+    expect(integrity_err(item_open(vk(5), vid(), bad))).toBeTrue();
+    expect(match item_open_listed(vk(5), vid(), bad) { Ok(_) => false, Err(e) => !is_newer_err(e) }).toBeTrue();
+}
+
+@requires(declassify)
+test "an item a newer agent wrote is never sealed again: it stays byte for byte" {
+    Item it = with_future_password(1);
+    List(FieldPlain) fresh = [FieldPlain {.name = "name", .value = secret_bytes(utf8("x"))}, FieldPlain {.name = "secret", .value = secret_bytes(utf8("y"))}];
+    List(Secret(UInt(8))) none = [];
+    expect(newer_err_i(item_reseal(vk(5), none, vid(), Some(it), it.id, "login", fresh))).toBeTrue();
+    expect(newer_err_i(item_protect(vk(5), secret_bytes(rep(9, 32)), vid(), it))).toBeTrue();
+    expect(newer_err_i(item_reencrypt(vk(5), vk(6), vid(), it))).toBeTrue();
+    expect(is_ok(item_reseal(vk(5), none, vid(), Some(make(1, 5)), iid(1), "login", fresh))).toBeTrue();
+}
+
+@requires(declassify)
+test "a field's header names its format; none is format 1" {
+    Item it = make(1, 5);
+    List(Int) ct = it.fields["password"] else { [] };
+    expect(field_format(ct)).toEqual(2);
+    expect(field_format([1, 2, 3])).toEqual(1);
+    expect(field_format(field_header(7).concat([0]))).toEqual(7);
+    expect(field_is_newer(field_header(2))).toBeFalse();
+    expect(field_is_newer(field_header(3))).toBeTrue();
 }
 
 @requires(declassify)

@@ -47,7 +47,7 @@ def seal(vk, vid, iid, ver, kind, f, pt):
     ik = item_key(vk, vid, iid)
     return AESGCM(field_key(ik, f, ver)).encrypt(field_nonce(ik, f, ver), pt, aad(vid, iid, ver, kind, f))
 
-# Format 2 (every seal now): a random 16-byte salt in front, as the HKDF salt
+# Format 2 (every seal now): the header b"SYMF" 2, then a random 16-byte salt, as the HKDF salt
 # of the field key and the nonce; the aad array is led by 2.
 def field_key2(ik, salt, f, ver): return hkdf(ik, salt, b'symbolon v2 field' + f.encode() + ver.to_bytes(8, 'big'), 32)
 def field_nonce2(ik, salt, f, ver): return hkdf(ik, salt, b'symbolon v2 nonce' + f.encode() + ver.to_bytes(8, 'big'), 12)
@@ -55,7 +55,7 @@ def aad2(vid, iid, ver, kind, f): return arr([uint(2), bstr(vid), bstr(iid), uin
 
 def seal2(vk, vid, iid, ver, kind, f, pt, salt):
     ik = item_key(vk, vid, iid)
-    return salt + AESGCM(field_key2(ik, salt, f, ver)).encrypt(field_nonce2(ik, salt, f, ver), pt, aad2(vid, iid, ver, kind, f))
+    return b"SYMF\x02" + salt + AESGCM(field_key2(ik, salt, f, ver)).encrypt(field_nonce2(ik, salt, f, ver), pt, aad2(vid, iid, ver, kind, f))
 
 def item_cbor(iid, ver, kind, fields, duress, handling):
     names = sorted(fields)

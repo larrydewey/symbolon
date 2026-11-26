@@ -135,7 +135,9 @@ case "$1 $2" in
     [ -f "$D/offline" ] && case "$3" in list|show|get) echo "device: local copy: no log at the relay; showing vault version 2 as this device last verified it" >&2 ;; *) echo "device: no log at the relay" >&2; exit 1 ;; esac
     case "$3" in
       list) case "$5" in
-        --long) printf 'login 6d61696c 68747470733a2f2f6d61696c2e6578616d706c652e636f6d 576f726b2f456d61696c %s\nsecret 62616e6b - - - protected\ncard 76697361 31313131 46696e616e6365\n' "$(printf 'com.example.mail %s' "$(printf 'ab%.0s' $(seq 32))" | od -v -An -tx1 | tr -d ' \n')" ;;
+        --long) printf 'login 6d61696c 68747470733a2f2f6d61696c2e6578616d706c652e636f6d 576f726b2f456d61696c %s\nsecret 62616e6b - - - protected\ncard 76697361 31313131 46696e616e6365\n' "$(printf 'com.example.mail %s' "$(printf 'ab%.0s' $(seq 32))" | od -v -An -tx1 | tr -d ' \n')"
+                # Items a newer agent saved (SPEC 18.3): one whose name opens, one whose name does not.
+                [ -f "$D/newer" ] && printf 'login 6e6f7465 - - - newer\nlogin - - - - newer\n' ;;
         --kinds) printf 'login mail\nsecret bank\n' ;;
         *) printf 'mail\nbank\n' ;; esac ;;
       show) [ -n "${SYMBOLON_FILL:-}" ] && [ "$5" = mail ] && {

@@ -143,11 +143,25 @@ class _VaultPageState extends State<VaultPage> {
   }
 
   Future<void> show(VaultItem it) async {
+    // Saved by a newer Symbolon (SPEC 18.3): there, locked; nothing to open or change here.
+    if (it.newer) return showNewer(it);
     final change = await Navigator.of(context).push<ItemChange>(
         MaterialPageRoute(builder: (_) => ItemPage(app: app, item: it, offline: offline, names: {for (final i in items ?? <VaultItem>[]) i.name}, folders: folders, share: share)));
     if (change == null || !mounted || items == null) return;
     setState(() => _keep([...?items?.where((x) => x.name != it.name && x.name != change.saved?.name), ?change.saved]));
   }
+
+  /// An item a newer Symbolon saved (SPEC 18.3): said calmly, and nothing
+  /// else offered: this app cannot open it, change it or write over it.
+  Future<void> showNewer(VaultItem it) => showDialog<void>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          icon: const Icon(Icons.lock_outline),
+          title: Text(it.title),
+          content: const Text(newerItemText, key: Key('newer-text')),
+          actions: [FilledButton(key: const Key('newer-ok'), onPressed: () => Navigator.of(ctx).pop(), child: const Text('OK'))],
+        ),
+      );
 
   /// What a row's copy button copies, by type: the field and its label.
   static const _quick = {'login': ('current', 'Password'), 'wifi': ('password', 'Wi-Fi password'), 'card': ('number', 'Card number')};
@@ -220,17 +234,18 @@ class _VaultPageState extends State<VaultPage> {
               if (folders.isNotEmpty) _FolderPicker(folders: folders, selected: folder, onSelected: (f) => setState(() => folder = f)),
               if (shown.isEmpty) const Padding(padding: EdgeInsets.all(24), child: Center(child: Text('Nothing matches.'))),
             ],
-            for (final it in shown)
+            for (final (i, it) in shown.indexed)
               Card(
                 child: ListTile(
-                  key: Key('item-${it.name}'),
+                  key: Key(it.name.isEmpty ? 'item-newer-$i' : 'item-${it.name}'),
                   leading: it.type == 'login'
                       ? SiteIcon(favicons: app.favicons, origin: it.detail, fallback: TypeAvatar(it.kind))
                       : TypeAvatar(it.kind),
-                  title: Text(it.name),
+                  title: Text(it.title),
                   subtitle: Wrap(spacing: 8, crossAxisAlignment: WrapCrossAlignment.center, children: [
                     KindTag(it.kind.label, it.kind.color),
                     if (it.protected) Icon(Icons.shield_outlined, size: 16, key: Key('protected-tag-${it.name}'), semanticLabel: 'Protected'),
+                    if (it.newer) Icon(Icons.lock_outline, size: 16, key: Key('newer-tag-${it.name}'), semanticLabel: 'Saved by a newer Symbolon'),
                     if (it.type == 'login' && app.settings.breachedCount(it.name, share: share) != null) KindTag('Breached', Colors.red.shade700, key: Key('breached-tag-${it.name}')),
                     if (it.type == 'login' || it.type == 'card') Text(it.subtitle, style: Theme.of(context).textTheme.bodySmall),
                     if (it.folder.isNotEmpty && folder != it.folder)
@@ -240,7 +255,9 @@ class _VaultPageState extends State<VaultPage> {
                         Text(it.folder.replaceAll('/', ' › '), style: Theme.of(context).textTheme.bodySmall),
                       ]),
                   ]),
-                  trailing: _quick.containsKey(it.type)
+                  trailing: it.newer
+                      ? const Icon(Icons.lock_outline)
+                      : _quick.containsKey(it.type)
                       ? IconButton(
                           key: Key('quick-copy-${it.name}'),
                           tooltip: 'Copy ${_quick[it.type]!.$2.toLowerCase()}',

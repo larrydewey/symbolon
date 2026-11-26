@@ -327,4 +327,5 @@ type SymbolonError =
   | ErrNetwork(Str)
   | ErrStorage(Str)
   | ErrHardware(Str)
-  | ErrInternal(Str);
+  | ErrInternal(Str)
+  | ErrNewerFormat(Str);                   // a vault field in a format a newer agent wrote (SPEC 18.3): its name, or ""

@@ -46,7 +46,7 @@ Str err_str(SymbolonError e) {
         ErrVaultIntegrity(s) => s, ErrPolicyViolation(s) => "policy: " + s, ErrDuressContainment(s) => "duress: " + s,
         ErrRecoveryFailed(s) => s, ErrRotationFailed(s) => s, ErrAttestationFailed(s) => s,
         ErrCapabilityDenied(s) => s, ErrNetwork(s) => "net: " + s, ErrStorage(s) => s, ErrHardware(s) => s,
-        ErrInternal(s) => s
+        ErrInternal(s) => s, ErrNewerFormat(s) => "newer: " + s
     };
 }
 

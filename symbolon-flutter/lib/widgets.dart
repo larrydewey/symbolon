@@ -10,6 +10,7 @@ import 'package:flutter/services.dart';
 
 import 'breach.dart';
 import 'cli.dart';
+import 'vault_types.dart' show newerItemText;
 
 /// Asks for the PIN (or another secret) in a dialog. The text is obscured
 /// (the eye shows it) and lives only in the dialog's controller; null when
@@ -71,6 +72,7 @@ String friendlyError(CliResult r) {
   final p = r.problem;
   final l = p.toLowerCase();
   if (l.contains('wrong pin')) return 'Wrong PIN.';
+  if (l.contains('saved by a newer symbolon')) return newerItemText;
   if (r.code == 124 || l.contains('timed out')) return 'This took too long and was stopped. Check that this device can reach the relay and the cosigner, then try again.';
   if (l.contains('needs the cosigner')) {
     return 'This item is protected: opening it needs your cosigner, which did not answer. It may be offline, past this device\'s hourly limit, '

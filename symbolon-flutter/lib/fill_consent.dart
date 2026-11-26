@@ -290,7 +290,7 @@ class _FillConsentPageState extends State<FillConsentPage> {
       return;
     }
     final all = [for (final l in r.lines) VaultItem.parse(l)].whereType<VaultItem>().toList();
-    final found = all.where(_fits).toList()..sort((a, b) => a.name.compareTo(b.name));
+    final found = all.where((i) => !i.newer && _fits(i)).toList()..sort((a, b) => a.name.compareTo(b.name));
     pin.clear();
     setState(() {
       busy = false;
