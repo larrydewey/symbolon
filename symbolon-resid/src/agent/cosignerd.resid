@@ -532,7 +532,9 @@ Cosigner refuse(Cosigner c, List(Int) to, List(Int) sid) {
 @requires(network, filesystem, declassify, clock)
 Handled decide(Cosigner c, List(Int) from, SignInvite inv, VerifiedHead vh, List(Got) early, List(Kept) kept) {
     CosignerState st = load_state(c, vh);
-    if (!bytes_eq(from, inv.requester) || inv.epoch < 0 || inv.kind < 0 || inv.kind > 255) { return Handled {.c = refuse(c, from, inv.session_id), .kept = kept}; }
+    // A signing session is a sign request: any other kind would be billed
+    // to another budget (an evaluation's) or pass as an authority request.
+    if (!bytes_eq(from, inv.requester) || inv.epoch < 0 || inv.kind != (Int)request_sign()) { return Handled {.c = refuse(c, from, inv.session_id), .kept = kept}; }
     CosignRequest req = CosignRequest {.session_id = inv.session_id, .message = inv.message, .epoch = (UInt(32))inv.epoch,
                                        .requester = inv.requester, .kind = (UInt(8))inv.kind, .sig = inv.sig};
     CosignOutcome o = cosign_decide(st, req, policy_now(c, vh));
