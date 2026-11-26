@@ -68,7 +68,31 @@ Bool in_ids(List(Int) xs, Int x, Int i) {
 
 // ─── Round 1 ────────────────────────────────────────────────────
 
+// The shape every party checks before it deals or receives: dealers
+// distinct and at least one; a dealer's polynomial x_i L_i(x) + h(x) has
+// degree |dealers| - 1 (L_i over the dealers), which the new degree must
+// cover, or the deal is not a sharing of that degree; the new parties
+// distinct, at least degree + 1 of them.
+pub Str rs_ctx_problem(RsCtx c) {
+    if (c.dealers.len() < 1 || !distinct_ids(c.dealers, 0) || !positive_ids(c.dealers, 0)) { return "the dealers are not distinct"; }
+    if (c.degree < 0 || c.degree < c.dealers.len() - 1) { return "the new degree is below the dealers' count less one"; }
+    List(Int) everyone = c.receivers.concat(c.offline);
+    if (!distinct_ids(everyone, 0) || !positive_ids(everyone, 0)) { return "the new parties are not distinct"; }
+    if (everyone.len() < c.degree + 1) { return "fewer new parties than the new threshold"; }
+    return "";
+}
+
+Bool distinct_ids(List(Int) xs, Int i) {
+    if (i >= xs.len()) { return true; }
+    if (in_ids(xs, xs[i], i + 1)) { return false; }
+    return distinct_ids(xs, i + 1);
+}
+
+Bool positive_ids(List(Int) xs, Int i) { return i >= xs.len() || (xs[i] > 0 && positive_ids(xs, i + 1)); }
+
 pub Result(RsStep, CgFail) rs_start(RsCtx c) {
+    Str bad = rs_ctx_problem(c);
+    if (str_len(bad) > 0) { return Err(cg_fail(bad, [])); }
     if (c.self == 0) { return Ok(RsStep {.state = RS1(c, []), .out = []}); }
     List(List(UInt(64))) pq = if (c.primes.len() == 2) { c.primes } else { kg_primes(KgCtx {.self = c.self, .ids = c.receivers, .threshold = c.degree, .prev = [], .session_id = c.session_id, .seed = c.seed, .primes = []}) };
     if (pq.len() != 2) { return Err(cg_fail("no Paillier primes", [])); }
@@ -129,6 +153,15 @@ Option(RsAnnMsg) ann_for(List(RsAnnMsg) as, Int id, Int i) {
 
 RshAnn rsh_of(RsAnnMsg a) { return RshAnn {.id = a.id, .pail = paillier_pub(a.n), .ped = a.ped, .modp = a.modp, .prm = a.prm}; }
 
+// A receiver's Paillier modulus is 2048 bits and odd, as key generation
+// requires (cggmp_keygen's kg_valid_n), and its Pedersen parameters are
+// over that same modulus: the fac proof's bound assumes a 2048-bit N, so a
+// smaller one with a small factor would pass it, and the deals encrypted
+// to it would leak the dealers' contributions.
+pub Bool rs_ann_params_ok(RsAnnMsg a) {
+    return bn_bit_len(a.n) == 2048 && bn_is_odd(a.n) && bn_cmp(a.ped.n, a.n) == 0;
+}
+
 // Every receiver's announcement, in id order, checked; the culprit otherwise.
 Result(List(RsAnnMsg), CgFail) check_anns(RsCtx c, List(RsAnnMsg) got, List(RsMine) mine, Int i, List(RsAnnMsg) acc) {
     if (i >= c.receivers.len()) { return Ok(acc); }
@@ -137,7 +170,8 @@ Result(List(RsAnnMsg), CgFail) check_anns(RsCtx c, List(RsAnnMsg) got, List(RsMi
     if (id == c.self) { return check_anns(c, got, mine, i + 1, acc.concat([own_ann(c, mine[0])])); }
     return match oa {
         None => Err(cg_fail("missing announcement", [id])),
-        Some(a) => if (rsh_announce_ok(rsh_of(a), rs_tr(c, id)) && pedersen_valid(a.ped) && sch_verify(a.elgamal, cv_g(), a.elg_proof, rs_tr(c, id))) {
+        Some(a) => if (!rs_ann_params_ok(a)) { Err(cg_fail("bad Paillier modulus or Pedersen parameters", [id])) }
+            else if (rsh_announce_ok(rsh_of(a), rs_tr(c, id)) && pedersen_valid(a.ped) && sch_verify(a.elgamal, cv_g(), a.elg_proof, rs_tr(c, id))) {
             check_anns(c, got, mine, i + 1, acc.concat([a]))
         } else { Err(cg_fail("announcement proofs failed", [id])) }
     };
@@ -234,22 +268,59 @@ CvPt public_share(List(RsDealMsg) ds, Int id, Int i, CvPt acc) {
     return public_share(ds, id, i + 1, cv_add(acc, rsh_commit_eval_at(ds[i].commits, id)));
 }
 
+// The Lagrange basis coefficient of `self` over `ids`, at x.
+List(UInt(64)) lag_at(List(Int) ids, Int self, Int x, Int k, List(UInt(64)) acc) {
+    if (k >= ids.len()) { return acc; }
+    Int j = ids[k];
+    if (j == self) { return lag_at(ids, self, x, k + 1, acc); }
+    return lag_at(ids, self, x, k + 1, sc_nat_mul(acc, sc_nat_mul(sc_int(x - j), sc_nat_inv(sc_int(self - j)))));
+}
+
+List(UInt(64)) sc_int(Int v) { return if (v >= 0) { bn_from_u64(u64(v)) } else { sc_nat_neg(bn_from_u64(u64(0 - v))) }; }
+
+List(Int) public_ids(List(CgPublicCfg) ps, Int i, List(Int) acc) {
+    if (i >= ps.len()) { return acc; }
+    return public_ids(ps, i + 1, acc.concat([ps[i].id]));
+}
+
+// Old party i's public share X_i = f(i) G, from the old configuration's
+// public shares: they all lie on f, of degree below their count, so
+// interpolating through all of them gives f(i) G (an offline party, the kit
+// among them, has no entry of its own).
+pub CvPt old_public_at(List(CgPublicCfg) ps, Int i) { return opa(ps, public_ids(ps, 0, []), i, 0, cv_inf()); }
+
+CvPt opa(List(CgPublicCfg) ps, List(Int) ids, Int i, Int k, CvPt acc) {
+    if (k >= ps.len()) { return acc; }
+    return opa(ps, ids, i, k + 1, cv_add(acc, cv_mul(lag_at(ids, ps[k].id, i, 0, [1]), ps[k].ecdsa)));
+}
+
+// Each dealer's constant term must be lambda_i X_i (lambda over the
+// dealers, at 0): a dealer that commits to anything else is named. Checked
+// by a party that holds the old public shares (every dealer that deals from
+// its own configuration); the sum check below holds for everyone.
+Result(Int, CgFail) check_constants(RsCtx c, List(RsDealMsg) ds, Int i) {
+    if (c.old.len() == 0 || c.old[0].public.len() == 0 || i >= ds.len()) { return Ok(0); }
+    CvPt want = cv_mul(cg_lagrange(c.dealers, ds[i].dealer), old_public_at(c.old[0].public, ds[i].dealer));
+    if (!cv_eq(ds[i].commits[0], want)) { return Err(cg_fail("a dealer's constant term is not its share of the root key", [ds[i].dealer])); }
+    return check_constants(c, ds, i + 1);
+}
+
 CvPt constant_sum(List(RsDealMsg) ds, Int i, CvPt acc) {
     if (i >= ds.len()) { return acc; }
     return constant_sum(ds, i + 1, cv_add(acc, ds[i].commits[0]));
 }
 
 // The transcript digest: SHA-256 over the session id, each receiver's
-// Paillier modulus, Pedersen parameters and ElGamal key, and each dealer's
+// Paillier modulus, Pedersen parameters (N, s, t) and ElGamal key, and each dealer's
 // commitments, in id order.
 List(Int) transcript_of(RsCtx c, List(RsAnnMsg) as, List(RsDealMsg) ds) {
     return sha256_bytes(c.session_id.concat(t_anns(as, 0, [])).concat(t_deals(ds, 0, [])));
 }
 
-List(Int) t_anns(List(RsAnnMsg) as, Int i, List(Int) acc) {
+pub List(Int) t_anns(List(RsAnnMsg) as, Int i, List(Int) acc) {
     if (i >= as.len()) { return acc; }
     RsAnnMsg a = as[i];
-    List(Int) one = bn_to_be(bn_from_u64(u64(a.id)), 4).concat(bn_to_be(a.n, 256)).concat(bn_to_be(a.ped.s, 256)).concat(bn_to_be(a.ped.t, 256)).concat(cv_enc(a.elgamal));
+    List(Int) one = bn_to_be(bn_from_u64(u64(a.id)), 4).concat(bn_to_be(a.n, 256)).concat(bn_to_be(a.ped.n, 256)).concat(bn_to_be(a.ped.s, 256)).concat(bn_to_be(a.ped.t, 256)).concat(cv_enc(a.elgamal));
     return t_anns(as, i + 1, acc.concat(one));
 }
 
@@ -289,6 +360,7 @@ List(CgPublicCfg) publics(List(RsAnnMsg) as, List(RsDealMsg) ds, Int i, List(CgP
 
 Result(RsStep, CgFail) rs_round3(RsCtx c, List(RsMine) mine, List(RsAnnMsg) as, List(RsOffline) off, List(ThMsg) in, List(RsDealMsg) own_deal) {
     List(RsDealMsg) ds = ordered_deals(c, deals_of(in, 0, []).concat(own_deal), 0, [])?;
+    _ = check_constants(c, ds, 0)?;
     // The deals must keep X: the constant terms add up to the root key.
     Option(CvPt) ox = cv_dec(compress(c.root));
     CvPt x = ox else { cv_inf() };

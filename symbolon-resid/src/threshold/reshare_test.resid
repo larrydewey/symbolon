@@ -215,3 +215,73 @@ test "re-share to a new device: same key, kit share by the dealers, transcripts 
     List(Int) sig = cose_hex_decode(signed(sr.ss, 0));
     expect(ecdsa_verify_digest(P256, credential_pubkey(x, tau), digest, ecdsa_sig_raw(P256, sig))).toBeTrue();
 }
+
+Str start_said(RsCtx c) { return match rs_start(c) { Ok(_) => "ok", Err(e) => e.why }; }
+
+RsCtx shaped(List(Int) dealers, List(Int) receivers, List(Int) offline, Int degree) {
+    return RsCtx { .self = 0, .old_self = 0, .dealers = dealers, .receivers = receivers, .offline = offline, .degree = degree, .old = [],
+                    .root = [], .session_id = bytes_of("s"), .seed = [1], .primes = [] };
+}
+
+// Degree 0 gives every receiver lambda_i x_i from each dealer, in the clear
+// to whoever decrypts it: the share itself (C-2).
+test "a re-share's shape is checked before anything is dealt" {
+    expect(start_said(shaped([1, 3], [1, 3, 4], [2], 1))).toEqual("ok");
+    expect(start_said(shaped([1, 3], [1, 3, 4], [2], 0))).toEqual("the new degree is below the dealers' count less one");
+    expect(start_said(shaped([1, 1], [1, 3, 4], [2], 1))).toEqual("the dealers are not distinct");
+    expect(start_said(shaped([], [1, 3, 4], [2], 1))).toEqual("the dealers are not distinct");
+    expect(start_said(shaped([1, 3], [1, 3, 3], [2], 1))).toEqual("the new parties are not distinct");
+    expect(start_said(shaped([1, 3], [1, 3], [1], 1))).toEqual("the new parties are not distinct");
+    expect(start_said(shaped([1, 3], [1], [], 1))).toEqual("fewer new parties than the new threshold");
+}
+
+RsAnnMsg ann(List(UInt(64)) n, List(UInt(64)) pn) {
+    List(UInt(64)) none = [];
+    return RsAnnMsg { .id = 4, .n = n, .ped = Pedersen { .n = pn, .s = [5], .t = [7] }, .modp = ModProof { .w = none, .responses = [] }, .prm = PrmProof { .as = [], .zs = [] },
+                      .elgamal = cv_mul_base([3]), .elg_proof = SchProof { .c = cv_inf(), .z = none } };
+}
+
+// The fac proof's bound assumes a 2048-bit modulus; the Pedersen
+// parameters must be over the announced modulus and are bound into the
+// transcript (C-4).
+test "an announced Paillier modulus is 2048 bits, its Pedersen parameters over it, all in the transcript" {
+    List(UInt(64)) big = bn_mul(primes()[0][0], primes()[0][1]);
+    List(UInt(64)) other = bn_mul(primes()[1][0], primes()[1][1]);
+    List(UInt(64)) small = bn_mul(primes()[0][0], [65537]);
+    expect(rs_ann_params_ok(ann(big, big))).toBeTrue();
+    expect(rs_ann_params_ok(ann(small, small))).toBeFalse();
+    expect(rs_ann_params_ok(ann(big, other))).toBeFalse();
+    expect(hex_encode(t_anns([ann(big, big)], 0, [])) == hex_encode(t_anns([ann(big, other)], 0, []))).toBeFalse();
+}
+
+// Dealer 3's deal, its constant term moved by G.
+List(ThMsg) shift_deal(List(ThMsg) ms, Int i, ListBuf(ThMsg) acc) {
+    if (i >= ms.len()) { return acc.finish(); }
+    ThMsg m = ms[i];
+    return shift_deal(ms, i + 1, acc.push(match m { ThRs(r) => ThRs(shifted(r)), _ => m }));
+}
+
+RsMsg shifted(RsMsg r) {
+    RsBody b = r.body;
+    return match b {
+        RsDeal(d) => if (d.dealer == 3) { RsMsg { .from = r.from, .to = r.to, .body = RsDeal(RsDealMsg { .dealer = 3, .commits = [cv_add(d.commits[0], cv_mul_base([1]))].concat(d.commits[1..d.commits.len()]), .parts = d.parts }) } } else { r },
+        _ => r
+    };
+}
+
+// A dealer whose constant term is not lambda_i X_i is named, not just
+// "the deals do not keep the root key" (C-6); X_i of a party with no
+// public entry (the kit) comes from the others by interpolation.
+test "a dealer that does not deal its own share of the root key is named" {
+    List(CgConfig) cs = keygen();
+    List(Int) x = cfg_root_pubkey(cs[0], [1, 2, 3]);
+    List(CgPublicCfg) ps = cs[0].public;
+    expect(cv_eq(old_public_at([ps[0], ps[2]], 2), ps[1].ecdsa)).toBeTrue();
+    RsStep a = rs_start(rctx(1, 1, [cs[0]], x, 3)) else { RsStep { .state = RSDone(none_res()), .out = [] } };
+    RsStep b = rs_start(rctx(3, 3, [cs[2]], x, 4)) else { a };
+    RsStep n = rs_start(rctx(4, 0, [], x, 5)) else { a };
+    RR r2 = rrun([RsP { .id = 1, .st = a.state }, RsP { .id = 3, .st = b.state }, RsP { .id = 4, .st = n.state }], a.out.concat(b.out).concat(n.out), 1);
+    expect(r2.fail).toEqual("");
+    RR r3 = rrun(r2.ps, shift_deal(r2.out, 0, ListBuf()), 1);
+    expect(r3.fail).toEqual("a dealer's constant term is not its share of the root key [3]");
+}
