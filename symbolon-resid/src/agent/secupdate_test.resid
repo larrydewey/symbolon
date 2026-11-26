@@ -296,6 +296,26 @@ test "the update takes only the PIN first and this device's duress PIN second, a
     expect(hex_encode(read_blob(dir, "a", []))).toEqual(hex_encode(a));
     expect(hex_encode(read_blob(dir, "b", []))).toEqual(hex_encode(b));
     expect(duress_pub(dir).len()).toEqual(65);
+    // Nor did the device move to its v2 key (the move now comes first).
+    expect(hex_encode(cfg(dir).hpke_pub)).toEqual(hex_encode(c.hpke_pub));
+}
+
+Bool is_err(Result(Int, Str) r) { return match r { Ok(_) => false, Err(_) => true }; }
+
+@requires(filesystem, device, declassify, provision, network, environment, clock)
+test "the duress keys are registered with the cosigner under the device's v2 key, never v1" {
+    Str dir = new_device(true);
+    expect(make_old(dir, true)).toBeTrue();
+    DeviceConfig c0 = cfg(dir);
+    Unlocked u = open_as(dir, pin());
+    // Before the move: the v1 key (which the old duress profile holds) is
+    // refused for a registration, also on a device not in a log yet.
+    expect(registers_under_v2(c0, u)).toBeFalse();
+    expect(is_err(register_keys(dir, c0, u, rep(4, 130)))).toBeTrue();
+    expect(update_with(dir, c0, pin(), dpin())).toEqual(0);
+    DeviceConfig c1 = cfg(dir);
+    expect(registers_under_v2(c1, u)).toBeTrue();
+    expect(is_err(register_keys(dir, c1, u, rep(4, 130)))).toBeFalse();
 }
 
 @requires(filesystem, device, declassify, provision, network, environment, clock)

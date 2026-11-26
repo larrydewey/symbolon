@@ -65,14 +65,44 @@ pub Int update_with(Str dir, DeviceConfig c, Str pin, Str dpin) {
     if (str_len(dpin) > 0 && dpin == pin) { return dfail("that is the PIN: give the duress PIN second (an empty line if this device has none)"); }
     // The transport keys ran before: the profile format is what is left.
     if (transport_update_done(dir)) { Int k = keys_update(dir, c, u, dpin, false); return k; }
-    Result(Int, Str) r1 = reseal_duress(dir, c, u, dpin);
-    if (match r1 { Err(_) => true, Ok(_) => false }) { return dfail(match r1 { Err(m) => m, Ok(_) => "" }); }
-    println("security update: the duress profile has its own transport key");
+    // The duress PIN checked before anything changes; then the device moves
+    // to v2 first, so that the duress keys are registered with the cosigner
+    // under v2: the v1 key is the one the old duress profile holds, and
+    // whoever has the duress PIN could otherwise register keys of their
+    // own under it, in the device's name, until the move.
+    Result(Int, Str) r0 = duress_pin_check(dir, c, u, dpin);
+    if (match r0 { Err(_) => true, Ok(_) => false }) { return dfail(match r0 { Err(m) => m, Ok(_) => "" }); }
     Result(DeviceConfig, Str) r2 = move_transport(dir, c, u);
     return match r2 {
         Err(m) => dfail(m),
-        Ok(n) => finish_update(dir, n, u, pin, dpin)
+        Ok(n) => resealed_then_finish(dir, n, u, pin, dpin)
     };
+}
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+Int resealed_then_finish(Str dir, DeviceConfig n, Unlocked u, Str pin, Str dpin) {
+    Result(Int, Str) r1 = reseal_duress(dir, n, u, dpin);
+    if (match r1 { Err(_) => true, Ok(_) => false }) { return dfail(match r1 { Err(m) => m + " (the device key moved to v2: run the update again)", Ok(_) => "" }); }
+    println("security update: the duress profile has its own transport key");
+    Int r = finish_update(dir, n, u, pin, dpin);
+    return r;
+}
+
+// Whether `dpin` is this device's duress PIN, or empty on a device without
+// one, before the update changes anything (reseal_duress checks again).
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+pub Result(Int, Str) duress_pin_check(Str dir, DeviceConfig c, Unlocked u, Str dpin) {
+    List(Secret(UInt(8))) ka = unlock_key_for(c, u.st, true);
+    Bool real_in_a = unlock(ka, read_blob(dir, "a", u.wrap), []).kind == 1;
+    Bool real_in_b = !real_in_a && unlock(ka, read_blob(dir, "b", u.wrap), []).kind == 1;
+    if (!real_in_a && !real_in_b) { return Err("the profile does not open again under the PIN; nothing changed"); }
+    // An empty line: no duress PIN from now on (no_duress).
+    if (str_len(dpin) == 0) { return Ok(0); }
+    List(Secret(UInt(8))) dst = stretch(c, pin_bytes(dpin));
+    List(Secret(UInt(8))) kb = if (c.unprotected) { unlock_key(dst, c.salt) } else { unlock_key_for(c, dst, false) };
+    Unlocked d = unlock(kb, read_blob(dir, if (real_in_a) { "b" } else { "a" }, u.wrap), []);
+    if (d.kind != 2) { return Err("that is not this device's duress PIN (an empty line if it has none); nothing changed"); }
+    return Ok(0);
 }
 
 @requires(filesystem, network, device, declassify, clock, provision, environment)
@@ -129,8 +159,9 @@ Result(Int, Str) reseal_duress(Str dir, DeviceConfig c, Unlocked u, Str dpin) {
     List(Int) blob = seal_blob(kb, random_bytes(12), dp);
     if (unlock(kb, blob, []).kind != 2) { return Err("the duress profile does not open again; nothing changed"); }
     List(Int) dpub = duress_pub_of(nd.subkey, nd.share);
-    // Registered first: until the cosigner has the new key, the duress
-    // profile as it was still works (it speaks with the device's key).
+    // Registered first, under the device's v2 key (update_with moves the
+    // device before this): until the cosigner has the new key, the duress
+    // profile as it was keeps the key it had.
     register_keys(dir, c, u, dpub)?;
     if (!filesystem.write_bytes(dir + "/duress.pub", dpub) || !write_blob(dir, other, blob, u.wrap)) { return Err("cannot write the duress profile"); }
     return Ok(0);
@@ -167,10 +198,12 @@ Bool reseal_real_in(Str dir, List(Secret(UInt(8))) ka, RealProfile r, Str which,
 }
 
 // The duress keys to the cosigner, under this device's transport key (the
-// cosigner takes a registration under no other). A device not in a log
-// yet registers at `device init`.
+// cosigner takes a registration under no other), which is v2 by now:
+// never under v1, which the old duress profile holds. A device not in a
+// log yet registers at `device init`.
 @requires(filesystem, network, declassify, clock)
-Result(Int, Str) register_keys(Str dir, DeviceConfig c, Unlocked u, List(Int) dpub) {
+pub Result(Int, Str) register_keys(Str dir, DeviceConfig c, Unlocked u, List(Int) dpub) {
+    if (!registers_under_v2(c, u)) { return Err("the device has not moved to its v2 key: nothing registered"); }
     if (c.log_id.len() == 0) { return Ok(0); }
     VerifiedHead vh = log_or(verified_log_dir(dir, relay_ep(c), c.log_id))?;
     Remote cos = cos_remote(vh);
@@ -178,6 +211,11 @@ Result(Int, Str) register_keys(Str dir, DeviceConfig c, Unlocked u, List(Int) dp
     Local me = Local {.party = c.party, .cg = 0, .hpke_sk = device_transport(c, u.real.dek).sk};
     return if (send_to(mail_relay(dir, c), me, cos, WDuressKey(dpub))) { Ok(0) } else { Err("cannot reach the relay; nothing changed") };
 }
+
+// Whether a registration from configuration `c` goes under the device's
+// v2 transport key.
+@requires(declassify)
+pub Bool registers_under_v2(DeviceConfig c, Unlocked u) { return bytes_eq(device_transport(c, u.real.dek).pk, device_hpke2(u.real.dek).pk); }
 
 // ─── 2. The device's transport key ──────────────────────────────
 
