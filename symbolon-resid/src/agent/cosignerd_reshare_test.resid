@@ -1,0 +1,34 @@
+// The cosigner service's re-share decisions that need no relay.
+
+import "../types.resid";
+import "../net/proto.resid";
+import "cosignerd.resid";
+import "device.resid";
+
+List(Int) rep(Int b, Int n) { return if (n == 0) { [] } else { [b].concat(rep(b, n - 1)) }; }
+
+Party party_of(Int n, UInt(8) kind) {
+    return Party {.id = rep(n, 32), .kind = kind, .auth_key = rep(n + 100, 65), .hpke_key = rep(n + 50, 65), .label = "p", .attestation = NoAttestation};
+}
+
+List(Party) parties() { return [party_of(1, party_kind_device()), party_of(2, party_kind_kit()), party_of(3, party_kind_cosigner())]; }
+
+ReshareInvite invite(Int degree) {
+    return ReshareInvite {.session_id = rep(7, 32), .log_id = rep(8, 32), .new_parties = parties(), .dealers = [1, 3], .receivers = [1, 3], .offline = [2],
+                          .degree = degree, .epoch = 4, .requester = rep(1, 32), .sig = []};
+}
+
+Quorum event_quorum(List(Party) ps, UInt(8) t) {
+    return Quorum {.parties = ps, .t = t, .root_pubkey = [], .epoch = 4, .transcript_digest = [], .kv_commits = []};
+}
+
+// The cosigner signs the reshare event only for the quorum it dealt to:
+// the same parties with the same keys, and the threshold its deal made.
+test "a reshare event is signed only for the threshold and keys dealt to" {
+    expect(event_is_invite(event_quorum(parties(), 2), Some(invite(1)))).toBeTrue();
+    expect(event_is_invite(event_quorum(parties(), 1), Some(invite(1)))).toBeFalse();
+    expect(event_is_invite(event_quorum(parties(), 3), Some(invite(1)))).toBeFalse();
+    Party other = Party {.id = rep(1, 32), .kind = party_kind_device(), .auth_key = rep(9, 65), .hpke_key = rep(9, 65), .label = "p", .attestation = NoAttestation};
+    expect(event_is_invite(event_quorum([other, party_of(2, party_kind_kit()), party_of(3, party_kind_cosigner())], 2), Some(invite(1)))).toBeFalse();
+    expect(event_is_invite(event_quorum(parties(), 2), None)).toBeFalse();
+}

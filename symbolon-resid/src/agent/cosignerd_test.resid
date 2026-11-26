@@ -1,34 +1,98 @@
-// The cosigner service's decisions that need no relay.
+// The cosigner's trust in the log and in its peers (agent/cosignerd.resid),
+// on a fresh directory under target/: the highest head it has seen bounds
+// every log it acts on (SPEC 8.4), and the kit's material comes only from
+// the device that asked for the re-share.
 
 import "../types.resid";
+import "../core/log.resid";
+import "../cosigner/cosigner.resid";
 import "../net/proto.resid";
-import "cosignerd.resid";
+import "state.resid";
+import "common.resid";
+import "serials.resid";
 import "device.resid";
+import "cosignerd.resid";
+import "crypto.resid";
+import "ecdsa.resid";
+import "cbor.resid";
+import "random.resid";
 
 List(Int) rep(Int b, Int n) { return if (n == 0) { [] } else { [b].concat(rep(b, n - 1)) }; }
 
-Party party_of(Int n, UInt(8) kind) {
-    return Party {.id = rep(n, 32), .kind = kind, .auth_key = rep(n + 100, 65), .hpke_key = rep(n + 50, 65), .label = "p", .attestation = NoAttestation};
+@requires(filesystem)
+Str fresh_dir() {
+    Str d = "target/cosignerd-test-" + hex_encode(random_bytes(8));
+    _ = filesystem.create_dir("target");
+    _ = filesystem.create_dir(d);
+    return d;
 }
 
-List(Party) parties() { return [party_of(1, party_kind_device()), party_of(2, party_kind_kit()), party_of(3, party_kind_cosigner())]; }
-
-ReshareInvite invite(Int degree) {
-    return ReshareInvite {.session_id = rep(7, 32), .log_id = rep(8, 32), .new_parties = parties(), .dealers = [1, 3], .receivers = [1, 3], .offline = [2],
-                          .degree = degree, .epoch = 4, .requester = rep(1, 32), .sig = []};
+@requires(declassify)
+Cosigner cosigner_in(Str dir) {
+    CosignerConfig cfg = CosignerConfig {.relay_host = "127.0.0.1", .relay_port = 1, .ca = "", .party = rep(1, 32), .dk_pub = [], .hpke_pub = [],
+                                         .log_id = rep(7, 32), .mbox_next = 0, .peers = [], .accept_inception = false};
+    return Cosigner {.dir = dir, .cfg = cfg, .root = random_secret(32)};
 }
 
-Quorum event_quorum(List(Party) ps, UInt(8) t) {
-    return Quorum {.parties = ps, .t = t, .root_pubkey = [], .epoch = 4, .transcript_digest = [], .kv_commits = []};
+Quorum quorum_at(Int epoch) {
+    return Quorum {.parties = [], .t = 1, .root_pubkey = [], .epoch = (UInt(32))epoch, .transcript_digest = [], .kv_commits = []};
 }
 
-// The cosigner signs the reshare event only for the quorum it dealt to:
-// the same parties with the same keys, and the threshold its deal made.
-test "a reshare event is signed only for the threshold and keys dealt to" {
-    expect(event_is_invite(event_quorum(parties(), 2), Some(invite(1)))).toBeTrue();
-    expect(event_is_invite(event_quorum(parties(), 1), Some(invite(1)))).toBeFalse();
-    expect(event_is_invite(event_quorum(parties(), 3), Some(invite(1)))).toBeFalse();
-    Party other = Party {.id = rep(1, 32), .kind = party_kind_device(), .auth_key = rep(9, 65), .hpke_key = rep(9, 65), .label = "p", .attestation = NoAttestation};
-    expect(event_is_invite(event_quorum([other, party_of(2, party_kind_kit()), party_of(3, party_kind_cosigner())], 2), Some(invite(1)))).toBeFalse();
-    expect(event_is_invite(event_quorum(parties(), 2), None)).toBeFalse();
+Policy no_policy() {
+    return Policy {.device_sigs_for_authority = 1, .recovery_delay_sec = 86400, .guardians = [], .guardian_threshold = 0, .witnesses = [], .duress_window_sec = 0, .cosigner_policy = NoCosignerPolicy};
+}
+
+LogView view_at(Int seq, Int d) {
+    VerifiedHead vh = VerifiedHead {.head = LogHead {.log_id = rep(7, 32), .sequence = (UInt(64))seq, .digest = rep(d, 32), .quorum = quorum_at(1), .policy = no_policy()},
+                                    .witness_cosigs = [], .pending = []};
+    return LogView {.vh = vh, .events = []};
+}
+
+Str verdict(Result(LogView, SymbolonError) r) { return match r { Ok(v) => f"ok {v.vh.head.sequence}", Err(_) => "refused" }; }
+
+@requires(filesystem, declassify)
+test "the cosigner refuses a log below the head it has seen, or another one at that head, and records a higher one" {
+    Cosigner c = cosigner_in(fresh_dir());
+    // The first head it sees is recorded.
+    expect(verdict(head_seen(c, view_at(5, 1)))).toEqual("ok 5");
+    // The relay serves the log cut before the veto at 5, or forked at 5.
+    expect(verdict(head_seen(c, view_at(4, 9)))).toEqual("refused");
+    expect(verdict(head_seen(c, view_at(5, 2)))).toEqual("refused");
+    expect(verdict(head_seen(c, view_at(5, 1)))).toEqual("ok 5");
+    expect(verdict(head_seen(c, view_at(6, 3)))).toEqual("ok 6");
+    // And now 5 is a rollback.
+    expect(verdict(head_seen(c, view_at(5, 1)))).toEqual("refused");
+}
+
+@requires(filesystem, declassify)
+test "the kit's key half is taken only from the device that asked for the re-share, and once" {
+    Str d = fresh_dir();
+    Cosigner c = cosigner_in(d);
+    ReshareInvite inv = ReshareInvite {.session_id = rep(3, 32), .log_id = rep(7, 32), .new_parties = [], .dealers = [], .receivers = [], .offline = [], .degree = 1,
+                                       .epoch = 2, .requester = rep(4, 32), .sig = []};
+    expect(filesystem.write_all(d + "/pending.epoch", "2")).toBeTrue();
+    expect(filesystem.write_bytes(d + "/kit-b-2", rep(5, 32))).toBeTrue();
+    expect(filesystem.write_bytes(d + "/pending-2.invite", match to_cbor(inv) { Ok(b) => b, Err(_) => [] })).toBeTrue();
+    // Another party's k_b: not kept.
+    _ = on_kit_key(c, rep(6, 32), rep(8, 32));
+    expect(filesystem.exists(d + "/kit-half-2.raw")).toBeFalse();
+    // The requester's: kept; a second one does not replace it.
+    _ = on_kit_key(c, rep(4, 32), rep(9, 32));
+    expect(hex_encode(filesystem.read_bytes(d + "/kit-half-2.raw"))).toEqual(hex_encode(rep(5, 32).concat(rep(9, 32))));
+    _ = on_kit_key(c, rep(4, 32), rep(10, 32));
+    expect(hex_encode(filesystem.read_bytes(d + "/kit-half-2.raw"))).toEqual(hex_encode(rep(5, 32).concat(rep(9, 32))));
+}
+
+List(Int) raw(List(Int) enc, Int cos) {
+    return cbor_of_event(StoredEvent {.encoded = enc, .sigs = [], .cosigs = if (cos == 0) { [] } else { [WitnessCosignature {.log_id = [], .sequence = 0, .digest = [], .witness_key = [], .signature = [cos], .witness_time = 0}] }});
+}
+
+test "a kept log copy is replaced only by a log that holds every kept event unchanged" {
+    List(List(Int)) kept = [raw([1], 0), raw([2], 0)];
+    expect(extends_kept(kept, [raw([1], 0), raw([2], 0), raw([3], 0)], 0)).toBeTrue();
+    // Other co-signatures on the same events: the same events.
+    expect(extends_kept(kept, [raw([1], 5), raw([2], 6)], 0)).toBeTrue();
+    // Shorter (a rollback), or another event at 1 (a fork).
+    expect(extends_kept(kept, [raw([1], 0)], 0)).toBeFalse();
+    expect(extends_kept(kept, [raw([1], 0), raw([9], 0), raw([3], 0)], 0)).toBeFalse();
 }

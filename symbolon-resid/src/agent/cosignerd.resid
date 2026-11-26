@@ -272,8 +272,8 @@ List(Kept) serve_once(Cosigner c0, List(List(UInt(64))) primes, List(List(UInt(6
     List(Remote) known = remotes_of(c.cfg.peers, 0, []);
     Cursor cur = Cursor {.party = c.cfg.party, .next = c.cfg.mbox_next};
     Drained d0 = drain(relay, me_of(c), known, cur, ListBuf());
-    // An envelope from a party not known yet (a device a recover event or a
-    // reshare just named): learn the log's parties and read again.
+    // An envelope from a party not known yet (a device a reshare or a
+    // recovery that took effect just added): learn the quorum and read again.
     Cosigner c1 = if (d0.unknown > 0) { refresh_peers(c) } else { c };
     Drained d = if (d0.unknown > 0) { drain(relay, me_of(c1), remotes_of(c1.cfg.peers, 0, []), cur, ListBuf()) } else { d0 };
     List(Got) gs = d.got;
@@ -300,11 +300,11 @@ Handled handle_all(Cosigner c, List(Got) gs, Int i, List(List(UInt(64))) primes,
     Handled h = match w {
         WKeygen(inv) => Handled {.c = on_keygen(c, gs[i].from, inv, rest, primes), .kept = kept},
         WSignEvent(b) => Handled {.c = on_sign_event(c, gs[i].from, b), .kept = kept},
-        WKitHalf(blob) => Handled {.c = on_kit_half(c, blob), .kept = kept},
+        WKitHalf(blob) => Handled {.c = on_kit_half(c, gs[i].from, blob), .kept = kept},
         WSign(inv) => on_sign(c, gs[i].from, inv, rest, kept),
         WSession(m) => Handled {.c = c, .kept = on_late(c, gs[i].from, m, kept)},
         WReshare(inv) => Handled {.c = on_reshare(c, gs[i].from, inv, rest, primes2), .kept = kept},
-        WKitKey(kb) => Handled {.c = on_kit_key(c, kb), .kept = kept},
+        WKitKey(kb) => Handled {.c = on_kit_key(c, gs[i].from, kb), .kept = kept},
         WKitRelease(l) => Handled {.c = on_release(c, gs[i].from, l), .kept = kept},
         WDuressKey(k) => Handled {.c = on_duress_key(c, gs[i].from, k), .kept = kept},
         WKvDeal(m) => Handled {.c = on_kv_deal(c, gs[i].from, m), .kept = kept},
@@ -313,7 +313,7 @@ Handled handle_all(Cosigner c, List(Got) gs, Int i, List(List(UInt(64))) primes,
         WBeacon(b) => Handled {.c = on_beacon(c, gs[i].from, b), .kept = kept},
         WAlertConfig(a) => Handled {.c = on_alert_config(c, gs[i].from, a), .kept = kept},
         WEndDuress(e) => Handled {.c = on_end_duress(c, gs[i].from, e), .kept = kept},
-        WAlertKey(k) => Handled {.c = on_alert_key(c, k), .kept = kept},
+        WAlertKey(k) => Handled {.c = on_alert_key(c, gs[i].from, k), .kept = kept},
         _ => Handled {.c = c, .kept = kept}
     };
     return handle_all(h.c, gs, i + 1, primes, primes2, h.kept);
@@ -458,10 +458,59 @@ Bool has_me(List(Party) ps, CosignerConfig c, Int i) {
     return has_me(ps, c, i + 1);
 }
 
-@requires(filesystem)
-Cosigner on_kit_half(Cosigner c, WrappedBlob b) {
+// The kit's half b || k_b of the inception (SPEC 10.6): from a device of
+// the log's quorum, once. Anyone else's, or a second one, is ignored: the
+// half the cosigner keeps is what it releases to a recovered device, so a
+// half an attacker sent would replace the kit's material.
+@requires(network, filesystem, declassify, clock(readonly))
+Cosigner on_kit_half(Cosigner c, List(Int) from, WrappedBlob b) {
+    if (c.cfg.log_id.len() == 0 || filesystem.exists(c.dir + "/kit-half.cbor")) { return cos_fail(c, "a kit half refused: no log yet, or one is held"); }
+    if (!quorum_device(cos_log(c), from)) { return cos_fail(c, "a kit half refused: not from a device of the log"); }
     _ = put_secret_file(c.dir + "/kit-half.cbor", cbor_of_blob(b));
     return c;
+}
+
+// Whether `p` is a device of the verified quorum.
+Bool quorum_device(Result(VerifiedHead, SymbolonError) rv, List(Int) p) {
+    return match rv {
+        Err(_) => false,
+        Ok(vh) => match party_at(vh.head.quorum.parties, p, 0) { None => false, Some(x) => x.kind == party_kind_device() }
+    };
+}
+
+// The log as the cosigner may act on it (SPEC 8.4, 13.4): verified now
+// from its kept copy (DIR/logcache/, refused when the relay's log does not
+// extend it), and no lower than the highest head the cosigner has seen
+// (state.cbor): a lower sequence, or another digest at the same one, is a
+// rollback or a fork and is refused (a relay that serves the log cut
+// before a veto gets nothing released or signed); a higher head is
+// recorded.
+@requires(network, filesystem, clock(readonly), declassify)
+Result(LogView, SymbolonError) cos_view(Cosigner c) {
+    Result(LogView, SymbolonError) r = log_view_dir(c.dir, relay_of(c.cfg), c.cfg.log_id, local_host(c.dir));
+    return match r { Err(e) => Err(e), Ok(v) => head_seen(c, v) };
+}
+
+@requires(network, filesystem, clock(readonly), declassify)
+Result(VerifiedHead, SymbolonError) cos_log(Cosigner c) {
+    Result(LogView, SymbolonError) r = cos_view(c);
+    return match r { Err(e) => Err(e), Ok(v) => Ok(v.vh) };
+}
+
+@requires(filesystem)
+pub Result(LogView, SymbolonError) head_seen(Cosigner c, LogView v) {
+    Option(CosignerState) os = state_of_cbor(get_file(c.dir + "/state.cbor"));
+    CosignerState s0 = os else { cosigner_new(v.vh, duress_keys_of(c)) };
+    Result(CosignerState, SymbolonError) u = cosigner_update_head(s0, v.vh);
+    return match u {
+        Err(e) => fork_alarm(e),
+        Ok(s) => if (filesystem.write_bytes(c.dir + "/state.cbor", cbor_of_state(s))) { Ok(v) } else { Err(ErrStorage("cannot record the log head")) }
+    };
+}
+
+Result(LogView, SymbolonError) fork_alarm(SymbolonError e) {
+    eprintln("cosigner: ALARM: the relay's log is a rollback or fork of the head already seen (" + match e { ErrInvalidLog(s) => s, _ => "error" } + "); refused (SPEC 20.4)");
+    return Err(e);
 }
 
 // ─── Co-signing (SPEC 10.4, 12.3) ───────────────────────────────
@@ -522,7 +571,7 @@ Str local_host(Str dir) { return str_trim(filesystem.read_all(dir + "/local_host
 @requires(network, filesystem, declassify, clock)
 Handled on_sign(Cosigner c, List(Int) from, SignInvite inv, List(Got) early, List(Kept) kept) {
     if (c.cfg.log_id.len() == 0) { return Handled {.c = cos_fail(c, "no log yet"), .kept = kept}; }
-    Result(VerifiedHead, SymbolonError) rv = verified_log_at(relay_of(c.cfg), c.cfg.log_id, local_host(c.dir));
+    Result(VerifiedHead, SymbolonError) rv = cos_log(c);
     return match rv {
         Err(_) => Handled {.c = refuse(c, from, inv.session_id), .kept = kept},
         Ok(vh) => decide(c, from, inv, vh, early, kept)
@@ -662,9 +711,13 @@ pub List(Remote) session_remotes(List(Party) np, List(Int) receivers, List(Int) 
 @requires(network, filesystem, declassify, clock)
 Cosigner on_reshare(Cosigner c, List(Int) from, ReshareInvite inv, List(Got) early, List(List(UInt(64))) primes) {
     if (c.cfg.log_id.len() == 0 || !bytes_eq(inv.log_id, c.cfg.log_id)) { return cos_fail(c, "re-share of another log"); }
-    List(SignedEvent) es = fetch_log(relay_of(c.cfg), c.cfg.log_id, 0, []);
+    // The events the cosigner may act on (cos_view: its kept copy, no
+    // lower than the highest head seen), then the membership in force at
+    // the witnesses' time (log_now).
+    Result(LogView, SymbolonError) cv = cos_view(c);
+    List(SignedEvent) es = match cv { Ok(v) => v.events, Err(_) => [] };
     LogNow ln = log_now(c, es);
-    Result(VerifiedHead, SymbolonError) rv = ln.vh;
+    Result(VerifiedHead, SymbolonError) rv = match cv { Err(e) => Err(e), Ok(_) => ln.vh };
     Option(Membership) om = ln.mem;
     return match rv {
         Err(_) => refuse(c, from, inv.session_id),
@@ -823,7 +876,7 @@ Option(Remote) remote_of_party(Cosigner c, List(Int) p) {
     Option(Remote) r = remote_by_party(remotes_of(c.cfg.peers, 0, []), p, 0);
     return match r {
         Some(x) => Some(x),
-        None => match verified_log_at(relay_of(c.cfg), c.cfg.log_id, local_host(c.dir)) {
+        None => match cos_log(c) {
             Err(_) => None,
             Ok(vh) => match party_at(vh.head.quorum.parties, p, 0) { None => None, Some(pt) => Some(Remote {.party = pt.id, .cg = 0, .hpke_pub = pt.hpke_key}) }
         }
@@ -831,48 +884,49 @@ Option(Remote) remote_of_party(Cosigner c, List(Int) p) {
 }
 
 // k_b for the pending epoch: with b, the cosigner's half of the kit's
-// material (SPEC 10.6).
+// material (SPEC 10.6). Only from the device that asked for that re-share,
+// and once: another party's k_b would replace the kit's material the
+// cosigner releases at a recovery.
 @requires(filesystem)
-Cosigner on_kit_key(Cosigner c, List(Int) kb) {
+pub Cosigner on_kit_key(Cosigner c, List(Int) from, List(Int) kb) {
     Str e = str_trim(filesystem.read_all(c.dir + "/pending.epoch"));
     List(Int) b = get_file(c.dir + "/kit-b-" + e);
     if (str_len(e) == 0 || b.len() != 32 || kb.len() != 32) { return cos_fail(c, "a kit key without a pending re-share"); }
+    Option(ReshareInvite) oi = invite_of(get_file(c.dir + "/pending-" + e + ".invite"));
+    Bool asked = match oi { None => false, Some(inv) => bytes_eq(inv.requester, from) };
+    if (!asked) { return cos_fail(c, "a kit key from a party that did not ask for the re-share"); }
+    if (filesystem.exists(c.dir + "/kit-half-" + e + ".raw")) { return cos_fail(c, "a kit key for that epoch is held already"); }
     _ = put_secret_file(c.dir + "/kit-half-" + e + ".raw", b.concat(kb));
     return c;
 }
 
 // ─── Peers from the log, and the kit release (SPEC 10.6, 13.4) ──
 
-List(PartyKeys) merge_keys(List(PartyKeys) a, List(PartyKeys) b, Int i) {
-    if (i >= b.len()) { return a; }
-    Bool known = index_of(a, b[i].party, 0) >= 0;
-    return merge_keys(if (known) { a } else { a.concat([b[i]]) }, b, i + 1);
-}
-
-List(PartyKeys) recover_parties(List(SignedEvent) es, Int i, List(PartyKeys) acc) {
-    if (i >= es.len()) { return acc; }
-    EventBody b = es[i].payload.body;
-    List(PartyKeys) more = match b { RecoverBody(r) => keys_of_parties(r.new_parties, 0, []), _ => [] };
-    return recover_parties(es, i + 1, merge_keys(acc, more, 0));
-}
-
-// The quorum's parties and every party a recover event names: the
-// cosigner opens their envelopes (and answers a recovering device, if only
-// to refuse it).
+// The parties of the verified quorum, and only they: the cosigner opens
+// their envelopes. A device a recover event names becomes a peer when the
+// recovery takes effect (its delay ran without a veto, SPEC 13.4), which is
+// also the first moment the cosigner would release anything to it; before
+// that its envelopes go unread. A party re-shared or recovered out of the
+// quorum stops being one.
 @requires(network, filesystem, clock(readonly), declassify)
 Cosigner refresh_peers(Cosigner c) {
     if (c.cfg.log_id.len() == 0) { return c; }
-    Result(VerifiedHead, SymbolonError) rv = verified_log_at(relay_of(c.cfg), c.cfg.log_id, local_host(c.dir));
-    List(SignedEvent) es = fetch_log(relay_of(c.cfg), c.cfg.log_id, 0, []);
+    Result(VerifiedHead, SymbolonError) rv = cos_log(c);
     return match rv {
         Err(_) => c,
-        Ok(vh) => with_known(c, merge_keys(merge_keys(c.cfg.peers, keys_of_parties(vh.head.quorum.parties, 0, []), 0), recover_parties(es, 0, []), 0))
+        Ok(vh) => with_known(c, keys_of_parties(vh.head.quorum.parties, 0, []))
     };
+}
+
+Bool same_keys(List(PartyKeys) a, List(PartyKeys) b, Int i) {
+    if (a.len() != b.len()) { return false; }
+    if (i >= a.len()) { return true; }
+    return bytes_eq(a[i].party, b[i].party) && bytes_eq(a[i].auth_key, b[i].auth_key) && bytes_eq(a[i].hpke_key, b[i].hpke_key) && same_keys(a, b, i + 1);
 }
 
 @requires(filesystem)
 Cosigner with_known(Cosigner c, List(PartyKeys) ps) {
-    if (ps.len() == c.cfg.peers.len()) { return c; }
+    if (same_keys(ps, c.cfg.peers, 0)) { return c; }
     CosignerConfig nc = with_peers(c.cfg, ps, c.cfg.accept_inception);
     _ = save_cfg(c.dir, nc);
     return Cosigner {.dir = c.dir, .cfg = nc, .root = c.root};
@@ -895,18 +949,19 @@ Option(Half) my_half(Cosigner c) {
 }
 
 @requires(network, filesystem, declassify, clock)
+// The kit release (SPEC 13.4) acts on the log the cosigner verified, from
+// the very events it verified, at no lower head than it has seen (cos_view).
 Cosigner on_release(Cosigner c, List(Int) from, List(Int) l) {
-    if (!bytes_eq(l, c.cfg.log_id)) { return refuse(c, from, l); }
-    List(SignedEvent) es = fetch_log(relay_of(c.cfg), l, 0, []);
-    Result(VerifiedHead, SymbolonError) rv = verified_log_at(relay_of(c.cfg), l, local_host(c.dir));
+    if (c.cfg.log_id.len() == 0 || !bytes_eq(l, c.cfg.log_id)) { return refuse(c, from, l); }
+    Result(LogView, SymbolonError) rv = cos_view(c);
     Option(Half) h = my_half(c);
     return match rv {
         Err(_) => refuse(c, from, l),
-        Ok(vh) => match h {
+        Ok(v) => match h {
             None => cos_fail(c, "no kit half held"),
-            Some(half) => match cosigner_release(es, vh, from, half, random_bytes(32)) {
+            Some(half) => match cosigner_release(v.events, v.vh, from, half, random_bytes(32)) {
                 Err(e) => release_refused(c, from, l, e),
-                Ok(w) => release_sent(c, from, w, vh)
+                Ok(w) => release_sent(c, from, w, v.vh)
             }
         }
     };
@@ -946,7 +1001,7 @@ Cosigner on_kv_deal(Cosigner c, List(Int) from, KvDealMsg m) {
     if (c.cfg.log_id.len() == 0) { return kv_inception_deal(c, from, m); }
     Str e = str_trim(filesystem.read_all(c.dir + "/pending.epoch"));
     Option(ReshareInvite) oi = if (str_len(e) == 0) { None } else { invite_of(get_file(c.dir + "/pending-" + e + ".invite")) };
-    Result(VerifiedHead, SymbolonError) rv = verified_log_at(relay_of(c.cfg), c.cfg.log_id, local_host(c.dir));
+    Result(VerifiedHead, SymbolonError) rv = cos_log(c);
     return match oi {
         None => cos_fail(c, "a vault OPRF dealing without a pending re-share"),
         Some(inv) => match rv {
@@ -1100,7 +1155,7 @@ List(Int) kit_half_at(Cosigner c, Int e) {
 @requires(network, filesystem, declassify, clock)
 Cosigner on_eval(Cosigner c, List(Int) from, EvalRequest r) {
     if (c.cfg.log_id.len() == 0 || !bytes_eq(r.log_id, c.cfg.log_id) || !bytes_eq(from, r.requester)) { return refuse(c, from, r.session_id); }
-    Result(VerifiedHead, SymbolonError) rv = verified_log_at(relay_of(c.cfg), c.cfg.log_id, local_host(c.dir));
+    Result(VerifiedHead, SymbolonError) rv = cos_log(c);
     return match rv {
         Err(_) => refuse(c, from, r.session_id),
         Ok(vh) => eval_decide(c, from, r, vh)
@@ -1139,7 +1194,7 @@ Cosigner evaluated(Cosigner c, List(Int) from, EvalRequest r, CosignerState s, T
 @requires(network, filesystem, declassify, clock)
 Cosigner on_eval_log(Cosigner c, List(Int) from, EvalLogRequest r) {
     if (c.cfg.log_id.len() == 0 || !bytes_eq(r.log_id, c.cfg.log_id) || !bytes_eq(from, r.requester) || r.session_id.len() != 32) { return refuse(c, from, r.session_id); }
-    Result(VerifiedHead, SymbolonError) rv = verified_log_at(relay_of(c.cfg), c.cfg.log_id, local_host(c.dir));
+    Result(VerifiedHead, SymbolonError) rv = cos_log(c);
     return match rv {
         Err(_) => refuse(c, from, r.session_id),
         Ok(vh) => eval_log_answer(c, from, r, vh)
@@ -1203,7 +1258,7 @@ Bool queue_ended(Cosigner c, Int at, Str how) {
 @requires(network, filesystem, declassify, clock)
 Cosigner on_beacon(Cosigner c, List(Int) from, Beacon b) {
     if (c.cfg.log_id.len() == 0 || !bytes_eq(b.log_id, c.cfg.log_id) || !bytes_eq(from, b.requester) || b.location.len() != 32) { return c; }
-    Result(VerifiedHead, SymbolonError) rv = verified_log_at(relay_of(c.cfg), c.cfg.log_id, local_host(c.dir));
+    Result(VerifiedHead, SymbolonError) rv = cos_log(c);
     return match rv { Err(_) => c, Ok(vh) => beacon_decide(c, from, b, vh) };
 }
 
@@ -1237,7 +1292,7 @@ Bool check_window(Cosigner c) {
     Option(CosignerState) os = state_of_cbor(get_file(c.dir + "/state.cbor"));
     Bool open = match os { None => false, Some(s) => duress_recorded(s) };
     if (!open || c.cfg.log_id.len() == 0) { return false; }
-    Result(VerifiedHead, SymbolonError) rv = verified_log_at(relay_of(c.cfg), c.cfg.log_id, local_host(c.dir));
+    Result(VerifiedHead, SymbolonError) rv = cos_log(c);
     return match rv { Err(_) => false, Ok(vh) => window_check(c, vh) };
 }
 
@@ -1262,7 +1317,7 @@ Bool duress_recorded(CosignerState s) {
 @requires(network, filesystem, declassify, clock)
 Cosigner on_alert_config(Cosigner c, List(Int) from, AlertConfig a) {
     if (c.cfg.log_id.len() == 0 || !bytes_eq(a.log_id, c.cfg.log_id) || !bytes_eq(from, a.requester) || a.session_id.len() != 32 || a.contacts.len() > 32) { return refuse(c, from, a.session_id); }
-    Result(VerifiedHead, SymbolonError) rv = verified_log_at(relay_of(c.cfg), c.cfg.log_id, local_host(c.dir));
+    Result(VerifiedHead, SymbolonError) rv = cos_log(c);
     return match rv { Err(_) => refuse(c, from, a.session_id), Ok(vh) => alert_config_with(c, from, a, vh) };
 }
 
@@ -1291,7 +1346,7 @@ Cosigner alert_config_with(Cosigner c, List(Int) from, AlertConfig a, VerifiedHe
 @requires(network, filesystem, declassify, clock)
 Cosigner on_end_duress(Cosigner c, List(Int) from, EndDuressReq r) {
     if (c.cfg.log_id.len() == 0 || !bytes_eq(r.log_id, c.cfg.log_id) || r.signers.len() != r.sigs.len() || r.sigs.len() > 16) { return c; }
-    Result(VerifiedHead, SymbolonError) rv = verified_log_at(relay_of(c.cfg), c.cfg.log_id, local_host(c.dir));
+    Result(VerifiedHead, SymbolonError) rv = cos_log(c);
     return match rv { Err(_) => c, Ok(vh) => end_duress_with(c, r, vh) };
 }
 
@@ -1320,10 +1375,28 @@ List(EventSig) event_sigs(List(List(Int)) who, List(List(Int)) sigs, Int i, List
 }
 
 // A device's alert key, for alerts other people's cosigners leave for this
-// person (at most eight kept, the newest last).
+// person (at most eight kept, the newest last): only from a device of the
+// verified quorum (anyone else's key would read this person's alerts), and
+// not during a duress window (a coerced device would hand the alerts to
+// the coercer; refused as an outage looks).
+@requires(network, filesystem, declassify, clock)
+Cosigner on_alert_key(Cosigner c, List(Int) from, List(Int) k) {
+    if (k.len() != 65 || k[0] != 4 || c.cfg.log_id.len() == 0) { return c; }
+    Result(VerifiedHead, SymbolonError) rv = cos_log(c);
+    if (!quorum_device(rv, from)) { return cos_fail(c, "an alert key from a party that is not a device of the log"); }
+    Bool calm = match rv { Err(_) => false, Ok(vh) => alert_key_calm(c, vh) };
+    if (!calm) { return cos_fail(c, "an alert key during a duress window, or without the witnesses' time: refused"); }
+    return alert_key_kept(c, k);
+}
+
+@requires(network, filesystem, declassify, clock)
+Bool alert_key_calm(Cosigner c, VerifiedHead vh) {
+    Int now = policy_now(c, vh);
+    return now > 0 && !cosigner_in_duress(load_state(c, vh), now);
+}
+
 @requires(filesystem)
-Cosigner on_alert_key(Cosigner c, List(Int) k) {
-    if (k.len() != 65 || k[0] != 4) { return c; }
+Cosigner alert_key_kept(Cosigner c, List(Int) k) {
     List(List(Int)) ks = alert_keys(get_file(c.dir + "/alert-keys"), 0, []);
     if (has_key(ks, k, 0)) { return c; }
     List(List(Int)) all = ks.concat([k]);
