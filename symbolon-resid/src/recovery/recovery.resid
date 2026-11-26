@@ -226,16 +226,22 @@ Option(SignedEvent) kit_recover_for(List(SignedEvent) es, List(Int) dev, Int i, 
 // material: that of the new device named in a kit recover that has taken
 // effect in the verified log `v` (its delay ran, by witness time, with no
 // veto; the device is now in the quorum). `events` is the log `v` was
-// verified from.
-pub Result(List(Int), SymbolonError) release_target(List(SignedEvent) events, VerifiedHead v, List(Int) dev) {
+// verified from. `heads`: the answers of the policy's witnesses to POST
+// /head for a fresh nonce (agent/common.resid witness_heads); a majority
+// must answer, none past `v`'s head (core/log.resid heads_problem): the
+// relay serves `v`, and a relay that cut the log before a veto would
+// otherwise have the half released (R2W-5).
+pub Result(List(Int), SymbolonError) release_target(List(SignedEvent) events, VerifiedHead v, List(Int) dev, List(Option(WitnessHead)) heads) {
     Option(SignedEvent) oe = kit_recover_for(events, dev, 0, None);
     return match oe {
         None => Err(ErrRecoveryFailed("no kit recovery names this device")),
-        Some(e) => release_after(e, v, dev)
+        Some(e) => release_after(e, v, dev, heads)
     };
 }
 
-Result(List(Int), SymbolonError) release_after(SignedEvent e, VerifiedHead v, List(Int) dev) {
+Result(List(Int), SymbolonError) release_after(SignedEvent e, VerifiedHead v, List(Int) dev, List(Option(WitnessHead)) heads) {
+    Str stale = heads_problem(heads, v.head.policy.witnesses.len(), (Int)v.head.sequence, v.head.digest);
+    if (str_len(stale) > 0) { return Err(ErrRecoveryFailed("the witnesses do not confirm the log's head: " + stale)); }
     if (e.payload.sequence > v.head.sequence) { return Err(ErrRecoveryFailed("the recovery is not in the verified log")); }
     if (seq_pending(v.pending, e.payload.sequence, 0)) { return Err(ErrRecoveryFailed("the recovery delay has not run")); }
     Option(Party) op = party_named(v.head.quorum.parties, dev, 0);
@@ -257,8 +263,8 @@ pub Option(Half) half_of(List(Int) b) {
 
 // The cosigner wraps b || k_b to the released device, bound to the log, the
 // epoch and the device.
-pub Result(Wrapped, SymbolonError) cosigner_release(List(SignedEvent) events, VerifiedHead v, List(Int) dev, Half b, List(Int) ikm_e) {
-    List(Int) to = release_target(events, v, dev)?;
+pub Result(Wrapped, SymbolonError) cosigner_release(List(SignedEvent) events, VerifiedHead v, List(Int) dev, Half b, List(Int) ikm_e, List(Option(WitnessHead)) heads) {
+    List(Int) to = release_target(events, v, dev, heads)?;
     Option(Wrapped) w = offline_wrap(to, v.head.log_id, v.head.quorum.epoch, dev, half_bytes(b.share, b.key), ikm_e);
     return match w { None => Err(ErrRecoveryFailed("cannot wrap to the device's key")), Some(x) => Ok(x) };
 }

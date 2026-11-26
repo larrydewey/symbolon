@@ -372,6 +372,78 @@ pub Option(Endpoint) endpoint_of_url(Str u, Str ca) {
     return if (parts.len() == 2) { Some(Endpoint {.host = parts[0], .port = str_parse_int(parts[1]), .ca = ca, .token = ""}) } else { None };
 }
 
+// ─── How far the witnesses co-signed a log (SPEC 20.3, POST /head) ──
+
+// A witness's answer to POST /head (agent/witnesssrv.resid): CBOR [seq,
+// digest, time, r || s], checked under its key `wkey` for log `l` and
+// `nonce` (core/log.resid head_message). None when it does not parse or
+// verify.
+pub Option(WitnessHead) head_answer(List(Int) b, List(Int) wkey, List(Int) l, List(Int) nonce) {
+    Rd a = rd(b, 0);
+    if (a.major != 4 || a.val != 4) { return None; }
+    Rd s = rd(b, a.next);
+    Rd dh = rd(b, s.next);
+    if (s.major != 0 || dh.major != 2 || (dh.val != 0 && dh.val != 32) || dh.next + dh.val > b.len()) { return None; }
+    List(Int) d = b[dh.next..dh.next + dh.val];
+    Rd t = rd(b, dh.next + dh.val);
+    Rd sh = rd(b, t.next);
+    if (t.major != 0 || sh.major != 2 || sh.val != 64 || sh.next + 64 != b.len()) { return None; }
+    if (d.len() == 0 && s.val != 0) { return None; }
+    List(Int) sig = b[sh.next..b.len()];
+    if (!ecdsa_verify_raw(P256, Sha256, wkey, head_message(l, s.val, d, nonce, t.val), sig)) { return None; }
+    return Some(WitnessHead {.seq = s.val, .digest = d, .time = t.val});
+}
+
+@requires(network, clock(readonly), declassify)
+Option(WitnessHead) head_from(Endpoint e, List(Int) wkey, List(Int) l, List(Int) nonce) {
+    HttpOut o = http_call_ep(e, "POST", "/head", nonce.concat(l));
+    Option(WitnessHead) h = if (o.status == 200) { head_answer(o.body, wkey, l, nonce) } else { None };
+    return h;
+}
+
+// Every witness's verified answer for log `l` and one fresh nonce, in the
+// order of `ws` (None for a witness that did not answer).
+@requires(network, clock(readonly), declassify)
+pub List(Option(WitnessHead)) witness_heads(List(WitnessRef) ws, Str ca, List(Int) l) {
+    List(Option(WitnessHead)) hs = heads_from(ws, ca, l, random_bytes(32), 0, []);
+    return hs;
+}
+
+@requires(network, clock(readonly), declassify)
+List(Option(WitnessHead)) heads_from(List(WitnessRef) ws, Str ca, List(Int) l, List(Int) nonce, Int i, List(Option(WitnessHead)) acc) {
+    if (i >= ws.len()) { return acc; }
+    Option(Endpoint) oe = endpoint_of_url(ws[i].url, ca);
+    Option(WitnessHead) h = match oe { None => None, Some(e) => head_from(e, ws[i].key, l, nonce) };
+    return heads_from(ws, ca, l, nonce, i + 1, acc.concat([h]));
+}
+
+// Whether the head `vh` is the log's head as a majority of its policy's
+// witnesses know it (core/log.resid heads_problem): "" when it is, else
+// why not. What the cosigner requires before it releases the kit's half or
+// deals a re-share (R2W-5), so a relay that serves the log cut before a
+// veto gets nothing. `here` as for verified_log_at.
+@requires(network, clock(readonly), declassify)
+pub Str witness_head_check(VerifiedHead vh, Str ca, Str here) {
+    List(WitnessRef) ws = witnesses_at(vh.head.policy.witnesses, here);
+    List(Option(WitnessHead)) hs = witness_heads(ws, ca, vh.head.log_id);
+    Str why = heads_problem(hs, ws.len(), (Int)vh.head.sequence, vh.head.digest);
+    return why;
+}
+
+// After the witnesses refused an event at `seq` (R2W-2): the freeze alarm
+// when no event can get a majority there any more, else "".
+@requires(network, clock(readonly), declassify)
+pub Str freeze_check(List(WitnessEp) ws, Str ca, List(Int) l, UInt(64) seq) {
+    List(WitnessRef) rs = refs_of_eps(ws, 0, []);
+    Str why = freeze_problem(witness_heads(rs, ca, l), rs.len(), (Int)seq);
+    return why;
+}
+
+pub List(WitnessRef) refs_of_eps(List(WitnessEp) ws, Int i, List(WitnessRef) acc) {
+    if (i >= ws.len()) { return acc; }
+    return refs_of_eps(ws, i + 1, acc.concat([WitnessRef {.url = ws[i].host + ":" + f"{ws[i].port}", .key = ws[i].key}]));
+}
+
 // ─── The relay's sign-in message (SPEC 29.4) ────────────────────
 // What a device signs to sign in to its relay: the relay's name as the
 // device reaches it ("HOST:PORT", the host in lower case) bound in, so a

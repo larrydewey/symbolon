@@ -470,6 +470,17 @@ times in the co-signatures of the policy's witnesses, which MUST number at
 least a majority of them. Field 7 is advisory and never used for a delay
 (A-07).
 
+Signatures and co-signatures are not covered by an event's digest, so
+anyone can add entries to a stored event. A verifier therefore refuses an
+event that carries more signature entries than parties that could sign it
+(the quorum's parties, plus those of the quorum a `reshare` or `recover`
+names, plus one for a kit's recovery key; for `E0`, its quorum's parties
+plus one), or more co-signatures than the policy names witnesses, and it
+tries only the first entry naming each party and the first co-signature
+under each witness key. A party marked removed (`remove-party`, until the
+next `reshare` or `recover`) no longer counts as a signer of an event's
+signing rule, and a party already removed cannot be removed again.
+
 ### 8.4 Monotonicity
 
 Each agent and the cosigner store the highest head they have verified per
@@ -941,6 +952,17 @@ after the delay, measured by witness time, without a valid `veto`.
   material, or take part in any session with the recovering device, until
   the event carries co-signatures from a majority of the policy's witnesses
   whose witness time is at least the delay in the past.
+- **Fresh head.** The relay could serve the log cut before a veto. Before
+  it releases the kit's half or deals in a re-share, the cosigner asks
+  every witness of the policy, for one fresh nonce, how far it co-signed
+  the log (`POST /head`, Section 20.3), and proceeds only if a majority of
+  them answer, every answer verifies, none reports a sequence past the
+  head it acts on, and none reports another digest at that head. A veto
+  co-signed by a majority cannot then be hidden from it while a majority
+  answers. The check fails closed: with fewer than a majority answering,
+  or with a witness that co-signed past the head an event that never
+  reached a majority (an abandoned or contested publish), the cosigner
+  refuses until the log's next event takes that sequence.
 - **Veto.** A veto is signed by the DK of a device in the quorum preceding
   the event, which requires that device to be unlocked (Section 9.1). A
   thief with a locked device therefore cannot veto.
@@ -2034,11 +2056,44 @@ events and on heads they release material against, and SHOULD require
 them on all heads. A policy MUST name at least three witnesses run by
 independent operators.
 
+A witness co-signs with the witness time at which it checked the event:
+its own clock, but never earlier than the last event's witness time, so a
+witness whose clock runs behind does not co-sign a time that every agent
+would refuse ("witness time went backwards") while it holds the sequence.
+It records what it co-signed whole or not at all (a temporary file renamed
+into place). A co-sign request is bounded (2 MiB, 2048 events); with the
+signature limits of Section 8.3 its cost grows only with its size.
+
+A witness answers, for a 32-byte nonce and a log id (`POST /head`, body
+`nonce || log`), CBOR `[seq, digest, time, sig]`: the highest sequence of
+the log it co-signed and the digest it co-signed there (an empty byte
+string, and `seq` 0, when it co-signed none), and its time, signed with
+its key over `["symbolon v1 witness head", log, seq, digest, nonce,
+time]`. The cosigner uses it before a release or a re-share (Section
+13.4), a device for the freeze alarm (Section 20.4).
+
 ### 20.4 Fork and freeze detection (G17)
 
 Parties exchange their highest verified heads at every contact and alarm
 on a fork. A party that sees no newer witnessed head within a configured
 interval warns that it may be frozen.
+
+A witness co-signs one digest per `(log, seq)` and never another. Anyone
+holding a key that can sign a valid next event (a device, a removed
+device until the next re-share, the kit) can therefore show different
+valid events to different witnesses, so that no event gets a majority at
+that sequence and the log can never grow again. When the witnesses refuse
+a device's event, the device asks each of them how far it co-signed the
+log (`POST /head`); if no digest at that sequence can still reach a
+majority, counting every witness that did not answer or co-signed nothing
+there as free, it reports "log frozen at sequence n" as a possible attack
+instead of a generic failure.
+
+**Residual (open).** The alarm detects the freeze; nothing in this version
+undoes it. A frozen log stays frozen, and recovering from it (for example
+with the relay as a sequencer whose signed claim on `(log, seq, digest)`
+the witnesses require) needs a protocol change not made here. Excluding
+removed parties from signing rules (Section 8.3) narrows who can cause it.
 
 ### 20.5 Symbolon Home
 

@@ -719,6 +719,12 @@ Cosigner on_reshare(Cosigner c, List(Int) from, ReshareInvite inv, List(Got) ear
     LogNow ln = log_now(c, es);
     Result(VerifiedHead, SymbolonError) rv = match cv { Err(e) => Err(e), Ok(_) => ln.vh };
     Option(Membership) om = ln.mem;
+    // Nothing is dealt against a head the witnesses have co-signed past
+    // (R2W-5): a relay hiding a later event (a removal, a recovery's veto)
+    // would otherwise choose the epoch's parties. Fails closed when fewer
+    // than a majority of the witnesses answer.
+    Str stale = match rv { Err(_) => "", Ok(vh) => witness_head_check(vh, c.cfg.ca, local_host(c.dir)) };
+    if (str_len(stale) > 0) { eprintln("cosigner: re-share refused: the witnesses do not confirm the log's head: " + stale); return refuse(c, from, inv.session_id); }
     return match rv {
         Err(_) => refuse(c, from, inv.session_id),
         Ok(vh) => match om { None => refuse(c, from, inv.session_id), Some(m) => reshare_decide(c, from, inv, vh, m, es, early, primes) }
@@ -959,7 +965,10 @@ Cosigner on_release(Cosigner c, List(Int) from, List(Int) l) {
         Err(_) => refuse(c, from, l),
         Ok(v) => match h {
             None => cos_fail(c, "no kit half held"),
-            Some(half) => match cosigner_release(v.events, v.vh, from, half, random_bytes(32)) {
+            // The head must be the one the witnesses co-signed up to
+            // (R2W-5): a relay that cuts the log before a veto is caught
+            // by the witnesses that co-signed the veto.
+            Some(half) => match cosigner_release(v.events, v.vh, from, half, random_bytes(32), witness_heads(witnesses_at(v.vh.head.policy.witnesses, local_host(c.dir)), c.cfg.ca, l)) {
                 Err(e) => release_refused(c, from, l, e),
                 Ok(w) => release_sent(c, from, w, v.vh)
             }

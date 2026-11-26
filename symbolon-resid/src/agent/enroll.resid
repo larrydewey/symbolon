@@ -75,7 +75,12 @@ pub Result(VerifiedHead, Str) publish_event(DeviceConfig c, EventPayload p, List
     if (have != (Int)p.sequence) { return Err(f"the relay's log has {have} events, not the {p.sequence} this event follows"); }
     List(List(Int)) shown = before.concat([cbor_of_event(StoredEvent {.encoded = enc, .sigs = sigs, .cosigs = []})]);
     List(WitnessCosignature) cs = cosigs_for(c.witnesses, c.ca, c.log_id, p.sequence, sha256_bytes(enc), shown, 0, []);
-    if (cs.len() < 2) { return Err("too few witnesses co-signed"); }
+    if (cs.len() * 2 <= c.witnesses.len() || cs.len() < 2) {
+        // The freeze alarm (SPEC 20.4): witnesses that co-signed different
+        // events at this sequence, so none can get a majority there.
+        Str frozen = freeze_check(c.witnesses, c.ca, c.log_id, p.sequence);
+        return Err(if (str_len(frozen) > 0) { frozen } else { "too few witnesses co-signed" });
+    }
     if (!log_put(relay_ep(c), c.log_id, p.sequence, cbor_of_event(StoredEvent {.encoded = enc, .sigs = sigs, .cosigs = cs}))) { return Err("the relay refused the event"); }
     return match verified_log(relay_ep(c), c.log_id) { Ok(v) => Ok(v), Err(e) => Err("the log does not verify: " + err_text(e)) };
 }

@@ -91,10 +91,26 @@ Str names(List(Party) ps, Int i, Str acc) {
     return names(ps, i + 1, acc + (if (i > 0) { "," } else { "" }) + ps[i].label);
 }
 
-Str released(List(SignedEvent) es, Int now) {
+// Every witness answers POST /head with the verified head itself.
+List(Option(WitnessHead)) at_head(VerifiedHead v, Int i, List(Option(WitnessHead)) acc) {
+    if (i >= v.head.policy.witnesses.len()) { return acc; }
+    return at_head(v, i + 1, acc.concat([Some(WitnessHead {.seq = (Int)v.head.sequence, .digest = v.head.digest, .time = 0})]));
+}
+
+// The first witness co-signed the next sequence (an event the relay does
+// not serve), the second does not answer.
+List(Option(WitnessHead)) one_past(VerifiedHead v) {
+    List(Option(WitnessHead)) all = at_head(v, 0, []);
+    List(Option(WitnessHead)) past = [Some(WitnessHead {.seq = (Int)v.head.sequence + 1, .digest = sha256_bytes([1]), .time = 0}), None];
+    return past.concat(all[2..all.len()]);
+}
+
+Str released(List(SignedEvent) es, Int now) { return released_with(es, now, false); }
+
+Str released_with(List(SignedEvent) es, Int now, Bool hidden) {
     return match il_verify([34, 166, 88, 216, 116, 190, 146, 177, 192, 52, 28, 190, 119, 174, 107, 101, 222, 241, 175, 80, 135, 48, 221, 26, 94, 61, 100, 181, 66, 4, 5, 202], es, now, lambda(p) { false }) {
         Err(_) => "log refused",
-        Ok(v) => match release_target(es, v, [208, 18, 249, 134, 243, 176, 201, 195, 43, 80, 22, 17, 254, 66, 178, 113, 2, 157, 184, 137, 166, 28, 241, 89, 226, 234, 195, 71, 6, 72, 147, 59]) { Ok(k) => hx(k), Err(e) => match e { ErrRecoveryFailed(s) => s, _ => "other" } }
+        Ok(v) => match release_target(es, v, [208, 18, 249, 134, 243, 176, 201, 195, 43, 80, 22, 17, 254, 66, 178, 113, 2, 157, 184, 137, 166, 28, 241, 89, 226, 234, 195, 71, 6, 72, 147, 59], if (hidden) { one_past(v) } else { at_head(v, 0, []) }) { Ok(k) => hx(k), Err(e) => match e { ErrRecoveryFailed(s) => s, _ => "other" } }
     };
 }
 
@@ -108,6 +124,12 @@ test "the cosigner releases its kit half to the new device only after the delay,
     expect(released([ev0(), ev1()], 2001 + 86400)).toEqual("04f933d02d2ccd59e5bf7e8dfe6ce013d3175ba109c984f845304f7082a25fcf8f9b2fa59a7f8be1a9491b9c197910ef461f7a10efd57f281a7fff649dbd4947ba");
     expect(released([ev0(), ev1(), ev2()], 2001 + 86400 * 2)).toEqual("the device is not in the quorum (vetoed?)");
     expect(released([ev0()], 5000)).toEqual("no kit recovery names this device");
+}
+
+test "the cosigner releases nothing when a witness co-signed past the head the relay serves (R2W-5)" {
+    // The relay serves the log cut before the veto (ev2): one witness
+    // co-signed sequence 2 and says so; the release is refused.
+    expect(str_starts_with(released_with([ev0(), ev1()], 2001 + 86400, true), "the witnesses do not confirm the log's head")).toBeTrue();
 }
 
 EventPayload gp() { return EventPayload { .log_id = Some([34, 166, 88, 216, 116, 190, 146, 177, 192, 52, 28, 190, 119, 174, 107, 101, 222, 241, 175, 80, 135, 48, 221, 26, 94, 61, 100, 181, 66, 4, 5, 202]), .sequence = 5, .predecessor_digest = Some([96, 177, 153, 221, 168, 112, 4, 81, 245, 150, 96, 206, 215, 21, 46, 84, 252, 164, 110, 87, 232, 245, 211, 155, 115, 14, 21, 91, 175, 181, 37, 28]), .suite = 1, .body = RecoverBody(RecoverBodyInner { .path = 2, .new_parties = [Party { .id = [208, 18, 249, 134, 243, 176, 201, 195, 43, 80, 22, 17, 254, 66, 178, 113, 2, 157, 184, 137, 166, 28, 241, 89, 226, 234, 195, 71, 6, 72, 147, 59], .kind = 0, .auth_key = [4, 148, 242, 3, 16, 144, 35, 40, 47, 16, 5, 200, 244, 240, 5, 47, 30, 67, 241, 10, 118, 53, 113, 56, 239, 149, 58, 153, 11, 94, 54, 81, 92, 167, 99, 180, 222, 91, 51, 131, 21, 219, 150, 218, 28, 14, 91, 63, 193, 241, 60, 81, 18, 105, 1, 252, 239, 168, 166, 10, 10, 183, 137, 135, 255], .hpke_key = [4, 249, 51, 208, 45, 44, 205, 89, 229, 191, 126, 141, 254, 108, 224, 19, 211, 23, 91, 161, 9, 201, 132, 248, 69, 48, 79, 112, 130, 162, 95, 207, 143, 155, 47, 165, 154, 127, 139, 225, 169, 73, 27, 156, 25, 121, 16, 239, 70, 31, 122, 16, 239, 213, 127, 40, 26, 127, 255, 100, 157, 189, 73, 71, 186], .label = "new phone", .attestation = NoAttestation }], .revealed_recovery_key = None, .guardian_approvals = [] }), .next_recovery_key_digests = [[130, 132, 139, 139, 239, 27, 215, 119, 207, 235, 112, 28, 118, 172, 17, 32, 199, 198, 176, 10, 240, 33, 21, 153, 125, 26, 155, 163, 243, 106, 76, 50]], .advisory_time = 9000 }; }
