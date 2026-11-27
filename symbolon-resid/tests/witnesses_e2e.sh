@@ -2,12 +2,14 @@
 # `symbolon device witnesses` end to end on loopback (SPEC 8.2, 20.3): a
 # relay, three witnesses and a cosigner as processes, a device (one device,
 # so policy[1] is 1) taken through inception; then
-#   - a fourth witness is added: in force at once (one added to three does
-#     not weaken the policy), and the next event is co-signed by the new set;
 #   - a witness whose address or key is wrong is refused before anything is
-#     signed (its time, for a fresh nonce, must verify under the key given);
-#   - a witness is removed: a weakening, so the set-policy is pending for the
-#     recovery delay; running the command again says so; the device vetoes it.
+#     signed (its time, for a fresh nonce, must verify under the key given),
+#     and so is a change that leaves an even number of witnesses (R4-6);
+#   - two witnesses are added (five): two new and one old make a majority,
+#     a weakening, so the set-policy is pending for the recovery delay;
+#     running the command again says so; the device vetoes it;
+#   - a witness is replaced, with the witness it replaces stopped: delayed
+#     as well, co-signed by the other two; the device vetoes it.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 BIN="${BIN:-$PWD/target/symbolon}"
@@ -35,13 +37,13 @@ EOF
 RP=$(port)
 runs 3600 "$BIN" relay serve "$W/relay" "$RP" --allow-private-witnesses --name "127.0.0.1:$RP" > "$W/relay.log" 2>&1 & PIDS+=($!)
 WS=()
-for i in 1 2 3 4 5; do
+for i in 1 2 3 4 5 6; do
   P=$(port)
   KEY=$(run 30 "$BIN" witness keygen "$W/w$i.key") || fail "witness keygen"
   WS+=("127.0.0.1:$P:$KEY"); WPORT[$i]=$P; WKEY[$i]=$KEY
 done
-# Witnesses 1 to 4 run; 5 has a key and a port but never runs.
-for i in 1 2 3 4; do
+# Witnesses 1 to 4 and 6 run; 5 has a key and a port but never runs.
+for i in 1 2 3 4 6; do
   runs 3600 "$BIN" witness serve "$W/w$i" "${WPORT[$i]}" "$W/w$i.key" > "$W/w$i.log" 2>&1 & PIDS+=($!)
   wait_port "${WPORT[$i]}" || fail "witness $i did not start"
 done
@@ -56,41 +58,50 @@ echo "inception (key generation with three parties; a minute or two)..."
 printf '2468\n' | run 1800 "$BIN" device init "$W/dev" "$COS" "${WS[0]}" "${WS[1]}" "${WS[2]}" "$W/device.primes" "$W/kit.primes" > "$W/init.log" 2>&1 || fail "device init"
 
 # Refused before anything is signed: a witness that does not run, one that
-# runs under another key, a key already in the policy, too few left, a wrong PIN.
-printf '2468\n' | run 300 "$BIN" device witnesses "$W/dev" --add "${WS[4]}" > "$W/dead.log" 2>&1 && fail "a witness that does not answer was added"
+# runs under another key (each named with a sixth, running witness, so the
+# policy would hold five), a key already in the policy, too few left, an even
+# number (R4-6), a wrong PIN.
+printf '2468\n' | run 300 "$BIN" device witnesses "$W/dev" --add "${WS[4]}" --add "${WS[5]}" > "$W/dead.log" 2>&1 && fail "a witness that does not answer was added"
 grep -q "does not answer" "$W/dead.log" || fail "dead witness: $(cat "$W/dead.log")"
-printf '2468\n' | run 300 "$BIN" device witnesses "$W/dev" --add "127.0.0.1:${WPORT[4]}:${WKEY[5]}" > "$W/typo.log" 2>&1 && fail "a witness under the wrong key was added"
+printf '2468\n' | run 300 "$BIN" device witnesses "$W/dev" --add "127.0.0.1:${WPORT[4]}:${WKEY[5]}" --add "${WS[5]}" > "$W/typo.log" 2>&1 && fail "a witness under the wrong key was added"
 grep -q "does not answer" "$W/typo.log" || fail "wrong key: $(cat "$W/typo.log")"
 printf '2468\n' | run 300 "$BIN" device witnesses "$W/dev" --add "127.0.0.1:${WPORT[4]}:${WKEY[1]}" > "$W/dup.log" 2>&1 && fail "a key already in the policy was added"
 printf '2468\n' | run 300 "$BIN" device witnesses "$W/dev" --remove "127.0.0.1:${WPORT[1]}" > "$W/few.log" 2>&1 && fail "the policy was left with two witnesses"
 grep -q "at least three" "$W/few.log" || fail "too few: $(cat "$W/few.log")"
-printf '9999\n' | run 300 "$BIN" device witnesses "$W/dev" --add "${WS[3]}" > "$W/pin.log" 2>&1 && fail "a wrong PIN changed the witnesses"
+printf '2468\n' | run 300 "$BIN" device witnesses "$W/dev" --add "${WS[3]}" > "$W/even.log" 2>&1 && fail "a fourth witness was added"
+grep -q "odd number" "$W/even.log" || fail "even: $(cat "$W/even.log")"
+printf '9999\n' | run 300 "$BIN" device witnesses "$W/dev" --add "${WS[3]}" --add "${WS[5]}" > "$W/pin.log" 2>&1 && fail "a wrong PIN changed the witnesses"
 run 120 "$BIN" device status "$W/dev" > "$W/s0.log" 2>&1 || fail "status"
 grep -q 'head sequence 0 ' "$W/s0.log" || fail "a refused change reached the log: $(cat "$W/s0.log")"
-echo "refused before signing: a witness that does not answer, one under another key, a duplicate key, too few, a wrong PIN"
+echo "refused before signing: a witness that does not answer, one under another key, a duplicate key, too few, an even number, a wrong PIN"
 
-# A fourth witness: one device is policy[1] here and one added to three does
-# not weaken the policy, so it is in force at once.
-printf '2468\n' | run 600 "$BIN" device witnesses "$W/dev" --add "${WS[3]}" > "$W/add.log" 2>&1 || fail "add: $(cat "$W/add.log")"
-grep -q "witnesses are now" "$W/add.log" || fail "add not in force: $(cat "$W/add.log")"
-printf '2468\n' | run 300 "$BIN" device witnesses "$W/dev" --add "${WS[3]}" > "$W/again.log" 2>&1 || fail "add again: $(cat "$W/again.log")"
-grep -q "already" "$W/again.log" || fail "add again: $(cat "$W/again.log")"
-echo "a fourth witness added, in force at once; the same command again changes nothing"
-
-# The next event needs three of the four: with witness 1 stopped, the other
-# three (the new one among them) co-sign it. Removing witness 1 weakens the
-# policy: pending for the recovery delay.
-kill "$(pgrep -f -- "witness child $W/w1 " | head -1)" 2>/dev/null; pkill -f -- "witness serve $W/w1 " 2>/dev/null
-printf '2468\n' | run 600 "$BIN" device witnesses "$W/dev" --remove "127.0.0.1:${WPORT[1]}" > "$W/rm.log" 2>&1 || fail "remove: $(cat "$W/rm.log")"
-grep -q "take effect once the recovery delay" "$W/rm.log" || fail "remove not delayed: $(cat "$W/rm.log")"
+# Two witnesses added to three: two new and one old would make a majority
+# of five, a weakening, so it waits out the recovery delay even though one
+# device is policy[1] here.
+printf '2468\n' | run 600 "$BIN" device witnesses "$W/dev" --add "${WS[3]}" --add "${WS[5]}" > "$W/add.log" 2>&1 || fail "add: $(cat "$W/add.log")"
+grep -q "take effect once the recovery delay" "$W/add.log" || fail "add not delayed: $(cat "$W/add.log")"
+run 120 "$BIN" device status "$W/dev" > "$W/s1.log" 2>&1 || fail "status"
+grep -q 'head sequence 1 .* pending 1' "$W/s1.log" || fail "status after add: $(cat "$W/s1.log")"
+printf '2468\n' | run 300 "$BIN" device witnesses "$W/dev" --add "${WS[3]}" --add "${WS[5]}" > "$W/again.log" 2>&1 || fail "add again: $(cat "$W/again.log")"
+grep -q "pending already" "$W/again.log" || fail "add again: $(cat "$W/again.log")"
+printf '2468\n' | run 600 "$BIN" device veto "$W/dev" > "$W/veto1.log" 2>&1 || fail "veto: $(cat "$W/veto1.log")"
 run 120 "$BIN" device status "$W/dev" > "$W/s2.log" 2>&1 || fail "status"
-grep -q 'head sequence 2 .* pending 1' "$W/s2.log" || fail "status after remove: $(cat "$W/s2.log")"
-printf '2468\n' | run 300 "$BIN" device witnesses "$W/dev" --remove "127.0.0.1:${WPORT[1]}" > "$W/rm2.log" 2>&1 || fail "remove again: $(cat "$W/rm2.log")"
-grep -q "pending already" "$W/rm2.log" || fail "remove again: $(cat "$W/rm2.log")"
-echo "removing a witness is delayed (co-signed by the new set without the witness removed); running it again reports it pending"
+grep -q 'head sequence 2 .* pending 0' "$W/s2.log" || fail "status after veto: $(cat "$W/s2.log")"
+echo "adding two witnesses is delayed; running it again reports it pending; the device vetoes it"
+
+# Replacing witness 1 (stopped) with witness 4: the set-policy is co-signed
+# by witnesses 2 and 3, a majority of the three, and is delayed.
+kill "$(pgrep -f -- "witness child $W/w1 " | head -1)" 2>/dev/null; pkill -f -- "witness serve $W/w1 " 2>/dev/null
+printf '2468\n' | run 600 "$BIN" device witnesses "$W/dev" --remove "127.0.0.1:${WPORT[1]}" --add "${WS[3]}" > "$W/rm.log" 2>&1 || fail "replace: $(cat "$W/rm.log")"
+grep -q "take effect once the recovery delay" "$W/rm.log" || fail "replace not delayed: $(cat "$W/rm.log")"
+run 120 "$BIN" device status "$W/dev" > "$W/s3.log" 2>&1 || fail "status"
+grep -q 'head sequence 3 .* pending 1' "$W/s3.log" || fail "status after replace: $(cat "$W/s3.log")"
+printf '2468\n' | run 300 "$BIN" device witnesses "$W/dev" --remove "127.0.0.1:${WPORT[1]}" --add "${WS[3]}" > "$W/rm2.log" 2>&1 || fail "replace again: $(cat "$W/rm2.log")"
+grep -q "pending already" "$W/rm2.log" || fail "replace again: $(cat "$W/rm2.log")"
+echo "replacing a witness is delayed (co-signed without the witness replaced); running it again reports it pending"
 
 printf '2468\n' | run 600 "$BIN" device veto "$W/dev" > "$W/veto.log" 2>&1 || fail "veto: $(cat "$W/veto.log")"
-run 120 "$BIN" device status "$W/dev" > "$W/s3.log" 2>&1 || fail "status"
-grep -q 'head sequence 3 .* pending 0' "$W/s3.log" || fail "status after veto: $(cat "$W/s3.log")"
-echo "the device vetoes the removal; the log keeps four witnesses"
+run 120 "$BIN" device status "$W/dev" > "$W/s4.log" 2>&1 || fail "status"
+grep -q 'head sequence 4 .* pending 0' "$W/s4.log" || fail "status after veto: $(cat "$W/s4.log")"
+echo "the device vetoes the replacement; the log keeps its three witnesses"
 echo "PASS"

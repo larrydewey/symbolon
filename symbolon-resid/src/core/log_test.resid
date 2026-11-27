@@ -670,16 +670,16 @@ Int witnesses_of(Result(VerifiedHead, SymbolonError) r) { return match r { Ok(v)
 
 test "a witness change keeps every other field, the sequencing relay above all" {
     List(WitnessRef) one = [WitnessRef {.url = "relay:1", .key = pubk(30)}];
-    Result(Policy, Str) r = policy_with_witnesses(policy_seq(one), quorum2(), [wref("http://w4:1", 12)], []);
+    Result(Policy, Str) r = policy_with_witnesses(policy_seq(one), quorum2(), [wref("http://w4:1", 12), wref("http://w5:1", 13)], []);
     expect(change_err(r)).toEqual("");
     Policy p = changed(r);
-    expect(p.witnesses.len()).toEqual(4);
+    expect(p.witnesses.len()).toEqual(5);
     expect(p.sequencer.len()).toEqual(1);
     expect(hex_encode(p.sequencer[0].key)).toEqual(hex_encode(pubk(30)));
     expect((Int)p.recovery_delay_sec).toEqual(86400);
     expect((Int)p.device_sigs_for_authority).toEqual(2);
     // Removal by address, with or without the scheme, in any case.
-    Policy q = changed(policy_with_witnesses(p, quorum2(), [], ["HTTP://W4:1"]));
+    Policy q = changed(policy_with_witnesses(p, quorum2(), [], ["HTTP://W4:1", "w5:1"]));
     expect(q.witnesses.len()).toEqual(3);
     expect(q.sequencer.len()).toEqual(1);
 }
@@ -703,6 +703,47 @@ test "a witness change is refused with a bad key, too few witnesses, or an addre
     expect(change_err(policy_with_witnesses(p, quorum2(), [wref("http://w4:1", 12)], ["w1"]))).toEqual("");
 }
 
+test "a witness change that leaves an even number of witnesses is refused, at the command and in the log (R4-6)" {
+    Policy p = policy(86400);
+    // One added to three: four, which a 2/2 split can freeze.
+    expect(str_contains(change_err(policy_with_witnesses(p, quorum2(), [wref("http://w4:1", 12)], [])), "odd number")).toBeTrue();
+    // Two added: five.
+    expect(change_err(policy_with_witnesses(p, quorum2(), [wref("http://w4:1", 12), wref("http://w5:1", 13)], []))).toEqual("");
+    // A set-policy to four witnesses, signed by both devices, is not a valid event of a log with three.
+    List(Int) l = log_id();
+    Policy four = Policy {.device_sigs_for_authority = 2, .recovery_delay_sec = 86400, .guardians = [], .guardian_threshold = 0,
+                          .witnesses = p.witnesses.concat([wref("w4", 12)]), .duress_window_sec = 3600, .sequencer = [], .cosigner_policy = NoCosignerPolicy};
+    expect(ok(il_verify(l, [e0([2, 3]), next(1, 1, enc(0), SetPolicyBody(four), [2, 3], 2000)], 2000, lambda(x) { false }))).toBeFalse();
+    // A log that began with four (before the rule) still verifies, and may change them to another four.
+    List(Int) enc4 = enc(0);
+    List(Int) l4 = sha256_bytes(enc4);
+    EventPayload ep = EventPayload {.log_id = None, .sequence = 0, .predecessor_digest = None, .suite = 1, .body = InceptionBody(quorum2(), four),
+                                    .next_recovery_key_digests = [id32(50)], .advisory_time = 0};
+    SignedEvent old4 = SignedEvent {.payload = ep, .encoded = enc4, .sigs = sigs([2, 3], enc4, 0, []), .cosigs = cosig3(l4, 0, l4, 1000)};
+    expect(ok(il_verify(l4, [old4], 1000, lambda(x) { false }))).toBeTrue();
+    Policy other4 = Policy {.device_sigs_for_authority = 2, .recovery_delay_sec = 86400, .guardians = [], .guardian_threshold = 0,
+                            .witnesses = [p.witnesses[0], p.witnesses[1], wref("w4", 12), wref("w5", 13)], .duress_window_sec = 3600, .sequencer = [], .cosigner_policy = NoCosignerPolicy};
+    expect(pending_n(il_verify(l4, [old4, three_cosigs(next(1, 1, enc(0), SetPolicyBody(other4), [2, 3], 2000))], 2000, lambda(x) { false }))).toEqual(1);
+}
+
+// Co-signatures by three witnesses (keys 7, 8, 11): a majority of four.
+List(WitnessCosignature) cosig3(List(Int) l, UInt(64) seq, List(Int) d, UInt(64) time) {
+    return cosig(l, seq, d, time).concat([WitnessCosignature {.log_id = l, .sequence = seq, .digest = d, .witness_key = pubk(11),
+                                                               .signature = sign(11, witness_message(l, seq, d)), .witness_time = time}]);
+}
+
+SignedEvent three_cosigs(SignedEvent e) {
+    return SignedEvent {.payload = e.payload, .encoded = e.encoded, .sigs = e.sigs, .cosigs = cosig3(log_id(), e.payload.sequence, sha256_bytes(e.encoded), e.cosigs[0].witness_time)};
+}
+
+test "moving a witness's key to another address weakens the policy (R4-7)" {
+    List(WitnessRef) old = policy(86400).witnesses;
+    // Every key kept, one at a new address (a dead host, say): delayed, vetoable.
+    expect(witnesses_weaken(old, [old[0], old[1], wref("http://dead.example:9", 11)])).toBeTrue();
+    // The same address written another way is the same witness.
+    expect(witnesses_weaken([wref("http://w1:1", 7), wref("w2:1", 8), wref("w3:1", 11)], [wref("W1:1", 7), wref("https://w2:1", 8), wref("w3:1", 11)])).toBeFalse();
+}
+
 test "removing or replacing a witness weakens the policy, and so does outvoting the old ones" {
     List(WitnessRef) old = policy(86400).witnesses;
     List(WitnessRef) four = old.concat([wref("w4", 12)]);
@@ -718,24 +759,25 @@ test "removing or replacing a witness weakens the policy, and so does outvoting 
                                           .witnesses = [old[0], old[1], wref("w4", 12)], .duress_window_sec = 3600, .sequencer = [], .cosigner_policy = NoCosignerPolicy})).toBeTrue();
 }
 
-test "adding a witness with one device's signature is delayed and vetoable; with policy[1] devices it is immediate" {
+test "adding witnesses (an odd number in all) is delayed and vetoable, even with every device's signature" {
     List(Int) l = log_id();
-    Policy np = changed(policy_with_witnesses(policy(86400), quorum2(), [wref("http://w4:1", 12)], []));
+    Policy np = changed(policy_with_witnesses(policy(86400), quorum2(), [wref("http://w4:1", 12), wref("http://w5:1", 13)], []));
     SignedEvent one = next(1, 1, enc(0), SetPolicyBody(np), [2], 2000);
     Result(VerifiedHead, SymbolonError) early = il_verify(l, [e0([2, 3]), one], 2000 + 86399, lambda(x) { false });
     expect(pending_n(early)).toEqual(1);
     expect(witnesses_of(early)).toEqual(3);
-    expect(witnesses_of(il_verify(l, [e0([2, 3]), one], 2000 + 86400, lambda(x) { false }))).toEqual(4);
+    expect(witnesses_of(il_verify(l, [e0([2, 3]), one], 2000 + 86400, lambda(x) { false }))).toEqual(5);
     // The other device vetoes it within the delay: never in force.
     SignedEvent veto = next(2, 2, enc(1), VetoBody(1), [3], 3000);
     Result(VerifiedHead, SymbolonError) vetoed = il_verify(l, [e0([2, 3]), one, veto], 2000 + 90000, lambda(x) { false });
     expect(pending_n(vetoed)).toEqual(0);
     expect(witnesses_of(vetoed)).toEqual(3);
-    // Both devices: in force at once.
+    // Both devices: two new witnesses and one old make a majority of five,
+    // a weakening, so it waits out the delay all the same.
     SignedEvent both = next(1, 1, enc(0), SetPolicyBody(np), [2, 3], 2000);
     Result(VerifiedHead, SymbolonError) r = il_verify(l, [e0([2, 3]), both], 2000, lambda(x) { false });
-    expect(pending_n(r)).toEqual(0);
-    expect(witnesses_of(r)).toEqual(4);
+    expect(pending_n(r)).toEqual(1);
+    expect(witnesses_of(r)).toEqual(3);
 }
 
 test "replacing a witness is delayed even with every device's signature" {

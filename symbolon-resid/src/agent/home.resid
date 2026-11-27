@@ -188,6 +188,10 @@ pub Str witnesses_problem(List(Str) ws, List(Str) box_hosts, List(Str) box_keys,
         Int need = on_box + 1;
         return f"the box runs {on_box} witness(es), so it would be a majority: name at least {need} witnesses outside it (--witness HOST:PORT:KEY)";
     }
+    // An odd number in all (SPEC 20.3, R4-6): an even one can split 2/2.
+    if ((on_box + ws.len()) % 2 == 0) {
+        return f"the box runs {on_box} witness(es) and {ws.len()} are named outside it: a log needs an odd number of witnesses in all, so name one more or one fewer";
+    }
     return "";
 }
 

@@ -334,6 +334,8 @@ test "home init needs witnesses outside the box that outnumber the box's own" {
     // One outside the box: the box's own would be half; none: all of them.
     expect(str_contains(witnesses_problem([a], box, [], 1), "majority")).toBeTrue();
     expect(str_contains(witnesses_problem([], box, [], 1), "majority")).toBeTrue();
+    // An odd number in all (R4-6): three outside and the box's one are four.
+    expect(str_contains(witnesses_problem([a, b, "w3.example.org:443:" + wkey(34)], box, [], 1), "odd")).toBeTrue();
     // A legacy box running three needs four outside.
     expect(str_contains(witnesses_problem([a, b], box, [], 3), "majority")).toBeTrue();
     // The same witness twice, or the box's own key, counts once.

@@ -540,6 +540,7 @@ pub Int device_init(Str dir, InitArgs a) {
     Option(DeviceConfig) oc = load_config(dir);
     Option(PartyKeys) ok = keys_of_cbor(cose_hex_decode(a.cosigner_keys));
     if (a.witnesses.len() < 3) { return dfail("three witnesses at least (SPEC 20.3)"); }
+    if (a.witnesses.len() % 2 == 0) { return dfail("an odd number of witnesses (SPEC 20.3: with an even number a split vote can freeze the log)"); }
     Str pin = read_pin();
     NewKitPass kp = read_new_kit_pass();
     if (!kp.ok) { return dfail(kit_pass_mismatch()); }

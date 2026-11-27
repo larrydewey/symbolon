@@ -242,14 +242,43 @@ pub Bool weakens(Policy old, Policy new) {
 // on their own (three added to three: three of the six new, with one old,
 // co-sign), which would let whoever runs the added ones fork the log with
 // fewer of the old witnesses than before.
+//
+// A witness is its key at its address (R4-7): an old key moved to another
+// address weakens the policy as well, since clients reach witnesses only
+// at the policy's addresses, and every one moved to a dead host would
+// otherwise freeze the log at once, with no veto window.
 pub Bool witnesses_weaken(List(WitnessRef) old, List(WitnessRef) new) {
     List(List(Int)) nk = witness_key_list(new, 0, ListBuf());
-    if (!keys_all_in(witness_key_list(old, 0, ListBuf()), nk, 0)) { return true; }
+    if (!pairs_all_in(old, new, 0)) { return true; }
     Int added = keys_not_in(nk, witness_key_list(old, 0, ListBuf()), 0, []);
     return witnesses_need(new) - added < witnesses_need(old);
 }
 
 Int witnesses_need(List(WitnessRef) ws) { return ws.len() / 2 + 1; }
+
+// Whether every witness of `xs` is in `ys` with the same key at the same
+// address (witness_addr).
+Bool pairs_all_in(List(WitnessRef) xs, List(WitnessRef) ys, Int i) {
+    if (i >= xs.len()) { return true; }
+    return pair_in(ys, xs[i], 0) && pairs_all_in(xs, ys, i + 1);
+}
+
+Bool pair_in(List(WitnessRef) ys, WitnessRef w, Int i) {
+    if (i >= ys.len()) { return false; }
+    if (bytes_eq(ys[i].key, w.key) && witness_addr(ys[i].url) == witness_addr(w.url)) { return true; }
+    return pair_in(ys, w, i + 1);
+}
+
+// An odd number of distinct witness keys (R4-6): a sequence split between
+// a claimed event and a claimless one can then always be settled by a
+// majority once every witness has answered (il_claimless); with an even
+// number a 2/2 split freezes the log for good. Required of every policy
+// made from now on: `device init`, `device witnesses`
+// (policy_with_witnesses), and any set-policy of a log whose policy has an
+// odd number already (do_set_policy). A log that began with an even number
+// before the rule still verifies, and its set-policies may keep an even
+// number (`device witnesses` makes only odd ones).
+pub Bool witnesses_odd(List(WitnessRef) ws) { return witness_keys_distinct(ws, 0) % 2 == 1; }
 
 Bool keys_all_in(List(List(Int)) xs, List(List(Int)) ys, Int i) {
     if (i >= xs.len()) { return true; }
@@ -326,6 +355,7 @@ pub Result(Policy, Str) policy_with_witnesses(Policy p0, Quorum q, List(WitnessR
     List(WitnessRef) ws = kept.concat(add);
     if (witness_keys_distinct(ws, 0) != ws.len()) { return Err("two witnesses would have the same key"); }
     if (ws.len() < 3) { return Err(f"a policy names at least three witnesses (SPEC 20.3); this would leave {ws.len()}"); }
+    if (!witnesses_odd(ws)) { return Err(f"a policy names an odd number of witnesses (SPEC 20.3: with an even number a split vote can freeze the log); this would leave {ws.len()}: add or remove one more"); }
     Int floor = if (device_count(q.parties, 0, 0) >= 2) { 2 } else { 1 };
     UInt(8) dsigs = if ((Int)p0.device_sigs_for_authority < floor) { (UInt(8))floor } else { p0.device_sigs_for_authority };
     Policy np = Policy {.device_sigs_for_authority = dsigs, .recovery_delay_sec = p0.recovery_delay_sec, .guardians = p0.guardians,
@@ -816,6 +846,7 @@ Result(LogState, SymbolonError) do_remove(LogState s, SignedEvent e, List(Int) d
 
 Result(LogState, SymbolonError) do_set_policy(LogState s, SignedEvent e, List(Int) dig, Int dev_sigs, Policy np) {
     if (!policy_ok(np, s.quorum)) { return refuse("policy below the SPEC 8.2 floor"); }
+    if (witnesses_odd(s.policy.witnesses) && !witnesses_odd(np.witnesses)) { return refuse("set-policy to an even number of witnesses (SPEC 20.3)"); }
     if (dev_sigs == 0 && kit_signed(s, e)) { return kit_escape(s, e, dig, np); }
     return authority(s, e, dig, weakens(s.policy, np), dev_sigs);
 }

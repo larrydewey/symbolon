@@ -537,10 +537,15 @@ recover-body = [
   weakens it unless it only adds witnesses, and few enough that every
   majority of the new set holds a majority of the old one (with `n` old
   and `a` added, `floor((n+a)/2) + 1 - a >= floor(n/2) + 1`: one added to
-  three does not weaken, two do): removing or replacing a witness (any key
-  of the old set missing from the new one) always weakens it, and so does
-  adding enough witnesses that the added ones and a minority of the old
-  ones could co-sign without the rest.
+  three does not weaken, two do): removing, replacing or moving a witness
+  (any key of the old set missing from the new one, or at another address
+  in it, R4-7: clients reach witnesses only at the policy's addresses)
+  always weakens it, and so does adding enough witnesses that the added
+  ones and a minority of the old ones could co-sign without the rest.
+  Since a policy names an odd number of witnesses (Section 20.3), every
+  change of witnesses from an odd set is a weakening, and delayed.
+- A `set-policy` of a log whose policy names an odd number of witnesses
+  MUST name an odd number too (R4-6; Section 20.3).
 - `reshare`: signatures from every party that took part in the re-share
   (Section 11.3), at least `t` of the old quorum.
 - `recover`: Section 13. `veto`: Section 13.4.
@@ -2804,7 +2809,11 @@ against two); and a malicious relay working with the kit can freeze the
 sequence at which the devices try the escape of kind 2 (three different
 events at three witnesses). Neither releases anything: the cosigner's
 fresh-head check (Section 13.4) fails closed on a frozen or contested
-head. Policies SHOULD name an odd number of witnesses.
+head. A new policy MUST name an odd number of witnesses (R4-6): `device
+init`, `home init`/`home secure` and `device witnesses` refuse an even
+one, and the log refuses a `set-policy` that takes an odd set to an even
+one. A log that began with an even number before this rule still
+verifies, and its owners SHOULD move it to an odd one.
 
 **Lapsed claims (R3P-6).** A claim lapses once its event can no longer be
 co-signed by any witness (it is invalid at witness time and at every later
@@ -2871,15 +2880,17 @@ sequencing relay of field 8 above all; `policy[1]` raised to the floor of
 Section 8.2 when the quorum has grown past it). It is refused, before
 anything is signed, when an address names no witness of the policy, an
 added witness's key is not a P-256 point or is in the policy already,
-two witnesses would share a key, or fewer than three would remain; and
+two witnesses would share a key, fewer than three would remain, or an even
+number would (so witnesses are added or removed two at a time, or replaced); and
 unless each added witness answers `POST /time` for a fresh nonce with a
 time signed under the key given (reached under the device's TLS trust
 anchor), so that a mistyped address or key cannot leave the log needing a
 witness that never answers. Signed by that one device, it takes effect at
 once only when that is `policy[1]` devices and it does not weaken the
 policy (Section 8.2); otherwise it waits out the recovery delay, during
-which any device of the quorum may veto it, as a recovery. Removing or
-replacing a witness is always delayed. The event itself is co-signed by
+which any device of the quorum may veto it, as a recovery. Removing,
+replacing or moving a witness is always delayed, and with an odd number
+of witnesses so is every change. The event itself is co-signed by
 the witnesses of the policy before it; from the event after the one at
 which the change is in force (Section 8.3), every device asks the new
 witnesses: a device co-signs with the witnesses the verified log names,
