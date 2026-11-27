@@ -27,7 +27,7 @@ pub type SignedEvent = {
 };
 
 // A delayed event, applied once its delay has run without a veto.
-type Pending = {
+pub type Pending = {
     UInt(64) seq;
     Int ready_at;
     EventBody body;
@@ -54,7 +54,10 @@ pub type PartyTime = { List(Int) id; Int time; };
 // its delay would have run.
 pub type Slot = { List(List(Int)) signers; Int until; };
 
-type LogState = {
+// The verifier's state after an event. A witness keeps the one it reached
+// for a log (agent/witnesssrv.resid, core/logstate.resid) and verifies the
+// next events on top of it (il_extend, il_next_from).
+pub type LogState = {
     Quorum quorum;
     Policy policy;
     List(List(Int)) recovery_digests;       // field 6 in force
@@ -1400,11 +1403,45 @@ pub Result(NextOk, SymbolonError) il_next(List(Int) l, List(SignedEvent) before,
     }
     LogState s0 = start(before[0], l)?;
     LogState s1 = run(s0, before, l, approvals_ok, 1)?;
+    NextOk n = il_next_from(l, s1, e, now, approvals_ok)?;
+    return Ok(n);
+}
+
+// il_next on top of `s1`, the state after the log before `e` (il_state,
+// il_extend): what a witness that keeps its verified state checks.
+pub Result(NextOk, SymbolonError) il_next_from(List(Int) l, LogState s1, SignedEvent e, Int now, Bool closure(EventPayload) approvals_ok) {
     Int t = if (now > s1.last_time) { now } else { s1.last_time };
     LogState s2 = step_at(s1, e, l, t, approvals_ok)?;
     LogState st = settle(s1, t);
     return Ok(NextOk {.time = t, .sequencer = s1.policy.sequencer, .witnesses = s1.policy.witnesses, .claimless = il_claimless(st, e)});
 }
+
+// ============================================================================
+// A witness's kept state (SPEC 20.3: incremental co-sign requests)
+// ============================================================================
+
+// The state after the log `events` (from E0, with co-signatures), as
+// il_verify reaches it before settling at a time of its own: what a
+// witness keeps for the log once it has verified it.
+pub Result(LogState, SymbolonError) il_state(List(Int) l, List(SignedEvent) events) {
+    if (events.len() < 1) { return refuse("empty log"); }
+    LogState s0 = start(events[0], l)?;
+    LogState s1 = run(s0, events, l, lambda(p) { false }, 1)?;
+    return Ok(s1);
+}
+
+// `s` (a state il_state or il_extend reached) with the next events of the
+// log, each verified as every agent verifies it (step): the same state as
+// il_state of the whole log reaches.
+pub Result(LogState, SymbolonError) il_extend(LogState s, List(Int) l, List(SignedEvent) events) {
+    LogState s1 = run(s, events, l, lambda(p) { false }, 0)?;
+    return Ok(s1);
+}
+
+// The sequence the next event of a kept state takes, and the digest of
+// the last event it holds.
+pub Int il_state_next(LogState s) { Int n = (Int)s.next_seq; return n; }
+pub List(Int) il_state_digest(LogState s) { List(Int) d = s.prev_digest; return d; }
 
 // The relay as sequencer has an escape (SPEC 20.3, R3P-3): the events a
 // witness co-signs at sequence n without the relay's claim, when it holds

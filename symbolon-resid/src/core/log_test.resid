@@ -2,6 +2,7 @@ import "../types.resid";
 import "log.resid";
 import "event.resid";
 import "event_decode.resid";
+import "logstate.resid";
 import "hash.resid";
 import "ecdsa.resid";
 import "crypto.resid";
@@ -1369,4 +1370,35 @@ test "a device has at most four delayed events open; remove-party and veto are n
     List(SignedEvent) old = [at(1, prop_of(31), [2], 2000), at(2, prop_of(32), [2], 2010), at(3, prop_of(33), [2], 2020),
                              at(4, prop_of(34), [2], 2030), at(5, prop_of(35), [2], 2040)];
     expect(pending_n(verify_at(old, 2040))).toEqual(5);
+}
+
+// ─── R3P-2: the state a witness keeps (core/logstate.resid) ───────
+
+Str state_hex(Result(LogState, SymbolonError) r) { return match r { Ok(s) => hex_encode(logstate_cbor(s)), Err(e) => "error" }; }
+
+Result(LogState, SymbolonError) extended(Result(LogState, SymbolonError) r, List(SignedEvent) es) {
+    return match r { Ok(s) => il_extend(s, log_id(), es), Err(e) => Err(e) };
+}
+
+test "a kept state reads back whole, and extending it reaches the state of the whole log" {
+    // Every field in use: a proposed party, pending events, a vetoed one
+    // holding a place (slots), a party-key time, a removal pending.
+    List(SignedEvent) es = [e0([2, 3]), at(1, prop_of(31), [2, 3], now_after(10)), at(2, prop_of(32), [2], now_after(20)),
+                            at(3, prop_of(33), [2], now_after(30)), at(4, VetoBody(3), [3], now_after(40)),
+                            at(5, PartyKeyBody(id32(3), pubk(22)), [3], now_after(50)), at(6, RemovePartyBody(id32(2)), [3], now_after(60))];
+    Result(LogState, SymbolonError) whole = il_state(log_id(), es);
+    Str h = state_hex(whole);
+    expect(str_len(h) > 100).toBeTrue();
+    Option(LogState) back = match whole { Ok(s) => logstate_of(logstate_cbor(s)), Err(_) => None };
+    expect(match back { Some(s) => hex_encode(logstate_cbor(s)), None => "none" }).toEqual(h);
+    expect(match back { Some(s) => il_state_next(s), None => -1 }).toEqual(7);
+    // From any point, the kept state and the rest of the log reach the same state.
+    expect(state_hex(extended(il_state(log_id(), es[0..1]), es[1..7]))).toEqual(h);
+    expect(state_hex(extended(il_state(log_id(), es[0..4]), es[4..7]))).toEqual(h);
+    // A rest that does not follow the kept state: refused.
+    expect(state_hex(extended(il_state(log_id(), es[0..4]), es[5..7]))).toEqual("error");
+    // Bytes that are not a kept state, or cut short: none.
+    List(Int) b = match whole { Ok(s) => logstate_cbor(s), Err(_) => [] };
+    expect(match logstate_of(b[0..b.len() - 1]) { Some(_) => "state", None => "none" }).toEqual("none");
+    expect(match logstate_of([128]) { Some(_) => "state", None => "none" }).toEqual("none");
 }

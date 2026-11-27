@@ -1,0 +1,224 @@
+// The verifier's state after a log (core/log.resid LogState) as bytes:
+// what a witness keeps for each log it has verified (SPEC 20.3,
+// agent/witnesssrv.resid), so that a co-sign request need carry only the
+// events after the head it holds.
+//
+// Only the witness writes and reads it, from its own data directory, and
+// only a state the verifier reached itself is written: nothing in it ever
+// comes from a request. A file that does not read back whole (cut short,
+// another version) is no state, and the witness asks for the log again.
+//
+// CBOR [bstr, ...]: a version tag, then each field. The quorum, policy,
+// parties and pending bodies ride as event payloads (core/event.resid
+// payload_cbor, read back by payload_decode, which re-encodes and
+// compares), so they are written and read exactly as the log's own events
+// are.
+
+import "../types.resid";
+import "log.resid";
+import "event.resid";
+import "event_decode.resid";
+import "cose.resid";
+
+List(Int) state_tag() { List(Int) t = cbe_text("symbolon v1 witness state", []); return t; }
+
+// The state's bytes; [] when a field cannot be written (it is then not
+// kept).
+pub List(Int) logstate_cbor(LogState s) {
+    List(Int) q = as_payload(ReshareBody(s.quorum), 0, [], 0);
+    List(Int) p = as_payload(SetPolicyBody(s.policy), 0, [], 0);
+    List(Int) f6 = as_payload(RotateRecoveryBody, 0, s.recovery_digests, 0);
+    List(Int) rm = as_payload(RotateRecoveryBody, 0, s.removed, 0);
+    List(Int) rt = as_payload(RotateRecoveryBody, 0, s.rotated_to, 0);
+    List(List(Int)) props = parties_bytes(s.proposed, 0, []);
+    List(List(Int)) pend = pendings_bytes(s.pending, 0, []);
+    Bool whole = q.len() > 0 && p.len() > 0 && f6.len() > 0 && rm.len() > 0 && rt.len() > 0
+        && props.len() == s.proposed.len() && pend.len() == s.pending.len()
+        && s.vetoes >= 0 && s.last_time >= 0 && times_ok(s.key_times, 0) && slots_ok(s.slots, 0);
+    if (!whole) { return []; }
+    List(Int) b = bstrs_cbor([state_tag(), q, p, f6, bstrs_cbor(props), rm, bstrs_cbor(pend), cbe_uint(s.vetoes, []), s.prev_digest,
+                              cbe_uint((Int)s.next_seq, []), cbe_uint(s.last_time, []), bstrs_cbor(cosigs_bytes(s.last_cosigs, 0, [])), rt,
+                              bstrs_cbor(times_bytes(s.key_times, 0, [])), bstrs_cbor(slots_bytes(s.slots, 0, []))]);
+    return b;
+}
+
+// The state `logstate_cbor` wrote, or None.
+pub Option(LogState) logstate_of(List(Int) b) {
+    List(List(Int)) xs = bstrs_of(b) else { [] };
+    if (xs.len() != 15 || !bytes_eq(xs[0], state_tag())) { return None; }
+    Option(Quorum) q = quorum_in(xs[1]);
+    Option(Policy) p = policy_in(xs[2]);
+    Option(List(List(Int))) f6 = digests_in(xs[3]);
+    Option(List(Party)) props = parties_in(bstrs_of(xs[4]) else { [[0]] }, 0, []);
+    Option(List(List(Int))) rm = digests_in(xs[5]);
+    Option(List(Pending)) pend = pendings_in(bstrs_of(xs[6]) else { [[0]] }, 0, []);
+    Int vetoes = uint_in(xs[7]);
+    Int next = uint_in(xs[9]);
+    Int last = uint_in(xs[10]);
+    Option(List(WitnessCosignature)) cs = cosigs_in(bstrs_of(xs[11]) else { [[0]] }, 0, []);
+    Option(List(List(Int))) rt = digests_in(xs[12]);
+    Option(List(PartyTime)) kt = times_in(bstrs_of(xs[13]) else { [[0]] }, 0, []);
+    Option(List(Slot)) sl = slots_in(bstrs_of(xs[14]) else { [[0]] }, 0, []);
+    if (vetoes < 0 || next < 1 || last < 0 || xs[8].len() != 32) { return None; }
+    return match q { None => None, Some(qv) => match p { None => None, Some(pv) => match f6 { None => None, Some(f6v) =>
+           match props { None => None, Some(propsv) => match rm { None => None, Some(rmv) => match pend { None => None, Some(pendv) =>
+           match cs { None => None, Some(csv) => match rt { None => None, Some(rtv) => match kt { None => None, Some(ktv) =>
+           match sl { None => None, Some(slv) => Some(LogState {
+               .quorum = qv, .policy = pv, .recovery_digests = f6v, .proposed = propsv, .removed = rmv, .pending = pendv,
+               .vetoes = vetoes, .prev_digest = xs[8], .next_seq = (UInt(64))next, .last_time = last, .last_cosigs = csv,
+               .rotated_to = rtv, .key_times = ktv, .slots = slv }) } } } } } } } } } };
+}
+
+// ─── CBOR [bstr, ...] ─────────────────────────────────────────────
+
+pub List(Int) bstrs_cbor(List(List(Int)) xs) {
+    List(Int) b = bstrs_from(xs, 0, cbe_array(xs.len(), []));
+    return b;
+}
+
+List(Int) bstrs_from(List(List(Int)) xs, Int i, List(Int) acc) {
+    if (i >= xs.len()) { return acc; }
+    return bstrs_from(xs, i + 1, cbe_bytes(xs[i], acc));
+}
+
+// Exactly an array of byte strings, nothing after it.
+pub Option(List(List(Int))) bstrs_of(List(Int) b) {
+    Rd h = rd(b, 0);
+    if (h.major != 4 || h.val > 65536) { return None; }
+    return bstrs_n(b, h.next, h.val, []);
+}
+
+Option(List(List(Int))) bstrs_n(List(Int) b, Int p, Int n, List(List(Int)) acc) {
+    if (n == 0) { return if (p == b.len()) { Some(acc) } else { None }; }
+    Rd h = rd(b, p);
+    if (h.major != 2 || h.next + h.val > b.len()) { return None; }
+    return bstrs_n(b, h.next + h.val, n - 1, acc.concat([b[h.next..h.next + h.val]]));
+}
+
+// A uint written alone, or -1.
+Int uint_in(List(Int) b) {
+    Rd h = rd(b, 0);
+    Int v = if (h.major == 0 && h.next == b.len()) { h.val } else { -1 };
+    return v;
+}
+
+// ─── Fields as event payloads ─────────────────────────────────────
+
+List(Int) as_payload(EventBody body, Int seq, List(List(Int)) nd, Int adv) {
+    EventPayload p = EventPayload {.log_id = None, .sequence = (UInt(64))seq, .predecessor_digest = None, .suite = 1, .body = body,
+                                   .next_recovery_key_digests = nd, .advisory_time = (UInt(64))adv};
+    List(Int) e = payload_cbor(p) else { [] };
+    return e;
+}
+
+Option(EventPayload) payload_in(List(Int) b) {
+    Option(EventPayload) p = if (b.len() == 0) { None } else { payload_decode(b) };
+    return p;
+}
+
+Option(Quorum) quorum_in(List(Int) b) {
+    Option(EventPayload) p = payload_in(b);
+    return match p { None => None, Some(x) => quorum_body(x.body) };
+}
+
+Option(Quorum) quorum_body(EventBody b) { return match b { ReshareBody(q) => Some(q), _ => None }; }
+
+Option(Policy) policy_in(List(Int) b) {
+    Option(EventPayload) p = payload_in(b);
+    return match p { None => None, Some(x) => policy_body(x.body) };
+}
+
+Option(Policy) policy_body(EventBody b) { return match b { SetPolicyBody(q) => Some(q), _ => None }; }
+
+Option(List(List(Int))) digests_in(List(Int) b) {
+    Option(EventPayload) p = payload_in(b);
+    return match p { None => None, Some(x) => Some(x.next_recovery_key_digests) };
+}
+
+List(List(Int)) parties_bytes(List(Party) ps, Int i, List(List(Int)) acc) {
+    if (i >= ps.len()) { return acc; }
+    List(Int) e = as_payload(ProposePartyBody(ps[i], []), 0, [], 0);
+    return if (e.len() == 0) { acc } else { parties_bytes(ps, i + 1, acc.concat([e])) };
+}
+
+Option(List(Party)) parties_in(List(List(Int)) xs, Int i, List(Party) acc) {
+    if (i >= xs.len()) { return Some(acc); }
+    Option(EventPayload) p = payload_in(xs[i]);
+    Option(Party) o = match p { None => None, Some(x) => party_body(x.body) };
+    return match o { None => None, Some(v) => parties_in(xs, i + 1, acc.concat([v])) };
+}
+
+Option(Party) party_body(EventBody b) { return match b { ProposePartyBody(q, _) => Some(q), _ => None }; }
+
+// A pending event: [its body as a payload of its sequence and field 6,
+// ready_at, digest, [kit, forced], [signer, ...]].
+List(List(Int)) pendings_bytes(List(Pending) ps, Int i, List(List(Int)) acc) {
+    if (i >= ps.len()) { return acc; }
+    Pending x = ps[i];
+    List(Int) e = as_payload(x.body, (Int)x.seq, x.next_digests, 0);
+    if (e.len() == 0 || x.ready_at < 0) { return acc; }
+    List(Int) one = bstrs_cbor([e, cbe_uint(x.ready_at, []), x.event_digest, [if (x.kit) { 1 } else { 0 }, if (x.forced) { 1 } else { 0 }], bstrs_cbor(x.signers)]);
+    return pendings_bytes(ps, i + 1, acc.concat([one]));
+}
+
+Option(List(Pending)) pendings_in(List(List(Int)) xs, Int i, List(Pending) acc) {
+    if (i >= xs.len()) { return Some(acc); }
+    Option(Pending) o = pending_in(bstrs_of(xs[i]) else { [] });
+    return match o { None => None, Some(v) => pendings_in(xs, i + 1, acc.concat([v])) };
+}
+
+Option(Pending) pending_in(List(List(Int)) f) {
+    if (f.len() != 5 || f[3].len() != 2 || f[3][0] > 1 || f[3][1] > 1) { return None; }
+    Option(EventPayload) p = payload_in(f[0]);
+    Option(List(List(Int))) signers = bstrs_of(f[4]);
+    Int ready = uint_in(f[1]);
+    if (ready < 0) { return None; }
+    return match p { None => None, Some(x) => match signers { None => None, Some(sv) => Some(Pending {
+        .seq = x.sequence, .ready_at = ready, .body = x.body, .event_digest = f[2], .next_digests = x.next_recovery_key_digests,
+        .kit = f[3][0] == 1, .signers = sv, .forced = f[3][1] == 1 }) } };
+}
+
+// A co-signature: [log, seq, digest, witness key, r || s, time].
+List(List(Int)) cosigs_bytes(List(WitnessCosignature) cs, Int i, List(List(Int)) acc) {
+    if (i >= cs.len()) { return acc; }
+    WitnessCosignature c = cs[i];
+    List(Int) one = bstrs_cbor([c.log_id, cbe_uint((Int)c.sequence, []), c.digest, c.witness_key, c.signature, cbe_uint((Int)c.witness_time, [])]);
+    return cosigs_bytes(cs, i + 1, acc.concat([one]));
+}
+
+Option(List(WitnessCosignature)) cosigs_in(List(List(Int)) xs, Int i, List(WitnessCosignature) acc) {
+    if (i >= xs.len()) { return Some(acc); }
+    List(List(Int)) f = bstrs_of(xs[i]) else { [] };
+    if (f.len() != 6 || uint_in(f[1]) < 0 || uint_in(f[5]) < 0) { return None; }
+    WitnessCosignature c = WitnessCosignature {.log_id = f[0], .sequence = (UInt(64))uint_in(f[1]), .digest = f[2], .witness_key = f[3],
+                                               .signature = f[4], .witness_time = (UInt(64))uint_in(f[5])};
+    return cosigs_in(xs, i + 1, acc.concat([c]));
+}
+
+Bool times_ok(List(PartyTime) ts, Int i) { return i >= ts.len() || (ts[i].time >= 0 && times_ok(ts, i + 1)); }
+Bool slots_ok(List(Slot) ss, Int i) { return i >= ss.len() || (ss[i].until >= 0 && slots_ok(ss, i + 1)); }
+
+List(List(Int)) times_bytes(List(PartyTime) ts, Int i, List(List(Int)) acc) {
+    if (i >= ts.len()) { return acc; }
+    return times_bytes(ts, i + 1, acc.concat([bstrs_cbor([ts[i].id, cbe_uint(ts[i].time, [])])]));
+}
+
+Option(List(PartyTime)) times_in(List(List(Int)) xs, Int i, List(PartyTime) acc) {
+    if (i >= xs.len()) { return Some(acc); }
+    List(List(Int)) f = bstrs_of(xs[i]) else { [] };
+    if (f.len() != 2 || uint_in(f[1]) < 0) { return None; }
+    return times_in(xs, i + 1, acc.concat([PartyTime {.id = f[0], .time = uint_in(f[1])}]));
+}
+
+List(List(Int)) slots_bytes(List(Slot) ss, Int i, List(List(Int)) acc) {
+    if (i >= ss.len()) { return acc; }
+    return slots_bytes(ss, i + 1, acc.concat([bstrs_cbor([bstrs_cbor(ss[i].signers), cbe_uint(ss[i].until, [])])]));
+}
+
+Option(List(Slot)) slots_in(List(List(Int)) xs, Int i, List(Slot) acc) {
+    if (i >= xs.len()) { return Some(acc); }
+    List(List(Int)) f = bstrs_of(xs[i]) else { [] };
+    Option(List(List(Int))) signers = if (f.len() == 2) { bstrs_of(f[0]) } else { None };
+    if (f.len() != 2 || uint_in(f[1]) < 0) { return None; }
+    return match signers { None => None, Some(sv) => slots_in(xs, i + 1, acc.concat([Slot {.signers = sv, .until = uint_in(f[1])}])) };
+}
