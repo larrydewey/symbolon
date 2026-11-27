@@ -249,7 +249,8 @@ recovery-request 00112233445566778899aabbccddeeff %s 1800000000
     case "$3" in
       status) [ -f "$D/kit-protected" ] && echo "kit: protected by a passphrase" || echo "kit: no passphrase" ;;
       renew) touch "$D/kit-protected"
-        echo "RECOVERY KIT (write it down; it is shown once): 01120301abababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab" ;;
+        echo "NEW RECOVERY KIT (write it down; it is shown once): 01120301abababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab"
+        echo "kit replaced: the new kit is the quorum's; every sheet of the old kit is useless now." ;;
     esac ;;
   *) echo "device: unknown command" >&2; exit 2 ;;
 esac

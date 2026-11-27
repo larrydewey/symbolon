@@ -449,7 +449,7 @@ event-body =
   / [2, party-id]                            ; remove-party (effective at reshare)
   / [3, quorum]                              ; reshare: new parties, t, epoch; same X
   / [4, policy]                              ; set-policy
-  / [5]                                      ; rotate-recovery (field 6 changes)
+  / [5]                                      ; rotate-recovery (field 6 changes: a new kit, 13.2)
   / [6, recover-body]                        ; recover
   / [7, target-seq: uint]                    ; veto
   / [8] / [9]                               ; reserved (draft 1 duress events; never used, A-05)
@@ -968,6 +968,12 @@ MUST refuse to sign with an epoch older than the log's.
 Proactive refresh (same parties, new shares) MUST run at least every 30
 days and after any suspected exposure.
 
+The new parties are the old quorum's, less removed parties, plus proposed
+parties, with one exception: after a `rotate-recovery` has taken effect
+(Section 13.2), the kit party it names (its id is the new field-6 digest)
+may take the old kit party's place, and only that kit. The old kit's
+share is then of a dead epoch like any removed party's (Section 11.2).
+
 ### 11.4 Lost party
 
 A lost device is removed by any `policy[1]` other devices; the remaining
@@ -1140,16 +1146,52 @@ photographed; it does not change who may recover or the delay and veto.
 
 Every kit is offered a passphrase where it is made: at the inception
 (`device init`: after the PIN, the passphrase and the same again on
-standard input, an empty line for none) and for the new kit a recovery
-makes (`device recover`). A kit made plain can be written again under a
-passphrase (`device kit renew`, offered by the interface for a plain kit or
-one made before passphrases): the same seed, sealed; the agent first checks
-it is the quorum's current kit. The old plain sheet still works for
-whoever holds it and must be destroyed. Replacing the kit itself, so that
-every old sheet is dead, is a change of the quorum (a `rotate-recovery`
-event and a re-share to a new kit party) that the reference agent does not
-make yet. Using a kit (`device recover`, `device recover-finish`) reads its
-passphrase only when the sheet is protected.
+standard input, an empty line for none), for the new kit a recovery makes
+(`device recover`) and for a replacement (below). Using a kit (`device
+recover`, `device recover-finish`) reads its passphrase only when the sheet
+is protected.
+
+**Replacing the kit.** A kit that was lost, or that someone else may have
+seen or photographed, is replaced, and so is a plain kit that should have
+a passphrase: sealing the same seed again would leave every copy of the old
+sheet working. `device kit renew DIR` (standard input: the PIN, then the
+new kit's passphrase twice, an empty line for none; the interface offers it
+for a lost or seen kit and for a kit without a passphrase, and `device kit
+status` points at it) does, from a device of the quorum:
+
+1. makes a fresh kit seed and prints the new sheet (shown once);
+2. appends `rotate-recovery` whose field 6 is the new kit's digest, which is
+   also its party id (SHA-256 of its recovery key, Section 20.2.1), signed by
+   this device. Like every authority event (Section 8.2) it takes effect at
+   once with `policy[1]` device signatures, otherwise after the recovery
+   delay, during which every device is notified and may veto it. A device
+   signs alone, so the replacement is immediate while `policy[1]` is 1 (the
+   inception's, with one device) and delayed and vetoable once it is 2 or
+   more, as it must be with two devices or more. Until it is in
+   force the old kit is the quorum's and recovers as before; a vetoed
+   replacement never takes effect and its kit never works;
+3. once it is in force (running `device kit renew DIR` again after the
+   delay), re-shares (Section 11.3) to the quorum's parties with the new kit
+   in the old kit's place: this device and the cosigner deal, every other
+   device of the quorum takes part (`device join DIR KEYS`, the keys this
+   device prints), and the new kit's material is computed, split and wrapped
+   as at every re-share (Section 10.6), replacing the old kit's at the sync
+   service. Its digest is already field 6. A re-share may bring in a kit
+   party that is neither a party nor proposed only so: a `kit` party whose
+   id is in field 6 as set by the `rotate-recovery` in force (none after a
+   later `recover`), in place of the old kit, which does not stay beside it;
+   the log refuses any other, and the cosigner deals only to that plan.
+
+From the moment the `rotate-recovery` is in force the old kit's recovery
+key is no longer in field 6: a `recover` revealing it is invalid, so no
+witness co-signs it, no relay sequences it and the cosigner releases
+nothing to it. After the re-share the old kit's material belongs to a dead
+epoch, which the parties delete (Section 11.3), and the cosigner's half it
+releases at a later recovery is the new kit's. Every sheet of the old kit,
+plain or protected, is then useless. Between steps 2 and 3 the new kit's
+public keys wait on the device (`DIR/kit-next`); the replacement needs a
+cosigner (without one the kit and any device can sign, Section 10.6, and the
+reference agent has no re-share without a cosigner).
 
 The parameters are those of Section 6.1, unreduced: a sheet is sealed
 once, when the kit is made, and opened once, at a recovery, so the cost

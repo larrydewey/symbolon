@@ -39,7 +39,8 @@ void main() {
     await cli.recoverFinish('/d', sealed, '2468', kitPassphrase: 'old words here');
     await cli.recoverFinish('/d', plain, '2468', kitPassphrase: 'ignored');
     expect(await cli.kitStatus('/d'), 'plain');
-    await cli.kitRenew('/d', plain, 'new words here');
+    await cli.kitRenew('/d', '2468', 'new words here');
+    await cli.kitRenew('/d', '2468', '');
     final args = await agent.argsLog.readAsString();
     expect(args, isNot(contains('words')));
     expect(args, isNot(contains('lantern')));
@@ -50,7 +51,8 @@ void main() {
         '2468\nold words here\n--\n'
         '2468\n--\n'
         '\n--\n'
-        '$plain\nnew words here\nnew words here\n--\n');
+        '2468\nnew words here\nnew words here\n--\n'
+        '2468\n\n--\n');
     expect(await cli.kitStatus('/d'), 'protected');
   });
 

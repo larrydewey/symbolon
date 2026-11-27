@@ -561,10 +561,15 @@ class SymbolonCli {
     return l.contains('protected by a passphrase') ? 'protected' : l.contains('no passphrase') ? 'plain' : 'unknown';
   }
 
-  /// The same kit written again under [newPassphrase]: prints a new
-  /// "RECOVERY KIT" line. [kitPassphrase] when the kit given is protected.
-  Future<CliResult> kitRenew(String dir, String kit, String newPassphrase, {String kitPassphrase = ''}) =>
-      run(['device', 'kit', 'renew', dir], input: [kit, if (kitIsProtected(kit)) kitPassphrase, newPassphrase, newPassphrase], timeout: const Duration(minutes: 20));
+  /// Replaces the recovery kit (SPEC 13.2): a new kit sealed under
+  /// [newPassphrase] ("" for none), printed as a "NEW RECOVERY KIT" line,
+  /// and a logged rotate-recovery. "kit replaced" when it took effect and
+  /// the quorum re-shared to the new kit; "kit replacement pending" while
+  /// it waits out the delay (vetoable), after which the same call finishes
+  /// it (no new kit is made then, and the passphrase lines go unread).
+  Future<CliResult> kitRenew(String dir, String pin, String newPassphrase, {String primes = ''}) =>
+      run(['device', 'kit', 'renew', dir, if (primes.isNotEmpty) primes], input: [pin, ...newKitPassLines(newPassphrase, explicitNone: true)],
+          timeout: const Duration(minutes: 30));
 
   // Duress alerts (SPEC 14.4).
 

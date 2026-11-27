@@ -12,8 +12,8 @@ import 'scan_page.dart';
 
 /// Kit recovery (SPEC 13.2): start it on a new device, veto it from a
 /// device you still hold, and finish it after the delay. On a device with
-/// an identity whose kit has no passphrase, an offer to write the kit again
-/// under one (`device kit renew`).
+/// an identity, replacing the kit (`device kit renew`): the answer to a
+/// lost or seen kit, and how a kit without a passphrase gets one.
 class RecoveryPage extends StatefulWidget {
   final App app;
   const RecoveryPage({super.key, required this.app});
@@ -58,32 +58,40 @@ class _RecoveryPageState extends State<RecoveryPage> {
         note: 'This kit is sealed under a passphrase. A wrong one is refused, and nothing is sent.');
   }
 
-  /// Writes the kit again under a passphrase: the same kit, so the old sheet
-  /// must be destroyed after.
-  Future<void> renew() async {
-    final k = await askSecret(context, title: 'Your recovery kit', label: 'Kit (item 2 on your sheet)', numeric: false, action: 'Continue');
-    if (k == null || !mounted) return;
-    final kit = clean(k);
-    if (v.hex(kit) != null) return toast(context, 'The kit is 0-9 and a-f: item 2 on your recovery sheet.');
-    final old = await kitPassFor(kit);
-    if (old == null || !mounted) return;
-    final pass = await askKitPassphrase(context, optional: false);
-    if (pass == null || pass.isEmpty || !mounted) return;
-    final r = await runTask(context, 'Sealing your kit', () => app.cli.kitRenew(app.dir, kit, pass, kitPassphrase: old),
-        detail: 'Your passphrase is stretched so that guessing it is slow.', usually: 'about a minute');
-    if (!r.ok || !mounted) return;
-    final fresh = r.lines.where((l) => l.startsWith('RECOVERY KIT')).map((l) => l.split(': ').last.trim().toLowerCase()).firstOrNull;
-    if (fresh == null) return;
-    final log = DeviceStatus.parse(await app.cli.status(app.dir))?.log ?? '';
+  /// Replaces the kit with a new one (SPEC 13.2): every sheet of the old
+  /// kit stops working once the replacement is in force and the quorum has
+  /// re-shared to the new kit. With other devices it waits out the
+  /// recovery delay (any device may stop it); then the same button
+  /// finishes it, and no new kit is made. [needPass]: offered to add a
+  /// passphrase, so one is required.
+  Future<void> renew({bool needPass = false}) async {
+    final pass = await askKitPassphrase(context, optional: !needPass, title: 'A passphrase for your new kit');
+    if (pass == null || (needPass && pass.isEmpty) || !mounted) return;
+    final r = await app.withPin(context, (p) => runTask(context, 'Replacing your kit', () => app.cli.kitRenew(app.dir, p, pass),
+        detail: 'A new kit, a logged change, then a re-share with the cosigner.', usually: '1-5 minutes'));
+    if (r == null || !mounted) return;
+    final fresh = r.lines.where((l) => l.startsWith('NEW RECOVERY KIT')).map((l) => l.split(': ').last.trim().toLowerCase()).firstOrNull;
+    final done = r.lines.any((l) => l.startsWith('kit replaced'));
+    if (fresh != null) {
+      final log = DeviceStatus.parse(await app.cli.status(app.dir))?.log ?? '';
+      if (!mounted) return;
+      await Navigator.of(context).push(MaterialPageRoute<void>(
+          fullscreenDialog: true,
+          builder: (_) => SheetPage(
+              sheet: RecoverySheet(log, fresh),
+              title: 'Your new recovery sheet',
+              intro: done
+                  ? 'Your kit was replaced: every old sheet, with or without a passphrase, no longer works. Write this one down or print it.'
+                  : 'This kit replaces your old one when the waiting period ends, unless one of your devices stops it. Until then the '
+                      'old sheet still works. Write this one down or print it, then come back here to finish the replacement.')));
+    }
     if (!mounted) return;
-    await Navigator.of(context).push(MaterialPageRoute<void>(
-        fullscreenDialog: true,
-        builder: (_) => SheetPage(
-            sheet: RecoverySheet(log, fresh),
-            title: 'Your protected recovery sheet',
-            intro: 'This is the same kit, now sealed under your passphrase. Write it down or print it, then destroy the old sheet: '
-                'it still works for whoever has it.')));
-    if (mounted) setState(() => kitKind = 'protected');
+    final rest = [...r.lines.where((l) => !l.startsWith('NEW RECOVERY KIT')), if (!r.ok) r.problem].join('\n').trim();
+    if (rest.isNotEmpty) await showOutput(context, done ? 'Kit replaced' : r.ok ? 'Kit replacement waiting' : 'Kit not replaced', rest);
+    if (done && mounted) {
+      final k = await app.cli.kitStatus(app.dir);
+      if (mounted) setState(() => kitKind = k);
+    }
   }
 
   @override
@@ -219,7 +227,7 @@ class _RecoveryPageState extends State<RecoveryPage> {
           WideButton('2. Finish recovery', onPressed: finish),
         ]);
     // A kit without a passphrase (or made before there were any): offer to
-    // write it again under one.
+    // replace it with one that has one.
     final offer = setUp && kitKind != 'protected'
         ? Card(
             key: const Key('kit-renew-offer'),
@@ -237,16 +245,31 @@ class _RecoveryPageState extends State<RecoveryPage> {
                     ? 'Your kit has no passphrase, so whoever reads your sheet holds it. With one, the sheet alone is no use to them.'
                     : 'Your kit was made before kits could have a passphrase. With one, the sheet alone is no use to whoever finds it.'),
                 const SizedBox(height: 8),
-                const Text('You need your sheet at hand. If you forget the passphrase, the kit cannot be used.'),
+                const Text('This makes a new kit with a passphrase, and your old sheet stops working. If you forget the passphrase, '
+                    'the kit cannot be used.'),
                 const SizedBox(height: 12),
-                WideButton('Add a passphrase', key: const Key('kit-renew'), icon: Icons.lock_outline, tonal: true, onPressed: renew),
+                WideButton('Add a passphrase', key: const Key('kit-renew'), icon: Icons.lock_outline, tonal: true, onPressed: () => renew(needPass: true)),
               ]),
             ),
           )
         : null;
+    // A kit lost, or seen or photographed by someone else: replace it.
+    final replace = setUp
+        ? Section('Replace your recovery kit',
+            subtitle: 'If your kit was lost, or someone else may have seen or photographed it. Every old sheet stops working, '
+                'with or without a passphrase. When your identity asks for two devices to approve changes, it waits out the waiting '
+                'period first, and any of your devices can stop it; come back here then to finish it.',
+            children: [
+                WideButton('Replace the kit', key: const Key('kit-replace'), icon: Icons.autorenew, tonal: true, onPressed: renew),
+              ])
+        : null;
     return Scaffold(
       appBar: AppBar(title: const Text('Recovery')),
-      body: PageBody(children: [if (offer != null && pending == 0) offer, ...(setUp || pending > 0 ? [stop, recover] : [recover, stop])]),
+      body: PageBody(children: [
+        if (offer != null && pending == 0) offer,
+        ...(setUp || pending > 0 ? [stop, recover] : [recover, stop]),
+        if (replace != null) replace,
+      ]),
     );
   }
 }
