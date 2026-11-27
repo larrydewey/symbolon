@@ -25,6 +25,20 @@ void main() {
     expect(await agent.stdinLog.readAsString(), '2468\nhunter2\n--\n');
   });
 
+  test('a confirm sends the PIN and the y on standard input; pending lines parse', () async {
+    final r = await cli.confirm('/d', 7, '2468');
+    expect(r.ok, isTrue);
+    expect((await agent.argsLog.readAsString()).trim(), 'device confirm /d 7');
+    expect(await agent.stdinLog.readAsString(), '2468\ny\n');
+    final es = PendingEvent.parseAll('7 0123456789abcdef 1796170000 confirmable rotate-recovery (a new kit); signed by "laptop"\n'
+        '9 fedcba9876543210 1796180000 not-confirmable recover; signed by ?\nnothing is pending\n');
+    expect(es.length, 2);
+    expect(es[0].seq, 7);
+    expect(es[0].confirmable, isTrue);
+    expect(es[0].what, 'rotate-recovery (a new kit); signed by "laptop"');
+    expect(es[1].confirmable, isFalse);
+  });
+
   test("a kit's passphrase goes to standard input, and only when the sheet is protected", () async {
     final plain = '9a' * 32, sealed = '01120301${'ab' * 64}';
     expect(kitIsProtected(plain), isFalse);

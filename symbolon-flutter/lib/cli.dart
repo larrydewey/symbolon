@@ -549,6 +549,18 @@ class SymbolonCli {
 
   Future<CliResult> veto(String dir, String pin) => run(['device', 'veto', dir], input: [pin], timeout: const Duration(minutes: 5));
 
+  /// The log's pending events (`device pending`), oldest first.
+  Future<List<PendingEvent>> pending(String dir) async {
+    final r = await run(['device', 'pending', dir], timeout: const Duration(minutes: 2));
+    return r.ok ? PendingEvent.parseAll(r.out) : const [];
+  }
+
+  /// This device confirms the pending authority event [seq], which another
+  /// device signed, so that it takes effect at once (SPEC 8.2). The PIN,
+  /// then "y" (the person saw the event in the app's list first).
+  Future<CliResult> confirm(String dir, int seq, String pin) =>
+      run(['device', 'confirm', dir, '$seq'], input: [pin, 'y'], timeout: const Duration(minutes: 5));
+
   Future<CliResult> recoverRelease(String dir, String pin) => run(['device', 'recover-release', dir], input: [pin], timeout: const Duration(minutes: 5));
 
   Future<CliResult> recoverFinish(String dir, String kit, String pin, {String kitPassphrase = '', String primes = ''}) =>
@@ -742,4 +754,26 @@ class Openings {
     }
     return (limit, out);
   }
+}
+
+/// One line of `device pending`: "SEQ DIGEST READY confirmable|not-confirmable
+/// KIND; signed by LABELS".
+class PendingEvent {
+  final int seq;
+  final String digest;    // the first 16 hex digits
+  final int readyAt;      // witness time (Unix seconds) it takes effect at, unless vetoed
+  final bool confirmable; // not a recover, the kit's set-policy or a weakening set-policy
+  final String what;      // KIND; signed by LABELS
+  const PendingEvent({required this.seq, required this.digest, required this.readyAt, required this.confirmable, required this.what});
+
+  static PendingEvent? parse(String line) {
+    final w = line.trim().split(' ');
+    if (w.length < 5) return null;
+    final seq = int.tryParse(w[0]), ready = int.tryParse(w[2]);
+    if (seq == null || ready == null || (w[3] != 'confirmable' && w[3] != 'not-confirmable')) return null;
+    return PendingEvent(seq: seq, digest: w[1], readyAt: ready, confirmable: w[3] == 'confirmable', what: w.sublist(4).join(' '));
+  }
+
+  static List<PendingEvent> parseAll(String out) =>
+      [for (final l in out.split('\n')) if (parse(l) case final p?) p];
 }

@@ -28,6 +28,7 @@ class _RecoveryPageState extends State<RecoveryPage> {
   int pending = 0;       // delayed events waiting on this identity, from device status
   bool setUp = false;    // whether this device has an identity
   String kitKind = 'protected';   // until known: "plain", "unknown" (made before passphrases) or "protected"
+  List<PendingEvent> events = const [];   // the pending events (`device pending`), when any
 
   App get app => widget.app;
 
@@ -43,6 +44,7 @@ class _RecoveryPageState extends State<RecoveryPage> {
         });
         if (s.log != null) {
           app.cli.kitStatus(app.dir).then((k) => mounted ? setState(() => kitKind = k) : null);
+          if ((s.pending ?? 0) > 0) loadPending();
         }
       }
     });
@@ -156,6 +158,35 @@ class _RecoveryPageState extends State<RecoveryPage> {
     if (r != null && r.ok && mounted) await showOutput(context, 'Recovered', r.out.trim());
   }
 
+  Future<void> loadPending() async {
+    final es = await app.cli.pending(app.dir);
+    if (mounted) setState(() => events = es);
+  }
+
+  /// Approve another device's pending change (SPEC 8.2: a confirm event):
+  /// it takes effect now instead of after the waiting period.
+  Future<void> approve(PendingEvent e) async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text('Approve change ${e.seq}?'),
+        content: Text('${e.what}\n\nAnother of your devices asked for this. Approve it only if you know who did and why: '
+            'it then takes effect now, and can no longer be stopped. If you do not recognise it, stop it instead.'),
+        actions: [
+          TextButton(onPressed: () => Navigator.of(ctx).pop(false), child: const Text('Cancel')),
+          FilledButton(key: const Key('confirm-approve'), onPressed: () => Navigator.of(ctx).pop(true), child: const Text('Approve')),
+        ],
+      ),
+    );
+    if (ok != true || !mounted) return;
+    final r = await app.withPin(context, (p) => runTask(context, 'Approving the change', () => app.cli.confirm(app.dir, e.seq, p), usually: 'a few seconds'));
+    if (r != null && r.ok && mounted) {
+      setState(() => pending = pending > 0 ? pending - 1 : 0);
+      await loadPending();
+      if (mounted) await showOutput(context, 'Approved', r.out.trim());
+    }
+  }
+
   Future<void> veto() async {
     final r = await app.withPin(context, (p) => runTask(context, 'Stopping the recovery', () => app.cli.veto(app.dir, p), usually: 'a few seconds'));
     if (r != null && r.ok && mounted) {
@@ -204,6 +235,25 @@ class _RecoveryPageState extends State<RecoveryPage> {
               onPressed: veto,
             ),
           ]);
+    // The pending changes, each with Approve when another device's
+    // authority change may be confirmed (never a recovery).
+    final waiting = events.isEmpty
+        ? null
+        : Section('Waiting changes',
+            subtitle: 'Changes one of your devices asked for, waiting out the waiting period. Approve one from this device '
+                'to put it in force now; stop one you do not recognise.',
+            children: [
+                for (final e in events)
+                  ListTile(
+                    key: Key('pending-${e.seq}'),
+                    contentPadding: EdgeInsets.zero,
+                    title: Text(e.what),
+                    subtitle: Text('Change ${e.seq} · ${e.digest}'),
+                    trailing: e.confirmable
+                        ? TextButton(key: Key('approve-${e.seq}'), onPressed: () => approve(e), child: const Text('Approve'))
+                        : null,
+                  ),
+              ]);
     final recover = Section(setUp ? 'Recover on a new device' : 'Recover on this device',
         subtitle: 'With your recovery kit, if you lost every device. It takes effect after a waiting period, unless one of your devices stops it.',
         children: [
@@ -267,7 +317,7 @@ class _RecoveryPageState extends State<RecoveryPage> {
       appBar: AppBar(title: const Text('Recovery')),
       body: PageBody(children: [
         if (offer != null && pending == 0) offer,
-        ...(setUp || pending > 0 ? [stop, recover] : [recover, stop]),
+        ...(setUp || pending > 0 ? [stop, if (waiting != null) waiting, recover] : [recover, stop]),
         if (replace != null) replace,
       ]),
     );
