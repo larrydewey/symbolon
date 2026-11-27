@@ -38,6 +38,7 @@ import "../vault/kvshare.resid";
 import "dev/tpm.resid";
 import "dev/tpm_wire.resid";
 import "hpkeg.resid";
+import "kitpass.resid";
 import "word.resid";
 import "ecdsa.resid";
 import "crypto.resid";
@@ -527,28 +528,38 @@ pub type InitArgs = {
 };
 
 // `symbolon device init DIR COSIGNER_KEYS W1 W2 W3 [DEVICE_PRIMES KIT_PRIMES]`,
-// each W as host:port:pubkeyhex. Reads the PIN from standard input. The
-// device plays the kit too (decision of 2026-10-29); it prints the kit's
-// seed, which the principal writes down, and erases it.
+// each W as host:port:pubkeyhex. Reads the PIN from standard input, then
+// the kit's passphrase twice (an empty line: none; SPEC 13.2). The device
+// plays the kit too (decision of 2026-10-29); it prints the kit's sheet
+// (the seed, sealed under the passphrase if there is one), which the
+// principal writes down, and erases it.
 @requires(filesystem, network, device, declassify, clock, provision, environment)
 pub Int device_init(Str dir, InitArgs a) {
     Option(DeviceConfig) oc = load_config(dir);
     Option(PartyKeys) ok = keys_of_cbor(cose_hex_decode(a.cosigner_keys));
     if (a.witnesses.len() < 3) { return dfail("three witnesses at least (SPEC 20.3)"); }
+    Str pin = read_pin();
+    NewKitPass kp = read_new_kit_pass();
+    if (!kp.ok) { return dfail(kit_pass_mismatch()); }
     return match oc {
         None => dfail("run `symbolon device new` first"),
         Some(c) => match ok {
             None => dfail("those are not the cosigner's keys"),
-            Some(cos) => if (c.log_id.len() > 0) { dfail("already in a log") } else { init_unlocked(dir, c, cos, a, read_pin()) }
+            Some(cos) => if (c.log_id.len() > 0) { dfail("already in a log") } else { init_unlocked(dir, c, cos, a, pin, kp.pass) }
         }
     };
 }
 
 @requires(filesystem, network, device, declassify, clock, provision, environment)
-Int init_unlocked(Str dir, DeviceConfig c, PartyKeys cos, InitArgs a, Str pin) {
+Int init_unlocked(Str dir, DeviceConfig c, PartyKeys cos, InitArgs a, Str pin, Str kit_pass) {
     Unlocked u = unlock_dir(dir, c, pin);
     if (u.kind != 1) { return dfail("wrong PIN"); }
     List(Int) seed = random_bytes(32);
+    // The sheet is made first: sealing it takes a while, and the kit must
+    // not be in a published log before its sheet exists.
+    if (str_len(kit_pass) > 0) { println("device: sealing the kit under its passphrase (Argon2id; this takes a while)..."); }
+    List(Int) sheet = new_kit_sheet(seed, kit_pass);
+    if (sheet.len() == 0) { return dfail("cannot seal the kit"); }
     KitKeys kit = kit_keys(seed) else { KitKeys {.sign_priv = [], .sign_pub = [], .hpke_priv = [], .hpke_pub = []} };
     PartyKeys me = PartyKeys {.party = c.party, .auth_key = c.dk_pub, .hpke_key = c.hpke_pub};
     PartyKeys kp = PartyKeys {.party = recovery_key_digest(kit.sign_pub), .auth_key = kit.sign_pub, .hpke_key = kit.hpke_pub};
@@ -574,7 +585,7 @@ Int init_unlocked(Str dir, DeviceConfig c, PartyKeys cos, InitArgs a, Str pin) {
                 run_session(relay, sid, [Seat {.me = dev, .st = k1.state, .round = 1, .out = k1.out, .done = false},
                                          Seat {.me = kitl, .st = k2.state, .round = 1, .out = k2.out, .done = false}],
                             [cr], [Cursor {.party = me.party, .next = start}, Cursor {.party = kp.party, .next = 0}], [],
-                            lambda(st, msgs) { kg_adapt(st, msgs) }, 1800), pin, seed, sid)
+                            lambda(st, msgs) { kg_adapt(st, msgs) }, 1800), pin, sheet, sid)
         }
     };
 }
@@ -599,7 +610,7 @@ List(WitnessRef) witness_refs(List(WitnessEp) ws, Int i, List(WitnessRef) acc) {
 }
 
 @requires(filesystem, network, device, declassify, clock, environment)
-Int after_keygen(Str dir, DeviceConfig c, Unlocked u, KitKeys kit, List(PartyKeys) parties, Remote cr, InitArgs a, Run(KgState) r, Str pin, List(Int) seed, List(Int) sid) {
+Int after_keygen(Str dir, DeviceConfig c, Unlocked u, KitKeys kit, List(PartyKeys) parties, Remote cr, InitArgs a, Run(KgState) r, Str pin, List(Int) sheet, List(Int) sid) {
     if (str_len(r.fail) > 0) { return dfail("keygen: " + r.fail); }
     KvInit kv = kv_inception(relay_ep(c), Local {.party = c.party, .cg = 1, .hpke_sk = device_transport(c, u.real.dek).sk}, cr, sid, mailbox_end(relay_ep(c), c.party, c.mbox_next));
     if (str_len(kv.why) > 0) { return dfail(kv.why); }
@@ -624,7 +635,7 @@ Int after_keygen(Str dir, DeviceConfig c, Unlocked u, KitKeys kit, List(PartyKey
                                     .next_recovery_key_digests = [recovery_key_digest(kit.sign_pub)], .advisory_time = (UInt(64))clock_now_seconds()};
     List(Int) enc = payload_cbor(e0) else { [] };
     if (enc.len() == 0) { return dfail("inception does not encode"); }
-    return sign_inception_event(dir, c, u, kit, parties, cr, a, mine, kitc, q, e0, enc, pin, seed, kv);
+    return sign_inception_event(dir, c, u, kit, parties, cr, a, mine, kitc, q, e0, enc, pin, sheet, kv);
 }
 
 // The inception's vault OPRF key (SPEC 18.10.1): this device (index 1) and
@@ -652,7 +663,7 @@ KvInit kv_inception(Endpoint relay, Local dev, Remote cr, List(Int) sid, Int sta
 
 @requires(filesystem, network, device, declassify, clock, environment)
 Int sign_inception_event(Str dir, DeviceConfig c, Unlocked u, KitKeys kit, List(PartyKeys) parties, Remote cr, InitArgs a,
-                         CgConfig mine, CgConfig kitc, Quorum q, EventPayload e0, List(Int) enc, Str pin, List(Int) seed, KvInit kv) {
+                         CgConfig mine, CgConfig kitc, Quorum q, EventPayload e0, List(Int) enc, Str pin, List(Int) sheet, KvInit kv) {
     Endpoint relay = relay_ep(c);
     Local dev = Local {.party = c.party, .cg = 1, .hpke_sk = device_transport(c, u.real.dek).sk};
     Int start = mailbox_end(relay, c.party, c.mbox_next);
@@ -670,7 +681,7 @@ Int sign_inception_event(Str dir, DeviceConfig c, Unlocked u, KitKeys kit, List(
     Result(VerifiedHead, SymbolonError) v = il_verify(l, [se], last_time([se], policy_of_e0([se])), lambda(p) { false });
     return match v {
         Err(e) => dfail("the inception does not verify: " + err_text(e)),
-        Ok(vh) => publish(dir, c, u, kit, parties, cr, a, mine, kitc, StoredEvent {.encoded = enc, .sigs = sigs, .cosigs = cs}, l, seed, kv)
+        Ok(vh) => publish(dir, c, u, kit, parties, cr, a, mine, kitc, StoredEvent {.encoded = enc, .sigs = sigs, .cosigs = cs}, l, sheet, kv)
     };
 }
 
@@ -745,10 +756,10 @@ pub Str duress_refusal_for(Result(VerifiedHead, SymbolonError) v) {
 }
 
 // Publishes the log, wraps the kit's halves (SPEC 10.6), stores the share,
-// and prints the kit's seed.
+// and prints the kit's sheet.
 @requires(filesystem, network, device, declassify, clock, environment)
 Int publish(Str dir, DeviceConfig c, Unlocked u, KitKeys kit, List(PartyKeys) parties, Remote cr, InitArgs a,
-            CgConfig mine, CgConfig kitc, StoredEvent se, List(Int) l, List(Int) seed, KvInit kv) {
+            CgConfig mine, CgConfig kitc, StoredEvent se, List(Int) l, List(Int) sheet, KvInit kv) {
     if (!log_put(relay_ep(c), l, 0, cbor_of_event(se))) { return dfail("the relay refused the inception"); }
     // The relay takes the kit's blobs only from a signed-in device of the
     // log (SPEC 29.4): this one, now that its log is there.
@@ -773,7 +784,9 @@ Int publish(Str dir, DeviceConfig c, Unlocked u, KitKeys kit, List(PartyKeys) pa
     if (!ok) { return dfail("cannot store the result"); }
     println("log " + hex_encode(l));
     println("root key " + hex_encode(cfg_root_pubkey(mine, [1, 2, 3])));
-    println("RECOVERY KIT (write it down; it is shown once): " + hex_encode(seed));
+    _ = mark_kit_sheet(dir, sheet);
+    println("RECOVERY KIT (write it down; it is shown once): " + kit_sheet_text(sheet));
+    println(kit_sheet_note(sheet));
     return 0;
 }
 

@@ -1,0 +1,52 @@
+// The kit's passphrase on the command line (src/agent/kitpass.resid): the
+// sheet a new kit gets, the marker the app reads, and the check that a kit
+// typed in for `device kit renew` is the quorum's own.
+
+import "../types.resid";
+import "../recovery/kitsheet.resid";
+import "../recovery/recovery.resid";
+import "kitpass.resid";
+import "crypto.resid";
+
+List(Int) seed1() { return sha256_bytes(rt [1]); }
+List(Int) seed2() { return sha256_bytes(rt [2]); }
+
+KitKeys keys_of(List(Int) s) { return kit_keys(s) else { KitKeys {.sign_priv = [], .sign_pub = [], .hpke_priv = [], .hpke_pub = []} }; }
+
+Party kit_party(KitKeys k) {
+    return Party {.id = recovery_key_digest(k.sign_pub), .kind = party_kind_kit(), .auth_key = k.sign_pub, .hpke_key = k.hpke_pub, .label = "recovery kit", .attestation = NoAttestation};
+}
+
+@requires(filesystem, declassify)
+Str tmp_dir() {
+    Str d = "/tmp/symbolon-kitpass-test-" + hex_encode(random_bytes(8));
+    _ = filesystem.create_dir(d);
+    return d;
+}
+
+@requires(declassify)
+test "a new kit without a passphrase is its seed; with one, a protected sheet" {
+    expect(hex_encode(new_kit_sheet(seed1(), ""))).toEqual(hex_encode(seed1()));
+    expect(str_contains(kit_sheet_note(seed1()), "no passphrase")).toEqual(true);
+    List(Int) s = kit_sheet_seal(seed1(), "pw", sha256_bytes([3])[0..16], 3, 1);
+    expect(str_contains(kit_sheet_note(s), "cannot be used")).toEqual(true);
+}
+
+@requires(filesystem, declassify)
+test "DIR/kit-sheet says which sheet the principal holds; none is unknown" {
+    Str d = tmp_dir();
+    expect(kit_sheet_kind(d)).toEqual("unknown");
+    expect(mark_kit_sheet(d, seed1())).toEqual(true);
+    expect(kit_sheet_kind(d)).toEqual("plain");
+    expect(mark_kit_sheet(d, kit_sheet_seal(seed1(), "pw", sha256_bytes([3])[0..16], 3, 1))).toEqual(true);
+    expect(kit_sheet_kind(d)).toEqual("protected");
+}
+
+test "renew takes only the quorum's current kit" {
+    KitKeys k1 = keys_of(seed1());
+    KitKeys k2 = keys_of(seed2());
+    expect(is_current_kit(Some(k1), Some(kit_party(k1)))).toEqual(true);
+    expect(is_current_kit(Some(k2), Some(kit_party(k1)))).toEqual(false);
+    expect(is_current_kit(None, Some(kit_party(k1)))).toEqual(false);
+    expect(is_current_kit(Some(k1), None)).toEqual(false);
+}

@@ -1,0 +1,74 @@
+// `symbolon device kit status|renew DIR` (SPEC 13.2): which kind of sheet
+// the principal holds, and a plain sheet written again under a passphrase.
+//
+// Renewing re-seals the same kit: the seed, and so the kit's keys, its
+// material at the relay and the cosigner, and the log's field 6, do not
+// change; only the sheet does. A copy of the old plain sheet therefore
+// still works: the old sheet must be destroyed. (Replacing the kit itself,
+// so that every old sheet is dead, is a change of the quorum: a
+// rotate-recovery event and a re-share to a new kit party. The log admits
+// those events; the agent does not make them yet.)
+
+import "../types.resid";
+import "../recovery/kitsheet.resid";
+import "../recovery/recovery.resid";
+import "common.resid";
+import "device.resid";
+import "enroll.resid";
+import "kitpass.resid";
+import "crypto.resid";
+
+@requires(filesystem)
+pub Int device_kit_status(Str dir) {
+    Option(DeviceConfig) oc = load_config(dir);
+    if (match oc { None => true, Some(_) => false }) { return dfail("not set up"); }
+    Str k = kit_sheet_kind(dir);
+    println(if (k == "protected") { "kit: protected by a passphrase" } else { if (k == "plain") { "kit: no passphrase" } else { "kit: unknown (made before passphrases, so most likely none)" } });
+    return 0;
+}
+
+// Standard input: the kit as written (hex, groups allowed), its passphrase
+// if it has one, then the new passphrase twice. Needs no PIN: nothing on
+// this device is opened or changed but DIR/kit-sheet. The kit is checked
+// against this device's verified log (it must be the quorum's kit), so a
+// mistyped kit is not sealed.
+@requires(filesystem, network, clock(readonly), declassify)
+pub Int device_kit_renew(Str dir) {
+    Option(DeviceConfig) oc = load_config(dir);
+    return match oc {
+        None => dfail("not set up"),
+        Some(c) => if (c.log_id.len() == 0) { dfail("not in a log yet") } else { renew_kit(dir, c, read_kit_seed(read_secret_line())) }
+    };
+}
+
+@requires(filesystem, network, clock(readonly), declassify)
+Int renew_kit(Str dir, DeviceConfig c, Result(List(Int), Str) rk) {
+    return match rk {
+        Err(m) => dfail(m),
+        Ok(seed) => renew_checked(dir, c, seed, read_new_kit_pass())
+    };
+}
+
+@requires(filesystem, network, clock(readonly), declassify)
+Int renew_checked(Str dir, DeviceConfig c, List(Int) seed, NewKitPass np) {
+    if (!np.ok) { return dfail(kit_pass_mismatch()); }
+    if (str_len(np.pass) == 0) { return dfail("a renewed kit needs a passphrase"); }
+    Result(VerifiedHead, SymbolonError) rv = verified_log(relay_ep(c), c.log_id);
+    return match rv {
+        Err(e) => dfail(err_text(e)),
+        Ok(vh) => renew_sealed(dir, seed, vh, np.pass)
+    };
+}
+
+@requires(filesystem, declassify)
+Int renew_sealed(Str dir, List(Int) seed, VerifiedHead vh, Str pass) {
+    if (!is_current_kit(kit_keys(seed), kit_of(vh.head.quorum.parties, 0))) { return dfail("that is not this identity's current recovery kit"); }
+    println("device: sealing the kit under its passphrase (Argon2id; this takes a while)...");
+    List(Int) sheet = new_kit_sheet(seed, pass);
+    if (!kit_sheet_protected(sheet)) { return dfail("cannot seal the kit"); }
+    if (!mark_kit_sheet(dir, sheet)) { return dfail("cannot store DIR/kit-sheet"); }
+    println("RECOVERY KIT (write it down; it is shown once): " + kit_sheet_text(sheet));
+    println(kit_sheet_note(sheet));
+    println("This is the same kit, written again: destroy the old sheet, which still works for whoever holds it.");
+    return 0;
+}

@@ -18,7 +18,8 @@
 //       --ca: speak TLS to the relay and the witnesses, trusting the PEM anchor CA.pem
 //                                              PIN and duress PIN on stdin; prints the device's keys
 //   symbolon device init DIR COSIGNER_KEYS W1 W2 W3 [DEVICE_PRIMES KIT_PRIMES]
-//                                              W as host:port:keyhex; PIN on stdin
+//                                              W as host:port:keyhex; PIN on stdin, then the kit's
+//                                              passphrase twice (an empty line: none; SPEC 13.2)
 //   symbolon device register DIR RP [--duress] PIN on stdin; prints a credential ID and public key;
 //                                              --duress puts it in the duress subset
 //   symbolon device sign DIR RP CID MESSAGE    PIN on stdin; prints r || s
@@ -110,7 +111,8 @@
 //                                              "passkey CID RP USER USERNAME DISPLAY PUBLIC-KEY REPLACED-BY" (hex)
 //   symbolon device enroll DIR NEW_KEYS [PRIMES]   PIN on stdin; adds the device NEW_KEYS (re-share)
 //   symbolon device join DIR ENROLLER_KEYS [PRIMES] PIN on stdin; joins when that device enrolls this one
-//   symbolon device recover DIR KIT_SEED LOG_ID    a new device starts a kit recovery (SPEC 13.2)
+//   symbolon device recover DIR KIT LOG_ID    a new device starts a kit recovery (SPEC 13.2); stdin: the
+//                                              kit's passphrase if it has one, then the new kit's twice
 //   symbolon device veto DIR                   PIN on stdin; vetoes the latest pending event
 //   symbolon device sequence DIR [HOST:PORT]  PIN on stdin; names the relay (this device's, or HOST:PORT) as the
 //                                              log's sequencer (policy field 8, SPEC 20.3): a set-policy
@@ -119,7 +121,11 @@
 //                                              signed time checked first; delayed and vetoable unless signed by
 //                                              policy[1] devices, and always when it removes one (SPEC 8.2)
 //   symbolon device recover-release DIR        PIN on stdin; asks the cosigner for its kit half
-//   symbolon device recover-finish DIR KIT_SEED [PRIMES]  PIN on stdin; after the delay: release, re-share
+//   symbolon device recover-finish DIR KIT [PRIMES]  PIN on stdin (then the kit's passphrase if it has one);
+//                                              after the delay: release, re-share
+//   symbolon device kit status DIR             whether the kit's sheet has a passphrase
+//   symbolon device kit renew DIR              stdin: the kit, its passphrase if any, a new passphrase twice;
+//                                              prints the same kit sealed under the new passphrase
 //
 // Services listen on 127.0.0.1 only; put a TLS terminator in front of them
 // for anything else (SPEC 20.2: envelopes are end to end, objects signed).
@@ -128,6 +134,7 @@ import "net/services.resid";
 import "net/store.resid";
 import "agent/state.resid";
 import "agent/device.resid";
+import "agent/kitcli.resid";
 import "agent/cosignerd.resid";
 import "agent/vaultcli.resid";
 import "agent/enroll.resid";
@@ -557,6 +564,8 @@ Int main_cmd() {
         if ((add.len() + rm.len()) * 2 != n - 4) { return dfail("usage: device witnesses DIR [--add HOST:PORT:KEY]... [--remove HOST:PORT]..."); }
         return device_witnesses(args.get(3), add, rm);
     }
+    if (a1 == "device" && a2 == "kit" && args.get(3) == "status" && n == 5) { return device_kit_status(args.get(4)); }
+    if (a1 == "device" && a2 == "kit" && args.get(3) == "renew" && n == 5) { return device_kit_renew(args.get(4)); }
     if (a1 == "device" && a2 == "sequence" && (n == 4 || n == 5)) { return device_sequence(args.get(3), if (n == 5) { args.get(4) } else { "" }); }
     if (a1 == "device" && a2 == "recover-release" && n == 4) { return device_recover_release(args.get(3)); }
     if (a1 == "device" && a2 == "recover-finish" && (n == 5 || n == 6)) { return device_recover_finish(args.get(3), args.get(4), if (n == 6) { args.get(5) } else { "" }); }

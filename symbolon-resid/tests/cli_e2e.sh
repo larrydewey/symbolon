@@ -383,9 +383,26 @@ echo "enrollment: epoch 2, both devices sign under the same credential key (Open
 # Kit recovery (SPEC 13.2, 13.4) up to the delay: a new device reveals the
 # kit; the cosigner refuses to release its half before the delay; a device
 # vetoes; the release is still refused.
-KIT=$(sed -n 's/^RECOVERY KIT (write it down; it is shown once): //p' "$W/init.log")
+PLAIN=$(sed -n 's/^RECOVERY KIT (write it down; it is shown once): //p' "$W/init.log")
+# The kit was made without a passphrase (init read only the PIN); it is
+# written again under one (SPEC 13.2): the same kit, sealed. A kit that is
+# not this identity's is refused.
+[ "$(run 60 "$BIN" device kit status "$W/dev")" = "kit: no passphrase" ] || fail "kit status (plain)"
+KP='lantern orchard pebble'
+printf '%s\n%s\n%s\n' "$(printf '%064d' 7)" "$KP" "$KP" | run 300 "$BIN" device kit renew "$W/dev" > "$W/renew-bad.log" 2>&1 && fail "renewed a kit that is not this identity's"
+grep -q "not this identity's current recovery kit" "$W/renew-bad.log" || fail "renew (wrong kit): $(cat "$W/renew-bad.log")"
+printf '%s\n%s\n%s\n' "$PLAIN" "$KP" "$KP" | run 1200 "$BIN" device kit renew "$W/dev" > "$W/renew.log" 2>&1 || fail "kit renew: $(cat "$W/renew.log")"
+KIT=$(sed -n 's/^RECOVERY KIT (write it down; it is shown once): //p' "$W/renew.log")
+[ "${#KIT}" = 136 ] && [ "${KIT:0:2}" = 01 ] || fail "the renewed kit is not a protected sheet: $KIT"
+case "$KIT" in *"$PLAIN"*) fail "the protected sheet carries the seed";; esac
+[ "$(run 60 "$BIN" device kit status "$W/dev")" = "kit: protected by a passphrase" ] || fail "kit status (protected)"
+echo "kit: written again under a passphrase; a kit not this identity's refused"
 DEV3=$(printf '3333\n\n' | run 120 "$BIN" device new "$W/dev3" 127.0.0.1 "$RP" --unprotected --fast-kdf "${CA[@]}") || fail "device new (recovering)"
-run 300 "$BIN" device recover "$W/dev3" "$KIT" "$LOG" > "$W/recover.log" 2>&1 || fail "recover: $(cat "$W/recover.log")"
+# A protected kit with the wrong passphrase: refused before anything is sent.
+printf 'lantern orchard pebbles\n\n' | run 600 "$BIN" device recover "$W/dev3" "$KIT" "$LOG" > "$W/recover-bad.log" 2>&1 && fail "recovered with a wrong passphrase"
+grep -q 'wrong passphrase' "$W/recover-bad.log" || fail "recover (wrong passphrase): $(cat "$W/recover-bad.log")"
+run 120 "$BIN" device status "$W/dev" | grep -q 'pending 0' || fail "a refused recovery left a pending event"
+printf '%s\n\n' "$KP" | run 600 "$BIN" device recover "$W/dev3" "$KIT" "$LOG" > "$W/recover.log" 2>&1 || fail "recover: $(cat "$W/recover.log")"
 grep -q 'recovery pending: 1' "$W/recover.log" || fail "recover: $(cat "$W/recover.log")"
 grep -q 'NEW RECOVERY KIT' "$W/recover.log" || fail "no new kit"
 run 120 "$BIN" device status "$W/dev" | grep -q 'pending 1' || fail "status does not show the pending recovery"
@@ -402,7 +419,7 @@ echo "recovery: pending, release refused before the delay, vetoed, still refused
 # moved forward (the witness majority is trusted for time); the recovered
 # device gets the cosigner's half, assembles the kit's share, re-shares
 # with the cosigner, and signs for the credential made at the start.
-run 300 "$BIN" device recover "$W/dev3" "$KIT" "$LOG" > "$W/recover2.log" 2>&1 || fail "second recover: $(cat "$W/recover2.log")"
+printf '%s\n\n' "$KP" | run 600 "$BIN" device recover "$W/dev3" "$KIT" "$LOG" > "$W/recover2.log" 2>&1 || fail "second recover: $(cat "$W/recover2.log")"
 for i in 1 2 3; do
   pkill -f -- "witness (serve|child) $W/w$i " 2>/dev/null; wait "${WPID[$i]}" 2>/dev/null
   for _ in $(seq 50); do (exec 3<>"/dev/tcp/127.0.0.1/${WPORT[$i]}") 2>/dev/null || break; sleep 0.1; done
@@ -410,7 +427,7 @@ for i in 1 2 3; do
   wait_port "${WPORT[$i]}" || fail "witness $i did not restart"
 done
 echo "recovery finish (release, kit share, re-share; a minute or two)..."
-printf '3333\n' | run 1800 "$BIN" device recover-finish "$W/dev3" "$KIT" "$W/dev3.primes" > "$W/finish.log" 2>&1 || fail "recover-finish: $(tail -3 "$W/finish.log")"
+printf '3333\n%s\n' "$KP" | run 1800 "$BIN" device recover-finish "$W/dev3" "$KIT" "$W/dev3.primes" > "$W/finish.log" 2>&1 || fail "recover-finish: $(tail -3 "$W/finish.log")"
 run 120 "$BIN" device status "$W/dev3" > "$W/status3.log" 2>&1 || fail "status (recovered)"
 grep -q 'parties 3 threshold 2' "$W/status3.log" || fail "status after recovery: $(cat "$W/status3.log")"
 grep -q "protected on $C0" "$W/status3.log" || fail "the recovery changed or dropped the vault OPRF key: $(cat "$W/status3.log")"

@@ -28,43 +28,62 @@ import "cosignerd.resid";
 import "vaultcli.resid";
 import "duresscli.resid";
 import "kvagent.resid";
+import "kitpass.resid";
 import "../vault/kvshare.resid";
 import "word.resid";
 import "crypto.resid";
 import "clock.resid";
 
-// `symbolon device recover DIR KIT_SEED LOG_ID`, on a device made with
-// `device new`: reveals the kit's key in a recover event naming this
-// device, the cosigner and a new kit, which it prints.
+// `symbolon device recover DIR KIT LOG_ID`, on a device made with `device
+// new`: reveals the kit's key in a recover event naming this device, the
+// cosigner and a new kit, which it prints. KIT is the sheet's text; when
+// it is protected its passphrase is the first line of standard input (a
+// wrong one is refused before anything is sent). Then the new kit's
+// passphrase, twice (an empty line: none; SPEC 13.2).
 @requires(filesystem, network, device, declassify, clock)
-pub Int device_recover(Str dir, Str seed_hex, Str log_hex) {
+pub Int device_recover(Str dir, Str kit_text, Str log_hex) {
     Option(DeviceConfig) oc = load_config(dir);
-    Option(KitKeys) ok = kit_keys(cose_hex_decode(seed_hex));
     List(Int) l = cose_hex_decode(log_hex);
+    if (l.len() != 32) { return dfail("a 32-byte log id"); }
     return match oc {
         None => dfail("run `symbolon device new` first"),
-        Some(c) => match ok {
-            None => dfail("that is not a kit seed"),
-            Some(kit) => if (l.len() != 32) { dfail("a 32-byte log id") } else { recover_with(dir, c, kit, l) }
-        }
+        Some(c) => recover_kit(dir, c, read_kit(kit_text), l)
     };
 }
 
 @requires(filesystem, network, device, declassify, clock)
-Int recover_with(Str dir, DeviceConfig c0, KitKeys kit, List(Int) l) {
+Int recover_kit(Str dir, DeviceConfig c, Result(KitKeys, Str) rk, List(Int) l) {
+    return match rk {
+        Err(m) => dfail(m),
+        Ok(kit) => recover_new_pass(dir, c, kit, l, read_new_kit_pass())
+    };
+}
+
+@requires(filesystem, network, device, declassify, clock)
+Int recover_new_pass(Str dir, DeviceConfig c, KitKeys kit, List(Int) l, NewKitPass np) {
+    if (!np.ok) { return dfail(kit_pass_mismatch()); }
+    return recover_with(dir, c, kit, l, np.pass);
+}
+
+@requires(filesystem, network, device, declassify, clock)
+Int recover_with(Str dir, DeviceConfig c0, KitKeys kit, List(Int) l, Str new_pass) {
     Result(VerifiedHead, SymbolonError) rv = verified_log(relay_ep(c0), l);
     return match rv {
         Err(e) => dfail(err_text(e)),
-        Ok(vh) => recover_event(dir, with_log(c0, eps_of(vh.head.policy.witnesses, 0, []), l, c0.mbox_next, []), kit, vh)
+        Ok(vh) => recover_event(dir, with_log(c0, eps_of(vh.head.policy.witnesses, 0, []), l, c0.mbox_next, []), kit, vh, new_pass)
     };
 }
 
 @requires(filesystem, network, device, declassify, clock)
-Int recover_event(Str dir, DeviceConfig c, KitKeys kit, VerifiedHead vh) {
+Int recover_event(Str dir, DeviceConfig c, KitKeys kit, VerifiedHead vh, Str new_pass) {
     Quorum q = vh.head.quorum;
     Party cos = cosigner_of(q.parties, 0) else { none_party() };
     List(Int) new_seed = random_bytes(32);
     KitKeys nk = kit_keys(new_seed) else { kit };
+    // The new kit's sheet before the event that names it.
+    if (str_len(new_pass) > 0) { println("device: sealing the new kit under its passphrase (Argon2id; this takes a while)..."); }
+    List(Int) sheet = new_kit_sheet(new_seed, new_pass);
+    if (sheet.len() == 0) { return dfail("cannot seal the new kit"); }
     Party me = Party {.id = c.party, .kind = party_kind_device(), .auth_key = c.dk_pub, .hpke_key = c.hpke_pub, .label = "recovered device", .attestation = NoAttestation};
     Party nkp = Party {.id = recovery_key_digest(nk.sign_pub), .kind = party_kind_kit(), .auth_key = nk.sign_pub, .hpke_key = nk.hpke_pub, .label = "recovery kit", .attestation = NoAttestation};
     List(Party) np = if (cos.id.len() > 0) { [me, nkp, cos] } else { [me, nkp] };
@@ -73,16 +92,18 @@ Int recover_event(Str dir, DeviceConfig c, KitKeys kit, VerifiedHead vh) {
         Err(e) => dfail(err_text(e)),
         Ok(se) => match publish_event(c, se.payload, se.encoded, se.sigs) {
             Err(m) => dfail("recover: " + m),
-            Ok(vh2) => recover_posted(dir, c, vh2, new_seed)
+            Ok(vh2) => recover_posted(dir, c, vh2, sheet)
         }
     };
 }
 
 @requires(filesystem)
-Int recover_posted(Str dir, DeviceConfig c, VerifiedHead vh, List(Int) new_seed) {
+Int recover_posted(Str dir, DeviceConfig c, VerifiedHead vh, List(Int) sheet) {
     if (!save_config(dir, c)) { return dfail("cannot store the configuration"); }
+    _ = mark_kit_sheet(dir, sheet);
     println(f"recovery pending: {vh.pending.len()} delayed event(s); it takes effect after {vh.head.policy.recovery_delay_sec} s of witness time unless a device vetoes");
-    println("NEW RECOVERY KIT (write it down; it is shown once): " + hex_encode(new_seed));
+    println("NEW RECOVERY KIT (write it down; it is shown once): " + kit_sheet_text(sheet));
+    println(kit_sheet_note(sheet));
     return 0;
 }
 
@@ -200,22 +221,28 @@ Waited wait_release(Endpoint relay, Local me, Remote from, Cursor cur, Int since
     return wait_release(relay, me, from, d.cur, since);
 }
 
-// ─── `device recover-finish DIR KIT_SEED [PRIMES]` (SPEC 13.2 step 4) ──
+// ─── `device recover-finish DIR KIT [PRIMES]` (SPEC 13.2 step 4) ──
+// Standard input: the PIN, then the kit's passphrase if KIT is protected.
 // After the delay: the cosigner's half and the kit's half give the kit's
 // share x_K and key k_K; k_K opens the chain code and vault key; this
 // device, holding x_K at the kit's x-coordinate, re-shares with the
 // cosigner to the recovered quorum, and the new kit gets fresh material.
 
 @requires(filesystem, network, device, declassify, clock, provision, environment)
-pub Int device_recover_finish(Str dir, Str seed_hex, Str primes_file) {
+pub Int device_recover_finish(Str dir, Str kit_text, Str primes_file) {
     Option(DeviceConfig) oc = load_config(dir);
-    Option(KitKeys) ok = kit_keys(cose_hex_decode(seed_hex));
     return match oc {
         None => dfail("not set up"),
-        Some(c) => match ok {
-            None => dfail("that is not a kit seed"),
-            Some(kit) => finish_with(dir, c, kit, read_pin(), primes_file)
-        }
+        Some(c) => finish_kit(dir, c, read_pin(), kit_text, primes_file)
+    };
+}
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+Int finish_kit(Str dir, DeviceConfig c, Str pin, Str kit_text, Str primes_file) {
+    Result(KitKeys, Str) rk = read_kit(kit_text);
+    return match rk {
+        Err(m) => dfail(m),
+        Ok(kit) => finish_with(dir, c, kit, pin, primes_file)
     };
 }
 

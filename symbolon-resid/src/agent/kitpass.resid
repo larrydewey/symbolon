@@ -1,0 +1,92 @@
+// The kit's passphrase on the command line (SPEC 13.2): read on standard
+// input, never in the arguments. Making a kit (`device init`, `device
+// recover`, `device kit renew`) reads a passphrase and the same again to
+// confirm it; an empty line means none. Using a kit reads its passphrase
+// only when the sheet says it is protected (src/recovery/kitsheet.resid).
+
+import "../types.resid";
+import "../recovery/kitsheet.resid";
+import "../recovery/recovery.resid";
+import "crypto.resid";
+
+// One line of standard input without its line end; "" at EOF.
+pub Str read_secret_line() {
+    Str l = resid_read_line();
+    Int n = str_len(l);
+    Str a = if (n > 0 && str_slice(l, n - 1, n) == "\n") { str_slice(l, 0, n - 1) } else { l };
+    Int m = str_len(a);
+    return if (m > 0 && str_slice(a, m - 1, m) == "\r") { str_slice(a, 0, m - 1) } else { a };
+}
+
+// A new kit's passphrase: "" for none. `ok` is false when the two lines
+// differ (nothing is made then).
+pub type NewKitPass = { Bool ok; Str pass; };
+
+pub NewKitPass read_new_kit_pass() {
+    Str p = read_secret_line();
+    if (str_len(p) == 0) { return NewKitPass {.ok = true, .pass = ""}; }
+    Str again = read_secret_line();
+    return NewKitPass {.ok = p == again, .pass = p};
+}
+
+pub Str kit_pass_mismatch() { return "the two passphrases differ; nothing was changed"; }
+
+// The sheet of a new kit's seed: the seed itself without a passphrase,
+// else sealed with Argon2id at the SPEC's parameters (this takes a while).
+@requires(declassify)
+pub List(Int) new_kit_sheet(List(Int) seed, Str pass) {
+    if (str_len(pass) == 0) { return seed; }
+    return kit_sheet_seal(seed, pass, random_bytes(16), kit_argon_log2_kib(), kit_argon_t());
+}
+
+// What is printed under a new kit.
+pub Str kit_sheet_note(List(Int) sheet) {
+    if (kit_sheet_protected(sheet)) {
+        return "This kit is protected by your passphrase. Recovery needs both the kit and the passphrase: keep the passphrase somewhere else than the kit. If the passphrase is forgotten, the kit cannot be used.";
+    }
+    return "This kit has no passphrase: whoever reads it holds your recovery kit. `symbolon device kit renew DIR` writes it again under a passphrase.";
+}
+
+// DIR/kit-sheet says which kind of sheet the principal holds, for `device
+// kit status` and the app's offer to protect a plain kit. A device made
+// before passphrases has none ("unknown").
+@requires(filesystem)
+pub Bool mark_kit_sheet(Str dir, List(Int) sheet) {
+    return filesystem.write_all(dir + "/kit-sheet", if (kit_sheet_protected(sheet)) { "protected\n" } else { "plain\n" });
+}
+
+// The seed a sheet's text holds, reading its passphrase from standard
+// input when the sheet is protected. A wrong passphrase is refused here,
+// before any key is derived or anything is sent.
+@requires(declassify)
+pub Result(List(Int), Str) read_kit_seed(Str text) {
+    List(Int) b = kit_sheet_decode(text) else { [] };
+    if (!kit_sheet_ok(b)) { return Err("that is not a recovery kit"); }
+    Str pass = if (kit_sheet_protected(b)) { read_secret_line() } else { "" };
+    return kit_sheet_open(b, pass);
+}
+
+// The kit's keys, the same way.
+@requires(declassify)
+pub Result(KitKeys, Str) read_kit(Str text) {
+    Result(List(Int), Str) r = read_kit_seed(text);
+    return match r {
+        Err(m) => Err(m),
+        Ok(seed) => match kit_keys(seed) { None => Err("that is not a recovery kit"), Some(k) => Ok(k) }
+    };
+}
+
+// "protected", "plain", or "unknown" (a device made before passphrases).
+@requires(filesystem)
+pub Str kit_sheet_kind(Str dir) {
+    Str s = filesystem.read_all(dir + "/kit-sheet");
+    return if (s == "protected\n") { "protected" } else { if (s == "plain\n") { "plain" } else { "unknown" } };
+}
+
+// Whether the kit's recovery key is the one the quorum's kit party holds.
+pub Bool is_current_kit(Option(KitKeys) okk, Option(Party) okp) {
+    return match okk {
+        None => false,
+        Some(k) => match okp { None => false, Some(p) => bytes_eq(p.id, recovery_key_digest(k.sign_pub)) && bytes_eq(p.auth_key, k.sign_pub) }
+    };
+}
