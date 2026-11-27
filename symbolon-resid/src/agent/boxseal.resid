@@ -39,7 +39,8 @@
 //
 // Files sealed in format 1 (the constant) are sealed again in format 2
 // once, by `home serve` (home.resid seal_migrate) while the box's
-// seal/format file does not say 2; after that format 1 opens nowhere.
+// seal/format marker, itself sealed (R5-7), does not say it is done; after
+// that format 1 opens nowhere.
 
 import "aesgcm.resid";
 import "crypto.resid";
@@ -104,13 +105,22 @@ pub Str seal_base_of(Str path) {
 // The secret files of a cosigner's directory (cosignerd.resid,
 // epochfiles.resid): its root key, its shares and the kit's halves, the
 // vault OPRF shares, the duress keys, a re-share's pending ones, its mail
-// session at the relay; and the box's alert settings.
+// session at the relay; and the box's alert settings. And its state
+// (seal_state_name), sealed for its integrity (R5-7).
 pub Bool seal_secret_name(Str n) {
-    return n == "root" || n == "duress-keys" || n == "duress-transport" || n == "relay.mtoken" || n == "alerts.conf"
+    return seal_state_name(n) || n == "root" || n == "duress-keys" || n == "duress-transport" || n == "relay.mtoken" || n == "alerts.conf"
         || (str_starts_with(n, "cg-") && str_ends_with(n, ".cfg")) || str_starts_with(n, "kit-b-") || str_starts_with(n, "kit-half")
         || str_starts_with(n, "kv-") || str_starts_with(n, "kitv-b-") || str_starts_with(n, "kvpend-")
         || (str_starts_with(n, "pending-") && (str_ends_with(n, ".cfg") || str_ends_with(n, ".kitb") || str_ends_with(n, ".kb") || str_ends_with(n, ".kv")));
 }
+
+// The cosigner's state, not secret but trusted (R5-7): state.cbor (the
+// log head it saw, so a fork or a rollback is refused), the vetoes it
+// holds ("veto-<target>-<seq>") and their marks ("spread-<target>-<seq>").
+// Read in the clear they could be planted or rolled back by anyone who can
+// write the box's disk: a planted spread mark kept a held veto from the
+// witnesses. Sealed for their names, they are the cosigner's or nothing.
+pub Bool seal_state_name(Str n) { return n == "state.cbor" || str_starts_with(n, "veto-") || str_starts_with(n, "spread-"); }
 
 // The directory part of a path ("" for none).
 pub Str seal_dir_of(Str path) {

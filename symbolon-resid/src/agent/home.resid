@@ -455,16 +455,121 @@ Bool seal_box_files_at(Str dir, List(Int) k, Bool again) {
 }
 
 // The box's files sealed in format 2 (R4-9): once, at the first `home
-// serve` after the update (while seal/format does not say 2), every file
-// sealed in format 1 is opened and sealed again for its path, and a
-// secret left in the clear is sealed; after that format 1 opens nowhere,
-// so a file sealed under one name cannot be put under another.
+// serve` after the update, every file sealed in format 1 is opened and
+// sealed again for its path, and a secret left in the clear is sealed;
+// after that format 1 opens nowhere, so a file sealed under one name
+// cannot be put under another.
+//
+// R5-7. The marker that said so (seal/format, "2") was a plain file:
+// deleting it ran the migration again, which opened a format-1 file put
+// back from an old backup and sealed it for whatever path it now had (the
+// swap R4-9 closed), and sealed any plaintext secret planted on the disk.
+// The marker is now sealed under the box key for its path ("3": done; "1":
+// a migration under way, so a run cut short finishes), so it cannot be
+// forged; and a marker that is missing or does not open while files of the
+// box are already sealed in format 2 is taken for what it is, someone
+// changing the disk: nothing is opened or sealed again, it is said, and
+// the marker is written anew. The cosigner's state (state.cbor), the
+// vetoes it holds (veto-*) and their marks (spread-*) are sealed too now
+// (boxseal.resid seal_secret_name): a box at format 2 seals them in place
+// once, unless one of them is sealed already (the plain "2" was put back).
 pub Str seal_format_file(Str dir) { return dir + "/seal/format"; }
+
+pub Str seal_format_rel() { return "seal/format"; }
+
+// 3: done (sealed "3"); 2: format 2 by a box from before R5-7 (the plain
+// "2"); 1: a migration under way (sealed "1"); 0: no marker, or one that
+// does not open under `k`.
+@requires(filesystem)
+pub Int seal_format_at(Str dir, List(Int) k) {
+    List(Int) b = filesystem.read_bytes(seal_format_file(dir));
+    Option(List(Int)) o = unseal_bytes(k, seal_format_rel(), b);
+    Str t = match o { Some(x) => seal_text(x), None => "" };
+    if (t == "3") { return 3; }
+    if (t == "1") { return 1; }
+    return if (!is_sealed(b) && str_trim(seal_text(b)) == "2") { 2 } else { 0 };
+}
+
+@requires(filesystem)
+pub Bool seal_format_write(Str dir, List(Int) k, Str v) {
+    _ = filesystem.create_dir(dir + "/seal");
+    List(Int) x = seal_bytes(k, seal_format_rel(), str_to_bytes(v));
+    return x.len() > 0 && filesystem.write_secret(seal_format_file(dir), x);
+}
 
 @requires(filesystem)
 pub Bool seal_migrate(Str dir, List(Int) k) {
-    if (str_trim(filesystem.read_all(seal_format_file(dir))) == "2") { return true; }
-    return seal_box_files_at(dir, k, true) && filesystem.write_all(seal_format_file(dir), "2");
+    Int f = seal_format_at(dir, k);
+    if (f == 3) { return true; }
+    if (f == 1) { return seal_box_files_at(dir, k, true) && seal_format_write(dir, k, "3"); }
+    if (f == 2) {
+        if (state_sealed_any(dir, filesystem.list_dir(dir + "/people"), 0)) { return seal_tampered(dir, k); }
+        return seal_people_state(dir, filesystem.list_dir(dir + "/people"), 0, k) && seal_format_write(dir, k, "3");
+    }
+    if (box_sealed2_any(dir)) { return seal_tampered(dir, k); }
+    return seal_format_write(dir, k, "1") && seal_box_files_at(dir, k, true) && seal_format_write(dir, k, "3");
+}
+
+// The marker gone or changed while the box's files are sealed in format 2
+// already: nothing is opened in format 1 or sealed from the clear.
+@requires(filesystem)
+Bool seal_tampered(Str dir, List(Int) k) {
+    eprintln("home: WARNING: " + seal_format_file(dir) + " is missing or was changed, but this box's files are sealed already: "
+        + "nothing is sealed again (has someone changed this box's disk?)");
+    return seal_format_write(dir, k, "3");
+}
+
+// The cosigner state files (boxseal.resid seal_state_name).
+@requires(filesystem)
+Bool seal_people_state(Str dir, List(Str) people, Int i, List(Int) k) {
+    if (i >= people.len()) { return true; }
+    Str cos = dir + "/people/" + people[i] + "/cos";
+    Bool ok = !filesystem.is_dir(cos) || seal_state_dir(cos, filesystem.list_dir(cos), 0, k);
+    return ok && seal_people_state(dir, people, i + 1, k);
+}
+
+@requires(filesystem)
+Bool seal_state_dir(Str cos, List(Str) names, Int i, List(Int) k) {
+    if (i >= names.len()) { return true; }
+    Bool ok = !seal_state_name(names[i]) || seal_in_place(cos, names[i], k, false);
+    return ok && seal_state_dir(cos, names, i + 1, k);
+}
+
+@requires(filesystem)
+Bool state_sealed_any(Str dir, List(Str) people, Int i) {
+    if (i >= people.len()) { return false; }
+    Str cos = dir + "/people/" + people[i] + "/cos";
+    return (filesystem.is_dir(cos) && names_sealed2(cos, filesystem.list_dir(cos), 0, true)) || state_sealed_any(dir, people, i + 1);
+}
+
+// Whether a file of `names` in `d` is sealed in format 2 (`only_state`:
+// only the cosigner's state files).
+@requires(filesystem)
+Bool names_sealed2(Str d, List(Str) names, Int i, Bool only_state) {
+    if (i >= names.len()) { return false; }
+    Bool look = !str_starts_with(names[i], ".") && (!only_state || seal_state_name(names[i]));
+    Bool hit = look && sealed2_file(d + "/" + names[i]);
+    return hit || names_sealed2(d, names, i + 1, only_state);
+}
+
+@requires(filesystem)
+Bool sealed2_file(Str p) { List(Int) b = filesystem.read_bytes(p); return is_sealed(b) && !is_sealed1(b); }
+
+// Whether any file of the box is sealed in format 2 already: its keys, a
+// cosigner's files, the alert settings, the relay's store at its top.
+@requires(filesystem)
+pub Bool box_sealed2_any(Str dir) {
+    return sealed2_file(dir + "/tls/ca.key") || sealed2_file(dir + "/tls/server.key") || sealed2_file(dir + "/w1.key")
+        || sealed2_file(dir + "/w2.key") || sealed2_file(dir + "/w3.key") || sealed2_file(dir + "/alerts.conf")
+        || cos_sealed2_any(dir, filesystem.list_dir(dir + "/people"), 0)
+        || sealed2_file(dir + "/relay/auth/challenge-key") || sealed2_file(dir + "/relay/auth/claim-key");
+}
+
+@requires(filesystem)
+Bool cos_sealed2_any(Str dir, List(Str) people, Int i) {
+    if (i >= people.len()) { return false; }
+    Str cos = dir + "/people/" + people[i] + "/cos";
+    return (filesystem.is_dir(cos) && names_sealed2(cos, filesystem.list_dir(cos), 0, false)) || cos_sealed2_any(dir, people, i + 1);
 }
 
 // `symbolon home alerts DIR [set KEY VALUE]`: on a sealed box, with the
@@ -475,7 +580,10 @@ pub Int home_alerts_cmd(Str dir, List(Str) args) {
     List(Int) k = open_box_key(dir, "");
     // Settings sealed in format 1, before the box's first `home serve`
     // since the update, are sealed for their path first (seal_migrate).
-    Bool fresh = str_trim(filesystem.read_all(seal_format_file(dir))) == "2" || seal_in_place(dir, "alerts.conf", k, true);
+    // Not when the marker was taken away from a box sealed in format 2
+    // already (R5-7).
+    Int f = seal_format_at(dir, k);
+    Bool fresh = f >= 2 || (f == 0 && box_sealed2_any(dir)) || seal_in_place(dir, "alerts.conf", k, true);
     return if (k.len() == 32 && fresh) { home_alerts_with(dir, args, k) } else { 1 };
 }
 
@@ -706,7 +814,11 @@ pub Int home_secure(Str dir, List(Str) witnesses, Str witness_ca, SealOpts so) {
     List(Int) sealed = if (was) { [1] } else { seal_new_box_key(k, so) };
     if (sealed.len() == 0) { return 1; }
     if (!was && !filesystem.write_secret(box_key_file(dir), sealed)) { eprintln("home: cannot write the sealed box key"); return 1; }
-    if (!seal_box_files(dir, k)) { eprintln("home: cannot seal every key file; run home secure again"); return 1; }
+    // A first sealing marks the format under way (so a run cut short
+    // finishes it); a box sealed already is migrated first (R5-7).
+    if (!was && !seal_format_write(dir, k, "1")) { eprintln("home: cannot write " + seal_format_file(dir)); return 1; }
+    if (was && !seal_migrate(dir, k)) { eprintln("home: cannot seal the box's files again for their paths"); return 1; }
+    if (!seal_box_files(dir, k) || !seal_format_write(dir, k, "3")) { eprintln("home: cannot seal every key file; run home secure again"); return 1; }
     Str trust = filesystem.read_all(trust_file(dir));
     Bool ok = (witnesses.len() == 0 || filesystem.write_all(dir + "/witnesses.txt", lines(witnesses, 0, StrBuf())))
            && (str_len(wca) == 0 || filesystem.write_all(dir + "/tls/trust.pem", trust + wca));
@@ -924,7 +1036,7 @@ pub Int home_serve(Str dir, Str self, Str pass_flag, Str run_base) {
     Bool sealed = home_sealed(dir);
     List(Int) k = if (sealed) { open_box_key(dir, pass_flag) } else { [] };
     if (sealed && k.len() != 32) { return 1; }
-    if (sealed && !seal_migrate(dir, k)) { eprintln("home: cannot seal the box's files again for their paths (format 2)"); return 1; }
+    if (sealed && !seal_migrate(dir, k)) { eprintln("home: cannot seal the box's files again for their paths"); return 1; }
     Str run = if (sealed) { make_run_dir(dir, run_base) } else { "" };
     if (sealed && str_len(run) == 0) { return 1; }
     ServeKeys sk = if (sealed) { unsealed_keys(dir, run, k) } else {

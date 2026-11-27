@@ -298,7 +298,8 @@ test "home serve seals files of the old format again for their paths, once" {
     expect(get_file(cos + "/cg-1.cfg")).toEqual([]);
     expect(box_file(d, "w1.key", k)).toEqual([]);
     expect(seal_migrate(d, k)).toBeTrue();
-    expect(str_trim(filesystem.read_all(seal_format_file(d)))).toEqual("2");
+    expect(seal_format_at(d, k)).toEqual(3);
+    expect(is_sealed(filesystem.read_bytes(seal_format_file(d)))).toBeTrue();
     expect(box_file(d, "w1.key", k)).toEqual(key32(101));
     expect(get_file(cos + "/root")).toEqual(key32(102));
     expect(get_file(cos + "/cg-1.cfg")).toEqual(key32(103));
@@ -307,6 +308,85 @@ test "home serve seals files of the old format again for their paths, once" {
     _ = filesystem.write_secret(cos + "/cg-1.cfg", seal1(k, key32(104)));
     expect(seal_migrate(d, k)).toBeTrue();
     expect(get_file(cos + "/cg-1.cfg")).toEqual([]);
+}
+
+// A box sealed in format 2: its cosigner `alice` holds a format-2 root
+// key; `run` holds the box key `k` in memory. The box's directory.
+@requires(filesystem, declassify)
+Str box2(List(Int) k) {
+    Str d = tmp_dir();
+    Str run = tmp_dir();
+    Str cos = d + "/people/alice/cos";
+    _ = filesystem.create_dir(d + "/seal");
+    _ = filesystem.create_dir(d + "/people");
+    _ = filesystem.create_dir(d + "/people/alice");
+    _ = filesystem.create_dir(cos);
+    _ = filesystem.create_dir(d + "/relay");
+    _ = filesystem.write_secret(run + "/box.key", k);
+    _ = filesystem.write_all(cos + "/" + seal_ptr_name(), run + "/box.key");
+    _ = filesystem.write_secret(cos + "/root", seal_bytes(k, "root", key32(102)));
+    return d;
+}
+
+// R5-7: the marker taken away (Resid deletes no file: overwritten, which
+// reads as missing) does not run the migration again: a format-1 file put back
+// from an old backup is not opened and sealed for its new path, and a
+// plaintext secret planted on the disk is not sealed.
+@requires(filesystem, declassify, network, clock(readonly))
+test "a box whose seal/format marker is taken away does not seal anything again (R5-7)" {
+    List(Int) k = key32(100);
+    Str d = box2(k);
+    Str cos = d + "/people/alice/cos";
+    expect(seal_migrate(d, k)).toBeTrue();
+    expect(hex_encode(get_file(cos + "/root"))).toEqual(hex_encode(key32(102)));
+    _ = filesystem.write_all(seal_format_file(d), "x");
+    _ = filesystem.write_secret(cos + "/cg-1.cfg", seal1(k, key32(104)));
+    _ = filesystem.write_secret(cos + "/kv-2", [9, 9]);
+    expect(seal_migrate(d, k)).toBeTrue();
+    expect(hex_encode(get_file(cos + "/cg-1.cfg"))).toEqual("");
+    expect(hex_encode(filesystem.read_bytes(cos + "/kv-2"))).toEqual(hex_encode([9, 9]));
+    expect(hex_encode(get_file(cos + "/kv-2"))).toEqual("");
+    // Nor a plain "2" put in its place.
+    _ = filesystem.write_all(seal_format_file(d), "2");
+    expect(seal_migrate(d, k)).toBeTrue();
+    expect(hex_encode(get_file(cos + "/cg-1.cfg"))).toEqual("");
+    expect(hex_encode(get_file(cos + "/root"))).toEqual(hex_encode(key32(102)));
+}
+
+// R5-7: the cosigner's state (state.cbor, veto-*, spread-*) is sealed on a
+// box; one planted in the clear reads as nothing. A box at format 2 from
+// before seals its plaintext state once.
+@requires(filesystem, declassify, network, clock(readonly))
+test "the cosigner's state on a box is sealed, and a planted state file, veto or spread mark reads as nothing (R5-7)" {
+    List(Int) k = key32(200);
+    Str d = box2(k);
+    Str cos = d + "/people/alice/cos";
+    // A box at format 2 from before: the plain marker, the state in the clear.
+    _ = filesystem.write_all(seal_format_file(d), "2");
+    _ = filesystem.write_bytes(cos + "/state.cbor", [5, 5]);
+    _ = filesystem.write_bytes(cos + "/veto-3-4", str_to_bytes("1000 aa"));
+    expect(seal_migrate(d, k)).toBeTrue();
+    expect(is_sealed(filesystem.read_bytes(cos + "/state.cbor"))).toBeTrue();
+    expect(hex_encode(get_file(cos + "/state.cbor"))).toEqual(hex_encode([5, 5]));
+    expect(hex_encode(get_file(cos + "/veto-3-4"))).toEqual(hex_encode(str_to_bytes("1000 aa")));
+    // Written by the cosigner: sealed, and read back.
+    expect(put_secret_file(cos + "/spread-3-4", str_to_bytes("done\n"))).toBeTrue();
+    expect(is_sealed(filesystem.read_bytes(cos + "/spread-3-4"))).toBeTrue();
+    expect(hex_encode(get_file(cos + "/spread-3-4"))).toEqual(hex_encode(str_to_bytes("done\n")));
+    // Planted in the clear, or a sealed one put under another name: nothing.
+    _ = filesystem.write_bytes(cos + "/spread-7-8", str_to_bytes("done\n"));
+    _ = filesystem.write_bytes(cos + "/veto-7-8", str_to_bytes("1000 aa"));
+    _ = filesystem.write_bytes(cos + "/state.cbor", [6, 6]);
+    expect(hex_encode(get_file(cos + "/spread-7-8"))).toEqual("");
+    expect(hex_encode(get_file(cos + "/veto-7-8"))).toEqual("");
+    expect(hex_encode(get_file(cos + "/state.cbor"))).toEqual("");
+    _ = filesystem.write_bytes(cos + "/spread-9-9", filesystem.read_bytes(cos + "/spread-3-4"));
+    expect(hex_encode(get_file(cos + "/spread-9-9"))).toEqual("");
+    // The plain "2" put back does not seal the planted ones.
+    _ = filesystem.write_all(seal_format_file(d), "2");
+    expect(seal_migrate(d, k)).toBeTrue();
+    expect(hex_encode(get_file(cos + "/spread-7-8"))).toEqual("");
+    expect(hex_encode(get_file(cos + "/state.cbor"))).toEqual("");
 }
 
 test "the unsealed keys go only to a directory in memory" {

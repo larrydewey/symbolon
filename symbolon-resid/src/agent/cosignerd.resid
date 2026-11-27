@@ -582,7 +582,7 @@ pub Result(LogView, SymbolonError) head_seen(Cosigner c, LogView v) {
     Result(CosignerState, SymbolonError) u = cosigner_update_head(s0, v.vh);
     return match u {
         Err(e) => fork_alarm(e),
-        Ok(s) => if (filesystem.write_bytes(c.dir + "/state.cbor", cbor_of_state(s))) { Ok(v) } else { Err(ErrStorage("cannot record the log head")) }
+        Ok(s) => if (put_secret_file(c.dir + "/state.cbor", cbor_of_state(s))) { Ok(v) } else { Err(ErrStorage("cannot record the log head")) }
     };
 }
 
@@ -745,13 +745,13 @@ Cosigner decide(Cosigner c, Remote back, SignInvite inv, VerifiedHead vh, List(G
 
 @requires(network, filesystem, declassify, clock(readonly))
 Cosigner refused_saved_to(Cosigner c, Remote to, List(Int) sid, CosignerState s) {
-    _ = filesystem.write_bytes(c.dir + "/state.cbor", cbor_of_state(s));
+    _ = put_secret_file(c.dir + "/state.cbor", cbor_of_state(s));
     return refuse_to(c, to, sid);
 }
 
 @requires(network, filesystem, declassify, clock(readonly))
 Cosigner refused_saved(Cosigner c, List(Int) from, List(Int) sid, CosignerState s) {
-    _ = filesystem.write_bytes(c.dir + "/state.cbor", cbor_of_state(s));
+    _ = put_secret_file(c.dir + "/state.cbor", cbor_of_state(s));
     return refuse(c, from, sid);
 }
 
@@ -770,7 +770,7 @@ Bool in_list(List(List(Int)) xs, List(Int) x, Int i) {
 
 @requires(network, filesystem, declassify, clock)
 Cosigner cosign(Cosigner c, SignInvite inv, VerifiedHead vh, CosignerState s, List(Got) early, List(Int) via) {
-    _ = filesystem.write_bytes(c.dir + "/state.cbor", cbor_of_state(s));
+    _ = put_secret_file(c.dir + "/state.cbor", cbor_of_state(s));
     Quorum q = vh.head.quorum;
     Option(CgConfig) cg = cg_at(c, (Int)q.epoch);
     CgConfig none = CgConfig {.id = 0, .threshold = 0, .ecdsa = [], .elgamal = [], .p = [], .q = [], .rid = [], .chain_key = [], .public = []};
@@ -914,7 +914,7 @@ Cosigner reshare_decide(Cosigner c, List(Int) from, ReshareInvite inv, VerifiedH
 
 @requires(network, filesystem, declassify, clock)
 Cosigner run_reshare(Cosigner c, ReshareInvite inv, Quorum q, CgConfig old, CosignerState s, List(Got) early, List(List(UInt(64))) primes) {
-    _ = filesystem.write_bytes(c.dir + "/state.cbor", cbor_of_state(s));
+    _ = put_secret_file(c.dir + "/state.cbor", cbor_of_state(s));
     Int new_id = pos1(inv.new_parties, c.cfg.party, 0);
     // The share dealt from (dealing_cfg), at its own x-coordinate.
     RsCtx rc = RsCtx {.self = if (has_int(inv.receivers, new_id, 0)) { new_id } else { 0 }, .old_self = if (has_int(inv.dealers, old.id, 0)) { old.id } else { 0 },
@@ -1189,7 +1189,9 @@ Cosigner veto_keep(Cosigner c, SignedEvent v, List(Int) raw) {
     Int target = match b { VetoBody(t) => (Int)t, _ => -1 };
     if (target < 1) { return cos_fail(c, "not a veto"); }
     Str f = c.dir + "/veto-" + f"{target}-{v.payload.sequence}";
-    if (filesystem.exists(f)) { return c; }
+    // Kept already: only one that opens (sealed on a box, R5-7), not a
+    // file planted under its name.
+    if (get_file(f).len() > 0) { return c; }
     // Checked against the log as the cosigner verified it, held against
     // the witnesses (R5-1), never the relay's answer alone: a relay that
     // hides the recovery from the cosigner cannot have the veto refused.
@@ -1208,7 +1210,7 @@ Cosigner veto_check(Cosigner c, LogView lv, SignedEvent v, List(Int) raw, Str f)
     Result(NextOk, SymbolonError) ok = il_next(c.cfg.log_id, lv.events, v, now, lambda(x) { false });
     Bool valid = next && match ok { Ok(_) => true, Err(_) => false };
     if (!valid) { return cos_fail(c, "a veto that is not valid as the log's next event; not kept"); }
-    _ = filesystem.write_all(f, f"{now} " + hex_encode(raw));
+    _ = put_secret_file(f, str_to_bytes(f"{now} " + hex_encode(raw)));
     println("cosigner: holds a device's veto of event " + f"{target_of(v)}");
     // Published at the end of this turn (R4-2), and again each turn while
     // it can still land (serve_once spread_held).
@@ -1235,12 +1237,17 @@ Int spread_held(Cosigner c) {
     return match rv { Err(_) => 0, Ok(s) => spread_each(c, s.view, todo, 0) };
 }
 
-Str spread_mark(Str dir, SignedEvent v) { return dir + "/spread-" + f"{target_of(v)}-{v.payload.sequence}"; }
+pub Str spread_mark(Str dir, SignedEvent v) { return dir + "/spread-" + f"{target_of(v)}-{v.payload.sequence}"; }
+
+// A mark the cosigner wrote (sealed on a box, R5-7): a file planted
+// under its name does not keep a held veto from the witnesses.
+@requires(filesystem)
+pub Bool spread_done(Str dir, SignedEvent v) { return seal_text(get_file(spread_mark(dir, v))) == "done\n"; }
 
 @requires(filesystem)
 List(HeldVeto) held_open(Str dir, List(HeldVeto) hs, Int i, List(HeldVeto) acc) {
     if (i >= hs.len()) { return acc; }
-    Bool done = filesystem.exists(spread_mark(dir, hs[i].veto));
+    Bool done = spread_done(dir, hs[i].veto);
     return held_open(dir, hs, i + 1, if (done) { acc } else { acc.concat([hs[i]]) });
 }
 
@@ -1248,7 +1255,7 @@ List(HeldVeto) held_open(Str dir, List(HeldVeto) hs, Int i, List(HeldVeto) acc) 
 Int spread_each(Cosigner c, LogView v, List(HeldVeto) hs, Int i) {
     if (i >= hs.len()) { return 0; }
     Bool live = held_veto_live(c.cfg.log_id, v.events, v.vh.pending, hs[i]);
-    _ = if (live) { veto_spread(c, v, hs[i].veto) } else { filesystem.write_all(spread_mark(c.dir, hs[i].veto), "done\n") };
+    _ = if (live) { veto_spread(c, v, hs[i].veto) } else { put_secret_file(spread_mark(c.dir, hs[i].veto), str_to_bytes("done\n")) };
     return spread_each(c, v, hs, i + 1);
 }
 
@@ -1328,7 +1335,7 @@ Cosigner take_loose(Cosigner c, LogView lv, List(SignedEvent) loose, Int i) {
     SignedEvent v = loose[i];
     Int target = target_of(v);
     Str f = c.dir + "/veto-" + f"{target}-{v.payload.sequence}";
-    Bool take = target >= 1 && (Int)v.payload.sequence == lv.events.len() && !filesystem.exists(f);
+    Bool take = target >= 1 && (Int)v.payload.sequence == lv.events.len() && get_file(f).len() == 0;
     List(Int) raw = cbor_of_event(StoredEvent {.encoded = v.encoded, .sigs = v.sigs, .cosigs = []});
     Cosigner c2 = if (take) { veto_check(c, lv, v, raw, f) } else { c };
     return take_loose(c2, lv, loose, i + 1);
@@ -1357,7 +1364,7 @@ List(HeldVeto) held_from(Str dir, List(Str) names, Int i, List(HeldVeto) acc) {
     if (i >= names.len()) { return acc; }
     Str n = names[i];
     Bool is = str_len(n) > 5 && str_slice(n, 0, 5) == "veto-";
-    List(Str) p = if (is) { str_split(str_trim(filesystem.read_all(dir + "/" + n)), " ") } else { [] };
+    List(Str) p = if (is) { str_split(str_trim(seal_text(get_file(dir + "/" + n))), " ") } else { [] };
     Option(StoredEvent) se = if (p.len() == 2) { event_of_cbor(cose_hex_decode(p[1])) } else { None };
     Option(SignedEvent) oe = match se { None => None, Some(x) => signed_of(x) };
     List(HeldVeto) next = match oe { None => acc, Some(v) => acc.concat([HeldVeto {.veto = v, .time = str_parse_int(p[0])}]) };
@@ -1570,7 +1577,7 @@ Cosigner eval_decide(Cosigner c, List(Int) from, EvalRequest r, VerifiedHead vh)
 @requires(network, filesystem, declassify, clock)
 Cosigner evaluated(Cosigner c, List(Int) from, EvalRequest r, CosignerState s, ToprfEval e) {
     if (!e.ok) { return refuse(c, from, r.session_id); }
-    _ = filesystem.write_bytes(c.dir + "/state.cbor", cbor_of_state(s));
+    _ = put_secret_file(c.dir + "/state.cbor", cbor_of_state(s));
     Option(Remote) rr = remote_of_party(c, from);
     _ = match rr { None => false, Some(x) => send_to(mail_of(c), me_of(c), x, WEvalAnswer(EvalAnswer {.session_id = r.session_id, .elements = e.elements, .proof = e.proof})) };
     println(f"cosigner: evaluated {r.blinded.len()} protected item element(s), purpose {r.purpose}");
@@ -1667,7 +1674,7 @@ Cosigner beacon_with(Cosigner c, Party p, Beacon b, VerifiedHead vh) {
     Int now = policy_now(c, vh);
     List(Int) tbs = request_tbs(b.session_id, beacon_message(b), vh.head.quorum.epoch, b.requester, request_beacon());
     BeaconOutcome o = cosigner_beacon(st, p, b.session_id, tbs, b.sig, b.time, now);
-    _ = filesystem.write_bytes(c.dir + "/state.cbor", cbor_of_state(o.s));
+    _ = put_secret_file(c.dir + "/state.cbor", cbor_of_state(o.s));
     Option(DuressState) was = o.was;
     _ = if (o.ended) { match was { None => false, Some(w) => queue_ended(c, w.started_at + (Int)vh.head.policy.duress_window_sec, "the duress window ran out") } } else { false };
     _ = if (o.opened) { queue_open(c, now, b.location) } else { false };
@@ -1691,7 +1698,7 @@ Bool window_check(Cosigner c, VerifiedHead vh) {
     Int now = policy_now(c, vh);
     if (now == 0 || !window_ran_out(st, now)) { return false; }
     Option(DuressState) w = st.duress;
-    _ = filesystem.write_bytes(c.dir + "/state.cbor", cbor_of_state(without_duress(st)));
+    _ = put_secret_file(c.dir + "/state.cbor", cbor_of_state(without_duress(st)));
     return match w { None => false, Some(x) => queue_ended(c, x.started_at + (Int)vh.head.policy.duress_window_sec, "the duress window ran out") };
 }
 
@@ -1754,7 +1761,7 @@ Cosigner end_duress_with(Cosigner c, EndDuressReq r, VerifiedHead vh) {
 
 @requires(filesystem, clock(readonly))
 Cosigner ended_now(Cosigner c, CosignerState s, Bool was, Int now) {
-    _ = filesystem.write_bytes(c.dir + "/state.cbor", cbor_of_state(s));
+    _ = put_secret_file(c.dir + "/state.cbor", cbor_of_state(s));
     _ = if (was) { queue_ended(c, now, "ended from another of their devices") } else { false };
     return c;
 }

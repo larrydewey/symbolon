@@ -3223,8 +3223,14 @@ or its sealed root or challenge key says so): it then writes nothing and
 opens nothing, and in a sealed directory a secret left or planted in the
 clear is never read. Files sealed before under one constant (format
 "SYMBSEAL") are sealed again for their paths once, at the first `home
-serve` after the update (`seal/format` then says 2); after that the old
-format opens nowhere. A rollback of one file to an older copy of itself
+serve` after the update; after that the old format opens nowhere. The
+marker that says so, `seal/format`, is itself sealed for its path (R5-7):
+it cannot be forged, and when it is missing or does not open while the
+box's files are sealed already, nothing is opened in the old format or
+sealed from the clear again (a warning says the disk was changed). The
+cosigner's state (`state.cbor`, the vetoes it holds and their marks) is
+sealed too, for its integrity: a state file planted or put under another
+name reads as nothing. A rollback of one file to an older copy of itself
 is not detected. A
 copy of the disk or of the box's data folder alone does not sign; with
 the TPM or the passphrase it holds every principal's cosigner, and with a
