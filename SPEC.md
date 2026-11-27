@@ -1242,9 +1242,18 @@ status` points at it) does, from a device of the quorum:
    the log refuses any other, and the cosigner deals only to that plan.
 
 From the moment the `rotate-recovery` is in force the old kit's recovery
-key is no longer in field 6: a `recover` revealing it is invalid, so no
-witness co-signs it, no relay sequences it and the cosigner releases
-nothing to it. After the re-share the old kit's material belongs to a dead
+key is no longer in field 6, but the new kit has no material until the
+re-share of step 3. Until that re-share lands the old kit, still the
+quorum's `kit` party (not removed), remains authorized: a `recover`
+revealing the key whose digest is the id of the quorum's kit party is
+valid while a `rotate-recovery` naming another kit is in force (R4-5).
+Otherwise neither kit could recover in that window, and losing the one
+device that holds the new kit's public keys would lose the identity; the
+agent therefore tells the principal to keep the old sheet and to run
+step 3 promptly. Once the re-share has put the new kit in the old one's
+place, a `recover` revealing the old kit's key is invalid, so no witness
+co-signs it, no relay sequences it and the cosigner releases nothing to
+it. After the re-share the old kit's material belongs to a dead
 epoch, which the parties delete (Section 11.3), and the cosigner's half it
 releases at a later recovery is the new kit's. Every sheet of the old kit,
 plain or protected, is then useless. Between steps 2 and 3 the new kit's

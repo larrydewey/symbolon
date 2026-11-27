@@ -945,14 +945,31 @@ Result(LogState, SymbolonError) do_reshare(LogState s, SignedEvent e, List(Int) 
     return Ok(apply_effect(s, e.payload.body, dig, e.payload.next_recovery_key_digests));
 }
 
+// The kit's recovery key: one field 6 names, or (R4-5) the quorum's own
+// kit party while a rotate-recovery is in force and the re-share to the
+// new kit has not landed yet. The new kit has no material until that
+// re-share, so without this neither kit could recover in the window, and
+// losing the one device that holds DIR/kit-next there lost the identity.
+// The old kit stays the quorum's kit until the re-share replaces it
+// (rotated_kit); a recover by it ends the rotation (rotated_to []).
 Bool kit_authorized(LogState s, SignedEvent e, List(List(Int)) next_digests, Option(List(Int)) revealed) {
     return match revealed {
         Some(k) => key_ok(k)
-                   && has_bytes(s.recovery_digests, sha256_bytes(k), 0)
+                   && (has_bytes(s.recovery_digests, sha256_bytes(k), 0) || old_kit_in_window(s, sha256_bytes(k)))
                    && !has_bytes(next_digests, sha256_bytes(k), 0)
                    && signed_by_key(e.sigs, k, e.encoded, 0),
         None => false
     };
+}
+
+// Whether `d` is the id of the quorum's kit party, not removed, while a
+// rotate-recovery in force (rotated_to) names another kit: the old kit
+// before the re-share (a re-share that brings the new kit keeps no other
+// kit beside it, do_reshare).
+Bool old_kit_in_window(LogState s, List(Int) d) {
+    if (s.rotated_to.len() == 0 || has_bytes(s.rotated_to, d, 0) || has_bytes(s.removed, d, 0)) { return false; }
+    Option(Party) op = party_by_id(s.quorum.parties, d, 0);
+    return match op { None => false, Some(p) => p.kind == party_kind_kit() };
 }
 
 Bool guardians_authorized(SignedEvent e, RecoverBodyInner r, Bool closure(EventPayload) approvals_ok) {

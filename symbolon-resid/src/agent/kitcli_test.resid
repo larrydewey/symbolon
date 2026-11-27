@@ -67,3 +67,10 @@ test "the new kit takes the old one's place; its keys survive DIR/kit-next" {
     expect(back.protected).toEqual(true);
     expect(next_kit_parse("").sign_pub.len()).toEqual(0);
 }
+
+test "after a replacement the principal is told to keep the old sheet and finish the re-share promptly (R4-5)" {
+    Str n = rotation_window_note("/d");
+    expect(str_contains(n, "keep the OLD sheet")).toBeTrue();
+    expect(str_contains(n, "symbolon device kit renew /d")).toBeTrue();
+    expect(str_contains(n, "promptly")).toBeTrue();
+}

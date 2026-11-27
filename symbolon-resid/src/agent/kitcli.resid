@@ -195,11 +195,22 @@ Int new_kit(Str dir, DeviceConfig c, Unlocked u, VerifiedHead vh, Str pin, Str p
     };
 }
 
+// What the principal must do between the replacement and the re-share
+// (R4-5): only this device holds the new kit's public keys (DIR/kit-next),
+// and the new kit has no material until the re-share; until then the old
+// kit keeps working (core/log.resid kit_authorized), so keep its sheet.
+pub Str rotation_window_note(Str dir) {
+    return "IMPORTANT: keep the OLD sheet until the replacement is finished. Once the replacement is in force, run `symbolon device kit renew "
+        + dir + "` again on THIS device, promptly: only this device can re-share to the new kit (it alone holds " + dir
+        + "/kit-next), and until it does the new kit cannot recover anything; the old kit still can.";
+}
+
 @requires(filesystem, network, device, declassify, clock, provision, environment)
 Int rotated(Str dir, DeviceConfig c, Unlocked u, Str pin, Str primes_file, List(Int) sheet) {
     println("NEW RECOVERY KIT (write it down; it is shown once): " + kit_sheet_text(sheet));
     println(kit_sheet_note(sheet));
     println("It replaces the old kit once the replacement is in force and the quorum has re-shared to it: then every old sheet, with or without a passphrase, is useless.");
+    println(rotation_window_note(dir));
     return renew_step(dir, c, u, pin, primes_file, false);
 }
 
