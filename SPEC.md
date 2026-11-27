@@ -2015,8 +2015,15 @@ stores a `vault-` or `coll-` state only when its head's version (field 2,
 which it reads without any key) is above the version stored, and of two
 writes of the same version only one (a lock per version, written once;
 one left by a writer that stopped is taken over after a minute); it
-answers 409 otherwise and takes nothing that is not a vault state. A
-device answered 409 reads the place again, accepted as any read is, makes
+answers 409 otherwise and takes nothing that is not a vault state. It
+also stores a state only when its head is signed by the device that
+writes it (signer the session's party, field 4 the session's log, the
+signature verifying under the key the relay verified against the log for
+that session; 403 otherwise) and its version is at most 2^20 above the
+version stored (400 otherwise; honest writers write the stored version
+plus one), so no device, stolen or one of a folder's people, can store a
+version so high that every later write is refused (R4-3). A device
+answered 409 reads the place again, accepted as any read is, makes
 its change again on what it finds (the items it removed or wrote replace
 the other device's; every other item of the other device's state stays)
 and writes the next version, a few times at most. A re-key, a deletion and
@@ -2811,7 +2818,15 @@ witness ports under each of its names and the witnesses the household
 named, so a stranger's log cannot make it call another address on the
 LAN); a log naming one is refused with 403 before any call, and so is a
 device's sign-in to such a log. Host names are judged as written: one
-that resolves to an internal address is not caught. The relay runs at
+that resolves to an internal address is not caught (R4-8, accepted: the
+runtime offers no name resolution to check, and pin, an address before
+connecting). What remains is a blind request: the relay learns whether
+something answers there, never a response, since a time or a co-signature
+counts only signed by the witness key the log names, and the log's own
+events must be valid offline first. An operator on an internal network
+should resolve such names outside it, or filter the relay's outbound
+traffic. IPv6 literals are never called (a URL with more than one ":" is
+not an endpoint). The relay runs at
 most two claims of one log at a time (leases in its store, taken over
 after two minutes; 429 beyond), starts no new round of witness calls
 after 20 seconds (three witnesses at a time; the rest count as not
@@ -2947,7 +2962,20 @@ its alert channels' settings (SMTP and ntfy credentials), under one box
 key (AES-256-GCM), and seals the box key to the box's TPM (a TPM-held HMAC key
 over a salt), or, without one, to a passphrase (Argon2id). The box key is
 unsealed into memory (a tmpfs) when the box starts and nowhere else; a
-cosigner that cannot reach it neither reads nor writes a secret file. A
+cosigner that cannot reach it neither reads nor writes a secret file.
+Each file is sealed for its path below its sealed directory (the
+associated data is "symbolon v1 home sealed file" || 0x00 || that path;
+format "SYMBSEA2"), so a sealed file put under another name, a share
+of one epoch where another's is, one relay object where another is,
+does not open (R4-9). A sealed directory stays sealed when the pointer
+to the box key is taken from it (a mark beside it, the box's sealed key,
+or its sealed root or challenge key says so): it then writes nothing and
+opens nothing, and in a sealed directory a secret left or planted in the
+clear is never read. Files sealed before under one constant (format
+"SYMBSEAL") are sealed again for their paths once, at the first `home
+serve` after the update (`seal/format` then says 2); after that the old
+format opens nowhere. A rollback of one file to an older copy of itself
+is not detected. A
 copy of the disk or of the box's data folder alone does not sign; with
 the TPM or the passphrase it holds every principal's cosigner, and with a
 principal's recovery kit as well, that principal's identity (t parties,
@@ -4116,8 +4144,18 @@ The relay then serves:
 Every write needs a signed-in device, but a cosigner's sealed alert
 (`alrt-<log>-<time>-<nonce>`, which a cosigner writes without a session:
 written once, never replaced, at most 64 KiB). A person's own objects
-(`vault-<log>`, `kit-<log>-a`, `kit-<log>-secrets`, `kitv-<log>-a`,
-`card-<log>`) are written only by a device of that log. A household
+(`vault-<log>`, `card-<log>`) are written only by a device of that log.
+The recovery kit's sealed blobs are named by the epoch they were made
+for (`kit-<log>-a-<epoch>`, `kit-<log>-secrets-<epoch>`,
+`kitv-<log>-a-<epoch>`) and written once, never replaced or removed,
+only by a device of the log's quorum (verified offline at the log's last
+witness time) and only for that quorum's epoch: the device that finishes
+an inception or a re-share writes the new epoch's. A stolen device can
+no longer overwrite the kit's half and so break kit recovery, nor write
+an epoch the log has not reached. Kit recovery reads the blobs of the
+epoch before the `recover` event, and falls back to the names without an
+epoch, from before, which the relay still serves but no longer takes
+(each is sealed to its epoch, so a stale one only fails to open). A household
 folder (19): its first roster makes its writer the owner, and only the
 owner's devices write it after; its `coll-` and `wrap-` objects are
 written by the owner's and the members' devices; `leave-<id>-<log>` by
@@ -4262,14 +4300,20 @@ changes act in two ways:
   organization's group of each directory group's name to the members it
   lists (making the group when there is none), signs one new membership
   record, invites each directory user who is neither a member nor
-  invited (29.3), and re-keys the group folders people left. The
+  invited (29.3), into the groups the directory lists them in, and
+  re-keys the group folders people left. The
   directory is served by the relay and not signed, so on its own it only
   takes away (R3U-4): members taken out of groups are taken out at once,
-  but a member put into a group, or a new group, is printed (`add
-  NAME-HEX LOG EXT-HEX`, `new NAME-HEX`, then `confirm HASH`) and
+  but a member put into a group, a new group, or an invite for a new
+  person with the groups it admits to, is printed (`add
+  NAME-HEX LOG EXT-HEX`, `new NAME-HEX`, `invite-new USERNAME-HEX
+  NAME-HEX,...` (`-` for no group), then `confirm HASH`) and
   applied only by `org sync DIR --yes HASH`, HASH being SHA-256 of
   exactly those lines, so a directory changed between the two runs adds
-  nothing (the app shows the additions and asks). A sync queued at the
+  nothing (the app shows the additions and asks). (Invites were made on
+  every sync before, outside the confirmation: a relay could have an
+  invite made for a user name it chose, admitting whoever answers it
+  into groups no one confirmed, R4-4.) A sync queued at the
   console applies removals only. An
   organization may run `org sync` on a schedule on a dedicated admin
   device (an automation administrator): an identity of its own, listed
