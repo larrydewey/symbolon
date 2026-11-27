@@ -914,8 +914,11 @@ its share and `b`, which cannot sign. A stolen kit gives nothing without a
 recovery that every surviving device is told about and can veto.
 
 **Without a cosigner,** the kit's material is wrapped to the kit alone,
-and the kit with any one device can sign. The kit's HPKE private key
-SHOULD then be encrypted under `Argon2id(kit passphrase)`.
+and the kit with any one device can sign. The kit's keys SHOULD then be
+sealed under a kit passphrase: the kit's sheet carries its seed, from which
+both keys derive, under a key from `Argon2id(kit passphrase)` (Section
+13.2). Setup offers the passphrase in every configuration, recommended and
+skippable.
 
 Guardian shares (Section 13.3) are offline material of the same kind.
 
@@ -1069,16 +1072,70 @@ credential.
 
 The kit holds static keys only (Section 10.6): a recovery signing key
 whose digest (SHA-256 of its SEC1 encoding) is in the log's field 6, and
-an HPKE key. Both derive from a 32-byte kit seed, the only thing printed or
-stored on the token: the signing scalar is
+an HPKE key. Both derive from a 32-byte kit seed, the only secret printed
+or stored on the token: the signing scalar is
 `HKDF(seed, nil, "symbolon v1 kit sign", 48) mod (n - 1) + 1`, the HPKE key
 pair `DeriveKeyPair(HKDF(seed, nil, "symbolon v1 kit hpke", 32))`. The chain
 code and vault recovery key are sealed under `k_K` with AES-256-GCM (nonce
 `HKDF(k_K, nil, "symbolon v1 kit nonce" || epoch, 12)`, aad
-`["symbolon v1 kit secrets", log-id, epoch]`). To recover, a new
-device:
+`["symbolon v1 kit secrets", log-id, epoch]`).
 
-1. reads the kit (printed words, QR, or hardware token) and fetches the
+**The sheet and its passphrase.** What the principal writes down, the
+kit's *sheet*, is either the seed itself (32 bytes, *plain*: every kit
+made before agent 0.14, and kits made without a passphrase) or the seed
+sealed under a passphrase (68 bytes, *protected*):
+
+| Bytes | Field |
+|---|---|
+| 0 | version, 1 |
+| 1 | `log2` of Argon2id's memory in KiB (18: 256 MiB) |
+| 2 | Argon2id passes `t` (3) |
+| 3 | Argon2id lanes `p` (1) |
+| 4..20 | salt, 16 random bytes |
+| 20..68 | AES-256-GCM of the seed (32 bytes and the tag) |
+
+The key and nonce are `Argon2id(passphrase as UTF-8, salt, m, t, p)`, 44
+bytes: the key the first 32, the nonce the last 12 (both new with every
+sheet); the AAD is `"symbolon v1 kit passphrase"` followed by bytes 0..20,
+so a sheet whose parameters or salt were changed does not open. A reader
+accepts parameters from 8 KiB to 1 GiB, 1 to 10 passes and one lane,
+refusing others before any work. The sheet is written as hex (the
+interface shows groups of four; spaces and dashes are ignored) and in a
+`symbolon://recover` link. A plain sheet is 64 hex digits, a protected one
+136, starting `01`.
+
+Without the passphrase a protected sheet is a GCM ciphertext under a key
+nobody holds: it reveals nothing of the seed, and each guess at the
+passphrase costs one Argon2id at the sheet's parameters. A wrong
+passphrase is refused before anything is derived, fetched or signed; the
+refusal is the only answer. A forgotten passphrase makes the kit useless,
+and nothing can reset it: the interface says so, calmly, when it offers
+one. The passphrase guards against a sheet that is found, copied or
+photographed; it does not change who may recover or the delay and veto.
+
+Every kit is offered a passphrase where it is made: at the inception
+(`device init`: after the PIN, the passphrase and the same again on
+standard input, an empty line for none) and for the new kit a recovery
+makes (`device recover`). A kit made plain can be written again under a
+passphrase (`device kit renew`, offered by the interface for a plain kit or
+one made before passphrases): the same seed, sealed; the agent first checks
+it is the quorum's current kit. The old plain sheet still works for
+whoever holds it and must be destroyed. Replacing the kit itself, so that
+every old sheet is dead, is a change of the quorum (a `rotate-recovery`
+event and a re-share to a new kit party) that the reference agent does not
+make yet. Using a kit (`device recover`, `device recover-finish`) reads its
+passphrase only when the sheet is protected.
+
+The parameters are those of Section 6.1, unreduced: a sheet is sealed
+once, when the kit is made, and opened once, at a recovery, so the cost
+falls where it is rare. The reference agent seals or opens one in about
+12 seconds on a 2026 laptop core (about one second per 64 MiB pass) and
+several times that on a phone.
+
+To recover, a new device:
+
+1. reads the kit (printed words, QR, or hardware token; for a protected
+   sheet, with its passphrase) and fetches the
    kit's wrapped current-epoch material from the sync service;
 2. appends `recover(path 1, new parties, revealed kit key)`, signed by the
    kit key, and submits it to the witnesses;
