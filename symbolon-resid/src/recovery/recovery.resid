@@ -319,7 +319,8 @@ pub Bool veto_held_ok(List(Int) l, List(SignedEvent) events, Int r, HeldVeto h) 
 
 
 Result(List(Int), SymbolonError) release_after(SignedEvent e, VerifiedHead v, List(Int) dev, List(Option(WitnessHead)) heads) {
-    Str stale = heads_problem(heads, v.head.policy.witnesses.len(), (Int)v.head.sequence, v.head.digest);
+    // `heads` are those of the distinct witnesses (agent/common.resid witnesses_at, R5-3).
+    Str stale = heads_problem(heads, witnesses_distinct(v.head.policy.witnesses).len(), (Int)v.head.sequence, v.head.digest);
     if (str_len(stale) > 0) { return Err(ErrRecoveryFailed("the witnesses do not confirm the log's head: " + stale)); }
     if (e.payload.sequence > v.head.sequence) { return Err(ErrRecoveryFailed("the recovery is not in the verified log")); }
     if (seq_pending(v.pending, e.payload.sequence, 0)) { return Err(ErrRecoveryFailed("the recovery delay has not run")); }

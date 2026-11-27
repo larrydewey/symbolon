@@ -384,7 +384,12 @@ pub Result(VerifiedHead, SymbolonError) verified_events(List(Int) l, List(Signed
 // port: a box that runs all of them), or "HOST KEY..." (KEY: a witness
 // public key, hex): only the witnesses with those keys, the box's own, are
 // at HOST; the others, outside the box, at their own addresses.
-pub List(WitnessRef) witnesses_at(List(WitnessRef) ws, Str here) {
+//
+// Each witness key once (core/log.resid witnesses_distinct, R5-3): a
+// policy from before the release cutover may name a key at two addresses,
+// and every majority counted over this list is a majority of witnesses.
+pub List(WitnessRef) witnesses_at(List(WitnessRef) ws0, Str here) {
+    List(WitnessRef) ws = witnesses_distinct(ws0);
     List(Str) parts = str_split(str_trim(here), " ");
     if (str_len(str_trim(here)) == 0) { return ws; }
     return witnesses_local(ws, parts[0], lower_keys(parts, 1, ListBuf()), 0, ListBuf());
@@ -408,7 +413,9 @@ Int at_least(Int a, Int b) { return if (a > b) { a } else { b }; }
 // The median of the witnesses' signed times, or 0 when fewer than a
 // majority answer.
 @requires(network, clock(readonly), declassify)
-pub Int witness_now(List(WitnessRef) ws, Str ca, List(Int) nonce) {
+pub Int witness_now(List(WitnessRef) ws0, Str ca, List(Int) nonce) {
+    // Each witness key once (R5-3): a majority of distinct witnesses.
+    List(WitnessRef) ws = witnesses_distinct(ws0);
     List(Int) ts = sort(witness_times_par(ws, ca, nonce));
     if (ts.len() * 2 <= ws.len()) { return 0; }
     return ts[(ts.len() - 1) / 2];
@@ -452,9 +459,13 @@ Option(Int) time_of(List(WitnessRef) ws, Int i, Str ca, List(Int) nonce) {
 
 // host:port of an http(s)://host:port URL; TLS under `ca` when it is set
 // (one trust anchor for the relay and the witnesses, from the config).
+// Read through core/log.resid witness_addr, the address the weakening
+// test compares (R5-5): two spellings that test takes for one witness
+// ("HTTPS://H:P", " h:p") reach the same host and port. A policy names
+// canonical URLs only (witness_url_ok) from the release cutover on; this
+// keeps the two in step for the policies from before it as well.
 pub Option(Endpoint) endpoint_of_url(Str u, Str ca) {
-    Str hp = if (str_len(u) > 8 && str_slice(u, 0, 8) == "https://") { str_slice(u, 8, str_len(u)) } else {
-        if (str_len(u) > 7 && str_slice(u, 0, 7) == "http://") { str_slice(u, 7, str_len(u)) } else { u } };
+    Str hp = witness_addr(u);
     List(Str) parts = str_split(hp, ":");
     return if (parts.len() == 2) { Some(Endpoint {.host = parts[0], .port = str_parse_int(parts[1]), .ca = ca, .token = ""}) } else { None };
 }
@@ -572,7 +583,7 @@ pub Str witness_head_check(VerifiedHead vh, Str ca, Str here) {
 // when no event can get a majority there any more, else "".
 @requires(network, clock(readonly), declassify)
 pub Str freeze_check(List(WitnessEp) ws, Str ca, List(Int) l, UInt(64) seq) {
-    List(WitnessRef) rs = refs_of_eps(ws, 0, []);
+    List(WitnessRef) rs = witnesses_distinct(refs_of_eps(ws, 0, []));
     Str why = freeze_problem(witness_heads(rs, ca, l), rs.len(), (Int)seq);
     return why;
 }

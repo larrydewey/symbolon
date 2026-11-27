@@ -196,6 +196,21 @@ Int witness_keys_distinct(List(WitnessRef) ws, Int i) {
     return (if (has_bytes(rest, ws[i].key, 0)) { 0 } else { 1 }) + witness_keys_distinct(ws, i + 1);
 }
 
+// The policy's witnesses, the first entry under each key (R5-3): what a
+// majority is counted over. A policy witnessed from the release cutover on
+// names each key once (policy_ok); one from before may name a key twice
+// (at two addresses), and that witness is still one witness.
+pub List(WitnessRef) witnesses_distinct(List(WitnessRef) ws) {
+    List(WitnessRef) d = distinct_from(ws, 0, ListBuf(), []);
+    return d;
+}
+
+List(WitnessRef) distinct_from(List(WitnessRef) ws, Int i, ListBuf(WitnessRef) acc, List(List(Int)) seen) {
+    if (i >= ws.len()) { return acc.finish(); }
+    if (has_bytes(seen, ws[i].key, 0)) { return distinct_from(ws, i + 1, acc, seen); }
+    return distinct_from(ws, i + 1, acc.push(ws[i]), seen.concat([ws[i].key]));
+}
+
 List(List(Int)) witness_key_list(List(WitnessRef) ws, Int i, ListBuf(List(Int)) acc) {
     if (i >= ws.len()) { return acc.finish(); }
     return witness_key_list(ws, i + 1, acc.push(ws[i].key));
@@ -240,12 +255,25 @@ pub Int party_key_secs() { return 86400; }
 pub Int delayed_cap() { return 4; }
 
 // SPEC 8.2 and 20.3: policy[1] >= 2 when the quorum holds two devices or more,
-// recovery delay at least 24 hours.
-Bool policy_ok(Policy p, Quorum q) {
+// recovery delay at least 24 hours. `t`: the witness time of the event
+// that names the policy; `old`: the witnesses of the policy it replaces
+// ([] for an inception). From the release cutover (authority_floor_from)
+// on, every witness key appears once (R5-3: a key named twice counted
+// twice towards a majority no event could reach, an immediate freeze) and
+// every witness URL is in its one canonical spelling (witness_url_ok,
+// R5-5: "HTTPS://h:p" or " h:p" was the same witness to the weakening
+// test but one the cosigner and relay could not dial), but for a witness
+// the old policy names with that very URL and key (a log written before
+// the cutover keeps its witnesses as written). Policies witnessed before
+// the cutover keep the old rule, so logs written before the release still
+// verify as they did.
+Bool policy_ok(Policy p, Quorum q, Int t, List(WitnessRef) old) {
     Int floor = if (device_count(q.parties, 0, 0) >= 2) { 2 } else { 1 };
     if ((Int)p.device_sigs_for_authority < floor) { return false; }
     if (p.recovery_delay_sec < 86400) { return false; }
     if (witness_keys_distinct(p.witnesses, 0) < 3) { return false; }
+    if (t >= authority_floor_from() && witness_keys_distinct(p.witnesses, 0) != p.witnesses.len()) { return false; }
+    if (t >= authority_floor_from() && !witnesses_canonical(p.witnesses, old, 0)) { return false; }
     if ((Int)p.guardian_threshold > p.guardians.len()) { return false; }
     // Field 8 (SPEC 20.3): at most one sequencing relay, with a valid key.
     if (p.sequencer.len() > 1) { return false; }
@@ -255,14 +283,30 @@ Bool policy_ok(Policy p, Quorum q) {
 
 // SPEC 8.2: a policy that shortens the delay or thins guardians or
 // witnesses, or drops the sequencing relay (SPEC 20.3: without one, any
-// single key holder can freeze the log again).
+// single key holder can freeze the log again). Witnesses are counted by
+// distinct key (R5-3).
 pub Bool weakens(Policy old, Policy new) {
+    if (weakens_but_witnesses(old, new)) { return true; }
+    if (witness_keys_distinct(new.witnesses, 0) < witness_keys_distinct(old.witnesses, 0)) { return true; }
+    return witnesses_weaken(old.witnesses, new.witnesses);
+}
+
+// weakens as the log reads it for a set-policy witnessed at `t`: before
+// the release cutover, witnesses counted by list entry, as they were.
+Bool weakens_at(Policy old, Policy new, Int t) {
+    if (t >= authority_floor_from()) { return weakens(old, new); }
+    if (weakens_but_witnesses(old, new)) { return true; }
+    if (new.witnesses.len() < old.witnesses.len()) { return true; }
+    if (!pairs_all_in(old.witnesses, new.witnesses, 0)) { return true; }
+    Int added = keys_not_in(witness_key_list(new.witnesses, 0, ListBuf()), witness_key_list(old.witnesses, 0, ListBuf()), 0, []);
+    return new.witnesses.len() / 2 + 1 - added < old.witnesses.len() / 2 + 1;
+}
+
+Bool weakens_but_witnesses(Policy old, Policy new) {
     if (old.sequencer.len() > 0 && new.sequencer.len() == 0) { return true; }
     if (new.recovery_delay_sec < old.recovery_delay_sec) { return true; }
     if (new.guardians.len() < old.guardians.len()) { return true; }
-    if (new.guardian_threshold < old.guardian_threshold) { return true; }
-    if (new.witnesses.len() < old.witnesses.len()) { return true; }
-    return witnesses_weaken(old.witnesses, new.witnesses);
+    return new.guardian_threshold < old.guardian_threshold;
 }
 
 // SPEC 8.2, 20.3: a witness change weakens the policy unless it only adds
@@ -286,7 +330,8 @@ pub Bool witnesses_weaken(List(WitnessRef) old, List(WitnessRef) new) {
     return witnesses_need(new) - added < witnesses_need(old);
 }
 
-Int witnesses_need(List(WitnessRef) ws) { return ws.len() / 2 + 1; }
+// A majority of the witnesses, counted by distinct key (R5-3).
+Int witnesses_need(List(WitnessRef) ws) { return witness_keys_distinct(ws, 0) / 2 + 1; }
 
 // Whether every witness of `xs` is in `ys` with the same key at the same
 // address (witness_addr).
@@ -328,6 +373,51 @@ Int keys_not_in(List(List(Int)) xs, List(List(Int)) ys, Int i, List(List(Int)) s
 // A witness change (`symbolon device witnesses`, SPEC 20.3)
 // ============================================================================
 
+// Whether a witness URL is in its canonical spelling (R5-5): "http://",
+// "https://" or nothing, then HOST:PORT, the host in lower-case letters,
+// digits, '.', '-' and '_', the port a decimal number from 1 to 65535
+// without leading zeros. For such a URL witness_addr (what the weakening
+// test compares) is the URL without its scheme, and the agents' dialer
+// (agent/common.resid endpoint_of_url) reaches exactly that host and port.
+pub Bool witness_url_ok(Str u) {
+    Str hp = if (str_starts_with(u, "https://")) { str_slice(u, 8, str_len(u)) } else {
+        if (str_starts_with(u, "http://")) { str_slice(u, 7, str_len(u)) } else { u } };
+    List(Str) parts = str_split(hp, ":");
+    if (parts.len() != 2) { return false; }
+    Str h = parts[0];
+    Str port = parts[1];
+    if (str_len(h) < 1 || str_len(h) > 253 || !host_chars(h, 0)) { return false; }
+    if (str_len(port) < 1 || str_len(port) > 5 || !port_digits(port, 0) || str_char_at(port, 0) == 48) { return false; }
+    return str_parse_int(port) <= 65535;
+}
+
+Bool host_chars(Str h, Int i) {
+    if (i >= str_len(h)) { return true; }
+    Int c = str_char_at(h, i);
+    Bool ok = (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c == 46 || c == 45 || c == 95;
+    return ok && host_chars(h, i + 1);
+}
+
+Bool port_digits(Str s, Int i) {
+    if (i >= str_len(s)) { return true; }
+    Int c = str_char_at(s, i);
+    return c >= 48 && c <= 57 && port_digits(s, i + 1);
+}
+
+// Every witness of `ws` canonical (witness_url_ok), or named by `old` with
+// the same URL, byte for byte, and key.
+Bool witnesses_canonical(List(WitnessRef) ws, List(WitnessRef) old, Int i) {
+    if (i >= ws.len()) { return true; }
+    Bool ok = witness_url_ok(ws[i].url) || same_ref_in(old, ws[i], 0);
+    return ok && witnesses_canonical(ws, old, i + 1);
+}
+
+Bool same_ref_in(List(WitnessRef) ws, WitnessRef w, Int i) {
+    if (i >= ws.len()) { return false; }
+    if (ws[i].url == w.url && bytes_eq(ws[i].key, w.key)) { return true; }
+    return same_ref_in(ws, w, i + 1);
+}
+
 // A witness's address as HOST:PORT, lower case, without http:// or https://.
 pub Str witness_addr(Str url) {
     Str u = str_to_lower(str_trim(url));
@@ -364,6 +454,7 @@ Str add_problem(List(WitnessRef) have, List(WitnessRef) add, Int i) {
     if (i >= add.len()) { return ""; }
     WitnessRef w = add[i];
     if (!key_ok(w.key)) { return w.url + ": the key is not a P-256 public key"; }
+    if (!witness_url_ok(w.url)) { return w.url + ": not a witness address (HOST:PORT, the host in lower case)"; }
     if (has_bytes(witness_key_list(have, 0, ListBuf()), w.key, 0)) { return w.url + ": a witness with that key is in the policy already"; }
     if (at_addr(have, witness_addr(w.url), 0, 0) > 0) { return w.url + ": a witness at that address is in the policy already"; }
     return add_problem(have.concat([w]), add, i + 1);
@@ -393,7 +484,7 @@ pub Result(Policy, Str) policy_with_witnesses(Policy p0, Quorum q, List(WitnessR
     Policy np = Policy {.device_sigs_for_authority = dsigs, .recovery_delay_sec = p0.recovery_delay_sec, .guardians = p0.guardians,
                         .guardian_threshold = p0.guardian_threshold, .witnesses = ws, .duress_window_sec = p0.duress_window_sec,
                         .sequencer = p0.sequencer, .cosigner_policy = p0.cosigner_policy};
-    if (!policy_ok(np, q)) { return Err("the new policy is not valid (SPEC 8.2, 20.3)"); }
+    if (!policy_ok(np, q, authority_floor_from(), p0.witnesses)) { return Err("the new policy is not valid (SPEC 8.2, 20.3)"); }
     return Ok(np);
 }
 
@@ -556,7 +647,9 @@ pub Result(Int, SymbolonError) witness_time(List(WitnessCosignature) cs, Policy 
         return Err(ErrInvalidLog("more co-signatures than the policy has witnesses"));
     }
     List(Int) ts = cosig_times(cs, pol.witnesses, l, seq, d, 0, [], []);
-    Int need = pol.witnesses.len() / 2 + 1;
+    // A majority of the distinct witness keys (R5-3): cosig_times counts
+    // each key once.
+    Int need = witnesses_need(pol.witnesses);
     if (ts.len() < need) {
         return Err(ErrInvalidLog("fewer than a majority of witnesses co-signed"));
     }
@@ -1008,10 +1101,11 @@ Result(LogState, SymbolonError) do_remove(LogState s, SignedEvent e, List(Int) d
 }
 
 Result(LogState, SymbolonError) do_set_policy(LogState s, SignedEvent e, List(Int) dig, Int dev_sigs, Policy np) {
-    if (!policy_ok(np, s.quorum)) { return refuse("policy below the SPEC 8.2 floor"); }
+    // s.last_time is this event's witness time here (step_at: with_time).
+    if (!policy_ok(np, s.quorum, s.last_time, s.policy.witnesses)) { return refuse("policy below the SPEC 8.2 floor, or its witnesses named twice or misspelt (SPEC 20.3)"); }
     if (witnesses_odd(s.policy.witnesses) && !witnesses_odd(np.witnesses)) { return refuse("set-policy to an even number of witnesses (SPEC 20.3)"); }
     if (dev_sigs == 0 && kit_signed(s, e)) { return kit_escape(s, e, dig, np); }
-    return authority(s, e, dig, weakens(s.policy, np), dev_sigs);
+    return authority(s, e, dig, weakens_at(s.policy, np, s.last_time), dev_sigs);
 }
 
 // The kit's escape from its relay (SPEC 20.3): a set-policy signed by the
@@ -1384,9 +1478,10 @@ Result(LogState, SymbolonError) start_at(SignedEvent e0, List(Int) l, Bool pre, 
 
 Result(LogState, SymbolonError) start_inception(SignedEvent e0, List(Int) l, List(Int) dig, Quorum q, Policy pol, Bool pre, Int now) {
     EventPayload ep = e0.payload;
-    if (!quorum_ok(q) || !policy_ok(pol, q)) { return refuse("E0 quorum or policy"); }
+    if (!quorum_ok(q) || !policy_ok(pol, q, 0, [])) { return refuse("E0 quorum or policy"); }
     Result(Int, SymbolonError) wt = if (pre) { Ok(now) } else { witness_time(e0.cosigs, pol, l, 0, dig) };
     Int t = wt?;
+    if (!policy_ok(pol, q, t, [])) { return refuse("E0 policy: from the release cutover on, each witness key once, each URL canonical (SPEC 20.3)"); }
     // E0 is signed by every party of its own quorum.
     if (e0.sigs.len() > q.parties.len() + 1) { return refuse("more signatures than parties that could sign"); }
     List(List(Int)) signers = valid_signers(e0.sigs, q.parties, false, e0.encoded, 0, []);
@@ -1468,7 +1563,7 @@ pub Result(NextOk, SymbolonError) il_next_from(List(Int) l, LogState s1, SignedE
     Int t = if (now > s1.last_time) { now } else { s1.last_time };
     LogState s2 = step_at(s1, e, l, t, approvals_ok)?;
     LogState st = settle(s1, t);
-    return Ok(NextOk {.time = t, .sequencer = s1.policy.sequencer, .witnesses = s1.policy.witnesses, .claimless = il_claimless(st, e)});
+    return Ok(NextOk {.time = t, .sequencer = s1.policy.sequencer, .witnesses = witnesses_distinct(s1.policy.witnesses), .claimless = il_claimless(st, e)});
 }
 
 // ============================================================================
@@ -1597,7 +1692,7 @@ pub List(WitnessRef) il_witnesses(List(Int) l, List(SignedEvent) before) {
     if (before.len() == 0) { return []; }
     return match start(before[0], l) {
         Err(_) => [],
-        Ok(a) => match run(a, before, l, lambda(x) { false }, 1) { Err(_) => [], Ok(s1) => s1.policy.witnesses }
+        Ok(a) => match run(a, before, l, lambda(x) { false }, 1) { Err(_) => [], Ok(s1) => witnesses_distinct(s1.policy.witnesses) }
     };
 }
 

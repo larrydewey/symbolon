@@ -476,3 +476,21 @@ test "the code is spent by exactly one of two racing claims" {
     expect(spend(d, "AAAAAAAAAAAAAAAAAAAAAA", "setup", "y")).toBeFalse();
     expect(filesystem.read_all(d + "/invites/AAAAAAAAAAAAAAAAAAAAAA.setup")).toEqual("x");
 }
+
+Str ep_text(Option(Endpoint) oe) { return match oe { None => "none", Some(e) => e.host + f":{e.port}" }; }
+
+test "R5-5: a witness URL is dialled at the address the weakening test compares" {
+    expect(ep_text(endpoint_of_url("https://w1.example:443", ""))).toEqual("w1.example:443");
+    expect(ep_text(endpoint_of_url("HTTPS://W1.example:443", ""))).toEqual("w1.example:443");
+    expect(ep_text(endpoint_of_url(" http://w1:7 ", ""))).toEqual("w1:7");
+    expect(ep_text(endpoint_of_url("w1:7", ""))).toEqual("w1:7");
+}
+
+test "R5-3: a witness key named twice is asked and counted once" {
+    List(WitnessRef) ws = [wref("a.lan:1", 40), wref("b.lan:1", 40), wref("c.lan:1", 43), wref("d.lan:1", 44)];
+    List(WitnessRef) at = witnesses_at(ws, "");
+    expect(at.len()).toEqual(3);
+    expect(at[0].url).toEqual("a.lan:1");
+    expect(at[1].url).toEqual("c.lan:1");
+    expect(witnesses_at(ws, "127.0.0.1").len()).toEqual(3);
+}

@@ -1501,3 +1501,95 @@ test "R5-2: a kept state extended event by event reaches the whole log's state a
     expect(next_ok(il_check_next(l, es, nx, now_after(86500), lambda(x) { false }))).toBeTrue();
     expect(match through_bytes(il_state(l, es)) { Ok(s) => match il_next_from(l, s, nx, now_after(86500), lambda(x) { false }) { Ok(_) => true, Err(_) => false }, Err(_) => false }).toBeTrue();
 }
+
+// ─── R5-3: a witness key named twice ───
+
+Policy with_ws(List(WitnessRef) ws) {
+    return Policy {.device_sigs_for_authority = 2, .recovery_delay_sec = 86400, .guardians = [], .guardian_threshold = 0,
+                   .witnesses = ws, .duress_window_sec = 3600, .sequencer = [], .cosigner_policy = NoCosignerPolicy};
+}
+
+List(WitnessRef) dup_ws() { return policy(86400).witnesses.concat([wref("w1b:1", 7), wref("w1c:1", 7), wref("w2b:1", 8), wref("w2c:1", 8)]); }
+
+test "R5-3: a set-policy naming a witness key twice is refused from the cutover on" {
+    List(Int) l = log_id();
+    SignedEvent sp = next(1, 1, enc(0), SetPolicyBody(with_ws(dup_ws())), [2, 3], after(0));
+    expect(ok(il_verify(l, [e0([2, 3]), sp], now_after(0), lambda(x) { false }))).toBeFalse();
+    // The same witnesses each named once: accepted.
+    SignedEvent sp1 = next(1, 1, enc(0), SetPolicyBody(with_ws(policy(86400).witnesses)), [2, 3], after(0));
+    expect(ok(il_verify(l, [e0([2, 3]), sp1], now_after(0), lambda(x) { false }))).toBeTrue();
+}
+
+test "R5-3: a log that named a key twice before the cutover still verifies, and a majority of distinct witnesses carries it" {
+    List(Int) l = log_id();
+    SignedEvent sp = next(1, 1, enc(0), SetPolicyBody(with_ws(dup_ws())), [2, 3], 2000);
+    expect(pending_n(il_verify(l, [e0([2, 3]), sp], 2000, lambda(x) { false }))).toEqual(0);
+    // Two of the three distinct witnesses co-sign the next event: a majority (was: four of seven entries, never reached).
+    SignedEvent nx = next(2, 2, enc(1), RotateRecoveryBody, [2, 3], 3000);
+    expect(ok(il_verify(l, [e0([2, 3]), sp, nx], 3000, lambda(x) { false }))).toBeTrue();
+    // What the next event needs, as the agents read it: each witness once.
+    expect(il_witnesses(l, [e0([2, 3]), sp]).len()).toEqual(3);
+}
+
+test "R5-3: dropping a second spelling of a witness is not a weakening; its distinct keys are counted" {
+    List(WitnessRef) old = [wref("w1:1", 7), wref("W1:1", 7), wref("w2:1", 8), wref("w3:1", 11)];
+    List(WitnessRef) neu = [wref("w1:1", 7), wref("w2:1", 8), wref("w3:1", 11)];
+    expect(weakens(with_ws(old), with_ws(neu))).toBeFalse();
+    // Dropping a witness still is.
+    expect(weakens(with_ws(neu), with_ws([wref("w1:1", 7), wref("w2:1", 8), wref("w2b:1", 8)]))).toBeTrue();
+}
+
+// ─── R5-5: one spelling of a witness URL ───
+
+test "R5-5: a set-policy respelling the witnesses' URLs is refused from the cutover on; the old spellings stay" {
+    List(Int) l = log_id();
+    List(WitnessRef) respelt = [wref(" w1", 7), wref("W2", 8), wref("HTTPS://w3", 11)];
+    SignedEvent sp = next(1, 1, enc(0), SetPolicyBody(with_ws(respelt)), [2, 3], after(0));
+    expect(ok(il_verify(l, [e0([2, 3]), sp], now_after(0), lambda(x) { false }))).toBeFalse();
+    // Before the cutover it is accepted as it was (and not a weakening).
+    SignedEvent sp0 = next(1, 1, enc(0), SetPolicyBody(with_ws(respelt)), [2, 3], 2000);
+    expect(pending_n(il_verify(l, [e0([2, 3]), sp0], 2000, lambda(x) { false }))).toEqual(0);
+    // The log's own witnesses as written ("w1", no port) may stay in a later policy.
+    SignedEvent keep = next(1, 1, enc(0), SetPolicyBody(policy(172800)), [2, 3], after(0));
+    expect(delay_of(il_verify(l, [e0([2, 3]), keep], now_after(0), lambda(x) { false }))).toEqual(172800);
+}
+
+SignedEvent e0_ws(List(WitnessRef) ws) {
+    SignedEvent base = e0([2, 3]);
+    EventPayload p = base.payload;
+    EventPayload op = EventPayload {
+        .log_id = p.log_id, .sequence = 0, .predecessor_digest = None, .suite = 1, .body = InceptionBody(quorum2(), with_ws(ws)),
+        .next_recovery_key_digests = p.next_recovery_key_digests, .advisory_time = 0 };
+    return SignedEvent {.payload = op, .encoded = base.encoded, .sigs = base.sigs, .cosigs = []};
+}
+
+test "R5-3, R5-5: an inception from the cutover on names each witness once, in canonical spelling" {
+    List(Int) l = log_id();
+    List(WitnessRef) canon = [wref("http://w1.example:443", 7), wref("https://w2.example:8443", 8), wref("w3:1", 11)];
+    expect(next_ok(il_check_next(l, [], e0_ws(canon), now_after(0), lambda(x) { false }))).toBeTrue();
+    expect(next_ok(il_check_next(l, [], e0_ws([wref("HTTP://W1.example:443", 7), canon[1], canon[2]]), now_after(0), lambda(x) { false }))).toBeFalse();
+    expect(next_ok(il_check_next(l, [], e0_ws(canon.concat([wref("w4:1", 7), wref("w5:1", 8)])), now_after(0), lambda(x) { false }))).toBeFalse();
+    // Before the cutover, as before.
+    expect(next_ok(il_check_next(l, [], e0_ws([wref("HTTP://W1.example:443", 7), canon[1], canon[2]]), 1000, lambda(x) { false }))).toBeTrue();
+}
+
+test "R5-5: witness_url_ok takes one spelling of HOST:PORT" {
+    expect(witness_url_ok("http://w1.example:443")).toBeTrue();
+    expect(witness_url_ok("https://10.0.0.7:47102")).toBeTrue();
+    expect(witness_url_ok("w_1-a.lan:1")).toBeTrue();
+    expect(witness_url_ok("HTTPS://w1:1")).toBeFalse();
+    expect(witness_url_ok(" https://w1:1")).toBeFalse();
+    expect(witness_url_ok("https://w1:1 ")).toBeFalse();
+    expect(witness_url_ok("https://W1:1")).toBeFalse();
+    expect(witness_url_ok("w1")).toBeFalse();
+    expect(witness_url_ok("w1:0")).toBeFalse();
+    expect(witness_url_ok("w1:01")).toBeFalse();
+    expect(witness_url_ok("w1:65536")).toBeFalse();
+    expect(witness_url_ok("w1:+1")).toBeFalse();
+    expect(witness_url_ok(":1")).toBeFalse();
+    expect(witness_url_ok("w1:1:2")).toBeFalse();
+    expect(witness_url_ok("user@w1:1")).toBeFalse();
+    // What the weakening test compares is what the agents dial.
+    expect(witness_addr("https://w1.example:443")).toEqual("w1.example:443");
+    expect(witnesses_distinct(dup_ws()).len()).toEqual(3);
+}

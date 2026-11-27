@@ -533,7 +533,8 @@ recover-body = [
   that holds one: agents, relays, witnesses and cosigners are upgraded
   together, as for every earlier change to the log's format.
 - A `set-policy` that weakens recovery protection (shorter delay, fewer
-  guardians, lower guardian threshold, fewer witnesses, or no sequencing
+  guardians, lower guardian threshold, fewer witnesses, counted by
+  distinct key from the release cutover on (R5-3), or no sequencing
   relay where there was one) is always delayed. A change of witnesses
   weakens it unless it only adds witnesses, and few enough that every
   majority of the new set holds a majority of the old one (with `n` old
@@ -604,7 +605,10 @@ failure is a refusal; the verifier never repairs a log.
 Delays are measured from an event's **witness time**: the median of the
 times in the co-signatures of the policy's witnesses, which MUST number at
 least a majority of them. Field 7 is advisory and never used for a delay
-(A-07).
+(A-07). Witnesses are counted by distinct key: a policy witnessed before
+the release cutover may name one key twice (Section 20.3), and that key is
+one witness, both towards the majority and in the count it is a majority
+of (R5-3).
 
 Signatures and co-signatures are not covered by an event's digest, so
 anyone can add entries to a stored event. A verifier therefore refuses an
@@ -2795,6 +2799,24 @@ majority of the policy's witnesses on `recover`, delayed and `reshare`
 events and on heads they release material against, and SHOULD require
 them on all heads. A policy MUST name at least three witnesses run by
 independent operators.
+
+From the release cutover of Section 8.2 (events whose witness time is at
+or after 2026-12-01T00:00:00Z), a policy, in an inception or a
+`set-policy`, MUST name each witness key once (R5-3: a key named twice
+counted twice in the majority, so a non-weakening `set-policy` that
+repeated two keys made a majority no event could reach and froze the log
+at once), and MUST spell each witness URL canonically (R5-5):
+`http://`, `https://` or nothing, then `HOST:PORT` with the host in
+lower-case letters, digits, `.`, `-` and `_`, and the port a decimal number
+from 1 to 65535 without leading zeros. A witness the replaced policy names
+with the very same URL and key may keep its spelling, so a log written
+before the cutover keeps its witnesses as written. (The weakening test
+compares addresses case-insensitively and without the scheme, while the
+cosigner and the relay dialled the URL as written: `HTTPS://h:p` or ` h:p`
+was the same witness to the first and unreachable to the others, so a
+non-weakening `set-policy` cut them off every witness.) Agents read every
+witness URL through that same normalization, and count and ask each
+witness key once. Policies witnessed before the cutover verify as before.
 
 **The relay as sequencer (R2W-2).** A policy names at most one relay
 that sequences the log (field 8: its name and claim key). Before a device

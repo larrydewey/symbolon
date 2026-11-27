@@ -541,6 +541,10 @@ pub Int device_init(Str dir, InitArgs a) {
     Option(PartyKeys) ok = keys_of_cbor(cose_hex_decode(a.cosigner_keys));
     if (a.witnesses.len() < 3) { return dfail("three witnesses at least (SPEC 20.3)"); }
     if (a.witnesses.len() % 2 == 0) { return dfail("an odd number of witnesses (SPEC 20.3: with an even number a split vote can freeze the log)"); }
+    List(WitnessRef) wrefs = witness_refs(a.witnesses, 0, []);
+    if (witnesses_distinct(wrefs).len() != wrefs.len()) { return dfail("two witnesses with the same key (SPEC 20.3)"); }
+    Str badw = bad_witness_url(wrefs, 0);
+    if (str_len(badw) > 0) { return dfail(badw + ": not a witness address (HOST:PORT, the port from 1 to 65535)"); }
     Str pin = read_pin();
     NewKitPass kp = read_new_kit_pass();
     if (!kp.ok) { return dfail(kit_pass_mismatch()); }
@@ -607,9 +611,17 @@ Party party_from(PartyKeys k, UInt(8) kind, Str label) {
     return Party {.id = k.party, .kind = kind, .auth_key = k.auth_key, .hpke_key = k.hpke_key, .label = label, .attestation = NoAttestation};
 }
 
+// The first witness URL that is not canonical (core/log.resid witness_url_ok), or "".
+Str bad_witness_url(List(WitnessRef) ws, Int i) {
+    if (i >= ws.len()) { return ""; }
+    if (!witness_url_ok(ws[i].url)) { return ws[i].url; }
+    return bad_witness_url(ws, i + 1);
+}
+
 List(WitnessRef) witness_refs(List(WitnessEp) ws, Int i, List(WitnessRef) acc) {
     if (i >= ws.len()) { return acc; }
-    return witness_refs(ws, i + 1, acc.concat([WitnessRef {.url = "http://" + ws[i].host + ":" + f"{ws[i].port}", .key = ws[i].key}]));
+    // The host in lower case: a policy names canonical witness URLs only (core/log.resid witness_url_ok).
+    return witness_refs(ws, i + 1, acc.concat([WitnessRef {.url = "http://" + str_to_lower(ws[i].host) + ":" + f"{ws[i].port}", .key = ws[i].key}]));
 }
 
 @requires(filesystem, network, device, declassify, clock, environment)

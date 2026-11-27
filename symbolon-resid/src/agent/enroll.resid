@@ -938,12 +938,20 @@ pub Remote cos_remote(VerifiedHead vh) {
     return Remote {.party = cos.id, .cg = 0, .hpke_pub = cos.hpke_key};
 }
 
-// Witness endpoints from the policy's URLs (http://host:port).
+// Witness endpoints from the policy's URLs (http://host:port), each
+// witness key once (R5-3: a policy from before the release cutover may
+// name a key at two addresses; a majority is one of distinct witnesses).
 pub List(WitnessEp) eps_of(List(WitnessRef) ws, Int i, List(WitnessEp) acc) {
     if (i >= ws.len()) { return acc; }
+    if (ep_key_in(acc, ws[i].key, 0)) { return eps_of(ws, i + 1, acc); }
     Str u = ws[i].url;
     Str hp = witness_addr(u);
     List(Str) parts = str_split(hp, ":");
     List(WitnessEp) next = if (parts.len() == 2) { acc.concat([WitnessEp {.host = parts[0], .port = str_parse_int(parts[1]), .key = ws[i].key}]) } else { acc };
     return eps_of(ws, i + 1, next);
+}
+
+Bool ep_key_in(List(WitnessEp) eps, List(Int) k, Int i) {
+    if (i >= eps.len()) { return false; }
+    return bytes_eq(eps[i].key, k) || ep_key_in(eps, k, i + 1);
 }
