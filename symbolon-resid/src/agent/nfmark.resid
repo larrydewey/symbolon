@@ -1,0 +1,154 @@
+// The nonce-fix marker (SPEC 6.2.2): which epoch of this household's
+// quorum a build with the Paillier nonce fix (SPEC 6.2.1) made first.
+//
+// Before the fix a party could send a Paillier ciphertext with the nonce 1
+// to the counterparty in a signature or re-share; the moduli of an epoch
+// stay until the next re-share. A quorum epoch made by a fixed build (its
+// inception, or a re-share: every party of the session ran session
+// protocol 2 or later, or the session ended) has fresh moduli and shares,
+// so the household's one automatic re-share after the upgrade
+// (migrate.resid) is done once this device holds a valid marker.
+//
+// DIR/nonce-fix, one line:
+//   nonce-fix v1 LOG EPOCH TRANSCRIPT SIGNER SIG
+// (hex; TRANSCRIPT "-" when empty). SIG is the signer's device key (DK)
+// over fix_mark_tbs. A marker counts only when, against the verified log:
+//   - the signature verifies under the key of this device (its own
+//     marker), or of the inception's device for an inception marker (one
+//     the enrolling device handed on, so that a device that joins a
+//     household made after the fix knows it);
+//   - the log holds the event that made that epoch with that transcript
+//     (the inception, or a reshare event), at or before the quorum in force.
+// Someone with the disk but not the device's PIN cannot sign one (the DK
+// is in the TPM or Keystore, or under the DEK), and cannot point one at an
+// epoch the device did not mark; removing the file only makes the device
+// re-share again. The first valid marker is kept: its epoch separates the
+// re-shares before the fix (the rotation advice) from those after.
+
+import "../types.resid";
+import "../core/log.resid";
+import "../vault/vault.resid";
+import "ecdsa.resid";
+import "crypto.resid";
+import "cose.resid";
+
+pub type FixMark = { List(Int) log_id; Int epoch; List(Int) transcript; List(Int) signer; List(Int) sig; };
+
+pub FixMark no_mark() { return FixMark {.log_id = [], .epoch = -1, .transcript = [], .signer = [], .sig = []}; }
+
+pub Str fix_mark_file(Str dir) { return dir + "/nonce-fix"; }
+
+// What the DK signs: a domain string no other DK signature starts with
+// (log events are CBOR maps, cosign requests CBOR arrays), then the
+// length-prefixed fields.
+pub List(Int) fix_mark_tbs(List(Int) log_id, Int epoch, List(Int) transcript, List(Int) signer) {
+    return utf8("symbolon v1 nonce-fix marker").concat([0]).concat(lp(log_id)).concat([(epoch >> 24) & 255, (epoch >> 16) & 255, (epoch >> 8) & 255, epoch & 255])
+        .concat(lp(transcript)).concat(lp(signer));
+}
+
+List(Int) lp(List(Int) b) { return [(b.len() >> 8) & 255, b.len() & 255].concat(b); }
+
+Str hex_or_dash(List(Int) b) { return if (b.len() == 0) { "-" } else { hex_encode(b) }; }
+
+List(Int) dash_or_hex(Str s) { return if (s == "-") { [] } else { cose_hex_decode(s) }; }
+
+pub Str fix_mark_line(FixMark m) {
+    return "nonce-fix v1 " + hex_encode(m.log_id) + f" {m.epoch} " + hex_or_dash(m.transcript) + " " + hex_encode(m.signer) + " " + hex_encode(m.sig) + "\n";
+}
+
+pub FixMark fix_mark_parse(Str s) {
+    List(Str) f = str_split(str_trim(s), " ");
+    if (f.len() != 7 || f[0] != "nonce-fix" || f[1] != "v1") { return no_mark(); }
+    FixMark m = FixMark {.log_id = cose_hex_decode(f[2]), .epoch = str_parse_int(f[3]), .transcript = dash_or_hex(f[4]), .signer = cose_hex_decode(f[5]), .sig = cose_hex_decode(f[6])};
+    if (m.log_id.len() == 0 || m.signer.len() == 0 || m.sig.len() != 64 || m.epoch < 0) { return no_mark(); }
+    return m;
+}
+
+// The marker as bytes, as one device hands it to another (printable
+// ASCII only; anything else reads as no marker).
+pub List(Int) fix_mark_bytes(FixMark m) { return if (m.sig.len() == 64) { utf8(fix_mark_line(m)) } else { [] }; }
+
+pub FixMark fix_mark_of_bytes(List(Int) b) {
+    if (b.len() == 0 || b.len() > 1024) { return no_mark(); }
+    if (!printable(b, 0)) { return no_mark(); }
+    Str s = ascii_of(b, 0, StrBuf());
+    return fix_mark_parse(s);
+}
+
+Bool printable(List(Int) b, Int i) { return i >= b.len() || (((b[i] >= 32 && b[i] <= 126) || b[i] == 10) && printable(b, i + 1)); }
+
+Str ascii_of(List(Int) b, Int i, StrBuf acc) {
+    if (i >= b.len()) { return acc.finish(); }
+    return ascii_of(b, i + 1, acc.push(str_from_code(b[i])));
+}
+
+@requires(filesystem)
+pub FixMark fix_mark_read(Str dir) {
+    if (!filesystem.exists(fix_mark_file(dir))) { return no_mark(); }
+    FixMark m = fix_mark_parse(filesystem.read_all(fix_mark_file(dir)));
+    return m;
+}
+
+@requires(filesystem)
+pub Bool fix_mark_write(Str dir, FixMark m) { return filesystem.write_all(fix_mark_file(dir), fix_mark_line(m)); }
+
+// Whether a marker file is there at all (the reminder reads no log).
+@requires(filesystem)
+pub Bool fix_mark_present(Str dir) { return fix_mark_read(dir).sig.len() == 64; }
+
+// A marker held against the verified log `es` whose quorum in force is
+// `q`: `ok` when it counts, its epoch, and whether that epoch is the
+// inception's (the household was made by a fixed build).
+pub type FixState = { Bool ok; Int epoch; Bool born; };
+
+pub FixState fix_none() { return FixState {.ok = false, .epoch = -1, .born = false}; }
+
+pub FixState fix_mark_check(FixMark m, List(Int) log_id, List(Int) me, Quorum q, List(SignedEvent) es) {
+    if (m.sig.len() != 64 || es.len() == 0 || !bytes_eq(m.log_id, log_id) || m.epoch < 0 || m.epoch > (Int)q.epoch) { return fix_none(); }
+    Bool born = inception_is(es[0], m.epoch, m.transcript);
+    List(Int) key = if (bytes_eq(m.signer, me)) { device_key(q.parties, me, 0) } else { if (born) { inception_device_key(es[0], m.signer) } else { [] } };
+    if (key.len() == 0 || !ecdsa_verify_raw(P256, Sha256, key, fix_mark_tbs(m.log_id, m.epoch, m.transcript, m.signer), m.sig)) { return fix_none(); }
+    if (!born && !made_by_reshare(es, m.epoch, m.transcript, 0)) { return fix_none(); }
+    return FixState {.ok = true, .epoch = m.epoch, .born = born};
+}
+
+Bool inception_is(SignedEvent e0, Int epoch, List(Int) transcript) {
+    EventBody b = e0.payload.body;
+    return match b { InceptionBody(q0, _) => (Int)q0.epoch == epoch && bytes_eq(q0.transcript_digest, transcript), _ => false };
+}
+
+List(Int) inception_device_key(SignedEvent e0, List(Int) id) {
+    EventBody b = e0.payload.body;
+    return match b { InceptionBody(q0, _) => device_key(q0.parties, id, 0), _ => [] };
+}
+
+List(Int) device_key(List(Party) ps, List(Int) id, Int i) {
+    if (i >= ps.len()) { return []; }
+    if (bytes_eq(ps[i].id, id) && ps[i].kind == party_kind_device()) { return ps[i].auth_key; }
+    return device_key(ps, id, i + 1);
+}
+
+Bool made_by_reshare(List(SignedEvent) es, Int epoch, List(Int) transcript, Int i) {
+    if (i >= es.len()) { return false; }
+    EventBody b = es[i].payload.body;
+    Bool hit = match b { ReshareBody(nq) => (Int)nq.epoch == epoch && bytes_eq(nq.transcript_digest, transcript), _ => false };
+    return hit || made_by_reshare(es, epoch, transcript, i + 1);
+}
+
+// What the verified log says for the rotation advice (migrate.resid): the
+// re-shares before the first fixed epoch (all of them without a valid
+// marker), and the events that may mean a device is in other hands: a
+// recover (the kit or guardians took over), or a party removed (the log
+// keeps no reason, so every removal counts).
+pub type FixFacts = { Int prefix_reshares; Int recovers; Int removals; };
+
+pub FixFacts fix_facts(List(SignedEvent) es, FixState st) { return facts_from(es, st, 0, FixFacts {.prefix_reshares = 0, .recovers = 0, .removals = 0}); }
+
+FixFacts facts_from(List(SignedEvent) es, FixState st, Int i, FixFacts acc) {
+    if (i >= es.len()) { return acc; }
+    EventBody b = es[i].payload.body;
+    Int rs = match b { ReshareBody(nq) => if (!st.ok || (Int)nq.epoch < st.epoch) { 1 } else { 0 }, _ => 0 };
+    Int rc = match b { RecoverBody(_) => 1, _ => 0 };
+    Int rm = match b { RemovePartyBody(_) => 1, _ => 0 };
+    return facts_from(es, st, i + 1, FixFacts {.prefix_reshares = acc.prefix_reshares + rs, .recovers = acc.recovers + rc, .removals = acc.removals + rm});
+}

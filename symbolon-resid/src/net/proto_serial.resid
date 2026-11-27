@@ -308,48 +308,52 @@ Result(Parsed(ReshareInvite, F), SerialError) derive_reshare_invite_done(F s, Op
 }
 Decode(ReshareInvite, F) = derive_reshare_invite_decode;
 
-// ── EnrollSecrets (line 67)
+// ── EnrollSecrets (line 70)
 /// The serialized field names of `EnrollSecrets`, in declaration order.
-pub List(Str) derive_enroll_secrets_names() { return ["cc", "vault_key"]; }
+pub List(Str) derive_enroll_secrets_names() { return ["cc", "vault_key", "fix_mark"]; }
 /// Encodes a `EnrollSecrets` through the encoder `s`.
 @needs(Encoder(F))
 pub Result(F, SerialError) derive_enroll_secrets_encode(EnrollSecrets v, F s) {
-    Int n = 2;
+    Int n = 3;
     F s0 = write_struct_begin(s, "EnrollSecrets", n)?;
     F s1 = write_named(s0, "cc", v.cc)?;
     F s2 = write_named(s1, "vault_key", v.vault_key)?;
-    return write_struct_end(s2);
+    F s3 = write_named(s2, "fix_mark", v.fix_mark)?;
+    return write_struct_end(s3);
 }
 Encode(EnrollSecrets, F) = derive_enroll_secrets_encode;
 /// Decodes a `EnrollSecrets` from the decoder `s`, with the input left over.
 @needs(Decoder(F))
 pub Result(Parsed(EnrollSecrets, F), SerialError) derive_enroll_secrets_decode(F s) {
     F s0 = read_struct_begin(s, "EnrollSecrets", derive_enroll_secrets_names())?;
-    return derive_enroll_secrets_fields(s0, None, None);
+    return derive_enroll_secrets_fields(s0, None, None, None);
 }
 @needs(Decoder(F))
-Result(Parsed(EnrollSecrets, F), SerialError) derive_enroll_secrets_fields(F s, Option(List(Int)) f_cc, Option(List(Int)) f_vault_key) {
+Result(Parsed(EnrollSecrets, F), SerialError) derive_enroll_secrets_fields(F s, Option(List(Int)) f_cc, Option(List(Int)) f_vault_key, Option(List(Int)) f_fix_mark) {
     Parsed(FieldKey, F) k = read_field(s, derive_enroll_secrets_names())?;
     FieldKey key = k.value;
     return match key {
-        KnownField(i) => derive_enroll_secrets_field(k.rest, i, f_cc, f_vault_key),
-        UnknownField(name) => derive_enroll_secrets_fields(skip_unknown(k.rest, name, derive_enroll_secrets_names(), false)?, f_cc, f_vault_key),
-        EndOfFields => derive_enroll_secrets_done(k.rest, f_cc, f_vault_key)
+        KnownField(i) => derive_enroll_secrets_field(k.rest, i, f_cc, f_vault_key, f_fix_mark),
+        UnknownField(name) => derive_enroll_secrets_fields(skip_unknown(k.rest, name, derive_enroll_secrets_names(), false)?, f_cc, f_vault_key, f_fix_mark),
+        EndOfFields => derive_enroll_secrets_done(k.rest, f_cc, f_vault_key, f_fix_mark)
     };
 }
 @needs(Decoder(F))
-Result(Parsed(EnrollSecrets, F), SerialError) derive_enroll_secrets_field(F s, Int i, Option(List(Int)) f_cc, Option(List(Int)) f_vault_key) {
-    if (i == 0) { Parsed(Option(List(Int)), F) p = read_slot(s, f_cc, "cc")?; return derive_enroll_secrets_fields(p.rest, p.value, f_vault_key); }
-    Parsed(Option(List(Int)), F) p = read_slot(s, f_vault_key, "vault_key")?; return derive_enroll_secrets_fields(p.rest, f_cc, p.value);
+Result(Parsed(EnrollSecrets, F), SerialError) derive_enroll_secrets_field(F s, Int i, Option(List(Int)) f_cc, Option(List(Int)) f_vault_key, Option(List(Int)) f_fix_mark) {
+    if (i == 0) { Parsed(Option(List(Int)), F) p = read_slot(s, f_cc, "cc")?; return derive_enroll_secrets_fields(p.rest, p.value, f_vault_key, f_fix_mark); }
+    if (i == 1) { Parsed(Option(List(Int)), F) p = read_slot(s, f_vault_key, "vault_key")?; return derive_enroll_secrets_fields(p.rest, f_cc, p.value, f_fix_mark); }
+    Parsed(Option(List(Int)), F) p = read_slot(s, f_fix_mark, "fix_mark")?; return derive_enroll_secrets_fields(p.rest, f_cc, f_vault_key, p.value);
 }
-Result(Parsed(EnrollSecrets, F), SerialError) derive_enroll_secrets_done(F s, Option(List(Int)) f_cc, Option(List(Int)) f_vault_key) {
+Result(Parsed(EnrollSecrets, F), SerialError) derive_enroll_secrets_done(F s, Option(List(Int)) f_cc, Option(List(Int)) f_vault_key, Option(List(Int)) f_fix_mark) {
     List(Int) d_cc = require(f_cc, "cc")?;
     List(Int) d_vault_key = require(f_vault_key, "vault_key")?;
-    return parsed(EnrollSecrets {.cc = d_cc, .vault_key = d_vault_key}, s);
+    List(Int) d_fix_mark_absent = [];
+    List(Int) d_fix_mark = or_default(f_fix_mark, d_fix_mark_absent);
+    return parsed(EnrollSecrets {.cc = d_cc, .vault_key = d_vault_key, .fix_mark = d_fix_mark}, s);
 }
 Decode(EnrollSecrets, F) = derive_enroll_secrets_decode;
 
-// ── KvDealMsg (line 74)
+// ── KvDealMsg (line 79)
 /// The serialized field names of `KvDealMsg`, in declaration order.
 pub List(Str) derive_kv_deal_msg_names() { return ["session_id", "dealer", "commits", "part"]; }
 /// Encodes a `KvDealMsg` through the encoder `s`.
@@ -396,7 +400,7 @@ Result(Parsed(KvDealMsg, F), SerialError) derive_kv_deal_msg_done(F s, Option(Li
 }
 Decode(KvDealMsg, F) = derive_kv_deal_msg_decode;
 
-// ── EvalRequest (line 82)
+// ── EvalRequest (line 87)
 /// The serialized field names of `EvalRequest`, in declaration order.
 pub List(Str) derive_eval_request_names() { return ["session_id", "log_id", "epoch", "purpose", "blinded", "event_seq", "requester", "sig"]; }
 /// Encodes a `EvalRequest` through the encoder `s`.
@@ -455,7 +459,7 @@ Result(Parsed(EvalRequest, F), SerialError) derive_eval_request_done(F s, Option
 }
 Decode(EvalRequest, F) = derive_eval_request_decode;
 
-// ── EvalAnswer (line 87)
+// ── EvalAnswer (line 92)
 /// The serialized field names of `EvalAnswer`, in declaration order.
 pub List(Str) derive_eval_answer_names() { return ["session_id", "elements", "proof"]; }
 /// Encodes a `EvalAnswer` through the encoder `s`.
@@ -499,7 +503,7 @@ Result(Parsed(EvalAnswer, F), SerialError) derive_eval_answer_done(F s, Option(L
 }
 Decode(EvalAnswer, F) = derive_eval_answer_decode;
 
-// ── EvalLogRequest (line 94)
+// ── EvalLogRequest (line 99)
 /// The serialized field names of `EvalLogRequest`, in declaration order.
 pub List(Str) derive_eval_log_request_names() { return ["session_id", "log_id", "epoch", "requester", "sig"]; }
 /// Encodes a `EvalLogRequest` through the encoder `s`.
@@ -549,7 +553,7 @@ Result(Parsed(EvalLogRequest, F), SerialError) derive_eval_log_request_done(F s,
 }
 Decode(EvalLogRequest, F) = derive_eval_log_request_decode;
 
-// ── EvalLogEntry (line 97)
+// ── EvalLogEntry (line 102)
 /// The serialized field names of `EvalLogEntry`, in declaration order.
 pub List(Str) derive_eval_log_entry_names() { return ["time", "device", "count"]; }
 /// Encodes a `EvalLogEntry` through the encoder `s`.
@@ -593,7 +597,7 @@ Result(Parsed(EvalLogEntry, F), SerialError) derive_eval_log_entry_done(F s, Opt
 }
 Decode(EvalLogEntry, F) = derive_eval_log_entry_decode;
 
-// ── EvalLogAnswer (line 100)
+// ── EvalLogAnswer (line 105)
 /// The serialized field names of `EvalLogAnswer`, in declaration order.
 pub List(Str) derive_eval_log_answer_names() { return ["session_id", "now", "limit", "entries"]; }
 /// Encodes a `EvalLogAnswer` through the encoder `s`.
@@ -640,7 +644,7 @@ Result(Parsed(EvalLogAnswer, F), SerialError) derive_eval_log_answer_done(F s, O
 }
 Decode(EvalLogAnswer, F) = derive_eval_log_answer_decode;
 
-// ── Beacon (line 110)
+// ── Beacon (line 115)
 /// The serialized field names of `Beacon`, in declaration order.
 pub List(Str) derive_beacon_names() { return ["session_id", "log_id", "epoch", "time", "location", "requester", "sig"]; }
 /// Encodes a `Beacon` through the encoder `s`.
@@ -696,7 +700,7 @@ Result(Parsed(Beacon, F), SerialError) derive_beacon_done(F s, Option(List(Int))
 }
 Decode(Beacon, F) = derive_beacon_decode;
 
-// ── AlertContact (line 114)
+// ── AlertContact (line 119)
 /// The serialized field names of `AlertContact`, in declaration order.
 pub List(Str) derive_alert_contact_names() { return ["name", "ntfy", "email", "phone", "household", "threnody"]; }
 /// Encodes a `AlertContact` through the encoder `s`.
@@ -749,7 +753,7 @@ Result(Parsed(AlertContact, F), SerialError) derive_alert_contact_done(F s, Opti
 }
 Decode(AlertContact, F) = derive_alert_contact_decode;
 
-// ── AlertConfig (line 119)
+// ── AlertConfig (line 124)
 /// The serialized field names of `AlertConfig`, in declaration order.
 pub List(Str) derive_alert_config_names() { return ["session_id", "log_id", "epoch", "set", "person", "contacts", "requester", "sig"]; }
 /// Encodes a `AlertConfig` through the encoder `s`.
@@ -808,7 +812,7 @@ Result(Parsed(AlertConfig, F), SerialError) derive_alert_config_done(F s, Option
 }
 Decode(AlertConfig, F) = derive_alert_config_decode;
 
-// ── AlertState (line 124)
+// ── AlertState (line 129)
 /// The serialized field names of `AlertState`, in declaration order.
 pub List(Str) derive_alert_state_names() { return ["session_id", "person", "contacts", "topics", "duress", "started_at", "party"]; }
 /// Encodes a `AlertState` through the encoder `s`.
@@ -864,7 +868,7 @@ Result(Parsed(AlertState, F), SerialError) derive_alert_state_done(F s, Option(L
 }
 Decode(AlertState, F) = derive_alert_state_decode;
 
-// ── EndDuressReq (line 129)
+// ── EndDuressReq (line 134)
 /// The serialized field names of `EndDuressReq`, in declaration order.
 pub List(Str) derive_end_duress_req_names() { return ["log_id", "started_at", "signers", "sigs"]; }
 /// Encodes a `EndDuressReq` through the encoder `s`.
@@ -911,7 +915,7 @@ Result(Parsed(EndDuressReq, F), SerialError) derive_end_duress_req_done(F s, Opt
 }
 Decode(EndDuressReq, F) = derive_end_duress_req_decode;
 
-// ── Packet (line 132)
+// ── Packet (line 137)
 /// The serialized variant names of `Packet`, in declaration order.
 pub List(Str) derive_packet_variants() { return ["WKeygen", "WSign", "WSession", "WRefused", "WKitHalf", "WSignEvent", "WEventSig", "WReshare", "WEnrollSecrets", "WKitKey", "WKitRelease", "WDuressKey", "WKvDeal", "WKvHalf", "WEval", "WEvalAnswer", "WEvalLog", "WEvalLogAnswer", "WBeacon", "WAlertConfig", "WAlertState", "WEndDuress", "WAlertKey", "WVeto"]; }
 /// Encodes a `Packet` through the encoder `s`.
@@ -978,7 +982,7 @@ pub Result(Parsed(Packet, F), SerialError) derive_packet_decode(F s) {
 }
 Decode(Packet, F) = derive_packet_decode;
 
-// ── Envelope (line 161)
+// ── Envelope (line 166)
 /// The serialized field names of `Envelope`, in declaration order.
 pub List(Str) derive_envelope_names() { return ["from", "to", "enc", "ct"]; }
 /// Encodes a `Envelope` through the encoder `s`.

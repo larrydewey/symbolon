@@ -64,7 +64,12 @@ pub type ReshareInvite = {
 // What an enrolled device receives from the device that enrolled it (SPEC
 // 11.1 step 4): the chain code and the vault key.
 //@ serial
-pub type EnrollSecrets = { List(Int) cc; List(Int) vault_key; };
+// fix_mark: the enrolling device's nonce-fix marker (agent/nfmark.resid,
+// SPEC 6.2.2) when its household was made by a fixed build; a build from
+// before leaves it out and skips it (absent reads as empty).
+pub type EnrollSecrets = { List(Int) cc; List(Int) vault_key;
+    List(Int) fix_mark;                 //@ default
+};
 
 // One dealer's dealing of the vault OPRF key to one receiver (SPEC
 // 18.10.1): the session it belongs to, the dealer's index, its Feldman

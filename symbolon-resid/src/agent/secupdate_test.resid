@@ -124,7 +124,7 @@ test "the duress profile opens no folder-key wrap, kit half, re-share or enrolme
     expect(half_unwrap(dur, 0, rep(9, 32), (UInt(32))1, c.party, kh).len()).toEqual(0);
     // A re-share invitation and an enrolment's secrets.
     Envelope e1 = env_to(c.party, c.hpke_pub, other, reshare_packet());
-    Envelope e2 = env_to(c.party, c.hpke_pub, other, WEnrollSecrets(EnrollSecrets {.cc = rep(4, 32), .vault_key = rep(5, 32)}));
+    Envelope e2 = env_to(c.party, c.hpke_pub, other, WEnrollSecrets(EnrollSecrets {.cc = rep(4, 32), .vault_key = rep(5, 32), .fix_mark = []}));
     expect(env_opens([device_transport(c, u.real.dek).sk], 0, e1, c.party, other.pk)).toBeTrue();
     expect(env_opens([device_transport(c, u.real.dek).sk], 0, e2, c.party, other.pk)).toBeTrue();
     expect(env_opens(dur, 0, e1, c.party, other.pk)).toBeFalse();

@@ -1,0 +1,99 @@
+// The nonce-fix marker (nfmark.resid): signed by this device's key (or the
+// inception's device, for an inception marker handed on), and held against
+// the verified log's events.
+
+import "../types.resid";
+import "../core/log.resid";
+import "nfmark.resid";
+import "ecdsa.resid";
+import "crypto.resid";
+
+List(Int) priv(Int n) {
+    List(Int) z = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    return z.concat([n]);
+}
+List(Int) pubk(Int n) { return ec_public_key(P256, priv(n)); }
+List(Int) pid(Int n) { return sha256_bytes(pubk(n)); }
+
+Party dev(Int n) { return Party {.id = pid(n), .kind = party_kind_device(), .auth_key = pubk(n), .hpke_key = pubk(n + 40), .label = "d", .attestation = NoAttestation}; }
+Party kit() { return Party {.id = pid(20), .kind = party_kind_kit(), .auth_key = pubk(20), .hpke_key = pubk(21), .label = "k", .attestation = NoAttestation}; }
+Party cos() { return Party {.id = pid(30), .kind = party_kind_cosigner(), .auth_key = pubk(30), .hpke_key = pubk(31), .label = "c", .attestation = NoAttestation}; }
+
+List(Int) logid() { return [7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7]; }
+List(Int) tr(Int n) { return [n, n, n, n, n, n, n, n, n, n, n, n, n, n, n, n]; }
+
+Quorum q(List(Party) ps, Int epoch, Int t) { return Quorum {.parties = ps, .t = 2, .root_pubkey = pubk(9), .epoch = (UInt(32))epoch, .transcript_digest = tr(t), .kv_commits = []}; }
+
+Policy pol() {
+    return Policy {.device_sigs_for_authority = 2, .recovery_delay_sec = 86400, .guardians = [], .guardian_threshold = 0, .witnesses = [], .duress_window_sec = 0, .sequencer = [], .cosigner_policy = NoCosignerPolicy};
+}
+
+SignedEvent ev(UInt(64) seq, EventBody b) {
+    return SignedEvent {.payload = EventPayload {.log_id = None, .sequence = seq, .predecessor_digest = None, .suite = 1, .body = b, .next_recovery_key_digests = [], .advisory_time = 0},
+                        .encoded = [], .sigs = [], .cosigs = []};
+}
+
+// Inception (epoch 1, device 1, kit, cosigner), device 2 enrolled at epoch 2
+// (before the fix), the fixed refresh at epoch 3.
+List(SignedEvent) log3() {
+    return [ev(0, InceptionBody(q([dev(1), kit(), cos()], 1, 1), pol())), ev(1, ReshareBody(q([dev(1), kit(), cos(), dev(2)], 2, 2))),
+            ev(2, ReshareBody(q([dev(1), kit(), cos(), dev(2)], 3, 3)))];
+}
+
+Quorum now() { return q([dev(1), kit(), cos(), dev(2)], 3, 3); }
+
+FixMark signed(Int by, Int epoch, Int t) {
+    List(Int) tbs = fix_mark_tbs(logid(), epoch, tr(t), pid(by));
+    return FixMark {.log_id = logid(), .epoch = epoch, .transcript = tr(t), .signer = pid(by), .sig = ecdsa_sign_raw(P256, Sha256, priv(by), tbs)};
+}
+
+test "a device's own marker over the epoch a fixed re-share made counts, and reads back from its line" {
+    FixMark m = signed(2, 3, 3);
+    FixState st = fix_mark_check(m, logid(), pid(2), now(), log3());
+    expect(st.ok).toEqual(true);
+    expect(st.epoch).toEqual(3);
+    expect(st.born).toEqual(false);
+    expect(fix_mark_check(fix_mark_parse(fix_mark_line(m)), logid(), pid(2), now(), log3()).ok).toEqual(true);
+    expect(fix_mark_check(fix_mark_of_bytes(fix_mark_bytes(m)), logid(), pid(2), now(), log3()).ok).toEqual(true);
+    expect(fix_mark_parse("nonce-fix v1 zz").sig.len()).toEqual(0);
+    expect(fix_mark_of_bytes([110, 0, 111]).sig.len()).toEqual(0);
+}
+
+test "a forged marker does not count: another key, another device, an epoch the log did not make, another log, a later epoch" {
+    // Someone with the disk but not the device key signs with a key of their own.
+    FixMark f = signed(5, 3, 3);
+    FixMark forged = FixMark {.log_id = f.log_id, .epoch = f.epoch, .transcript = f.transcript, .signer = pid(2), .sig = f.sig};
+    expect(fix_mark_check(forged, logid(), pid(2), now(), log3()).ok).toEqual(false);
+    // Another device's marker is not this device's (only an inception marker is handed on).
+    expect(fix_mark_check(signed(1, 3, 3), logid(), pid(2), now(), log3()).ok).toEqual(false);
+    // Pointed at the epoch made before the fix, with a transcript the log does not hold for it.
+    expect(fix_mark_check(signed(2, 2, 3), logid(), pid(2), now(), log3()).ok).toEqual(false);
+    expect(fix_mark_check(signed(2, 4, 3), logid(), pid(2), now(), log3()).ok).toEqual(false);
+    FixMark other = signed(2, 3, 3);
+    expect(fix_mark_check(other, [1, 2, 3], pid(2), now(), log3()).ok).toEqual(false);
+    // No file: no marker.
+    expect(fix_mark_check(no_mark(), logid(), pid(2), now(), log3()).ok).toEqual(false);
+}
+
+test "an inception marker counts on another device only when the inception's device signed it" {
+    FixState st = fix_mark_check(signed(1, 1, 1), logid(), pid(2), now(), log3());
+    expect(st.ok).toEqual(true);
+    expect(st.born).toEqual(true);
+    // Device 2 was not in the inception: its "inception" marker for device 3 does not count.
+    expect(fix_mark_check(signed(2, 1, 1), logid(), pid(3), now(), log3()).ok).toEqual(false);
+    // Nor does one over the inception's epoch with another transcript.
+    expect(fix_mark_check(signed(1, 1, 2), logid(), pid(2), now(), log3()).ok).toEqual(false);
+}
+
+test "the re-shares before the fix are those before the marker's epoch, all of them without one; recovers and removals counted" {
+    FixFacts a = fix_facts(log3(), FixState {.ok = true, .epoch = 3, .born = false});
+    expect(a.prefix_reshares).toEqual(1);
+    FixFacts b = fix_facts(log3(), fix_none());
+    expect(b.prefix_reshares).toEqual(2);
+    FixFacts c = fix_facts(log3(), FixState {.ok = true, .epoch = 1, .born = true});
+    expect(c.prefix_reshares).toEqual(0);
+    RecoverBodyInner r = RecoverBodyInner {.path = 1, .new_parties = [dev(1)], .revealed_recovery_key = None, .guardian_approvals = []};
+    FixFacts d = fix_facts(log3().concat([ev(3, RemovePartyBody(pid(2))), ev(4, RecoverBody(r))]), fix_none());
+    expect(d.removals).toEqual(1);
+    expect(d.recovers).toEqual(1);
+}

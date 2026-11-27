@@ -36,6 +36,7 @@ import "word.resid";
 import "crypto.resid";
 import "ecdsa.resid";
 import "clock.resid";
+import "nfmark.resid";
 
 pub Party none_party() { return Party {.id = [], .kind = 0, .auth_key = [], .hpke_key = [], .label = "", .attestation = NoAttestation}; }
 
@@ -673,7 +674,7 @@ pub Bool send_all_invites(Endpoint relay, Local me, List(Remote) rs, Packet w, I
 
 @requires(filesystem, network, device, declassify, clock, environment)
 pub Int after_session(Str dir, DeviceConfig c, Unlocked u, VerifiedHead vh, List(Party) np, ReshareInvite inv, List(Remote) rem, Str pin, KvMode kv, Run(RsState) r) {
-    if (str_len(r.fail) > 0) { return dfail("re-share: " + r.fail); }
+    if (str_len(r.fail) > 0) { _ = note_reshare_fail(dir, r.fail); return dfail("re-share: " + r.fail); }
     KvDone kd = kv_reshare(mail_ep(dir, c, u), Local {.party = c.party, .cg = 0, .hpke_sk = device_transport(c, u.real.dek).sk}, vh.head.quorum, np, inv, rem, kv, mailbox_end(relay_ep(c), c.party, c.mbox_next));
     if (str_len(kd.why) > 0) { return dfail(kd.why); }
     RsResult res = rs_result(r.seats[0].st) else { RsResult {.cfg = None, .offline = [], .transcript = []} };
@@ -755,9 +756,12 @@ Int finish_enroll(Str dir, DeviceConfig c, Unlocked u, VerifiedHead vh, CgConfig
     if (!kept) { return dfail("cannot store this device's new share"); }
     Bool ok = wa.ct.len() > 0
         && send_to(relay, me, Remote {.party = cos.id, .cg = 0, .hpke_pub = cos.hpke_key}, WKitKey(kb))
-        && send_secrets(relay, me, rem, cos.id, u, 0)
+        && send_secrets(relay, me, rem, cos.id, u, fix_mark_bytes(fix_mark_read(dir)), 0)
         && save_config(dir, with_log(c, c.witnesses, c.log_id, mailbox_end(relay, c.party, c.mbox_next), c.peers));
     if (!ok) { return dfail("cannot finish the enrollment"); }
+    // This build made the epoch (SPEC 6.2.2): the nonce-fix marker.
+    _ = mark_fixed_quorum(dir, u, []);
+    _ = filesystem.write_all(reshare_fail_file(dir), "");
     // The kit's blobs: a, k_a, the secrets under k_K, and a_v.
     Bool kit_ok = blob_put(relay, kit_a_blob(c.log_id, (Int)nq.epoch), cbor_of_blob(WrappedBlob {.enc = wa.enc, .ct = wa.ct}))
         && blob_put(relay, kit_secrets_blob(c.log_id, (Int)nq.epoch), kit_secrets_seal(secret_bytes(kk), c.log_id, nq.epoch, u.real.cc, u.real.vault_key))
@@ -770,11 +774,11 @@ Int finish_enroll(Str dir, DeviceConfig c, Unlocked u, VerifiedHead vh, CgConfig
 // The chain code and vault key go to the new devices (every remote but the
 // cosigner).
 @requires(network, declassify, clock(readonly))
-Bool send_secrets(Endpoint relay, Local me, List(Remote) rem, List(Int) cos, Unlocked u, Int i) {
+Bool send_secrets(Endpoint relay, Local me, List(Remote) rem, List(Int) cos, Unlocked u, List(Int) mark, Int i) {
     if (i >= rem.len()) { return true; }
-    if (bytes_eq(rem[i].party, cos)) { return send_secrets(relay, me, rem, cos, u, i + 1); }
-    Bool ok = send_to(relay, me, rem[i], WEnrollSecrets(EnrollSecrets {.cc = reveal(u.real.cc), .vault_key = reveal(u.real.vault_key)}));
-    return ok && send_secrets(relay, me, rem, cos, u, i + 1);
+    if (bytes_eq(rem[i].party, cos)) { return send_secrets(relay, me, rem, cos, u, mark, i + 1); }
+    Bool ok = send_to(relay, me, rem[i], WEnrollSecrets(EnrollSecrets {.cc = reveal(u.real.cc), .vault_key = reveal(u.real.vault_key), .fix_mark = mark}));
+    return ok && send_secrets(relay, me, rem, cos, u, mark, i + 1);
 }
 
 // ─── `device join DIR ENROLLING_DEVICE_KEYS [PRIMES]` ───────────
@@ -840,7 +844,7 @@ Waited wait_more(Endpoint relay, Local me, List(Remote) from, Cursor cur, Int si
 }
 
 @requires(filesystem, network, device, declassify, clock, provision, environment)
-Int join_session(Str dir, DeviceConfig c, Unlocked u, Remote x, ReshareInvite inv, Waited w, Str pin, Str primes_file) {
+pub Int join_session(Str dir, DeviceConfig c, Unlocked u, Remote x, ReshareInvite inv, Waited w, Str pin, Str primes_file) {
     DeviceConfig c1 = with_log(c, c.witnesses, inv.log_id, w.cur.next, c.peers);
     // Not one of the log's devices yet: a mail session as a proposed party.
     Endpoint relay = mail_ep(dir, c1, u);
@@ -864,7 +868,7 @@ Int join_session(Str dir, DeviceConfig c, Unlocked u, Remote x, ReshareInvite in
 
 @requires(filesystem, network, device, declassify, clock, provision, environment)
 Int join_after(Str dir, DeviceConfig c, Unlocked u, Remote x, ReshareInvite inv, VerifiedHead vh, Str pin, Cursor before, Run(RsState) r) {
-    if (str_len(r.fail) > 0) { return dfail("re-share: " + r.fail); }
+    if (str_len(r.fail) > 0) { _ = note_reshare_fail(dir, r.fail); return dfail("re-share: " + r.fail); }
     RsResult res = rs_result(r.seats[0].st) else { RsResult {.cfg = None, .offline = [], .transcript = []} };
     Option(CgConfig) ocfg = res.cfg;
     CgConfig ncfg = ocfg else { CgConfig {.id = 0, .threshold = 0, .ecdsa = [], .elgamal = [], .p = [], .q = [], .rid = [], .chain_key = [], .public = []} };
@@ -935,6 +939,10 @@ Int joined(Str dir, DeviceConfig c, Unlocked u, Str pin, CgConfig ncfg, EnrollSe
         && send_duress_key(dir, mail_ep(dir, c, u), Local {.party = c.party, .cg = 0, .hpke_sk = device_transport(c, u.real.dek).sk}, cos_remote(vh))
         && save_config(dir, with_log(c, eps_of(vh.head.policy.witnesses, 0, []), c.log_id, cur.next, c.peers));
     if (!ok) { return dfail("cannot store the enrollment"); }
+    // This build took part in the epoch (SPEC 6.2.2); the inception's
+    // marker, when the enrolling device handed one on, is kept instead.
+    _ = mark_fixed_quorum(dir, u, es.fix_mark);
+    _ = filesystem.write_all(reshare_fail_file(dir), "");
     println("joined the quorum: log " + hex_encode(c.log_id));
     return 0;
 }
@@ -961,3 +969,10 @@ Bool ep_key_in(List(WitnessEp) eps, List(Int) k, Int i) {
     if (i >= eps.len()) { return false; }
     return bytes_eq(eps[i].key, k) || ep_key_in(eps, k, i + 1);
 }
+
+// The last re-share's failure, for `device status` (migrate.resid: an old
+// build's refusal names the party to upgrade); emptied when one succeeds.
+pub Str reshare_fail_file(Str dir) { return dir + "/reshare-failed"; }
+
+@requires(filesystem)
+pub Bool note_reshare_fail(Str dir, Str why) { return filesystem.write_all(reshare_fail_file(dir), why + "\n"); }

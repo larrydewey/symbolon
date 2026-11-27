@@ -34,6 +34,7 @@ import "duresscli.resid";
 import "keystore.resid";
 import "cggmp_store.resid";
 import "kvagent.resid";
+import "nfmark.resid";
 import "../vault/kvshare.resid";
 import "dev/tpm.resid";
 import "dev/tpm_wire.resid";
@@ -490,6 +491,39 @@ pub Str security_update_reminder(Str dir) {
     return "Finish the security update: run `symbolon device security-update " + dir + "` (it asks for the PIN, then the duress PIN). Until then a duress PIN may give access to your shared folders, and this device's files show its security keys to anyone.";
 }
 
+// ─── The nonce-fix marker (nfmark.resid, SPEC 6.2.2) ────────────
+// Written by this build after every quorum epoch it made with the
+// cosigner (the inception, a re-share it led or joined): every party of
+// that session ran the Paillier nonce fix, or the session ended. The
+// first valid marker is kept. `offered`: a marker another device handed
+// on (EnrollSecrets.fix_mark), kept instead when it is the inception's,
+// signed by the inception's device.
+@requires(filesystem, network, device, declassify, clock, environment)
+pub Bool mark_fixed_quorum(Str dir, Unlocked u, List(Int) offered) {
+    Option(DeviceConfig) oc = load_config(dir);
+    return match oc { None => false, Some(c) => mark_fixed_in(dir, c, u, offered) };
+}
+
+@requires(filesystem, network, device, declassify, clock, environment)
+Bool mark_fixed_in(Str dir, DeviceConfig c, Unlocked u, List(Int) offered) {
+    if (c.log_id.len() == 0) { return false; }
+    Result(LogView, SymbolonError) rv = log_view_dir(dir, relay_ep(c), c.log_id, "");
+    return match rv { Err(_) => false, Ok(v) => mark_fixed_at(dir, c, u, v, offered) };
+}
+
+@requires(filesystem, device, declassify, network, environment)
+Bool mark_fixed_at(Str dir, DeviceConfig c, Unlocked u, LogView v, List(Int) offered) {
+    Quorum q = v.vh.head.quorum;
+    if (fix_mark_check(fix_mark_read(dir), c.log_id, c.party, q, v.events).ok) { return true; }
+    FixMark om = fix_mark_of_bytes(offered);
+    FixState os = fix_mark_check(om, c.log_id, c.party, q, v.events);
+    if (os.ok && os.born) { return fix_mark_write(dir, om); }
+    List(Int) tbs = fix_mark_tbs(c.log_id, (Int)q.epoch, q.transcript_digest, c.party);
+    Result(List(Int), Str) s = dk_sign(c, u.real, u.st, tbs);
+    List(Int) sig = match s { Ok(x) => x, Err(_) => [] };
+    return sig.len() == 64 && fix_mark_write(dir, FixMark {.log_id = c.log_id, .epoch = (Int)q.epoch, .transcript = q.transcript_digest, .signer = c.party, .sig = sig});
+}
+
 DeviceConfig with_identity(DeviceConfig c, List(Int) dk_pub) {
     return DeviceConfig {.relay_host = c.relay_host, .relay_port = c.relay_port, .ca = c.ca, .witnesses = c.witnesses, .unprotected = c.unprotected,
         .argon_m_kib = c.argon_m_kib, .argon_t = c.argon_t, .salt = c.salt, .tpm_dk = c.tpm_dk, .tpm_unlock_a = c.tpm_unlock_a, .tpm_unlock_b = c.tpm_unlock_b,
@@ -797,6 +831,9 @@ Int publish(Str dir, DeviceConfig c, Unlocked u, KitKeys kit, List(PartyKeys) pa
            && filesystem.write_bytes(dir + "/log/0", cbor_of_event(se))
            && save_config(dir, with_log(c, a.witnesses, l, mailbox_end(relay, c.party, c.mbox_next), parties));
     if (!ok) { return dfail("cannot store the result"); }
+    // This build made the inception with the cosigner: the household's
+    // keys never ran without the nonce fix (SPEC 6.2.2).
+    _ = mark_fixed_quorum(dir, u, []);
     println("log " + hex_encode(l));
     println("root key " + hex_encode(cfg_root_pubkey(mine, [1, 2, 3])));
     _ = mark_kit_sheet(dir, sheet);
