@@ -164,17 +164,36 @@ Option(Batch) batch_from(List(Batch) bs, List(Int) from, List(Int) to, Int round
     return batch_from(bs, from, to, round, i + 1);
 }
 
-// The inbox for `me` at `round` from every other party, or None while one
-// is missing.
-Option(List(ThMsg)) round_inbox(List(Batch) bs, List(List(Int)) others, List(Int) me, Int round, Int i, List(ThMsg) acc) {
-    if (i >= others.len()) { return Some(acc); }
-    Option(Batch) b = batch_from(bs, others[i], me, round, 0);
-    return match b { None => None, Some(x) => round_inbox(bs, others, me, round, i + 1, acc.concat(x.msgs)) };
+// The inbox for `me` at `round` from every other party (`everyone`, with
+// their CGGMP ids `cgs` in the same order), or None while one is missing.
+// Of a party's batch only the messages that say they are from that
+// party's id are kept: the batch's sender is authenticated (HPKE
+// mode_auth), the `from` inside a message is whatever the sender wrote. A
+// signer could otherwise put in a message "from" another party, such as
+// the designated party's "ok" verdict after it forced an abort, so that
+// an honest signer sent sigma instead of its openings and was blamed for
+// the abort (R4-10).
+pub Option(List(ThMsg)) round_inbox(List(Batch) bs, List(List(Int)) everyone, List(Int) cgs, List(Int) me, Int round, Int i, List(ThMsg) acc) {
+    if (i >= everyone.len() || i >= cgs.len()) { return Some(acc); }
+    if (bytes_eq(everyone[i], me)) { return round_inbox(bs, everyone, cgs, me, round, i + 1, acc); }
+    Option(Batch) b = batch_from(bs, everyone[i], me, round, 0);
+    return match b { None => None, Some(x) => round_inbox(bs, everyone, cgs, me, round, i + 1, acc.concat(from_only(x.msgs, cgs[i], 0, ListBuf()))) };
 }
 
-List(List(Int)) others_of(List(List(Int)) all, List(Int) me, Int i, List(List(Int)) acc) {
-    if (i >= all.len()) { return acc; }
-    return others_of(all, me, i + 1, if (bytes_eq(all[i], me)) { acc } else { acc.concat([all[i]]) });
+// The messages of `ms` that say they are from CGGMP id `from`.
+pub List(ThMsg) from_only(List(ThMsg) ms, Int from, Int i, ListBuf(ThMsg) acc) {
+    if (i >= ms.len()) { return acc.finish(); }
+    ThMsg m = ms[i];
+    Int f = match m { ThCg(c) => c.from, ThTw(t) => t.from, ThVerdict(v) => v.from, ThRs(r) => r.from };
+    return from_only(ms, from, i + 1, if (f == from) { acc.push(m) } else { acc });
+}
+
+// The CGGMP ids of the remotes and then the locals: parties_of's order.
+List(Int) cgs_of(List(Remote) rs, List(Local) ls, Int i, ListBuf(Int) acc) {
+    if (i < rs.len()) { return cgs_of(rs, ls, i + 1, acc.push(rs[i].cg)); }
+    Int j = i - rs.len();
+    if (j >= ls.len()) { return acc.finish(); }
+    return cgs_of(rs, ls, i + 1, acc.push(ls[j].cg));
 }
 
 pub type Run(T) = { List(Seat(T)) seats; Str fail; List(Int) culprits; List(Cursor) cursors; };
@@ -272,7 +291,7 @@ Run(T) rs_loop(Endpoint relay, List(Int) sid, List(Seat(T)) seats, List(Remote) 
                Result(Stepped(T), CgFail) closure(T, List(ThMsg)) step, Int wait_s, Int since) {
     if (all_done(seats, 0)) { return rs_end(relay, posts, Run {.seats = seats, .fail = "", .culprits = [], .cursors = cs}); }
     List(List(Int)) everyone = parties_of(remotes, ls, 0, []);
-    Adv(T) a = advance_seats(seats, buf, everyone, step, 0, [], false);
+    Adv(T) a = advance_seats(seats, buf, everyone, cgs_of(remotes, ls, 0, ListBuf()), step, 0, [], false);
     if (str_len(a.fail) > 0) { return rs_end(relay, posts, Run {.seats = a.seats, .fail = a.fail, .culprits = a.culprits, .cursors = cs}); }
     if (a.moved) {
         Outs o = outs_moved(sid, seats, a.seats, remotes, ls, 0, no_outs());
@@ -352,16 +371,16 @@ Str describe(List(ThMsg) ms, Int i, Str acc) {
 
 // Each seat whose round-r inputs are all here advances; its next output is
 // for round r + 1.
-Adv(T) advance_seats(List(Seat(T)) ss, List(Batch) got, List(List(Int)) everyone, Result(Stepped(T), CgFail) closure(T, List(ThMsg)) step, Int i, List(Seat(T)) acc, Bool moved) {
+Adv(T) advance_seats(List(Seat(T)) ss, List(Batch) got, List(List(Int)) everyone, List(Int) cgs, Result(Stepped(T), CgFail) closure(T, List(ThMsg)) step, Int i, List(Seat(T)) acc, Bool moved) {
     if (i >= ss.len()) { return Adv {.seats = acc, .moved = moved, .fail = "", .culprits = []}; }
     Seat(T) s = ss[i];
-    if (s.done) { return advance_seats(ss, got, everyone, step, i + 1, acc.concat([s]), moved); }
-    Option(List(ThMsg)) inb = round_inbox(got, others_of(everyone, s.me.party, 0, []), s.me.party, s.round, 0, []);
+    if (s.done) { return advance_seats(ss, got, everyone, cgs, step, i + 1, acc.concat([s]), moved); }
+    Option(List(ThMsg)) inb = round_inbox(got, everyone, cgs, s.me.party, s.round, 0, []);
     return match inb {
-        None => advance_seats(ss, got, everyone, step, i + 1, acc.concat([s]), moved),
+        None => advance_seats(ss, got, everyone, cgs, step, i + 1, acc.concat([s]), moved),
         Some(msgs) => match step(s.st, msgs) {
             Err(e) => Adv {.seats = acc, .moved = moved, .fail = e.why + f" (seat {s.me.cg}, round {s.round}, culprits {e.culprits}, inbox {describe(msgs, 0, "")})", .culprits = e.culprits},
-            Ok(n) => advance_seats(ss, got, everyone, step, i + 1, acc.concat([Seat {.me = s.me, .st = n.st, .round = s.round + 1, .out = n.out, .done = n.done}]), true)
+            Ok(n) => advance_seats(ss, got, everyone, cgs, step, i + 1, acc.concat([Seat {.me = s.me, .st = n.st, .round = s.round + 1, .out = n.out, .done = n.done}]), true)
         }
     };
 }

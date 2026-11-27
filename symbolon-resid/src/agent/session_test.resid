@@ -1,0 +1,40 @@
+// A session's rounds (src/agent/session.resid): what one party's batch may
+// put into another party's inbox.
+
+import "../threshold/threshold.resid";
+import "cggmp_blind.resid";
+import "session.resid";
+
+List(Int) pid(Int n) { return [n, n, n, n]; }
+
+ThMsg verdict(Int from, Int to, Bool ok) { return ThVerdict(BlVerdict {.from = from, .to = to, .ok = ok}); }
+
+Str froms(List(ThMsg) ms, Int i, Str acc) {
+    if (i >= ms.len()) { return acc; }
+    ThMsg m = ms[i];
+    Int f = match m { ThCg(c) => c.from, ThTw(t) => t.from, ThVerdict(v) => v.from, ThRs(r) => r.from };
+    return froms(ms, i + 1, acc + f"{f};");
+}
+
+// R4-10: a signer's batch carried a verdict "from" the designated party
+// (the forged "ok" after it forced an abort), and the victim took it.
+test "a party's batch brings only messages from that party's id" {
+    // parties 1, 2, 3 (CGGMP ids 1, 2, 3); this is party 3
+    List(List(Int)) everyone = [pid(1), pid(2), pid(3)];
+    List(Int) cgs = [1, 2, 3];
+    // party 2's batch: its own message, and a verdict "from" party 1
+    Batch b1 = Batch {.from = pid(1), .to = pid(3), .round = 8, .msgs = [verdict(1, 3, false)]};
+    Batch b2 = Batch {.from = pid(2), .to = pid(3), .round = 8, .msgs = [verdict(1, 3, true), verdict(2, 3, true)]};
+    Option(List(ThMsg)) inb = round_inbox([b2, b1], everyone, cgs, pid(3), 8, 0, []);
+    List(ThMsg) got = inb else { [] };
+    expect(froms(got, 0, "")).toEqual("1;2;");
+    // the designated party's own verdict is the only one "from" it
+    ThMsg first = got[0];
+    Bool ok = match first { ThVerdict(x) => x.ok, _ => true };
+    expect(ok).toBeFalse();
+    // a missing batch: no inbox yet
+    Option(List(ThMsg)) none = round_inbox([b2], everyone, cgs, pid(3), 8, 0, []);
+    Bool missing = match none { None => true, Some(_) => false };
+    expect(missing).toBeTrue();
+    expect(from_only([verdict(1, 3, true), verdict(2, 3, true), verdict(1, 2, false)], 1, 0, ListBuf()).len()).toEqual(2);
+}
