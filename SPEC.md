@@ -211,7 +211,8 @@ P-256 base point, `q` its order.
   20.3) can stall that log's events, not the credentials' signing, and
   not a veto of a pending recovery or the escape from it: those are
   co-signed without its claim (Section 20.3, "What the relay cannot hold
-  back").
+  back"), and devices and the cosigner take from the witnesses what the
+  relay does not serve (Section 13.4, "Notification").
 
 ### 3.4 Symbolon Home
 
@@ -1337,7 +1338,20 @@ after the delay, measured by witness time, without a valid `veto`.
   device MUST poll at least two of the policy's witnesses directly, not
   through the sync service, at an interval no longer than a quarter of the
   delay, so a sync service that suppresses the event cannot hide it (A-05).
-  Guardians are notified through their own agents.
+  Guardians are notified through their own agents. Every view a device
+  takes of the log (`device status`, `device pending`, `device veto`, and
+  every operation that verifies the log) asks every witness of the policy
+  how far it co-signed the log (`POST /head`, Section 20.3). When one is
+  past the log the relay serves, the device takes the events a majority
+  co-signed from the witnesses themselves (`POST /event`), verifies the
+  log with them, keeps them with its copy of the log and gives them to the
+  relay; if the relay still does not serve them it reports an alarm
+  (`device status`: "hidden N"; ALARM on standard error) (R5-1). So a
+  relay working with whoever holds the kit cannot keep a pending
+  `recover` from the devices: `device pending` lists it and `device veto`
+  vetoes it. The cosigner does the same once a minute, and alerts the
+  person through their duress-alert channels (Section 14.4) when the relay
+  hides witnessed events.
 - **Witness time.** "Now", for every delay, is the median of the times a
   majority of the policy's witnesses sign for a fresh nonce (`["symbolon
   v1 witness time", nonce, time]`), never a party's local clock, so a
@@ -1363,20 +1377,34 @@ after the delay, measured by witness time, without a valid `veto`.
   advisory time 0, so every device's veto of one event at one sequence is
   the same event. The witnesses co-sign a veto of a pending `recover` (or
   of the kit's escape `set-policy`, Section 20.3) without the sequencing
-  relay's claim, and the device also leaves its signed veto in the
-  cosigner's mailbox (`WVeto`). The cosigner keeps a veto that is valid,
-  at witness time when it arrives, as the next event of the log it
-  verified, and publishes it as a device does: with the relay's claim if
-  it gives one, else to the witnesses without one, then to the relay, and
-  again at each of its turns while the veto can still land (no other event
-  at its sequence, its target still pending). A veto a device sent only
-  to the cosigner thus becomes an ordinary veto in the log, which the
-  contest rule counts (R4-2). The cosigner refuses the release while it
-  keeps such a live veto of that recovery; once another event took the
-  veto's sequence or the recovery took effect, the held veto is moot and
-  the release follows the log. A relay that refuses to claim or to store
-  a veto that the witnesses co-signed has nothing released: their heads
-  are past the log it serves (R2W-5, R3P-3).
+  relay's claim. A device makes and publishes its veto from the log it
+  verified itself (its kept copy, the relay's events and what the
+  witnesses co-signed past them, above), never from the relay's answer to
+  `GET /log`, so a relay that serves a short log, an error or a fork
+  cannot keep the veto from the witnesses; once a majority co-signed it,
+  it is the log's next event whether or not the relay stores it (R5-1).
+  The device also leaves its signed veto in the cosigner's mailbox
+  (`WVeto`), and the cosigner takes a veto that some witness co-signed at
+  the log's next sequence without a majority from that witness
+  (`POST /event`), which does not go through the relay. The cosigner
+  keeps a veto that is valid, at witness time when it arrives, as the
+  next event of the log it verified (held against the witnesses as a
+  device's), and publishes it as a device does, from that log: with the
+  relay's claim if it gives one, else to the witnesses without one, then
+  to the relay, and again at each of its turns while the veto can still
+  land (no other event at its sequence, its target still pending). A veto
+  a device sent only to the cosigner thus becomes an ordinary veto in the
+  log, which the contest rule counts (R4-2). The cosigner refuses the
+  release while it keeps a veto of that recovery, until a majority of the
+  witnesses co-signed another event at the veto's sequence (the log it
+  verified holds one there): not merely until the recovery's delay has
+  run, which a relay working with the kit could reach by keeping the veto
+  from the witnesses (R5-1). A held veto that could not land before the
+  delay ran (it reached the cosigner in its last moments) blocks until
+  the log's next event takes its sequence: the recovered device's next
+  event does. A relay that refuses to claim or to store a veto that the
+  witnesses co-signed has nothing released: their heads are past the log
+  it serves (R2W-5, R3P-3).
 - **One at a time.** A `recover` filed while another `recover` is pending
   is invalid. Otherwise whoever holds the kit could take every next
   sequence with another `recover` as soon as the last was witnessed, and
@@ -2818,7 +2846,16 @@ claim either), when the event is valid as always and is one of:
 
 So a relay that is gone, or works with whoever holds the kit, stalls the
 log for at most the recovery delay (the kit's escape, or the devices'
-escape at once), and cannot keep a veto from the witnesses. A
+escape at once), and cannot keep a veto from the witnesses: devices and
+the cosigner publish these events from the log they verified themselves,
+never gating on the relay's `GET /log`, and take what the relay hides
+from the witnesses (`POST /event` below; Section 13.4, R5-1). The
+residual is a veto that reaches no witness at all (every witness
+unreachable from the vetoing device and from the cosigner until the
+delay has run): the cosigner still refuses the kit's release for a veto
+it received in time, until a majority of the witnesses co-signed another
+event at the veto's sequence, but whoever the recovery made a device of
+the quorum can file that event. A
 principal who still has a device keeps the relay by vetoing the kit's
 escape. Without its relay, the log is exposed to the freeze of Section
 20.4 until a `set-policy` names another (adding one is not a weakening).
@@ -2981,7 +3018,22 @@ the log it co-signed and the digest it co-signed there (an empty byte
 string, and `seq` 0, when it co-signed none), and its time, signed with
 its key over `["symbolon v1 witness head", log, seq, digest, nonce,
 time]`. The cosigner uses it before a release or a re-share (Section
-13.4), a device for the freeze alarm (Section 20.4).
+13.4), a device for the freeze alarm (Section 20.4), and both on every
+view of the log, to find what the relay does not serve (Section 13.4,
+"Notification").
+
+A witness keeps each event it co-signs, without co-signatures, beside its
+digest (at most 16 KiB; a larger one is not kept), and answers, for a log
+id and a sequence (`POST /event`, body `log || seq` with `seq` 8 bytes
+big-endian), CBOR `[event, [time, sig]]`: the event it co-signed there
+and its co-signature, the answer it gave the co-sign request (404 when it
+holds none). Anyone may ask, as for `POST /head`: what a log's witnesses
+co-signed is what the relay serves to anyone who asks. The answer is
+checked under the witness's key, and an agent takes an event from the
+witnesses only with a majority's co-signatures on it and only when the
+whole log then verifies, so a witness can withhold an event but never add
+one. It stores one event per co-signed sequence, so the event adds a
+bounded amount to what the witness already keeps (R5-1).
 
 ### 20.4 Fork and freeze detection (G17)
 
