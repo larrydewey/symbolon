@@ -393,6 +393,19 @@ run 60 "$BIN" device kit status "$W/dev" > "$W/kstat.log" 2>&1 || fail "kit stat
 # delay (witnesses restarted with clocks moved forward), `kit renew` again
 # re-shares with the cosigner to the new kit; the second device takes
 # part, as it did in the enrollment.
+# The floor holds for events witnessed from the release cutover
+# (2026-12-01T00:00:00Z, SPEC 8.2) on: the witnesses restart with clocks
+# moved past it first (at least 5000 s ahead, more than the duress test's
+# 4000, while real time is before it), so the rotate-recovery is
+# witnessed after the cutover whatever the date the suite runs on.
+CUTOVER=1796083200
+SHIFT=$(( CUTOVER - $(date +%s) + 1000 )); [ "$SHIFT" -lt 5000 ] && SHIFT=5000
+for i in 1 2 3; do
+  pkill -f -- "witness (serve|child) $W/w$i " 2>/dev/null
+  for _ in $(seq 50); do (exec 3<>"/dev/tcp/127.0.0.1/${WPORT[$i]}") 2>/dev/null || break; sleep 0.1; done
+  runs 3600 "$BIN" witness serve "$W/w$i" "${WPORT[$i]}" "$W/w$i.key" "$SHIFT" "${SERVE_TLS[@]}" > "$W/w$i-cutover.log" 2>&1 & PIDS+=($!)
+  wait_port "${WPORT[$i]}" || fail "witness $i did not restart"
+done
 KP='lantern orchard pebble'
 echo "kit replacement (rotate-recovery: delayed with two devices)..."
 printf '2468\n%s\n%s\n' "$KP" "$KP" | run 1800 "$BIN" device kit renew "$W/dev" "$W/devrs.primes" > "$W/renew.log" 2>&1 || fail "kit renew: $(tail -3 "$W/renew.log")"
@@ -403,7 +416,7 @@ run 120 "$BIN" device status "$W/dev2" | grep -q 'epoch 2 parties 4 threshold 2 
 for i in 1 2 3; do
   pkill -f -- "witness (serve|child) $W/w$i " 2>/dev/null
   for _ in $(seq 50); do (exec 3<>"/dev/tcp/127.0.0.1/${WPORT[$i]}") 2>/dev/null || break; sleep 0.1; done
-  runs 3600 "$BIN" witness serve "$W/w$i" "${WPORT[$i]}" "$W/w$i.key" 267400 "${SERVE_TLS[@]}" > "$W/w$i-renew.log" 2>&1 & PIDS+=($!)
+  runs 3600 "$BIN" witness serve "$W/w$i" "${WPORT[$i]}" "$W/w$i.key" $((SHIFT + 263400)) "${SERVE_TLS[@]}" > "$W/w$i-renew.log" 2>&1 & PIDS+=($!)
   wait_port "${WPORT[$i]}" || fail "witness $i did not restart"
 done
 printf '1111\n' | run 1800 "$BIN" device join "$W/dev2" "$DEV" "$W/dev2.primes" > "$W/kjoin.log" 2>&1 & KJ=$!
@@ -447,7 +460,7 @@ printf '%s\n\n' "$KP" | run 600 "$BIN" device recover "$W/dev3" "$KIT" "$LOG" > 
 for i in 1 2 3; do
   pkill -f -- "witness (serve|child) $W/w$i " 2>/dev/null; wait "${WPID[$i]}" 2>/dev/null
   for _ in $(seq 50); do (exec 3<>"/dev/tcp/127.0.0.1/${WPORT[$i]}") 2>/dev/null || break; sleep 0.1; done
-  runs 3600 "$BIN" witness serve "$W/w$i" "${WPORT[$i]}" "$W/w$i.key" 530800 "${SERVE_TLS[@]}" > "$W/w$i-later.log" 2>&1 & PIDS+=($!)
+  runs 3600 "$BIN" witness serve "$W/w$i" "${WPORT[$i]}" "$W/w$i.key" $((SHIFT + 526800)) "${SERVE_TLS[@]}" > "$W/w$i-later.log" 2>&1 & PIDS+=($!)
   wait_port "${WPORT[$i]}" || fail "witness $i did not restart"
 done
 echo "recovery finish (release, kit share, re-share; a minute or two)..."

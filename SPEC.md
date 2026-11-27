@@ -484,8 +484,17 @@ recover-body = [
   and vetoable all the same, and once a `remove-party` has left one device
   that device acts at once again. (Before this rule, such a log let one
   device of a household, a stolen one included, remove the others or
-  replace the kit at once.) Re-verifying an older log under this rule
-  delays any single-device authority event such a log already holds.
+  replace the kit at once.) **Release cutover:** the floor holds for
+  events whose witness time (Section 8.3) is at or after
+  2026-12-01T00:00:00Z (Unix time 1796083200); an event witnessed earlier
+  keeps the rule of the stored `policy[1]` alone, so a log written before
+  the release (one device's `propose-party` followed at once by the
+  enrolment's `reshare`, say) still verifies as it did. This is sound:
+  witness time is the median of a witness majority's co-signed times and
+  never goes backwards along a log, so a new event cannot be dated before
+  the cutover without a corrupt witness majority, which can already
+  rewrite delays. Until the cutover, logs with a stored `policy[1] = 1`
+  and two devices remain exposed as before.
   Guardian and kit paths (`recover`, the kit's set-policy of Section 20.3)
   and `veto` keep their own rules (Sections 13, 13.4).
 - A `set-policy` that weakens recovery protection (shorter delay, fewer

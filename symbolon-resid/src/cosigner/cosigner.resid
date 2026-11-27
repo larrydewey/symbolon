@@ -312,7 +312,10 @@ Result(CosignerState, SymbolonError) end_window(CosignerState s, DuressState w, 
     // policy[1] raised to the floor of SPEC 8.2 (two with two devices or
     // more), as for authority events: a policy[1] of 1 left from the
     // inception does not let one other device of three end the window.
-    Int pol = authority_sigs(h.policy, h.quorum.parties);
+    // Always the floor: an end-duress message is checked live, not
+    // replayed from a stored log, so the log's release cutover does not
+    // apply.
+    Int pol = authority_sigs(h.policy, h.quorum.parties, authority_floor_from());
     Int need = if (others < pol) { others } else { pol };
     if (need < 1 || who.len() < need) {
         return Err(ErrQuorumNotMet((UInt(8))who.len(), (UInt(8))need));

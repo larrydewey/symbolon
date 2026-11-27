@@ -183,12 +183,23 @@ List(List(Int)) witness_key_list(List(WitnessRef) ws, Int i, ListBuf(List(Int)) 
 // may still say 1, and one device of a household must not then make
 // authority events (remove the other devices, rotate the kit, propose
 // parties) immediate (R4-1). Fewer signatures delay the event, vetoable.
-pub Int authority_sigs(Policy p, List(Party) live) {
-    Int floor = if (device_count(live, 0, 0) >= 2) { 2 } else { 1 };
+// `t`: the event's witness time. The floor holds from the release cutover
+// (authority_floor_from) on; an event witnessed before it keeps the stored
+// policy[1] rule, so logs written before the release still verify as they
+// did. Witness time is the median of a witness majority's co-signed times
+// (and never goes backwards along a log), so a new event cannot be
+// backdated below the cutover without a corrupt witness majority.
+pub Int authority_sigs(Policy p, List(Party) live, Int t) {
     Int set = (Int)p.device_sigs_for_authority;
+    if (t < authority_floor_from()) { return set; }
+    Int floor = if (device_count(live, 0, 0) >= 2) { 2 } else { 1 };
     Int need = if (set < floor) { floor } else { set };
     return need;
 }
+
+// SPEC 8.2: the release cutover of the quorum-in-force floor,
+// 2026-12-01T00:00:00Z as Unix seconds of witness time.
+pub Int authority_floor_from() { return 1796083200; }
 
 // SPEC 8.2 and 20.3: policy[1] >= 2 when the quorum holds two devices or more,
 // recovery delay at least 24 hours.
@@ -768,7 +779,8 @@ Result(LogState, SymbolonError) refuse(Str why) { return Err(ErrInvalidLog(why))
 Result(LogState, SymbolonError) authority(LogState s, SignedEvent e, List(Int) dig, Bool force_delay, Int dev_sigs) {
     if (dev_sigs < 1) { return refuse("authority event without a device signature"); }
     EventPayload ep = e.payload;
-    Int need = authority_sigs(s.policy, not_removed(s.quorum.parties, s.removed, 0, ListBuf()));
+    // s.last_time is this event's witness time here (step_at: with_time).
+    Int need = authority_sigs(s.policy, not_removed(s.quorum.parties, s.removed, 0, ListBuf()), s.last_time);
     Bool immediate = !force_delay && dev_sigs >= need;
     if (immediate) {
         return Ok(apply_effect(s, ep.body, dig, ep.next_recovery_key_digests));
