@@ -5,7 +5,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 RC="${RESIDC:-$HOME/git/larry/resid/build/boot/residc}"
-BIN=target/symbolon
+BIN="${BIN:-target/symbolon}"
 [ -x "$BIN" ] || { tools/depmap.sh > /dev/null; "$RC" src/main.resid -o "$BIN" --profile debug --verify-lib-dev -depmap target/deps.map > /dev/null; }
 W="$(mktemp -d)"
 # The servers' forked children outlive their parents: stop everything under $W.
