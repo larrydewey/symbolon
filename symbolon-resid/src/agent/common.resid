@@ -339,15 +339,28 @@ pub Result(VerifiedHead, SymbolonError) verified_events(List(Int) l, List(Signed
     };
 }
 
+// The witnesses as a process on a Symbolon Home box reaches them. `here`
+// is "" (as the policy names them), "HOST" (every witness at HOST, on its
+// port: a box that runs all of them), or "HOST KEY..." (KEY: a witness
+// public key, hex): only the witnesses with those keys, the box's own, are
+// at HOST; the others, outside the box, at their own addresses.
 pub List(WitnessRef) witnesses_at(List(WitnessRef) ws, Str here) {
-    return if (str_len(here) == 0) { ws } else { witnesses_local(ws, here, 0, ListBuf()) };
+    List(Str) parts = str_split(str_trim(here), " ");
+    if (str_len(str_trim(here)) == 0) { return ws; }
+    return witnesses_local(ws, parts[0], lower_keys(parts, 1, ListBuf()), 0, ListBuf());
 }
 
-List(WitnessRef) witnesses_local(List(WitnessRef) ws, Str host, Int i, ListBuf(WitnessRef) acc) {
+List(Str) lower_keys(List(Str) ps, Int i, ListBuf(Str) acc) {
+    if (i >= ps.len()) { return acc.finish(); }
+    return lower_keys(ps, i + 1, if (str_len(ps[i]) > 0) { acc.push(str_to_lower(ps[i])) } else { acc });
+}
+
+List(WitnessRef) witnesses_local(List(WitnessRef) ws, Str host, List(Str) keys, Int i, ListBuf(WitnessRef) acc) {
     if (i >= ws.len()) { return acc.finish(); }
     List(Str) p = str_split(ws[i].url, ":");
-    Str url = if (p.len() >= 2) { host + ":" + p[p.len() - 1] } else { ws[i].url };
-    return witnesses_local(ws, host, i + 1, acc.push(WitnessRef {.url = url, .key = ws[i].key}));
+    Bool here = keys.len() == 0 || keys.contains(str_to_lower(hex_encode(ws[i].key)));
+    Str url = if (here && p.len() >= 2) { host + ":" + p[p.len() - 1] } else { ws[i].url };
+    return witnesses_local(ws, host, keys, i + 1, acc.push(WitnessRef {.url = url, .key = ws[i].key}));
 }
 
 Int at_least(Int a, Int b) { return if (a > b) { a } else { b }; }

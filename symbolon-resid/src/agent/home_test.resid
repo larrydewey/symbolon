@@ -161,6 +161,33 @@ test "home init needs witnesses outside the box that outnumber the box's own" {
     expect(str_len(witness_problem("pc.lan:47110:abcd", box)) > 0).toBeTrue();
 }
 
+WitnessRef wref(Str url, Int n) { return WitnessRef {.url = url, .key = ec_public_key(P256, key32(n))}; }
+
+@requires(filesystem, declassify)
+test "a cosigner on the box reaches its one witness locally and the two outside it where they are" {
+    // The policy as the devices hold it: the box's witness at the address
+    // the devices use, two witnesses outside the box.
+    List(WitnessRef) ws = [wref("192.168.1.20:47102", 40), wref("pc.lan:47110", 41), wref("w.example.org:443", 42)];
+    // What `home serve` writes into each cosigner's local_host.
+    Str d = tmp_dir();
+    _ = filesystem.write_all(d + "/w1.pub", str_to_upper(wkey(40)));
+    HomeCfg c = HomeCfg {.base = 47100, .hosts = ["192.168.1.20"], .bind = "0.0.0.0"};
+    Str here = local_witnesses(d, c);
+    expect(here).toEqual("127.0.0.1 " + wkey(40));
+    List(WitnessRef) at = witnesses_at(ws, here);
+    expect(at[0].url).toEqual("127.0.0.1:47102");
+    expect(at[1].url).toEqual("pc.lan:47110");
+    expect(at[2].url).toEqual("w.example.org:443");
+    // So two of the three a cosigner asks are outside the box: a majority
+    // it can only get from them (before, all three went to 127.0.0.1,
+    // where only the box's one listens, and no majority ever answered).
+    expect(at[1].key).toEqual(ws[1].key);
+    // A box that runs all three (set up before): every witness at the box.
+    List(WitnessRef) old = witnesses_at([wref("192.168.1.20:47102", 40), wref("192.168.1.20:47103", 43), wref("192.168.1.20:47104", 44)], "127.0.0.1");
+    expect(old[2].url).toEqual("127.0.0.1:47104");
+    expect(witnesses_at(ws, "")[0].url).toEqual("192.168.1.20:47102");
+}
+
 test "home init listens on the first host's address unless told otherwise" {
     expect(bind_for("", ["192.168.1.20", "10.8.0.1"])).toEqual("192.168.1.20");
     expect(bind_for("0.0.0.0", ["192.168.1.20"])).toEqual("0.0.0.0");

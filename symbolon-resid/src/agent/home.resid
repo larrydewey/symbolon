@@ -442,6 +442,24 @@ List(Int) present_witnesses(Str dir, Int i, List(Int) acc) {
 @requires(filesystem)
 pub List(Str) offbox_witnesses(Str dir) { return file_lines(dir + "/witnesses.txt"); }
 
+// What a cosigner on the box keeps in its local_host: the address the box
+// listens on, and the keys of the box's own witnesses, which it reaches
+// there; the witnesses outside the box it reaches at their own addresses
+// (common.resid witnesses_at).
+@requires(filesystem)
+pub Str local_witnesses(Str dir, HomeCfg c) { return str_join([local_of(c.bind)].concat(box_keys(dir, 1, [])), " "); }
+
+// Every person's cosigner told where the witnesses are (at each start: a
+// cosigner made before kept only the box's address there, and so sent
+// every witness to the box).
+@requires(filesystem)
+Bool local_hosts(Str dir, List(Str) people, Int i, Str lh) {
+    if (i >= people.len()) { return true; }
+    Str cos = dir + "/people/" + people[i] + "/cos";
+    Bool ok = !filesystem.exists(cos + "/cosigner.cbor") || filesystem.write_all(cos + "/local_host", lh);
+    return ok && local_hosts(dir, people, i + 1, lh);
+}
+
 @requires(filesystem)
 List(Str) box_keys(Str dir, Int i, List(Str) acc) {
     if (i > 3) { return acc; }
@@ -846,6 +864,7 @@ pub Int home_serve(Str dir, Str self, Str pass_flag, Str run_base) {
     if (str_len(sk.server_key) == 0) { eprintln("home: cannot unseal the keys into " + run); return 1; }
     Str keyfile = if (sealed) { run + "/box.key" } else { "" };
     if (sealed && !point_people(dir, filesystem.list_dir(dir + "/people"), 0, keyfile)) { eprintln("home: cannot point the cosigners at the box key"); return 1; }
+    if (!local_hosts(dir, filesystem.list_dir(dir + "/people"), 0, local_witnesses(dir, c))) { eprintln("home: cannot tell the cosigners where the witnesses are"); return 1; }
     Str tls = " --tls " + dir + "/tls/server.pem " + sk.server_key + " --bind " + c.bind;
     List(Str) cmds = [
         self + " home pair-serve " + dir + " " + sk.server_key,
@@ -922,7 +941,7 @@ Bool make_cosigner(Str dir, Str pd, HomeCfg c, Str keyfile) {
     _ = filesystem.create_dir(cos);
     if (str_len(keyfile) > 0 && !filesystem.write_all(cos + "/" + seal_ptr_name(), keyfile)) { return false; }
     Str keys = cosigner_make(cos, local_of(c.bind), c.base + 1, filesystem.read_all(trust_file(dir)));
-    Bool ok = str_len(keys) > 0 && filesystem.write_all(cos + "/local_host", local_of(c.bind))
+    Bool ok = str_len(keys) > 0 && filesystem.write_all(cos + "/local_host", local_witnesses(dir, c))
            && filesystem.write_all(pd + "/witnesses", lines(witness_list(dir, c), 0, StrBuf()))
            && filesystem.write_all(pd + "/keys", keys);
     if (!ok) { eprintln("home: cannot make the cosigner in " + cos); }

@@ -116,6 +116,9 @@ curl -s --cacert "$W/ca.pem" -o /dev/null -w '%{http_code}' -X POST --data "$DEV
 # first turn takes the pairing and opens its mailbox for the inception.
 for _ in $(seq 60); do pgrep -f "cosigner serve-for $W/box/people/alice/cos" > /dev/null && break; sleep 1; done
 pgrep -f "cosigner serve-for $W/box/people/alice/cos" > /dev/null || fail "alice's cosigner did not start"
+# It reaches the box's own witness locally and the two outside it where
+# they are (the box's key only in its local_host).
+[ "$(cat "$W/box/people/alice/cos/local_host")" = "127.0.0.1 $(cat "$W/box/w1.pub")" ] || fail "local_host: $(cat "$W/box/people/alice/cos/local_host")"
 echo "inception against the box (key generation; a minute or two)..."
 printf '2468\n' | run 1800 "$BIN" device init "$W/dev" "$COSK" "$W1" "$W2" "$W3" "$W/device.primes" "$W/kit.primes" > "$W/devinit.log" 2>&1 || fail "device init: $(tail -3 "$W/devinit.log")"
 run 120 "$BIN" device status "$W/dev" > "$W/status.log" 2>&1 || fail "status: $(cat "$W/status.log")"
