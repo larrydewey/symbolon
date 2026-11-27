@@ -309,7 +309,11 @@ Result(CosignerState, SymbolonError) end_window(CosignerState s, DuressState w, 
     // policy[1] devices other than the duress one, or all of them when
     // there are fewer (two devices: the other one alone).
     Int others = other_devices(h.quorum.parties, w.party, 0, 0);
-    Int need = if (others < (Int)h.policy.device_sigs_for_authority) { others } else { (Int)h.policy.device_sigs_for_authority };
+    // policy[1] raised to the floor of SPEC 8.2 (two with two devices or
+    // more), as for authority events: a policy[1] of 1 left from the
+    // inception does not let one other device of three end the window.
+    Int pol = authority_sigs(h.policy, h.quorum.parties);
+    Int need = if (others < pol) { others } else { pol };
     if (need < 1 || who.len() < need) {
         return Err(ErrQuorumNotMet((UInt(8))who.len(), (UInt(8))need));
     }

@@ -834,3 +834,164 @@ test "a re-share puts the rotated kit in the old one's place only once the rotat
     expect(rotated_of(il_membership(l, [e0_with_kit(), slow], 2000, lambda(x) { false })).len()).toEqual(0);
     expect(rotated_of(il_membership(l, [e0_with_kit(), slow], 88400, lambda(x) { false })).len()).toEqual(1);
 }
+
+// ─── R4-1: the floor of policy[1] holds for the quorum in force ───
+// A log incepted with one device (policy[1] = 1, as `device init` makes
+// it) that enrolled a second one by propose-party and re-share, with no
+// set-policy: the stored policy[1] is still 1.
+
+Quorum quorum_one() {
+    return Quorum {
+        .parties = [test_device(2)], .t = 1, .root_pubkey = pubk(9),
+        .epoch = 0, .transcript_digest = id32(99), .kv_commits = [] };
+}
+
+Policy policy_one() {
+    Policy p = policy(86400);
+    return Policy {
+        .device_sigs_for_authority = 1, .recovery_delay_sec = p.recovery_delay_sec, .guardians = [],
+        .guardian_threshold = 0, .witnesses = p.witnesses, .duress_window_sec = p.duress_window_sec,
+        .sequencer = [], .cosigner_policy = NoCosignerPolicy };
+}
+
+SignedEvent e0_one() {
+    SignedEvent base = e0([2]);
+    EventPayload p = base.payload;
+    EventPayload op = EventPayload {
+        .log_id = p.log_id, .sequence = p.sequence, .predecessor_digest = p.predecessor_digest,
+        .suite = p.suite, .body = InceptionBody(quorum_one(), policy_one()),
+        .next_recovery_key_digests = p.next_recovery_key_digests, .advisory_time = 0 };
+    return SignedEvent {.payload = op, .encoded = base.encoded, .sigs = base.sigs, .cosigs = base.cosigs};
+}
+
+// E0 (device 2 alone), device 2 proposes device 3, both re-share to the
+// two of them (epoch 1): events 0 to 2.
+List(SignedEvent) enrolled() {
+    SignedEvent prop = next(1, 1, enc(0), ProposePartyBody(test_device(3), id32(43)), [2], 1500);
+    Quorum two = Quorum {.parties = [test_device(2), test_device(3)], .t = 1, .root_pubkey = pubk(9), .epoch = 1, .transcript_digest = id32(98), .kv_commits = []};
+    SignedEvent rs = next(2, 2, enc(1), ReshareBody(two), [2, 3], 1800);
+    return [e0_one(), prop, rs];
+}
+
+Int removed_n(Option(Membership) m) { return match m { Some(x) => x.removed.len(), None => -1 }; }
+Int proposed_n(Option(Membership) m) { return match m { Some(x) => x.proposed.len(), None => -1 }; }
+
+test "one device enrolls the second at once (one device: policy[1] = 1 holds)" {
+    List(Int) l = log_id();
+    List(SignedEvent) es = enrolled();
+    Result(VerifiedHead, SymbolonError) r = il_verify(l, es, 1800, lambda(x) { false });
+    expect(ok(r)).toBeTrue();
+    expect(epoch_of(r)).toEqual(1);
+    expect(pending_n(r)).toEqual(0);
+}
+
+test "with two devices and policy[1] = 1 stored, one device's remove-party is delayed and vetoable" {
+    List(Int) l = log_id();
+    List(SignedEvent) es = enrolled();
+    SignedEvent rm = next(3, 3, enc(2), RemovePartyBody(id32(3)), [2], 2000);
+    // Not removed at once: pending for the recovery delay.
+    expect(pending_n(il_verify(l, es.concat([rm]), 2000, lambda(x) { false }))).toEqual(1);
+    expect(removed_n(il_membership(l, es.concat([rm]), 2000, lambda(x) { false }))).toEqual(0);
+    // The other device vetoes it: never removed.
+    SignedEvent veto = next(4, 4, enc(3), VetoBody(3), [3], 3000);
+    expect(pending_n(il_verify(l, es.concat([rm, veto]), 2000 + 90000, lambda(x) { false }))).toEqual(0);
+    expect(removed_n(il_membership(l, es.concat([rm, veto]), 2000 + 90000, lambda(x) { false }))).toEqual(0);
+    // Unvetoed, it applies after the delay.
+    expect(removed_n(il_membership(l, es.concat([rm]), 2000 + 86400, lambda(x) { false }))).toEqual(1);
+    // Signed by both devices: immediate.
+    SignedEvent rm2 = next(3, 3, enc(2), RemovePartyBody(id32(3)), [2, 3], 2000);
+    expect(pending_n(il_verify(l, es.concat([rm2]), 2000, lambda(x) { false }))).toEqual(0);
+    expect(removed_n(il_membership(l, es.concat([rm2]), 2000, lambda(x) { false }))).toEqual(1);
+}
+
+test "with two devices and policy[1] = 1 stored, one device's rotate-recovery, propose-party and set-policy are delayed" {
+    List(Int) l = log_id();
+    List(SignedEvent) es = enrolled();
+    SignedEvent rot = next(3, 3, enc(2), RotateRecoveryBody, [3], 2000);
+    expect(pending_n(il_verify(l, es.concat([rot]), 2000, lambda(x) { false }))).toEqual(1);
+    expect(rotated_of(il_membership(l, es.concat([rot]), 2000, lambda(x) { false })).len()).toEqual(0);
+    SignedEvent veto = next(4, 4, enc(3), VetoBody(3), [2], 3000);
+    expect(pending_n(il_verify(l, es.concat([rot, veto]), 2000 + 90000, lambda(x) { false }))).toEqual(0);
+    expect(rotated_of(il_membership(l, es.concat([rot, veto]), 2000 + 90000, lambda(x) { false })).len()).toEqual(0);
+    SignedEvent rot2 = next(3, 3, enc(2), RotateRecoveryBody, [2, 3], 2000);
+    expect(rotated_of(il_membership(l, es.concat([rot2]), 2000, lambda(x) { false })).len()).toEqual(1);
+    SignedEvent prop = next(3, 3, enc(2), ProposePartyBody(test_device(4), id32(44)), [2], 2000);
+    expect(pending_n(il_verify(l, es.concat([prop]), 2000, lambda(x) { false }))).toEqual(1);
+    expect(proposed_n(il_membership(l, es.concat([prop]), 2000, lambda(x) { false }))).toEqual(0);
+    SignedEvent prop2 = next(3, 3, enc(2), ProposePartyBody(test_device(4), id32(44)), [2, 3], 2000);
+    expect(proposed_n(il_membership(l, es.concat([prop2]), 2000, lambda(x) { false }))).toEqual(1);
+    // A set-policy that only lengthens the delay (not weakening): one device's is delayed too.
+    Policy longer = Policy {.device_sigs_for_authority = 2, .recovery_delay_sec = 172800, .guardians = [], .guardian_threshold = 0,
+                            .witnesses = policy(86400).witnesses, .duress_window_sec = 3600, .sequencer = [], .cosigner_policy = NoCosignerPolicy};
+    SignedEvent sp = next(3, 3, enc(2), SetPolicyBody(longer), [2], 2000);
+    expect(pending_n(il_verify(l, es.concat([sp]), 2000, lambda(x) { false }))).toEqual(1);
+    SignedEvent sp2 = next(3, 3, enc(2), SetPolicyBody(longer), [2, 3], 2000);
+    expect(pending_n(il_verify(l, es.concat([sp2]), 2000, lambda(x) { false }))).toEqual(0);
+    // What a witness checks before co-signing (il_check_next) agrees: accepted, as a delayed event.
+    expect(next_ok(il_check_next(l, es, bare(rm_by(2)), 2000, lambda(x) { false }))).toBeTrue();
+}
+
+SignedEvent rm_by(Int who) { return next(3, 3, enc(2), RemovePartyBody(id32(3)), [who], 2000); }
+
+test "once the other device is removed, the one left acts at once again" {
+    List(Int) l = log_id();
+    List(SignedEvent) es = enrolled();
+    SignedEvent rm = rm_by(2);
+    SignedEvent prop = next(4, 4, enc(3), ProposePartyBody(test_device(4), id32(44)), [2], 88400);
+    Option(Membership) m = il_membership(l, es.concat([rm, prop]), 2000 + 86400, lambda(x) { false });
+    expect(removed_n(m)).toEqual(1);
+    expect(proposed_n(m)).toEqual(1);
+}
+
+test "authority_sigs: policy[1] raised to two with two live devices, kept with one" {
+    expect(authority_sigs(policy_one(), [test_device(2)])).toEqual(1);
+    expect(authority_sigs(policy_one(), [test_device(2), test_device(3)])).toEqual(2);
+    expect(authority_sigs(policy_one(), [test_device(2), kit_of_key(20)])).toEqual(1);
+    expect(authority_sigs(policy(86400), [test_device(2)])).toEqual(2);
+}
+
+// The log exactly as `device init` and `device enroll` build it (device.resid
+// inception, enroll.resid propose then reshare_in/after_session): E0 with
+// [this device, recovery kit, cosigner], t = 2, epoch 1, policy[1] = 1,
+// signed by all three; the device's propose-party of the new device, signed
+// by it alone; the re-share to [device, kit, cosigner, new device] at epoch
+// 2, signed by every online party of the new quorum (the kit is offline).
+// No set-policy: policy[1] is still 1 with two devices. (The relay's
+// sequencing, policy field 8, is left out: this verifier test has no relay
+// claims; it does not touch the signing rule.)
+Party cosigner_party(Int n) {
+    return Party {.id = id32(n), .kind = party_kind_cosigner(), .auth_key = pubk(n), .hpke_key = pubk(n), .label = "cosigner", .attestation = NoAttestation};
+}
+
+List(SignedEvent) enrolled_as_cli() {
+    Quorum q1 = Quorum {.parties = [test_device(2), kit_of_key(50), cosigner_party(6)], .t = 2, .root_pubkey = pubk(9),
+                        .epoch = 1, .transcript_digest = id32(99), .kv_commits = []};
+    SignedEvent base = e0([2, 50, 6]);
+    EventPayload p = base.payload;
+    EventPayload ip = EventPayload {
+        .log_id = p.log_id, .sequence = 0, .predecessor_digest = None, .suite = 1,
+        .body = InceptionBody(q1, policy_one()), .next_recovery_key_digests = [id32(50)], .advisory_time = 0 };
+    SignedEvent ev0 = SignedEvent {.payload = ip, .encoded = base.encoded, .sigs = base.sigs, .cosigs = base.cosigs};
+    SignedEvent prop = next(1, 1, enc(0), ProposePartyBody(test_device(3), id32(43)), [2], 1500);
+    Quorum q2 = Quorum {.parties = [test_device(2), kit_of_key(50), cosigner_party(6), test_device(3)], .t = 2, .root_pubkey = pubk(9),
+                        .epoch = 2, .transcript_digest = id32(98), .kv_commits = []};
+    SignedEvent rs = next(2, 2, enc(1), ReshareBody(q2), [2, 6, 3], 1800);
+    return [ev0, prop, rs];
+}
+
+test "after a normal enrolment (policy[1] still 1, two devices) one device's remove-party is delayed and vetoable" {
+    List(Int) l = log_id();
+    List(SignedEvent) es = enrolled_as_cli();
+    Result(VerifiedHead, SymbolonError) r = il_verify(l, es, 1800, lambda(x) { false });
+    expect(ok(r)).toBeTrue();
+    expect(epoch_of(r)).toEqual(2);
+    expect(pending_n(r)).toEqual(0);
+    // The stolen device 3 removes the owner's device 2 alone: not at once.
+    SignedEvent rm = next(3, 3, enc(2), RemovePartyBody(id32(2)), [3], 2000);
+    expect(pending_n(il_verify(l, es.concat([rm]), 2000, lambda(x) { false }))).toEqual(1);
+    expect(removed_n(il_membership(l, es.concat([rm]), 2000, lambda(x) { false }))).toEqual(0);
+    // The owner's device vetoes it within the delay: never removed.
+    SignedEvent veto = next(4, 4, enc(3), VetoBody(3), [2], 3000);
+    expect(removed_n(il_membership(l, es.concat([rm, veto]), 2000 + 90000, lambda(x) { false }))).toEqual(0);
+    expect(pending_n(il_verify(l, es.concat([rm, veto]), 2000 + 90000, lambda(x) { false }))).toEqual(0);
+}

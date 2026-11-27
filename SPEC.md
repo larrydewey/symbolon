@@ -473,6 +473,21 @@ recover-body = [
   the only device a principal still has) is **delayed**: it takes effect
   only after the recovery delay, during which every other device is
   notified and may veto, exactly as for `recover` (A-04).
+  The floor applies to the quorum **in force** when the event is checked,
+  not only to the policy as written: a verifier takes the device
+  signatures an event needs at once as `max(policy[1], f)`, where `f` is 2
+  while the quorum in force holds two or more devices that are not removed
+  and 1 otherwise. A policy written while the quorum had one device (the
+  inception's `policy[1] = 1`) stays in force when an enrolment's
+  `reshare` brings in a second device, since a `reshare` carries no
+  policy; from that `reshare` on, one device's authority event is delayed
+  and vetoable all the same, and once a `remove-party` has left one device
+  that device acts at once again. (Before this rule, such a log let one
+  device of a household, a stolen one included, remove the others or
+  replace the kit at once.) Re-verifying an older log under this rule
+  delays any single-device authority event such a log already holds.
+  Guardian and kit paths (`recover`, the kit's set-policy of Section 20.3)
+  and `veto` keep their own rules (Sections 13, 13.4).
 - A `set-policy` that weakens recovery protection (shorter delay, fewer
   guardians, lower guardian threshold, fewer witnesses, or no sequencing
   relay where there was one) is always delayed. A change of witnesses
@@ -1165,9 +1180,10 @@ status` points at it) does, from a device of the quorum:
    this device. Like every authority event (Section 8.2) it takes effect at
    once with `policy[1]` device signatures, otherwise after the recovery
    delay, during which every device is notified and may veto it. A device
-   signs alone, so the replacement is immediate while `policy[1]` is 1 (the
-   inception's, with one device) and delayed and vetoable once it is 2 or
-   more, as it must be with two devices or more. Until it is in
+   signs alone, so the replacement is immediate while the quorum has one
+   device and `policy[1]` is 1 (the inception's), and delayed and vetoable
+   with two devices or more, whatever `policy[1]` says (the floor of
+   Section 8.2 applies to the quorum in force). Until it is in
    force the old kit is the quorum's and recovers as before; a vetoed
    replacement never takes effect and its kit never works;
 3. once it is in force (running `device kit renew DIR` again after the
@@ -1438,7 +1454,8 @@ outside the subset.
 
 An end-duress message names the window (its start time) and carries
 signatures over `["symbolon v1 end-duress", log_id, started_at]` from
-`min(policy[1], other devices)` devices other than the duress device, at
+`min(policy[1], other devices)` devices other than the duress device
+(`policy[1]` raised to the floor of Section 8.2 for the quorum in force), at
 least one: an identity with two devices ends a window from the second
 alone. The agent sends it as `device duress end DIR` (the app's "I'm
 safe" button), from any device but the one that opened the window.
