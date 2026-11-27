@@ -23,6 +23,7 @@ import "cose.resid";
 import "cbor.resid";
 import "httpserv.resid";
 import "../net/services.resid";
+import "../vault/vault.resid";
 
 @requires(filesystem, network, clock(readonly), declassify)
 Str tmp_dir() {
@@ -1055,11 +1056,20 @@ Str http_body_text_of(List(Int) b) {
 
 List(Int) vrep(Int b, Int n) { return if (n <= 0) { [] } else { [b].concat(vrep(b, n - 1)) }; }
 
-List(Int) vstate(UInt(64) v, Int tag) {
-    VaultState st = VaultState {.head = VaultHead {.vault_id = vrep(1, 32), .version = v, .merkle_root = vrep(tag, 32), .log_id = vrep(2, 32),
-                                                   .log_sequence = 1, .suite = 1, .signer = vrep(3, 32), .sig = []}, .items = []};
+// A state at version `v` signed by `d` (its log and party in the head).
+List(Int) vstate_by(TDev d, UInt(64) v, Int tag) {
+    VaultHead h = VaultHead {.vault_id = vrep(1, 32), .version = v, .merkle_root = vrep(tag, 32), .log_id = d.log,
+                             .log_sequence = 1, .suite = 1, .signer = d.party, .sig = []};
+    VaultState st = VaultState {.head = VaultHead {.vault_id = h.vault_id, .version = v, .merkle_root = h.merkle_root, .log_id = h.log_id,
+                                                   .log_sequence = 1, .suite = 1, .signer = h.signer, .sig = tsign(d, head_tbs(h))}, .items = []};
     return match to_cbor(st) { Ok(b) => b, Err(_) => [] };
 }
+
+TDev vdev() { return TDev {.log = vrep(2, 32), .party = vrep(3, 32), .priv = lpriv(5), .pub = lpub(5)}; }
+
+List(Int) vstate(UInt(64) v, Int tag) { return vstate_by(vdev(), v, tag); }
+
+Who vwho() { return twho(vdev()); }
 
 @requires(filesystem, network, clock(readonly), declassify)
 test "a vault or folder state is stored only above the version stored" {
@@ -1068,26 +1078,55 @@ test "a vault or folder state is stored only above the version stored" {
     expect(versioned_blob(n)).toBeTrue();
     expect(versioned_blob("coll-" + hex_encode(vrep(4, 16)))).toBeTrue();
     expect(versioned_blob("card-" + hex_encode(vrep(2, 32)))).toBeFalse();
-    expect(versioned_put(s, n, vstate(1, 10), 1000).status).toEqual(200);
-    expect(versioned_put(s, n, vstate(2, 11), 1000).status).toEqual(200);
+    expect(versioned_put(s, n, vstate(1, 10), vwho(), 1000).status).toEqual(200);
+    List(Int) v2 = vstate(2, 11);
+    expect(versioned_put(s, n, v2, vwho(), 1000).status).toEqual(200);
     // Another device that read version 1 writes its own version 2: before,
     // it replaced the first device's version 2 (which then saw a fork).
-    expect(versioned_put(s, n, vstate(2, 12), 1000).status).toEqual(409);
-    expect(versioned_put(s, n, vstate(1, 12), 1000).status).toEqual(409);
-    expect(hex_encode(st_bytes(s, "blob/" + n))).toEqual(hex_encode(vstate(2, 11)));
+    expect(versioned_put(s, n, vstate(2, 12), vwho(), 1000).status).toEqual(409);
+    expect(versioned_put(s, n, vstate(1, 12), vwho(), 1000).status).toEqual(409);
+    expect(hex_encode(st_bytes(s, "blob/" + n))).toEqual(hex_encode(v2));
     // what is not a state is not stored
-    expect(versioned_put(s, n, [1], 1000).status).toEqual(400);
-    expect(versioned_put(s, n, [], 1000).status).toEqual(400);
+    expect(versioned_put(s, n, [1], vwho(), 1000).status).toEqual(400);
+    expect(versioned_put(s, n, [], vwho(), 1000).status).toEqual(400);
     // two writers of version 3 at once: the lock gives it to one
     _ = st_put_new(s, "blobv/" + n + "-3", utf8("1000"));
-    expect(versioned_put(s, n, vstate(3, 13), 1030).status).toEqual(409);
+    expect(versioned_put(s, n, vstate(3, 13), vwho(), 1030).status).toEqual(409);
     // a lock whose writer stopped before storing is taken over after a minute
-    expect(versioned_put(s, n, vstate(3, 13), 1061).status).toEqual(200);
-    expect(versioned_put(s, n, vstate(4, 14), 1062).status).toEqual(200);
+    expect(versioned_put(s, n, vstate(3, 13), vwho(), 1061).status).toEqual(200);
+    expect(versioned_put(s, n, vstate(4, 14), vwho(), 1062).status).toEqual(200);
     // a folder's items: the same
     Str c = "coll-" + hex_encode(vrep(4, 16));
-    expect(versioned_put(s, c, vstate(5, 15), 1000).status).toEqual(200);
-    expect(versioned_put(s, c, vstate(5, 16), 1000).status).toEqual(409);
+    expect(versioned_put(s, c, vstate(5, 15), vwho(), 1000).status).toEqual(200);
+    expect(versioned_put(s, c, vstate(5, 16), vwho(), 1000).status).toEqual(409);
+}
+
+// R4-3: a stolen device (or one of a folder's people) stored version
+// 2^63-1, unsigned or badly signed, and every later write got 409, the
+// owner's re-key included. A state is now stored only signed by the
+// device that writes it, and at most 2^20 above the stored version.
+@requires(filesystem, network, clock(readonly), declassify)
+test "a vault state is stored only signed by its writer and one version up" {
+    Store s = tmp_store();
+    RelayCfg g = cfg_of(s, "");
+    TDev a = tdev();
+    TDev b = TDev {.log = a.log, .party = random_bytes(16), .priv = ec_generate(P256), .pub = []};
+    TDev b2 = TDev {.log = b.log, .party = b.party, .priv = b.priv, .pub = ec_public_key(P256, b.priv)};
+    Str n = "vault-" + hex_encode(a.log);
+    Str ta = tsession(s, a, 0);
+    List(Int) a1 = vstate_by(a, 1, 10);
+    expect(relay_serve_handle(g, treq("PUT", "/blob/" + n, ta, a1)).status).toEqual(200);
+    // a version far above the stored one: refused, and the honest next one still lands
+    expect(relay_serve_handle(g, treq("PUT", "/blob/" + n, ta, vstate_by(a, 9223372036854775807, 11))).status).toEqual(400);
+    expect(relay_serve_handle(g, treq("PUT", "/blob/" + n, ta, vstate_by(a, 1048578, 11))).status).toEqual(400);
+    // a head signed by another key than the writer's session, or naming another signer
+    expect(relay_serve_handle(g, treq("PUT", "/blob/" + n, tsession(s, b2, 0), vstate_by(a, 2, 12))).status).toEqual(403);
+    TDev forged = TDev {.log = a.log, .party = a.party, .priv = b.priv, .pub = a.pub};
+    expect(relay_serve_handle(g, treq("PUT", "/blob/" + n, ta, vstate_by(forged, 2, 12))).status).toEqual(403);
+    expect(relay_serve_handle(g, treq("PUT", "/blob/" + n, ta, vstate(2, 12))).status).toEqual(403);
+    expect(hex_encode(st_bytes(s, "blob/" + n))).toEqual(hex_encode(a1));
+    expect(relay_serve_handle(g, treq("PUT", "/blob/" + n, ta, vstate_by(a, 2, 13))).status).toEqual(200);
+    expect(relay_serve_handle(g, treq("PUT", "/blob/" + n, tsession(s, b2, 0), vstate_by(b2, 3, 14))).status).toEqual(200);
 }
 
 // The new device's (key `k`) rotate-recovery at 2 after the recover at 1

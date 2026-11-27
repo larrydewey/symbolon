@@ -54,6 +54,7 @@
 import "../types.resid";
 import "../core/log.resid";
 import "../core/event_decode.resid";
+import "../vault/vault.resid";
 import "../net/services.resid";
 import "../net/store.resid";
 import "state.resid";
@@ -1061,7 +1062,7 @@ HttpReply handle(RelayCfg g, Store root, HttpRequest r) {
         if (why == alerts_full()) { return http_reply_text(429, "text/plain", why); }
         if (str_len(why) > 0) { return http_reply_text(denied, "text/plain", why); }
         if (r.body.len() > max_body()) { return http_reply_status(413); }
-        if (versioned_blob(name)) { return versioned_put(root, name, r.body, clock_now_seconds()); }
+        if (versioned_blob(name)) { return versioned_put(root, name, r.body, w, clock_now_seconds()); }
         return stored_reply(root, name, r.body);
     }
     return http_reply_status(404);
@@ -1076,9 +1077,15 @@ HttpReply handle(RelayCfg g, Store root, HttpRequest r) {
 // version, "blobv/<name>-<version>", written once; one older than a
 // minute whose state never landed is taken over). The writer that gets
 // 409 reads the state again, makes its change on it and writes again.
-// The relay reads only the head's version, which is not sealed; it does
-// not check the signature (the devices do), so a device of the log or one
-// of the folder's people can still write a state the others refuse.
+// The relay read only the head's version and checked no signature, so a
+// stolen device (or any of a folder's people) could store version 2^63-1
+// and every later write, the owner's included, got 409 until the relay's
+// operator stepped in (R4-3). Now the head must be signed by the device
+// that writes it (its signer the session's party, its log the session's
+// log, its signature verifying under the session's key, which the relay
+// verified against the log at sign-in and whenever the log grew: who_of),
+// and its version at most max_version_step() above the one stored. Honest
+// writers always write stored + 1 (vaultcli.resid publish_once).
 pub Bool versioned_blob(Str name) {
     return (str_starts_with(name, "vault-") && str_len(log_named(name)) > 0) || (str_starts_with(name, "coll-") && str_len(folder_of(name)) > 0);
 }
@@ -1091,15 +1098,33 @@ pub Int head_version_of(List(Int) b) {
     return if (v < 0) { -1 } else { v };
 }
 
+// How far above the stored version a new state's version may be.
+pub Int max_version_step() { return 1048576; }
+
+// Whether the vault state `b` is signed by the writing device `w`: its
+// head names w's party as signer and w's log, and the signature verifies
+// under w's key (SPEC 18.4: a head is signed by its writer's DK).
+pub Bool state_signed_by(List(Int) b, Who w) {
+    if (b.len() == 0 || b.len() > max_body() || !cbor_well_formed(b, 24)) { return false; }
+    Result(VaultState, SerialError) r = from_cbor(b);
+    return match r {
+        Err(_) => false,
+        Ok(st) => bytes_eq(st.head.signer, w.party) && bytes_eq(st.head.log_id, w.log) && st.head.sig.len() == 64
+                  && ecdsa_verify_raw(P256, Sha256, w.key, head_tbs(st.head), st.head.sig)
+    };
+}
+
 pub Str stale_state_text() { return "a newer state is stored: read it, make the change on it, and write again"; }
 
 @requires(filesystem, network, clock(readonly), declassify)
-pub HttpReply versioned_put(Store root, Str name, List(Int) body, Int now) {
+pub HttpReply versioned_put(Store root, Str name, List(Int) body, Who w, Int now) {
     Int nv = head_version_of(body);
     if (nv < 1) { return http_reply_text(400, "text/plain", "not a vault state"); }
+    if (!state_signed_by(body, w)) { return http_reply_text(403, "text/plain", "a state is stored only signed by the device that writes it"); }
     List(Int) prev = stored(root, name);
     Int ov = if (prev.len() == 0) { 0 } else { head_version_of(prev) };
     if (nv <= ov) { return http_reply_text(409, "text/plain", stale_state_text()); }
+    if (nv - ov > max_version_step()) { return http_reply_text(400, "text/plain", "a state's version is the stored version plus one"); }
     Str lk = "blobv/" + name + f"-{nv}";
     Int got = st_put_new(root, lk, utf8(f"{now}"));
     if (got < 0) { return http_reply_status(500); }
