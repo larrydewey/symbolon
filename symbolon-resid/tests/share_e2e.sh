@@ -16,8 +16,12 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 BIN="${BIN:-$PWD/target/symbolon}"
 [ -x "$BIN" ] || { echo "build target/symbolon first"; exit 2; }
+# The box's two witnesses outside it listen on this machine's own address
+# (not loopback, which `home init` takes for the box itself).
+XIP=$(hostname -I 2>/dev/null | awk '{print $1}')
+[ -n "$XIP" ] || { echo "SKIP: no address but loopback"; exit 0; }
 W="$(mktemp -d)"
-cleanup() { pkill -f -- "$W/" 2>/dev/null; [ -n "${KEEP:-}" ] && echo "kept $W" || rm -rf "$W"; }
+cleanup() { pkill -f -- "$W/" 2>/dev/null; [ -n "$(cat "$W/box/run.path" 2>/dev/null)" ] && rm -rf "$(cat "$W/box/run.path")"; [ -n "${KEEP:-}" ] && echo "kept $W" || rm -rf "$W"; }
 trap cleanup EXIT
 trap "exit 1" INT TERM HUP
 run() { ( ulimit -v 40000000; ulimit -s unlimited; timeout "$1" "${@:2}" ); }
@@ -35,26 +39,40 @@ for name, i in (('alice.device', 0), ('alice.kit', 1), ('bob.device', 2), ('bob.
     open(f'{sys.argv[1]}/{name}.primes', 'w').write(f"{k[i]['P']} {k[i]['Q']}\n")
 EOF
 
-run 60 "$BIN" home init "$W/box" 127.0.0.1 --ports "$BASE" --bind 127.0.0.1 > "$W/init.log" 2>&1 || fail "home init: $(cat "$W/init.log")"
+# The box: its keys sealed to a passphrase (fast Argon2id for the test),
+# its one witness, and two witnesses outside it (SPEC 20.5).
+printf 'household passphrase\n' > "$W/pass"
+X1=$(run 30 "$BIN" witness keygen "$W/x1.key") || fail "witness keygen"
+X2=$(run 30 "$BIN" witness keygen "$W/x2.key") || fail "witness keygen"
+run 120 "$BIN" home init "$W/box" 127.0.0.1 --ports "$BASE" --bind 127.0.0.1 --witness "$XIP:$((BASE + 5)):$X1" --witness "$XIP:$((BASE + 6)):$X2" \
+    --seal passphrase --passphrase-file "$W/pass" --fast-kdf > "$W/init.log" 2>&1 || fail "home init: $(cat "$W/init.log")"
+for x in 1 2; do
+  run 120 "$BIN" home witness-cert "$W/box" "$XIP" "$W/x${x}tls" --passphrase-file "$W/pass" > "$W/wcert$x.log" 2>&1 || fail "witness-cert: $(cat "$W/wcert$x.log")"
+  ( setsid "$BIN" witness serve "$W/x$x" $((BASE + 4 + x)) "$W/x$x.key" 0 --bind "$XIP" --tls "$W/x${x}tls/server.pem" "$W/x${x}tls/server.key" > "$W/x$x.log" 2>&1 & )
+done
 LA=$(run 60 "$BIN" home invite "$W/box" alice) || fail "invite alice"
 LB=$(run 60 "$BIN" home invite "$W/box" bob) || fail "invite bob"
-( setsid "$BIN" home serve "$W/box" > "$W/serve.log" 2>&1 & )
-for p in 0 1 2 3 4; do wait_port $((BASE + p)) || fail "port $((BASE + p)) did not open"; done
+( setsid "$BIN" home serve "$W/box" --passphrase-file "$W/pass" > "$W/serve.log" 2>&1 & )
+for p in 0 1 2; do wait_port $((BASE + p)) || fail "port $((BASE + p)) did not open"; done
 URL="https://127.0.0.1:$BASE"
 
 # What the app does with a pairing link: setup, pair, inception.
 person() {
     local who=$1 link=$2 dpin=${3:-} code
     code=$(sed -n 's/.*[?&]c=\([^&]*\).*/\1/p' <<< "$link")
+    # `home serve` makes the person's cosigner within ten seconds; the
+    # code's first setup spends it and gives the pair token.
+    for _ in $(seq 60); do [ -s "$W/box/people/$who/keys" ] && break; sleep 1; done
     curl -sS --cacert "$W/box/tls/ca.pem" "$URL/setup?c=$code" > "$W/$who.setup.json" || fail "setup $who"
-    read -r RH RPORT COSK W1 W2 W3 < <(python3 -c '
+    read -r RH RPORT COSK W1 W2 W3 TOK < <(python3 -c '
 import json, sys
 j = json.load(open(sys.argv[1]))
-print(j["relay_host"], j["relay_port"], j["cosigner_keys"], *j["witnesses"])' "$W/$who.setup.json")
-    for _ in $(seq 60); do pgrep -f "cosigner serve-for $W/box/people/$who/cos" > /dev/null && break; sleep 1; done
+print(j["relay_host"], j["relay_port"], j["cosigner_keys"], *j["witnesses"], j["pair_token"])' "$W/$who.setup.json") || fail "setup $who: $(cat "$W/$who.setup.json")"
     local dev
     dev=$(printf '2468\n%s\n' "$dpin" | run 120 "$BIN" device new "$W/$who" "$RH" "$RPORT" --unprotected --fast-kdf --ca "$W/box/tls/ca.pem") || fail "device new $who"
-    curl -sS --cacert "$W/box/tls/ca.pem" -X POST --data "$dev" "$URL/pair?c=$code" | grep -q '"paired": true' || fail "pair $who"
+    curl -sS --cacert "$W/box/tls/ca.pem" -X POST --data "$dev" "$URL/pair?c=$code&t=$TOK" | grep -q '"paired": true' || fail "pair $who"
+    # The box starts the person's cosigner once a device has paired.
+    for _ in $(seq 60); do pgrep -f "cosigner serve-for $W/box/people/$who/cos" > /dev/null && break; sleep 1; done
     printf '2468\n' | run 1800 "$BIN" device init "$W/$who" "$COSK" "$W1" "$W2" "$W3" "$W/$who.device.primes" "$W/$who.kit.primes" > "$W/$who.init.log" 2>&1 || fail "device init $who: $(tail -3 "$W/$who.init.log")"
 }
 echo "two inceptions against the box (key generation; a few minutes)..."
@@ -205,8 +223,8 @@ grep -qx "current $(hx s3cret)" "$W/off.log" && grep -q "local copy:" "$W/off.er
 pin device share list "$A" > "$W/offlist.log" 2>"$W/offlist.err" || fail "offline list: $(cat "$W/offlist.err")"
 grep -qx "$ID $(hx Family) owner 1" "$W/offlist.log" && grep -q "local copy:" "$W/offlist.err" || fail "offline list: $(cat "$W/offlist.log" "$W/offlist.err")"
 printf '2468\ntext %s\n' "$(hx x)" | run 300 "$BIN" device vault set "$A" Off note --share "$ID" > "$W/offset.log" 2>&1 && fail "a change offline"
-( setsid "$BIN" home serve "$W/box" > "$W/serve2.log" 2>&1 & )
-for p in 0 1 2 3 4; do wait_port $((BASE + p)) || fail "port $((BASE + p)) did not open again"; done
+( setsid "$BIN" home serve "$W/box" --passphrase-file "$W/pass" > "$W/serve2.log" 2>&1 & )
+for p in 0 1 2; do wait_port $((BASE + p)) || fail "port $((BASE + p)) did not open again"; done
 for _ in $(seq 60); do pgrep -f "cosigner serve-for $W/box/people/alice/cos" > /dev/null && break; sleep 1; done
 echo "offline: alice reads the folder and lists her folders from her device's copy; no change offline"
 

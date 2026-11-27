@@ -106,16 +106,16 @@ python3 -c 'import json, sys; open(sys.argv[2], "w").write(json.load(open(sys.ar
 cmp -s "$W/ca.pem" "$W/box/tls/ca.pem" || fail "the setup's CA is not the box's"
 echo "pairing service: setup over TLS with the code, once; a wrong code refused"
 
-# The person's cosigner starts within ten seconds, and is already serving
-# when the device pairs (a pairing must not be lost to the copy of the
-# configuration it read before).
-for _ in $(seq 60); do pgrep -f "cosigner serve-for $W/box/people/alice/cos" > /dev/null && break; sleep 1; done
-pgrep -f "cosigner serve-for $W/box/people/alice/cos" > /dev/null || fail "alice's cosigner did not start"
 sealed "$W/box/people/alice/cos/root" || fail "alice's cosigner's root key is not sealed"
+pgrep -f "cosigner serve-for $W/box/people/alice/cos" > /dev/null && fail "alice's cosigner runs before a device paired"
 DEV=$(printf '2468\n\n' | run 120 "$BIN" device new "$W/dev" "$RH" "$RPORT" --unprotected --fast-kdf --ca "$W/ca.pem") || fail "device new"
 curl -s --cacert "$W/ca.pem" -o /dev/null -w '%{http_code}' -X POST --data "$DEV" "$URL/pair?c=$CODE" | grep -q 403 || fail "paired without the setup's token"
 curl -sS --cacert "$W/ca.pem" -X POST --data "$DEV" "$URL/pair?c=$CODE&t=$TOK" | grep -q '"paired": true' || fail "pair"
 curl -s --cacert "$W/ca.pem" -o /dev/null -w '%{http_code}' -X POST --data "$DEV" "$URL/pair?c=$CODE&t=$TOK" | grep -q 403 || fail "a spent code paired again"
+# The person's cosigner starts within ten seconds of the pairing, and its
+# first turn takes the pairing and opens its mailbox for the inception.
+for _ in $(seq 60); do pgrep -f "cosigner serve-for $W/box/people/alice/cos" > /dev/null && break; sleep 1; done
+pgrep -f "cosigner serve-for $W/box/people/alice/cos" > /dev/null || fail "alice's cosigner did not start"
 echo "inception against the box (key generation; a minute or two)..."
 printf '2468\n' | run 1800 "$BIN" device init "$W/dev" "$COSK" "$W1" "$W2" "$W3" "$W/device.primes" "$W/kit.primes" > "$W/devinit.log" 2>&1 || fail "device init: $(tail -3 "$W/devinit.log")"
 run 120 "$BIN" device status "$W/dev" > "$W/status.log" 2>&1 || fail "status: $(cat "$W/status.log")"

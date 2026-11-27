@@ -929,10 +929,16 @@ Bool make_cosigner(Str dir, Str pd, HomeCfg c, Str keyfile) {
     return ok;
 }
 
+// A person's cosigner starts once a device has paired with it (pair.keys,
+// kept, emptied, once taken): its first turn then takes the pairing and
+// opens its mailbox at once. Started before, it would sit out a whole
+// child's minute waiting for mail before it read the pairing, which is as
+// long as the device waits to post its keygen invite.
 @requires(filesystem)
 List(Str) new_people(Str dir, List(Str) all, List(Str) started, Int i, ListBuf(Str) acc) {
     if (i >= all.len()) { return acc.finish(); }
-    Bool ready = filesystem.exists(dir + "/people/" + all[i] + "/cos/cosigner.cbor");
+    Str cos = dir + "/people/" + all[i] + "/cos";
+    Bool ready = filesystem.exists(cos + "/cosigner.cbor") && filesystem.exists(cos + "/pair.keys");
     return new_people(dir, all, started, i + 1, if (ready && !started.contains(all[i])) { acc.push(all[i]) } else { acc });
 }
 
