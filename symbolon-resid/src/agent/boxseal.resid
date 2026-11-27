@@ -54,7 +54,7 @@ pub Str seal_mark_name() { return ".box-sealed"; }
 List(Int) seal_aad() { return [115, 121, 109, 98, 111, 108, 111, 110, 32, 118, 49, 32, 104, 111, 109, 101, 32, 115, 101, 97, 108, 101, 100, 32, 102, 105, 108, 101]; }
 
 // The associated data of a file at `rel` below its sealed root.
-pub List(Int) seal_aad_at(Str rel) { return seal_aad().concat([0]).concat(str_to_bytes(rel)); }
+pub List(Int) seal_aad_at(Str rel) { return seal_aad().concat([0]).concat(bytes_of(rel)); }
 
 // Sealed, in either format (so nothing is sealed twice).
 pub Bool is_sealed(List(Int) b) { return b.len() >= 36 && (b[0..8] == seal_magic() || b[0..8] == seal_magic2()); }
