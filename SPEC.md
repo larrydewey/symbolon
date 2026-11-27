@@ -457,11 +457,18 @@ did. Two steps follow the upgrade.
   version 2 or later, signed by the requester's device key) or, after two
   minutes without one, leads. A device already in a log joins re-shares
   of that log only, and keeps its own chain code and vault key whatever
-  the leader sends. A joiner signs the reshare event only when it is
-  exactly the invitation's re-share (its parties with their keys, its
-  threshold, the epoch, the session's transcript and the log's root key),
-  and stores its new share only once the verified log, held against the
-  witnesses, is at that epoch with that transcript.
+  the leader sends: no re-share changes them (26.1), and a leader that
+  sends others is reported to the person, not followed. A joiner signs
+  the reshare event only when it is exactly the invitation's re-share
+  (its parties with their keys, its threshold, the epoch, the session's
+  transcript and the log's root key), and takes its new share into use
+  only once the verified log, held against the witnesses, is at that
+  epoch with that transcript. It asks a few times over about two
+  minutes; until then the new share is kept aside, sealed as the share
+  in use is, and every later command takes it into use as soon as the
+  log is there, or drops it once the log made that epoch otherwise or
+  moved past it (then a kit renewal from another device gives the device
+  a share again).
   It is done on a device once that device holds a **nonce-fix marker**:
   its device key's signature over the log id, an epoch, that epoch's
   transcript digest and its own id. This build writes it for the epoch a
@@ -3938,7 +3945,7 @@ benefit for unique random secrets. Triggers:
 
 | Trigger | Rotates |
 |---|---|
-| A device is removed from the quorum (Section 11.2) | Shares (re-share), chain code for new credentials, vault keys, **every legacy password and TOTP seed the removed device could decrypt** |
+| A device is removed from the quorum (Section 11.2) | Shares (re-share), chain code for new credentials, vault keys, **every legacy password and TOTP seed the removed device could decrypt** (not built yet for the chain code and vault keys: a re-share never changes them, and a device already in the log keeps its own whatever a re-share's leader sends, 6.2.2; their rotation must come in a form the log anchors, not from the leader alone) |
 | A party is suspected compromised | As above, plus re-registration of Threshold credentials (26.5) |
 | A password appears in a breach corpus (k-anonymity range query, e.g. Pwned Passwords; only a 5-hex-digit SHA-1 prefix leaves the agent) | That password |
 | A relying party is reported breached | Every credential for that relying party |

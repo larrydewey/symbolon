@@ -963,14 +963,19 @@ Int joined(Str dir, DeviceConfig c, Unlocked u, Str pin, CgConfig ncfg, EnrollSe
     // to refuse after its signature, so no device is left behind).
     List(Int) cc = chosen_secret(member, es.cc, reveal(u.real.cc));
     List(Int) vk = chosen_secret(member, es.vault_key, reveal(u.real.vault_key));
-    if (member && (!bytes_eq(es.cc, cc) || !bytes_eq(es.vault_key, vk))) { eprintln("device: the device that led the re-share sent another chain code or vault key; this device keeps its own"); }
-    // The new share only once the verified log, held against the
-    // witnesses, is at the epoch this session made (MR-1, MR-5): a leader
-    // that never publishes leaves this device with the share it had.
-    if (!landed_now(dir, c, inv.epoch, transcript)) {
-        _ = note_reshare_fail(dir, "the re-share's event is not in the log");
-        return dfail("the re-share's event is not in the verified log: nothing was stored (run it again)");
+    // MR-10: no re-share rotates them (SPEC 26.1, 6.2.2); one that differs
+    // is said plainly and not taken.
+    if (member && (!bytes_eq(es.cc, cc) || !bytes_eq(es.vault_key, vk))) {
+        eprintln("device: the device that led this re-share sent a different chain code or vault key. Symbolon does not change them in a re-share, so this device keeps its own. If you did not expect this, check your other devices.");
     }
+    // The new share is taken into use only once the verified log, held
+    // against the witnesses, is at the epoch this session made (MR-1,
+    // MR-5), asked a few times with pauses. Until then it is kept aside,
+    // sealed like the share in use (DIR/share-next), and taken into use by
+    // the next command that sees the log there (settle_pending, MR-9).
+    Bool landed = landed_retry(dir, c, inv.epoch, transcript, 0);
+    Str at = if (landed) { dir } else { next_share_dir(dir) };
+    if (!landed) { _ = filesystem.create_dir(at); }
     RealProfile real = RealProfile {.share = u.real.share, .cc = secret_bytes(cc), .vault_key = secret_bytes(vk), .dek = u.real.dek, .duress_hpke_pub = u.real.duress_hpke_pub};
     List(Secret(UInt(8))) k = u.ukey;
     List(Secret(UInt(8))) rp = encode_real(real) else { [] };
@@ -978,11 +983,16 @@ Int joined(Str dir, DeviceConfig c, Unlocked u, Str pin, CgConfig ncfg, EnrollSe
     Bool a_real = unlock(k, read_blob(dir, "a", u.wrap), []).kind == 1;
     List(Int) blob = seal_blob(k, random_bytes(12), rp);
     Bool ok = write_blob(dir, if (a_real) { "a" } else { "b" }, blob, u.wrap)
-        && store_share(dir, u.real.dek, ncfg) && store_dshare(dir, real, ncfg)
-        && match kvo { None => true, Some(o) => kv_store(dir, u.real.dek, KvKept {.epoch = inv.epoch, .id = pos1(inv.new_parties, c.party, 0), .share = o.share}) }
+        && store_share(at, u.real.dek, ncfg) && store_dshare(at, real, ncfg)
+        && match kvo { None => true, Some(o) => kv_store(at, u.real.dek, KvKept {.epoch = inv.epoch, .id = pos1(inv.new_parties, c.party, 0), .share = o.share}) }
+        && (landed || filesystem.write_all(next_share_meta(dir), next_share_line(inv.epoch, transcript)))
         && send_duress_key(dir, mail_ep(dir, c, u), Local {.party = c.party, .cg = 0, .hpke_sk = device_transport(c, u.real.dek).sk}, cos_remote(vh))
         && save_config(dir, with_log(c, eps_of(vh.head.policy.witnesses, 0, []), c.log_id, cur.next, c.peers));
     if (!ok) { return dfail("cannot store the enrollment"); }
+    if (!landed) {
+        _ = note_reshare_fail(dir, "the re-share's new epoch was not in the log yet");
+        return dfail(next_share_words());
+    }
     // This build took part in the epoch (SPEC 6.2.2); a new device keeps
     // the inception's marker instead when the enrolling device handed one
     // on, an existing one never (MR-2).
@@ -1018,6 +1028,93 @@ Bool ep_key_in(List(WitnessEp) eps, List(Int) k, Int i) {
 // The chain code or vault key a joining device keeps: a new device takes
 // what the leader sent; one already in the log keeps its own (M-3, MR-5).
 pub List(Int) chosen_secret(Bool member, List(Int) sent, List(Int) mine) { return if (member) { mine } else { sent }; }
+
+// landed_now, asked again after 5, 10, 20, 40 and 60 seconds.
+@requires(filesystem, network, clock, declassify)
+Bool landed_retry(Str dir, DeviceConfig c, Int epoch, List(Int) transcript, Int i) {
+    if (landed_now(dir, c, epoch, transcript)) { return true; }
+    List(Int) waits = [5, 10, 20, 40, 60];
+    if (i >= waits.len()) { return false; }
+    _ = clock_sleep_ms(waits[i] * 1000);
+    return landed_retry(dir, c, epoch, transcript, i + 1);
+}
+
+// ─── A joined re-share's share kept aside (MR-9) ────────────────
+// DIR/share-next/ holds share.enc, dshare and kv.enc exactly as they are
+// kept in use (sealed under the DEK; dshare to the duress key), and meta:
+// "epoch E transcript HEX". They are copied into use, needing no PIN,
+// when the verified log is at E with that transcript; dropped when the
+// log made E with another transcript, or moved past E.
+
+pub Str next_share_dir(Str dir) { return dir + "/share-next"; }
+pub Str next_share_meta(Str dir) { return next_share_dir(dir) + "/meta"; }
+pub Str next_share_promoted(Str dir) { return next_share_dir(dir) + "/promoted"; }
+
+pub Str next_share_line(Int epoch, List(Int) transcript) { return f"epoch {epoch} transcript " + (if (transcript.len() == 0) { "-" } else { hex_encode(transcript) }) + "\n"; }
+
+pub type SharePending = { Int epoch; List(Int) transcript; };
+
+pub SharePending next_share_parse(Str s) {
+    List(Str) f = str_split(str_trim(s), " ");
+    if (f.len() != 4 || f[0] != "epoch" || f[2] != "transcript") { return SharePending {.epoch = -1, .transcript = []}; }
+    return SharePending {.epoch = str_parse_int(f[1]), .transcript = if (f[3] == "-") { [] } else { cose_hex_decode(f[3]) }};
+}
+
+pub Str next_share_words() {
+    return "This device joined the re-share, but your identity log did not show its new epoch yet. The new share is kept aside, sealed, and taken into use by itself as soon as this device sees the log there (any symbolon command checks).";
+}
+
+// "promote", "drop" or "wait", for a share kept aside for `epoch` with
+// `transcript`, against the verified head and its events.
+pub Str next_share_action(Quorum head, List(SignedEvent) es, Int epoch, List(Int) transcript) {
+    if (epoch < 0) { return "drop"; }
+    if ((Int)head.epoch == epoch && bytes_eq(head.transcript_digest, transcript)) { return "promote"; }
+    if (next_share_other(es, epoch, transcript, 0) || (Int)head.epoch > epoch) { return "drop"; }
+    return "wait";
+}
+
+Bool next_share_other(List(SignedEvent) es, Int epoch, List(Int) transcript, Int i) {
+    if (i >= es.len()) { return false; }
+    EventBody b = es[i].payload.body;
+    Bool hit = match b { ReshareBody(nq) => (Int)nq.epoch == epoch && !bytes_eq(nq.transcript_digest, transcript), _ => false };
+    return hit || next_share_other(es, epoch, transcript, i + 1);
+}
+
+// Run at the start of every device command (main.resid): a share kept
+// aside is taken into use, or dropped, as the verified log says. Returns
+// the action taken ("" when nothing is kept aside).
+@requires(filesystem, network, clock(readonly), declassify)
+pub Str settle_pending(Str dir) {
+    if (!filesystem.exists(next_share_meta(dir))) { return ""; }
+    SharePending p = next_share_parse(filesystem.read_all(next_share_meta(dir)));
+    if (p.epoch < 0) { return ""; }
+    Option(DeviceConfig) oc = load_config(dir);
+    return match oc { None => "", Some(c) => settle_next_share(dir, c, p) };
+}
+
+@requires(filesystem, network, clock(readonly), declassify)
+Str settle_next_share(Str dir, DeviceConfig c, SharePending p) {
+    Result(LogView, SymbolonError) rv = log_view_dir(dir, relay_ep(c), c.log_id, "");
+    Str act = match rv { Ok(v) => next_share_action(v.vh.head.quorum, v.events, p.epoch, p.transcript), Err(_) => "wait" };
+    if (act == "promote") {
+        Str pd = next_share_dir(dir);
+        Bool ok = put_secret_file(dir + "/share.enc", get_file(pd + "/share.enc"))
+            && filesystem.write_bytes(dir + "/dshare", filesystem.read_bytes(pd + "/dshare"))
+            && (!filesystem.exists(pd + "/kv.enc") || put_secret_file(dir + "/kv.enc", get_file(pd + "/kv.enc")))
+            && filesystem.write_all(next_share_promoted(dir), next_share_line(p.epoch, p.transcript))
+            && filesystem.write_all(next_share_meta(dir), "");
+        if (!ok) { return "wait"; }
+        _ = filesystem.write_all(reshare_fail_file(dir), "");
+        eprintln("device: the re-share this device joined is in your identity log now; its new share is in use.");
+        return act;
+    }
+    if (act == "drop") {
+        _ = filesystem.write_all(next_share_meta(dir), "");
+        _ = note_reshare_fail(dir, "the re-share this device joined never reached the log");
+        eprintln("device: the re-share this device joined never reached your identity log, so its new share was dropped. If this device can no longer sign, replace the recovery kit from another device (`symbolon device kit renew DIR`): this device then gets a new share.");
+    }
+    return act;
+}
 
 // Whether the verified log of `c`'s identity, held against the witnesses,
 // is at `epoch` with `transcript`.

@@ -444,9 +444,19 @@ Int org_command(Int n) {
 // reads the same under the PIN, the duress PIN, or none (SPEC 9.2).
 @requires(args, environment, network, filesystem, device, declassify, clock, process, provision)
 Int main() {
+    _ = settle();
     Int rc = main_cmd();
     _ = remind();
     return rc;
+}
+
+// A re-share's share kept aside is taken into use (or dropped) as the
+// verified log says, before any device command (enroll.resid, MR-9).
+@requires(args, filesystem, network, clock(readonly), declassify)
+Bool settle() {
+    if (args.get(1) != "device") { return false; }
+    Str d = device_dir_arg(3);
+    return str_len(d) > 0 && str_len(settle_pending(d)) > 0;
 }
 
 @requires(args, filesystem)

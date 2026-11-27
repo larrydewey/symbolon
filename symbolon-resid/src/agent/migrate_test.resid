@@ -274,3 +274,37 @@ test "MR-6: the joiner signs only an event with the invitation's parties, thresh
     expect(reshare_event_problem(rs_ev(q4().parties, 2, pubk(8), 5, 4).payload, tr, inv, pubk(9))).toEqual("another threshold or root key");
     expect(reshare_event_problem(rs_ev(q4().parties, 2, pubk(9), 5, 7).payload, tr, inv, pubk(9))).toEqual("another session or epoch");
 }
+
+// MR-9: a joined re-share's share is kept aside, never thrown away, and
+// taken into use once the log shows its epoch; dropped only when the log
+// made that epoch otherwise or moved past it.
+Quorum head_at(Int epoch, Int tn) {
+    return Quorum {.parties = q4().parties, .t = 2, .root_pubkey = pubk(9), .epoch = (UInt(32))epoch, .transcript_digest = [tn, tn, tn, tn, tn, tn, tn, tn], .kv_commits = []};
+}
+
+test "MR-9: a share kept aside waits while the log is not there, then is taken into use" {
+    List(Int) tr = [4, 4, 4, 4, 4, 4, 4, 4];
+    // The check after the session failed (an error, a stale view): wait.
+    expect(next_share_action(head_at(4, 1), [], 5, tr)).toEqual("wait");
+    // The next command sees the log at the epoch: promote.
+    expect(next_share_action(head_at(5, 4), [rs_ev(q4().parties, 2, pubk(9), 5, 4)], 5, tr)).toEqual("promote");
+    SharePending p = next_share_parse(next_share_line(5, tr));
+    expect(p.epoch).toEqual(5);
+    expect(hex_encode(p.transcript)).toEqual("0404040404040404");
+    expect(next_share_parse("").epoch).toEqual(-1);
+}
+
+test "MR-9: a share kept aside is dropped when the log made that epoch otherwise or moved past it" {
+    List(Int) tr = [4, 4, 4, 4, 4, 4, 4, 4];
+    expect(next_share_action(head_at(5, 7), [rs_ev(q4().parties, 2, pubk(9), 5, 7)], 5, tr)).toEqual("drop");
+    expect(next_share_action(head_at(6, 8), [rs_ev(q4().parties, 2, pubk(9), 6, 8)], 5, tr)).toEqual("drop");
+    expect(next_share_action(head_at(4, 1), [rs_ev(q4().parties, 2, pubk(9), 5, 7)], 5, tr)).toEqual("drop");
+}
+
+test "MR-9: a new device's share kept aside follows the same rule (it is in the log's parties, not yet with a share)" {
+    List(Int) tr = [4, 4, 4, 4, 4, 4, 4, 4];
+    List(Party) more = q4().parties.concat([dev(6)]);
+    Quorum h = Quorum {.parties = more, .t = 2, .root_pubkey = pubk(9), .epoch = 5, .transcript_digest = tr, .kv_commits = []};
+    expect(next_share_action(h, [rs_ev(more, 2, pubk(9), 5, 4)], 5, tr)).toEqual("promote");
+    expect(str_len(next_share_words()) > 0).toEqual(true);
+}
