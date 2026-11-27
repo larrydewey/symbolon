@@ -604,7 +604,8 @@ pub Str equivocation_in(WitnessRef sq, List(Int) l, Int n, List(Int) d, RelayCla
 
 // As equivocation_in, but a claim the relay's answer carried as lapsed
 // (R3P-6) is none: `lapsed` are those records of it (CBOR [event,
-// claim]) whose event the caller found can no longer be co-signed
+// claim]) whose claim the caller checked is the relay's on that event
+// and whose event it found can no longer be co-signed
 // (core/log.resid il_lapsed), and a claim of them made at least
 // claim_lapse_secs() before `mine` is the relay's earlier claim, not a
 // second one.
@@ -629,12 +630,12 @@ Bool lapsed_claim(List(List(Int)) recs, List(Int) d, RelayClaim c, Int later, In
     Option(ClaimRecord) r = claim_record_of(recs[i]);
     Bool hit = match r {
         None => false,
-        Some(x) => bytes_eq(x.claim.sig, c.sig) && x.claim.time == c.time && c.time + claim_lapse_secs() <= later && opt_digest_is(event_of_cbor(x.event), d)
+        Some(x) => bytes_eq(x.claim.sig, c.sig) && x.claim.time == c.time && c.time + claim_lapse_secs() <= later
     };
     return hit || lapsed_claim(recs, d, c, later, i + 1);
 }
 
-Bool opt_digest_is(Option(StoredEvent) o, List(Int) d) { return match o { None => false, Some(x) => bytes_eq(sha256_bytes(x.encoded), d) }; }
+
 
 // The relay's claim key (GET /claim-key, hex); [] when it serves none.
 @requires(network, clock(readonly), declassify)

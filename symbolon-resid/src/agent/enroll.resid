@@ -412,18 +412,21 @@ Str equivocation(DeviceConfig c, List(List(Int)) before, UInt(64) n, List(Int) d
     // A claim the relay says lapsed counts as lapsed only if its event can
     // no longer be co-signed, at witness time now.
     Int now = if (lapsed.len() == 0) { 0 } else { witness_now(refs_of_eps(witnesses_for(c, before), 0, []), c.ca, random_bytes(32)) };
-    List(List(Int)) gone = if (now > 0) { really_lapsed(c.log_id, bs, lapsed, now, 0, []) } else { [] };
+    List(List(Int)) gone = if (now > 0) { really_lapsed(sq[0], c.log_id, (Int)n, bs, lapsed, now, 0, []) } else { [] };
     Str why = equivocation_after(sq[0], c.log_id, (Int)n, d, mine, gone, outs, 0);
     return why;
 }
 
-List(List(Int)) really_lapsed(List(Int) l, List(SignedEvent) bs, List(List(Int)) recs, Int now, Int i, List(List(Int)) acc) {
+// The lapsed claim records that are the relay's claim on their own event
+// at (l, n), and whose event can no longer be co-signed at `now`.
+List(List(Int)) really_lapsed(WitnessRef sq, List(Int) l, Int n, List(SignedEvent) bs, List(List(Int)) recs, Int now, Int i, List(List(Int)) acc) {
     if (i >= recs.len()) { return acc; }
     Option(ClaimRecord) r = claim_record_of(recs[i]);
+    RelayClaim rc = match r { None => RelayClaim {.time = -1, .sig = []}, Some(x) => x.claim };
     Option(StoredEvent) se = match r { None => None, Some(x) => event_of_cbor(x.event) };
     Option(SignedEvent) e = match se { None => None, Some(x) => signed_of(x) };
-    Bool gone = match e { None => false, Some(x) => il_lapsed(l, bs, x, now) };
-    return really_lapsed(l, bs, recs, now, i + 1, if (gone) { acc.concat([recs[i]]) } else { acc });
+    Bool gone = match e { None => false, Some(x) => claim_ok(sq, l, n, sha256_bytes(x.encoded), rc) && il_lapsed(l, bs, x, now) };
+    return really_lapsed(sq, l, n, bs, recs, now, i + 1, if (gone) { acc.concat([recs[i]]) } else { acc });
 }
 
 // ─── `device protection enable DIR [PRIMES]` (SPEC 18.10.1) ─────
