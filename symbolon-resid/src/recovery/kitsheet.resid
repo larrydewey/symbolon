@@ -1,0 +1,141 @@
+// The recovery kit's sheet (SPEC 13.2): what the principal writes down.
+//
+// The kit's only secret is its 32-byte seed (src/recovery/recovery.resid
+// kit_keys): the recovery signing key, the HPKE key that opens the kit's
+// half of its material, and through them the kit's share all derive from
+// it. A sheet is either
+//
+//   plain:     the seed itself, 32 bytes (every kit made before 0.14);
+//   protected: 68 bytes, the seed sealed under a passphrase:
+//
+//     0      version, 1
+//     1      log2 of Argon2id's memory in KiB (18 = 256 MiB)
+//     2      Argon2id passes t
+//     3      Argon2id lanes p
+//     4..20  salt, 16 random bytes
+//     20..68 AES-256-GCM(key, nonce, seed, aad) (32 bytes and a tag)
+//
+//   key || nonce = Argon2id(passphrase (UTF-8), salt, m, t, p, 44 bytes)
+//   aad = "symbolon v1 kit passphrase" || bytes 0..20
+//
+// Key and nonce are fresh for every sheet (a fresh salt). The header is in
+// the AAD: a sheet whose parameters were
+// changed does not open. Without the passphrase the sheet's bytes are a
+// GCM ciphertext under a key nobody holds: they say nothing about the seed
+// beyond what guessing passphrases (each guess one Argon2id) gives, and a
+// wrong passphrase gives only a refusal, before anything is derived,
+// fetched or signed.
+//
+// As text, a sheet is its bytes in hex; spaces and dashes (the groups of
+// four the app shows) are ignored.
+
+import "argon2g.resid";
+import "aesgcmg.resid";
+import "word.resid";
+import "crypto.resid";
+
+// The parameters new sheets use (SPEC 13.2): m = 256 MiB, t = 3, p = 1.
+pub Int kit_argon_log2_kib() { return 18; }
+pub Int kit_argon_t() { return 3; }
+
+pub Int kit_sheet_plain_len() { return 32; }
+pub Int kit_sheet_sealed_len() { return 68; }
+
+// Bounds a sheet's header must keep: up to 1 GiB and 10 passes, so an
+// altered sheet cannot ask for unbounded work. The lower bound is
+// Argon2id's own (8 KiB per lane); tests use small sheets.
+Bool params_ok(Int log2m, Int t, Int p) { return log2m >= 3 && log2m <= 20 && t >= 1 && t <= 10 && p == 1; }
+
+// Whether `b` is a protected sheet (otherwise a plain one or nothing).
+pub Bool kit_sheet_protected(List(Int) b) { return b.len() == kit_sheet_sealed_len() && b[0] == 1; }
+
+// Whether `b` is a sheet of either kind.
+pub Bool kit_sheet_ok(List(Int) b) {
+    if (b.len() == kit_sheet_plain_len()) { return true; }
+    return kit_sheet_protected(b) && params_ok(b[1], b[2], b[3]);
+}
+
+List(Int) sheet_aad(List(Int) header) { return utf8("symbolon v1 kit passphrase").concat(header); }
+
+@requires(declassify)
+List(Secret(UInt(8))) sheet_key(Str pass, List(Int) header) {
+    List(Secret(UInt(8))) none = [];
+    Int m_kib = pow2(header[1], 1);
+    return argon2id(secret_bytes(utf8(pass)), header[4..20], none, [], header[3], m_kib, header[2], 44);
+}
+
+Int pow2(Int k, Int acc) { return if (k <= 0) { acc } else { pow2(k - 1, acc * 2) }; }
+
+List(Int) ints_of(List(UInt(8)) bs, Int i, ListBuf(Int) acc) {
+    if (i >= bs.len()) { return acc.finish(); }
+    return ints_of(bs, i + 1, acc.push((Int)bs[i]));
+}
+
+// The protected sheet of `seed` under `pass`, with Argon2id at 2^log2m KiB
+// and t passes, salt `salt` (16 random bytes). [] if an argument is out of
+// range (an empty passphrase among them: that is a plain sheet).
+@requires(declassify)
+pub List(Int) kit_sheet_seal(List(Int) seed, Str pass, List(Int) salt, Int log2m, Int t) {
+    if (seed.len() != 32 || salt.len() != 16 || str_len(pass) == 0 || !params_ok(log2m, t, 1)) { return []; }
+    List(Int) header = [1, log2m, t, 1].concat(salt);
+    List(Secret(UInt(8))) kn = sheet_key(pass, header);
+    List(Secret(UInt(8))) ct = aes_gcmg_seal_ivb(kn[0..32], kn[32..44], secret_bytes(seed), sheet_aad(header));
+    return header.concat(ints_of(declassify(secret_join(ct), "AEAD output is public"), 0, ListBuf()));
+}
+
+// The seed a sheet holds: a plain sheet's bytes, or a protected sheet
+// opened with `pass`. A wrong passphrase, an altered sheet or anything
+// that is not a sheet is refused; nothing of the seed comes out then.
+@requires(declassify)
+pub Result(List(Int), Str) kit_sheet_open(List(Int) b, Str pass) {
+    if (b.len() == kit_sheet_plain_len()) { return Ok(b); }
+    if (!kit_sheet_ok(b)) { return Err("that is not a recovery kit"); }
+    if (str_len(pass) == 0) { return Err("this kit is protected by a passphrase"); }
+    List(Int) header = b[0..20];
+    List(Secret(UInt(8))) kn = sheet_key(pass, header);
+    Option(List(Secret(UInt(8)))) o = aes_gcmg_decrypt_ivb(kn[0..32], kn[32..44], b[20..68], sheet_aad(header));
+    return match o {
+        None => Err("wrong passphrase for this kit"),
+        Some(pt) => if (pt.len() != 32) { Err("wrong passphrase for this kit") } else { Ok(ints_of(declassify(secret_join(pt), "the kit seed, opened by its owner"), 0, ListBuf())) }
+    };
+}
+
+// ─── Text ───────────────────────────────────────────────────────
+
+pub Str kit_sheet_text(List(Int) b) { return hex_encode(b); }
+
+Int hex_val(Int c) {
+    if (c >= 48 && c <= 57) { return c - 48; }
+    if (c >= 97 && c <= 102) { return c - 87; }
+    if (c >= 65 && c <= 70) { return c - 55; }
+    return -1;
+}
+
+// The sheet's bytes from its text: hex digits, with spaces, dashes and line
+// ends ignored. None for any other character or an odd count.
+pub Option(List(Int)) kit_sheet_decode(Str s) {
+    List(Int) ds = sheet_digits(s, 0, ListBuf());
+    if (ds.len() % 2 != 0 || has_bad(ds, 0)) { return None; }
+    return Some(sheet_pairs(ds, 0, ListBuf()));
+}
+
+// The hex digits' values, -1 for a character that is neither a digit nor
+// one of those ignored.
+List(Int) sheet_digits(Str s, Int i, ListBuf(Int) acc) {
+    if (i >= str_len(s)) { return acc.finish(); }
+    Int c = str_char_at(s, i);
+    // space, dash, tab, newline, carriage return
+    Bool skip = c == 32 || c == 45 || c == 9 || c == 10 || c == 13;
+    return sheet_digits(s, i + 1, if (skip) { acc } else { acc.push(hex_val(c)) });
+}
+
+Bool has_bad(List(Int) ds, Int i) {
+    if (i >= ds.len()) { return false; }
+    if (ds[i] < 0) { return true; }
+    return has_bad(ds, i + 1);
+}
+
+List(Int) sheet_pairs(List(Int) ds, Int i, ListBuf(Int) acc) {
+    if (i + 1 >= ds.len()) { return acc.finish(); }
+    return sheet_pairs(ds, i + 2, acc.push(ds[i] * 16 + ds[i + 1]));
+}

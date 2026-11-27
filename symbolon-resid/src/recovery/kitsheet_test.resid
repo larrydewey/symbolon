@@ -1,0 +1,108 @@
+// The kit's sheet (src/recovery/kitsheet.resid, SPEC 13.2): a passphrase
+// seals the seed; a plain sheet still opens. Argon2id runs at 8 KiB and one
+// pass here (the format carries its parameters; new sheets use 256 MiB, 3).
+
+import "kitsheet.resid";
+import "recovery.resid";
+import "crypto.resid";
+
+List(Int) seed0() { return rt [7, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31]; }
+List(Int) salt0() { return [9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9]; }
+
+Str opened(Result(List(Int), Str) r) { return match r { Ok(b) => "ok " + hex_encode(b), Err(m) => "refused: " + m }; }
+
+// Whether `needle` occurs in `hay` at any offset.
+Bool occurs_in(List(Int) hay, List(Int) needle, Int i) {
+    if (i + needle.len() > hay.len()) { return false; }
+    if (hex_encode(hay[i..i + needle.len()]) == hex_encode(needle)) { return true; }
+    return occurs_in(hay, needle, i + 1);
+}
+
+// Whether any 4 consecutive bytes of `a` occur in `b`.
+Bool shares4(List(Int) a, List(Int) b, Int i) {
+    if (i + 4 > a.len()) { return false; }
+    if (occurs_in(b, a[i..i + 4], 0)) { return true; }
+    return shares4(a, b, i + 1);
+}
+
+List(Int) flip(List(Int) b, Int at) {
+    return b[0..at].concat([(b[at] + 1) % 256]).concat(b[at + 1..b.len()]);
+}
+
+@requires(declassify)
+test "a protected sheet opens with its passphrase to the seed" {
+    List(Int) s = kit_sheet_seal(seed0(), "correct horse battery", salt0(), 3, 1);
+    expect(s.len()).toEqual(68);
+    expect(kit_sheet_protected(s)).toEqual(true);
+    expect(kit_sheet_ok(s)).toEqual(true);
+    expect(opened(kit_sheet_open(s, "correct horse battery"))).toEqual("ok " + hex_encode(seed0()));
+    // and through its text, written in groups of four with dashes and spaces
+    Str t = kit_sheet_text(s);
+    Str grouped = str_slice(t, 0, 4) + "-" + str_slice(t, 4, 8) + " " + str_slice(t, 8, str_len(t)) + "\n";
+    List(Int) back = kit_sheet_decode(grouped) else { [] };
+    expect(opened(kit_sheet_open(back, "correct horse battery"))).toEqual("ok " + hex_encode(seed0()));
+}
+
+@requires(declassify)
+test "a wrong or missing passphrase is refused, and nothing of the seed comes out" {
+    List(Int) s = kit_sheet_seal(seed0(), "correct horse battery", salt0(), 3, 1);
+    expect(opened(kit_sheet_open(s, "correct horse batterY"))).toEqual("refused: wrong passphrase for this kit");
+    expect(opened(kit_sheet_open(s, "correct horse battery "))).toEqual("refused: wrong passphrase for this kit");
+    expect(opened(kit_sheet_open(s, ""))).toEqual("refused: this kit is protected by a passphrase");
+}
+
+@requires(declassify)
+test "the sheet without its passphrase holds nothing of the seed" {
+    List(Int) s = kit_sheet_seal(seed0(), "correct horse battery", salt0(), 3, 1);
+    expect(occurs_in(s, seed0(), 0)).toEqual(false);
+    expect(shares4(seed0(), s, 0)).toEqual(false);
+    // nor of the kit's keys
+    KitKeys k = kit_keys(seed0()) else { KitKeys {.sign_priv = [], .sign_pub = [], .hpke_priv = [], .hpke_pub = []} };
+    expect(shares4(k.sign_priv, s, 0)).toEqual(false);
+    expect(shares4(k.hpke_priv, s, 0)).toEqual(false);
+    // a second sheet of the same seed and passphrase (another salt) shares
+    // nothing with the first past the header
+    List(Int) s2 = kit_sheet_seal(seed0(), "correct horse battery", [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16], 3, 1);
+    expect(shares4(s[20..68], s2[20..68], 0)).toEqual(false);
+}
+
+@requires(declassify)
+test "an altered sheet is refused: salt, parameters or ciphertext" {
+    List(Int) s = kit_sheet_seal(seed0(), "pw", salt0(), 3, 1);
+    expect(opened(kit_sheet_open(flip(s, 10), "pw"))).toEqual("refused: wrong passphrase for this kit");
+    expect(opened(kit_sheet_open(flip(s, 40), "pw"))).toEqual("refused: wrong passphrase for this kit");
+    expect(opened(kit_sheet_open(flip(s, 67), "pw"))).toEqual("refused: wrong passphrase for this kit");
+    // t = 1 -> 2: the header is in the AAD (and the key changes)
+    expect(opened(kit_sheet_open(flip(s, 2), "pw"))).toEqual("refused: wrong passphrase for this kit");
+    // parameters out of bounds are refused before any work
+    List(Int) huge = [1, 30, 1, 1].concat(s[4..68]);
+    expect(opened(kit_sheet_open(huge, "pw"))).toEqual("refused: that is not a recovery kit");
+    expect(opened(kit_sheet_open(s[0..67], "pw"))).toEqual("refused: that is not a recovery kit");
+    expect(opened(kit_sheet_open([2].concat(s[1..68]), "pw"))).toEqual("refused: that is not a recovery kit");
+}
+
+@requires(declassify)
+test "a plain sheet (a kit made before passphrases) still opens, with or without one" {
+    expect(kit_sheet_protected(seed0())).toEqual(false);
+    expect(kit_sheet_ok(seed0())).toEqual(true);
+    expect(opened(kit_sheet_open(seed0(), ""))).toEqual("ok " + hex_encode(seed0()));
+    expect(opened(kit_sheet_open(seed0(), "anything"))).toEqual("ok " + hex_encode(seed0()));
+    List(Int) back = kit_sheet_decode(hex_encode(seed0())) else { [] };
+    expect(hex_encode(back)).toEqual(hex_encode(seed0()));
+}
+
+@requires(declassify)
+test "sealing refuses an empty passphrase and bad parameters" {
+    expect(kit_sheet_seal(seed0(), "", salt0(), 3, 1).len()).toEqual(0);
+    expect(kit_sheet_seal(seed0(), "pw", salt0(), 2, 1).len()).toEqual(0);
+    expect(kit_sheet_seal(seed0(), "pw", salt0(), 3, 0).len()).toEqual(0);
+    expect(kit_sheet_seal(seed0()[0..31], "pw", salt0(), 3, 1).len()).toEqual(0);
+    expect(kit_sheet_seal(seed0(), "pw", [1, 2], 3, 1).len()).toEqual(0);
+}
+
+test "sheet text: hex with spaces and dashes; anything else is refused" {
+    expect(match kit_sheet_decode("zz") { None => "none", Some(_) => "some" }).toEqual("none");
+    expect(match kit_sheet_decode("abc") { None => "none", Some(_) => "some" }).toEqual("none");
+    expect(hex_encode(kit_sheet_decode("AB cd-01") else { [] })).toEqual("abcd01");
+}
+
