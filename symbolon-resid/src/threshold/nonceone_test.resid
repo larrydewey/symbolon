@@ -149,13 +149,14 @@ Str session(List(Int) seed) {
 
 // ─── The bug, and the sender's guard ────────────────────────────
 
-test "a Paillier ciphertext with the nonce 1 is 1 + mN: it shows m, and Resid's pa_ct_ok accepts it" {
+test "a Paillier ciphertext with the nonce 1 is 1 + mN: it shows m, and the guard flags it" {
     List(UInt(64)) n = publics()[0].n;
     PaillierPub pk = paillier_pub(n);
     List(UInt(64)) m = bn_from_be([1, 2, 3, 4, 5, 6, 7, 8, 9]);
     List(UInt(64)) c = pa_enc(pk, zi_from_nat(m), [1]);
     expect(pa_nonce_one(n, c)).toBeTrue();
-    expect(pa_ct_ok(pk, c)).toBeTrue();
+    // Resid before the fast-track fix (991062e8) accepts it in pa_ct_ok,
+    // later Resid refuses it; the guard flags it either way.
     expect(bn_cmp(bn_divmod(bn_sub(c, [1]), n).q, m)).toEqual(0);
     // An ordinary nonce hides m, and the test does not flag it.
     expect(pa_nonce_one(n, pa_enc(pk, zi_from_nat(m), cg_unit(seed_n(1), "x", n)))).toBeFalse();
