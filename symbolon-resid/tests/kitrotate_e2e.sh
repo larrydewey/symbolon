@@ -107,7 +107,7 @@ run 60 "$BIN" device kit status "$W/dev" > "$W/kstat.log" 2>&1 || fail "kit stat
 # The replacement: a wrong PIN changes nothing; mismatched passphrases make nothing.
 printf '9999\nx\nx\n' | run 300 "$BIN" device kit renew "$W/dev" > "$W/renew-pin.log" 2>&1 && fail "renewed under a wrong PIN"
 printf '2468\nonce\ntwice\n' | run 300 "$BIN" device kit renew "$W/dev" > "$W/renew-mm.log" 2>&1 && fail "renewed with passphrases that differ"
-run 120 "$BIN" device status "$W/dev" | grep -q 'head sequence 1 ' || fail "a refused renewal changed the log"
+run 120 "$BIN" device status "$W/dev" > "$W/status-refused.log" 2>&1; grep -q 'head sequence 1 ' "$W/status-refused.log" || fail "a refused renewal changed the log: $(cat "$W/status-refused.log")"
 KP='lantern orchard pebble'
 echo "kit replacement (rotate-recovery, then a re-share; a minute or two)..."
 printf '2468\n%s\n%s\n' "$KP" "$KP" | run 1800 "$BIN" device kit renew "$W/dev" "$W/devrs.primes" > "$W/renew.log" 2>&1 || fail "kit renew: $(tail -3 "$W/renew.log")"
@@ -120,9 +120,9 @@ grep -q 'head sequence 3 epoch 3 parties 3 threshold 2 pending 0' "$W/status2.lo
 # Run again: nothing is under way, so it would make another kit; with no
 # passphrase lines it makes one without (not wanted here), so it is not run.
 MSG=$(python3 -c 'import hashlib; print(hashlib.sha256(b"after the kit was replaced").hexdigest())')
-printf '2468\n' | run 600 "$BIN" device sign "$W/dev" login.example.com "$CID" "$MSG" > "$W/sign.log" 2>&1 || fail "sign at epoch 2: $(tail -2 "$W/sign.log")"
-verify "$PUB" "$MSG" "$(tail -1 "$W/sign.log")" || fail "the epoch-2 signature does not verify"
-echo "kit replaced: rotate-recovery in force, re-shared to epoch 2 with the new kit; the device still signs (OpenSSL)"
+printf '2468\n' | run 600 "$BIN" device sign "$W/dev" login.example.com "$CID" "$MSG" > "$W/sign.log" 2>&1 || fail "sign at epoch 3: $(tail -2 "$W/sign.log")"
+verify "$PUB" "$MSG" "$(tail -1 "$W/sign.log")" || fail "the epoch-3 signature does not verify"
+echo "kit replaced: rotate-recovery in force, re-shared to epoch 3 with the new kit; the device still signs (OpenSSL)"
 
 # The old sheet is dead: its recover is refused (the witnesses and the
 # relay will not take it), and the cosigner has nothing to release to it.

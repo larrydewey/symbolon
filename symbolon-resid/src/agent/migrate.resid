@@ -248,13 +248,15 @@ pub Int device_status_plus(Str dir) {
     return match oc { None => device_status(dir), Some(c) => if (c.log_id.len() == 0) { device_status(dir) } else { status_then(dir, known_now(dir, c)) } };
 }
 
-// What the device knows is worked out first, so that its lines follow
-// the status at once: a reader that stops at the line it wants (`grep
-// -q`) is gone before a late write, which would end this process.
+// These lines come first and the status's own lines last, as before: a
+// reader that stops at the line it wants (`grep -q 'head sequence ...'`)
+// is gone before any later write, which would end this process with
+// SIGPIPE (and fail a `set -o pipefail` script).
 @requires(filesystem, network, clock(readonly), declassify)
 Int status_then(Str dir, Known k) {
+    _ = status_lines(dir, k, 0);
     Int r = device_status(dir);
-    return status_lines(dir, k, r);
+    return r;
 }
 
 Int status_lines(Str dir, Known k, Int r) {
