@@ -230,8 +230,8 @@ test "a clean mailbox is not flagged, and the words never call the household saf
     LeakScan r = scan_dev(k, [env(k, k.dev.pk, 1, t.r1), env(k, k.dev.pk, 2, t.r2)], [config(1)]);
     expect(counts(r)).toEqual("checked 2 hits 0 unreadable 0");
     List(Str) w = scan_words(r);
-    expect(says(w, "Nothing found in the 2 message batch(es) that could be checked", 0)).toBeTrue();
-    expect(says(w, "does not prove the household is safe", 0)).toBeTrue();
+    expect(says(w, "Checked 2 message(s) from the last 30 days and found no problem", 0)).toBeTrue();
+    expect(says(w, "can't prove nothing happened", 0)).toBeTrue();
     expect(says(w, "compromised", 0)).toBeFalse();
     expect(scan_exit(r)).toEqual(0);
 }
@@ -246,7 +246,7 @@ test "a planted nonce-1 K or MtA F is found, and the words say the household is 
     LeakScan rf = scan_dev(k, [env(k, k.dev.pk, 1, t.r1), env(k, k.dev.pk, 2, forged(t.r2, n3, 0, ListBuf()))], [config(1)]);
     expect(counts(rf)).toEqual("checked 1 hits 1 unreadable 0");
     List(Str) w = scan_words(rk);
-    expect(says(w, "compromised", 0)).toBeTrue();
+    expect(says(w, "known to someone else", 0)).toBeTrue();
     expect(says(w, "new household key", 0)).toBeTrue();
     expect(says(w, "account recovery", 0)).toBeTrue();
     expect(scan_exit(rk)).toEqual(3);
@@ -261,8 +261,8 @@ test "a batch that cannot be opened, a damaged one, or one of an epoch not held 
     List(Int) damaged = good[0..good.len() - 1].concat([(good[good.len() - 1] + 1) % 256]);
     LeakScan r = scan_dev(k, [env(k, k.other.pk, 1, forged(t.r1, publics()[2].n, 0, ListBuf())), [1, 2, 3], damaged], [config(1)]);
     expect(counts(r)).toEqual("checked 0 hits 0 unreadable 3");
-    expect(says(scan_words(r), "3 message(s) could not be checked", 0)).toBeTrue();
-    expect(says(scan_words(r), "does not prove the household is safe", 0)).toBeTrue();
+    expect(says(scan_words(r), "3 message(s) could not be opened", 0)).toBeTrue();
+    expect(says(scan_words(r), "can't prove nothing happened", 0)).toBeTrue();
     // The session's epoch is not one this party holds (its own key opens no D): nothing is checked.
     LeakScan e = scan_dev(k, [env(k, k.dev.pk, 1, t.r1), env(k, k.dev.pk, 2, t.r2)], [config(2)]);
     expect(counts(e)).toEqual("checked 0 hits 0 unreadable 2");
@@ -294,5 +294,5 @@ test "the kept result reads back, and a missing or garbled one reads as never ru
     ScanResult g = scan_parse("checked x");
     expect(f"{g.checked} {g.hits} {g.unreadable}").toEqual("-1 -1 -1");
     expect(scan_exit(scan_problem("wrong PIN"))).toEqual(1);
-    expect(says(scan_words(scan_problem("wrong PIN")), "Nothing was checked", 0)).toBeTrue();
+    expect(says(scan_words(scan_problem("wrong PIN")), "Nothing was checked yet", 0)).toBeTrue();
 }

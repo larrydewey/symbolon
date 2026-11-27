@@ -323,21 +323,22 @@ pub LeakScan cosigner_scan_result(Str dir) {
 // ─── In plain words ─────────────────────────────────────────────
 
 pub List(Str) scan_words(LeakScan r) {
-    if (str_len(r.problem) > 0) { return ["The check could not run: " + r.problem + ".", "Nothing was checked, so nothing can be said about this household yet."]; }
-    List(Str) unread = if (r.unreadable > 0) { [f"{r.unreadable} message(s) could not be checked (this device or cosigner could not open them, or they were damaged). They might hide a problem."] } else { [] };
+    if (str_len(r.problem) > 0) { return ["The check could not run: " + r.problem + ".", "Nothing was checked yet. Try again later; if it keeps failing, ask for help."]; }
+    List(Str) unread = if (r.unreadable > 0) { [f"{r.unreadable} message(s) could not be opened or were damaged, so they could not be checked."] } else { [] };
     if (r.hits > 0) {
-        return [f"PROBLEM FOUND: {r.hits} message(s) in this mailbox exposed secret key material.",
-                "Treat this household as compromised: whoever holds these messages may be able to sign as you, without your other devices or the cosigner.",
-                "What to do now:",
+        return [f"The check found a problem in {r.hits} message(s) from the last 30 days.",
+                "An older version of Symbolon had a flaw that could reveal part of your secret key in some messages. These messages show it happened.",
+                "Treat your household key as known to someone else: they may be able to sign in as you without your other devices.",
+                "What to do now, in this order:",
                 "  1. Update Symbolon on every device and on the cosigner.",
-                "  2. Create a new household key (a root-key rotation) and stop using the old one.",
+                "  2. Create a new household key (Symbolon calls this a root-key rotation).",
                 "  3. For each website or service, move your login to the new key using that site's own account recovery or security settings.",
-                "     Do not rely on moving the old key over: someone who has the old key could do the same.",
+                "     Don't use the rollover browser extension for this: whoever has the old key could use it too.",
                 "  4. If a device was lost or stolen recently, remove it from the household."].concat(unread);
     }
-    return [f"Nothing found in the {r.checked} message batch(es) that could be checked."].concat(unread).concat([
-            "This does not prove the household is safe: only messages from the last 30 days are kept, and the relay could have held some back.",
-            "Run this check on every device and on the cosigner."]);
+    return [f"Checked {r.checked} message(s) from the last 30 days and found no problem."].concat(unread).concat([
+            "Older messages are gone and can't be checked, and the relay could have held some back, so this can't prove nothing happened.",
+            "Run this check on every device and on the cosigner. Your security advice says whether a new household key is still recommended."]);
 }
 
 // ─── The kept result ────────────────────────────────────────────
