@@ -850,7 +850,7 @@ Cosigner reshare_decide(Cosigner c, List(Int) from, ReshareInvite inv, VerifiedH
     CgConfig none = CgConfig {.id = 0, .threshold = 0, .ecdsa = [], .elgamal = [], .p = [], .q = [], .rid = [], .chain_key = [], .public = []};
     Dealing d = dealing_cfg(c, q, es) else { Dealing {.cfg = none, .old_q = q} };
     Str bad = if (d.cfg.id == 0 || d.cfg.id != pos1(d.old_q.parties, c.cfg.party, 0)) { "no configuration of the epoch to deal from" }
-        else { reshare_plan_problem(inv.new_parties, inv.dealers, inv.receivers, inv.offline, inv.degree, q, d.old_q, mem.proposed, mem.removed) };
+        else { reshare_plan_problem(inv.new_parties, inv.dealers, inv.receivers, inv.offline, inv.degree, q, d.old_q, mem.proposed, mem.removed, mem.rotated_to) };
     if (str_len(bad) > 0) { eprintln("cosigner: re-share refused: " + bad); return refuse(c, from, inv.session_id); }
     CosignRequest req = CosignRequest {.session_id = inv.session_id, .message = reshare_message(inv), .epoch = q.epoch, .requester = inv.requester, .kind = request_reshare(), .sig = inv.sig};
     CosignOutcome o = cosign_decide(st, req, policy_now(c, vh));

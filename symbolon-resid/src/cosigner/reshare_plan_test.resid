@@ -4,6 +4,8 @@
 import "../types.resid";
 import "../core/log.resid";
 import "cosigner.resid";
+import "ecdsa.resid";
+import "crypto.resid";
 
 List(Int) rep(Int b, Int n) { return if (n == 0) { [] } else { [b].concat(rep(b, n - 1)) }; }
 
@@ -23,7 +25,7 @@ Quorum quorum_of(List(Party) ps, UInt(8) t, UInt(32) epoch) {
 Quorum q3() { return quorum_of([dev1(), kit(), cos()], 2, 3); }
 
 Str plan(List(Party) np, List(Int) dealers, List(Int) receivers, List(Int) offline, Int degree, List(Party) proposed) {
-    return reshare_plan_problem(np, dealers, receivers, offline, degree, q3(), q3(), proposed, []);
+    return reshare_plan_problem(np, dealers, receivers, offline, degree, q3(), q3(), proposed, [], []);
 }
 
 test "a refresh and an enrollment of a proposed device are dealt to" {
@@ -35,7 +37,7 @@ test "degree 0, or a changed threshold, is refused: one share would be the key" 
     expect(plan([dev1(), kit(), cos()], [1, 3], [1, 3], [2], 0, [])).toEqual("the re-share changes the threshold or makes it below 2");
     expect(plan([dev1(), kit(), cos()], [1, 3], [1, 3], [2], 2, [])).toEqual("the re-share changes the threshold or makes it below 2");
     Quorum one = quorum_of([dev1(), kit(), cos()], 1, 3);
-    expect(reshare_plan_problem([dev1(), kit(), cos()], [1], [1, 3], [2], 0, one, one, [], [])).toEqual("the re-share changes the threshold or makes it below 2");
+    expect(reshare_plan_problem([dev1(), kit(), cos()], [1], [1, 3], [2], 0, one, one, [], [], [])).toEqual("the re-share changes the threshold or makes it below 2");
 }
 
 test "a party the log did not propose, or other keys for one, is refused" {
@@ -52,8 +54,8 @@ test "a party the log did not propose, or other keys for one, is refused" {
 
 test "a removed party is left out, and only then" {
     Quorum q = q3();
-    expect(reshare_plan_problem([dev1(), cos()], [1, 3], [1, 2], [], 1, q, q, [], [kit().id])).toEqual("");
-    expect(reshare_plan_problem([dev1(), kit(), cos()], [1, 3], [1, 3], [2], 1, q, q, [], [kit().id])).toEqual("the new party set does not keep the quorum less the removed parties");
+    expect(reshare_plan_problem([dev1(), cos()], [1, 3], [1, 2], [], 1, q, q, [], [kit().id], [])).toEqual("");
+    expect(reshare_plan_problem([dev1(), kit(), cos()], [1, 3], [1, 3], [2], 1, q, q, [], [kit().id], [])).toEqual("the new party set does not keep the quorum less the removed parties");
 }
 
 test "receivers and offline parties follow the kinds" {
@@ -73,5 +75,36 @@ test "the dealers are t distinct online parties of the old quorum; the kit deals
     // After a recovery (the head at the epoch the recover made), the new
     // device deals as the old quorum's kit.
     Quorum pre = quorum_of([party_of(5, party_kind_device()), kit(), cos()], 2, 2);
-    expect(reshare_plan_problem([dev1(), kit(), cos()], [2, 3], [1, 3], [2], 1, q3(), pre, [], [])).toEqual("");
+    expect(reshare_plan_problem([dev1(), kit(), cos()], [2, 3], [1, 3], [2], 1, q3(), pre, [], [], [])).toEqual("");
+}
+
+// SPEC 13.2: the kit replaced by the one an in-force rotate-recovery names.
+List(Int) key_n(Int n) { return ec_public_key(P256, rep(0, 31).concat([n])); }
+
+Party kit_with(List(Int) id, List(Int) key) {
+    return Party {.id = id, .kind = party_kind_kit(), .auth_key = key, .hpke_key = key_n(9), .label = "k", .attestation = NoAttestation};
+}
+
+Party newkit() { return kit_with(sha256_bytes(key_n(7)), key_n(7)); }
+
+Str swap(List(Party) np, List(Int) offline, List(List(Int)) rotated) {
+    return reshare_plan_problem(np, [1, 3], [1, 3], offline, 1, q3(), q3(), [], [], rotated);
+}
+
+test "the kit is replaced, in its place, only by the kit an in-force rotate-recovery names" {
+    List(List(Int)) rot = [newkit().id];
+    expect(swap([dev1(), newkit(), cos()], [2], rot)).toEqual("");
+    // No rotation in force (none, pending or vetoed: il_membership gives []).
+    expect(swap([dev1(), newkit(), cos()], [2], [])).toEqual("the new party set does not keep the quorum less the removed parties");
+    // Another kit than the one named, or the named id with another key.
+    expect(swap([dev1(), kit_with(sha256_bytes(key_n(8)), key_n(8)), cos()], [2], rot)).toEqual("the new party set does not keep the quorum less the removed parties");
+    expect(swap([dev1(), kit_with(newkit().id, key_n(8)), cos()], [2], rot)).toEqual("the new party set does not keep the quorum less the removed parties");
+    // A rotation that names the quorum's own kit replaces nothing.
+    expect(swap([dev1(), newkit(), cos()], [2], [kit().id, newkit().id])).toEqual("the new party set does not keep the quorum less the removed parties");
+    // Only the kit: not a device or the cosigner, and not moved.
+    Party asdev = Party {.id = newkit().id, .kind = party_kind_device(), .auth_key = key_n(7), .hpke_key = key_n(9), .label = "k", .attestation = NoAttestation};
+    expect(reshare_plan_problem([asdev, kit(), cos()], [1, 3], [1, 3], [2], 1, q3(), q3(), [], [], rot)).toEqual("the new party set does not keep the quorum less the removed parties");
+    expect(reshare_plan_problem([dev1(), cos(), newkit()], [1, 3], [1, 2], [3], 1, q3(), q3(), [], [], rot)).toEqual("the new party set does not keep the quorum less the removed parties");
+    // Beside the old kit: an extra party the log never proposed.
+    expect(reshare_plan_problem([dev1(), kit(), cos(), newkit()], [1, 3], [1, 3], [2, 4], 1, q3(), q3(), [], [], rot)).toEqual("a new party was not proposed in the log");
 }

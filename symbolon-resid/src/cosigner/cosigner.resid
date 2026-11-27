@@ -347,6 +347,11 @@ pub Bool cosigner_in_duress(CosignerState s, Int now) {
 // - the new parties are the head quorum `q`'s parties less those removed,
 //   in order, then parties proposed (policy-approved, SPEC 8.2), each with
 //   the keys the log holds; a refresh keeps q's parties as they are;
+// - the one exception: once a rotate-recovery is in force (SPEC 13.2,
+//   `rotated_to` its field-6 digests, core/log.resid il_membership), the
+//   quorum's kit party, whose recovery key it took out of field 6, may be
+//   replaced in its place by a kit party whose id is one of those digests
+//   (SHA-256 of its key); never otherwise, and never another party;
 // - the online new parties receive and the offline ones (kit, guardians)
 //   get wrapped material, by their kinds;
 // - the threshold is kept: degree = t - 1, with t at least 2, so no single
@@ -357,12 +362,12 @@ pub Bool cosigner_in_duress(CosignerState s, Int now) {
 //   degree); an offline party deals only in a recovery, where the new
 //   device deals as the kit (SPEC 10.6).
 pub Str reshare_plan_problem(List(Party) np, List(Int) dealers, List(Int) receivers, List(Int) offline, Int degree,
-                             Quorum q, Quorum old_q, List(Party) proposed, List(List(Int)) removed) {
+                             Quorum q, Quorum old_q, List(Party) proposed, List(List(Int)) removed, List(List(Int)) rotated_to) {
     Int t = (Int)q.t;
     if (t < 2 || (Int)old_q.t != t || degree != t - 1) { return "the re-share changes the threshold or makes it below 2"; }
     if (np.len() > 8 || np.len() < t || !ids_distinct_ps(np, 0)) { return "the new party set is malformed"; }
     List(Party) keep = survivors(q.parties, removed, 0, []);
-    if (np.len() < keep.len() || !same_parties(np, keep, 0)) { return "the new party set does not keep the quorum less the removed parties"; }
+    if (np.len() < keep.len() || !same_parties(np, keep, rotated_to, 0)) { return "the new party set does not keep the quorum less the removed parties"; }
     if (!all_proposed(np, proposed, keep.len())) { return "a new party was not proposed in the log"; }
     if (!ints_eq(receivers, kind_ids(np, false, 0, [])) || !ints_eq(offline, kind_ids(np, true, 0, []))) { return "the receivers and offline parties do not follow the parties' kinds"; }
     if (dealers.len() != t || !dealers_ok(dealers, old_q, old_q.epoch != q.epoch, 0)) { return "the dealers are not t distinct parties of the old quorum"; }
@@ -375,9 +380,17 @@ Bool same_party(Party a, Party b) {
     return bytes_eq(a.id, b.id) && a.kind == b.kind && bytes_eq(a.auth_key, b.auth_key) && bytes_eq(a.hpke_key, b.hpke_key);
 }
 
-Bool same_parties(List(Party) np, List(Party) keep, Int i) {
+Bool same_parties(List(Party) np, List(Party) keep, List(List(Int)) rotated_to, Int i) {
     if (i >= keep.len()) { return true; }
-    return same_party(np[i], keep[i]) && same_parties(np, keep, i + 1);
+    return (same_party(np[i], keep[i]) || kit_rotated(np[i], keep[i], rotated_to)) && same_parties(np, keep, rotated_to, i + 1);
+}
+
+// `ok`, the quorum's kit, whose recovery key an in-force rotate-recovery
+// took out of field 6, replaced by `nk`, the kit that rotation names.
+Bool kit_rotated(Party nk, Party ok, List(List(Int)) rotated_to) {
+    return ok.kind == party_kind_kit() && nk.kind == party_kind_kit()
+        && !seen(rotated_to, ok.id, 0) && seen(rotated_to, nk.id, 0)
+        && ec_public_ok(P256, nk.auth_key) && bytes_eq(nk.id, sha256_bytes(nk.auth_key)) && ec_public_ok(P256, nk.hpke_key);
 }
 
 List(Party) survivors(List(Party) ps, List(List(Int)) removed, Int i, List(Party) acc) {
