@@ -1,0 +1,213 @@
+// The writes of a key or fill change (SPEC 9.4, 14.2): their order, and
+// a fill change's pattern. (Apart from keyslot_test for its memory budget;
+// the helpers are keyslot_test's.)
+//
+// The update slot (SPEC 9.4, 14.2): every key or PIN change writes both
+// profile files in one pattern, whichever PIN makes it, and neither
+// profile's change alters what the other opens to; the real profile takes
+// nothing from its slot. (Apart from keycli_test for its memory budget.)
+// A fast-KDF unprotected device in target/test-keycli/ (a fresh directory
+// per test). No authenticator answers here: a key's touches are past
+// (key_add_commit takes their result), and an unlock that needs a touch is
+// made with the key's known hmac-secret output (touched), as unlock_v2
+// makes it with the one the key gives. The TPM and Keystore paths
+// (unlock_key_at, tpm_repin, the device key's authValue) are checked by
+// reading only.
+
+import "../types.resid";
+import "../duress/duress.resid";
+import "state.resid";
+import "common.resid";
+import "device.resid";
+import "fidokey.resid";
+import "keycli.resid";
+import "crypto.resid";
+import "word.resid";
+
+List(Int) rep(Int b, Int n) { return if (n <= 0) { [] } else { [b].concat(rep(b, n - 1)) }; }
+
+@requires(filesystem)
+Str fresh_dir() {
+    _ = filesystem.create_dir("target");
+    _ = filesystem.create_dir("target/test-keywrites");
+    Str d = "target/test-keywrites/" + hex_encode(random_bytes(8));
+    _ = filesystem.create_dir(d);
+    return d;
+}
+
+DeviceConfig cfg_none() {
+    return DeviceConfig {.relay_host = "", .relay_port = 0, .ca = "", .witnesses = [], .unprotected = true, .argon_m_kib = 0, .argon_t = 0, .salt = [],
+        .tpm_dk = 0, .tpm_unlock_a = 0, .tpm_unlock_b = 0, .party = [], .dk_pub = [], .hpke_pub = [], .log_id = [], .mbox_next = 0, .peers = []};
+}
+
+// A device with PIN 1111 and duress PIN `dpin` ("" for none), its log id set (no relay is asked).
+@requires(filesystem, device, declassify, provision, network, environment)
+DeviceConfig made_with(Str dir, Str dpin) {
+    _ = device_new_pins(dir, "relay.invalid", 1, true, false, true, "", "1111", dpin);
+    DeviceConfig c0 = load_config(dir) else { cfg_none() };
+    DeviceConfig c = with_log(c0, [], rep(9, 32), 0, []);
+    _ = save_config(dir, c);
+    return c;
+}
+
+@requires(filesystem, device, declassify, provision, network, environment)
+DeviceConfig made(Str dir) { return made_with(dir, "2222"); }
+
+Str joined(List(Str) ns) { return str_join(ns, ","); }
+
+@requires(filesystem, device, declassify, provision, network, environment)
+Str names_under(Str dir, DeviceConfig c, Str pin) { return joined(shown_names(dir, c, stretch(c, pin_bytes(pin)))); }
+
+// A key's hmac-secret output, and its credential, as the test's keys give them.
+List(Secret(UInt(8))) out_of(Int n) { return secret_bytes(rep(n, 32)); }
+List(Int) cred_of(Int n) { return rep(n, 16); }
+
+// An unlock as unlock_v2 makes it, with key `n` touched (0: none present).
+@requires(filesystem, device, declassify, provision, network, environment)
+Unlocked touched(Str dir, DeviceConfig c, Str pin, Int n) {
+    List(Secret(UInt(8))) st = stretch(c, pin_bytes(pin));
+    Found f = find_own(dir, c, st, true);
+    OwnList o = f.o;
+    if (o.which == "") { return unlocked_none(); }
+    KeyList l = o.list;
+    List(Secret(UInt(8))) none = [];
+    List(Secret(UInt(8))) w = if (l.keys.len() == 0) { l.w } else { if (n == 0) { none } else { list_w_for(l, cred_of(n), out_of(n)) } };
+    return with_ukey(with_wrap(with_stretched(unlock(f.k, read_blob(dir, o.which, w), []), st), w), f.k);
+}
+
+// key add's writes, with key `n` (its touches past), under `pin` with key `t` touched.
+@requires(filesystem, device, declassify, provision, network, environment)
+Int add_key(Str dir, DeviceConfig c, Str pin, Int t, Str name, Int n) {
+    Int r = key_add_commit(dir, c, touched(dir, c, pin, t), name, cred_of(n), [4].concat(rep(2, 64)), out_of(n));
+    return r;
+}
+
+@requires(filesystem, device, declassify, provision, network, environment)
+Int remove_key(Str dir, DeviceConfig c, Str pin, Int t, Str name) {
+    Unlocked u = touched(dir, c, pin, t);
+    if (u.kind == 0) { return 1; }
+    Int r = key_remove_commit(dir, u, name);
+    return r;
+}
+
+@requires(filesystem, declassify)
+Str real_bytes(Unlocked u) { return hex_encode(reveal(u.real.share)) + hex_encode(reveal(u.real.cc)) + hex_encode(reveal(u.real.vault_key)) + hex_encode(reveal(u.real.dek)); }
+
+@requires(filesystem, declassify)
+Str duress_bytes(Unlocked u) { return hex_encode(reveal(u.duress.share)) + hex_encode(reveal(u.duress.subkey)) + hex_encode(reveal(u.duress.vault_key)) + hex_encode(reveal(u.duress.hpke_priv)); }
+
+// The file of the profile PIN `pin` opens.
+@requires(filesystem, device, declassify, provision, network, environment)
+Str file_of(Str dir, DeviceConfig c, Str pin) {
+    Found f = find_own(dir, c, stretch(c, pin_bytes(pin)), true);
+    OwnList o = f.o;
+    return hex_encode(get_file(profile_file(dir, o.which)));
+}
+
+// The sealed parts (header, list, blob) of the file of the profile PIN
+// `pin` opens: all but its update slot, which a change under the other PIN
+// writes.
+@requires(filesystem, device, declassify, provision, network, environment)
+Str sealed_of(Str dir, DeviceConfig c, Str pin) {
+    Found f = find_own(dir, c, stretch(c, pin_bytes(pin)), true);
+    OwnList o = f.o;
+    List(Int) b = get_file(profile_file(dir, o.which));
+    return if (b.len() == profile_file_len()) { hex_encode(b[0..sealed_len()]) } else { "" };
+}
+
+// Which of a profile file's four parts (header, list, blob, slot) differ
+// between two copies, as "1"/"0"; its size after.
+Str parts_changed(List(Int) x, List(Int) y) {
+    if (x.len() != profile_file_len() || y.len() != profile_file_len()) { return f"size {x.len()} {y.len()}"; }
+    return bit(hdr_part(x), hdr_part(y)) + bit(list_part(x), list_part(y)) + bit(wblob_part(x), wblob_part(y)) + bit(pslot_part(x), pslot_part(y));
+}
+
+Str bit(List(Int) x, List(Int) y) { return if (hex_encode(x) == hex_encode(y)) { "0" } else { "1" }; }
+
+// What a forensic copy before and after a change shows: the profile
+// writes traced (none: DIR/profile-writes, which an earlier build appended to, stays empty), each file's size, which parts changed,
+// with the two files in a fixed order (the changing one's file is a or b
+// at random, and says nothing), and the other files.
+@requires(filesystem)
+List(List(Int)) pattern_before(Str dir) {
+    _ = filesystem.write_bytes(dir + "/profile-writes", []);
+    return [get_file(profile_file(dir, "a")), get_file(profile_file(dir, "b"))];
+}
+
+@requires(filesystem)
+Str pattern_after(Str dir, List(List(Int)) before, Int code) {
+    List(Int) fa = get_file(profile_file(dir, "a"));
+    List(Int) fb = get_file(profile_file(dir, "b"));
+    Str pa = parts_changed(before[0], fa);
+    Str pb = parts_changed(before[1], fb);
+    Str lo = if (pa == "1111") { pb } else { pa };
+    Str hi = if (pa == "1111") { pa } else { pb };
+    Int sa = fa.len();
+    Int sb = fb.len();
+    Str w = if (get_file(dir + "/profile-writes").len() == 0) { "none" } else { str_replace(filesystem.read_all(dir + "/profile-writes"), "\n", " ") };
+    return f"exit {code}; writes " + w + "; parts " + lo + " " + hi + f"; sizes {sa} {sb}" + "; others " + shape(dir);
+}
+
+@requires(filesystem)
+Str want_pattern(Str dir) { Int n = profile_file_len(); return f"exit 0; writes none; parts 0001 1111; sizes {n} {n}; others " + shape(dir); }
+
+
+// A PIN change (device_pin_with) made with key 5 touched.
+@requires(filesystem, device, declassify, provision, network, environment, clock)
+Int device_pin_with_touch(Str dir, DeviceConfig c, Str pin, Str npin) {
+    Int r = device_pin_unlocked(dir, c, touched(dir, c, pin, 5), npin);
+    return r;
+}
+
+// Which files a device directory has, with their sizes.
+@requires(filesystem)
+Str shape(Str dir) { return shape_of(dir, ["profile_a", "profile_b", "blob_a", "blob_b", "blob_a.k", "blob_b.k", "security-keys", "security-keys.view", "slot", "duress.pub", "security-update"], 0, ""); }
+
+@requires(filesystem)
+Str shape_of(Str dir, List(Str) fs, Int i, Str acc) {
+    if (i >= fs.len()) { return acc; }
+    Str f = dir + "/" + fs[i];
+    return shape_of(dir, fs, i + 1, acc + fs[i] + "=" + (if (filesystem.exists(f)) { f"{get_file(f).len()}" } else { "-" }) + " ");
+}
+
+@requires(filesystem, device, declassify, provision, network, environment)
+Str made_dir(Str dpin) { Str d = fresh_dir(); _ = made_with(d, dpin); return d; }
+
+// SPEC 14.2: a key or PIN change writes the same files the same way
+// whichever PIN makes it, with or without a duress PIN: both profile
+// files, a then b, each whole; one with every part new (the changing
+// profile's), the other with its update slot alone new; sizes and the
+// other files as they were. Each profile opens as it did after the other's
+// change.
+// The order of the two writes, seen without any trace in the device
+// directory: with profile_b's new file blocked (a directory in its place),
+// a change under either PIN writes profile_a and stops before profile_b.
+@requires(filesystem, device, declassify, provision, network, environment, clock)
+Str order_under(Str pin) {
+    Str dir = fresh_dir();
+    DeviceConfig c = made(dir);
+    List(Int) fa = get_file(profile_file(dir, "a"));
+    List(Int) fb = get_file(profile_file(dir, "b"));
+    _ = filesystem.create_dir(profile_file(dir, "b") + ".new");
+    Int r = add_key(dir, c, pin, 0, "main", 5);
+    Str a = if (hex_encode(get_file(profile_file(dir, "a"))) == hex_encode(fa)) { "a kept" } else { "a written" };
+    Str b = if (hex_encode(get_file(profile_file(dir, "b"))) == hex_encode(fb)) { "b kept" } else { "b written" };
+    return f"exit {r}, " + a + ", " + b;
+}
+
+@requires(filesystem, device, declassify, provision, network, environment, clock)
+test "a change writes profile_a, then profile_b, under either PIN" {
+    expect(order_under("1111")).toEqual("exit 1, a written, b kept");
+    expect(order_under("2222")).toEqual("exit 1, a written, b kept");
+}
+
+@requires(filesystem, device, declassify, provision, network, environment, clock)
+test "a fill policy change under either PIN shows one pattern" {
+    Str dir = fresh_dir();
+    DeviceConfig c = made(dir);
+    Str want = want_pattern(dir);
+    List(List(Int)) b1 = pattern_before(dir);
+    expect(pattern_after(dir, b1, key_fills_pin(dir, "keys", "1111"))).toEqual(want);
+    List(List(Int)) b2 = pattern_before(dir);
+    expect(pattern_after(dir, b2, key_fills_pin(dir, "any", "2222"))).toEqual(want);
+}

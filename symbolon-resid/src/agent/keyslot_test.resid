@@ -272,36 +272,3 @@ test "the real profile takes nothing from its update slot, even a list sealed wi
     // The duress profile's slot, written by the real profile, is taken.
     expect(names_under(dir, c, "2222")).toEqual("main");
 }
-
-// The order of the two writes, seen without any trace in the device
-// directory: with profile_b's new file blocked (a directory in its place),
-// a change under either PIN writes profile_a and stops before profile_b.
-@requires(filesystem, device, declassify, provision, network, environment, clock)
-Str order_under(Str pin) {
-    Str dir = fresh_dir();
-    DeviceConfig c = made(dir);
-    List(Int) fa = get_file(profile_file(dir, "a"));
-    List(Int) fb = get_file(profile_file(dir, "b"));
-    _ = filesystem.create_dir(profile_file(dir, "b") + ".new");
-    Int r = add_key(dir, c, pin, 0, "main", 5);
-    Str a = if (hex_encode(get_file(profile_file(dir, "a"))) == hex_encode(fa)) { "a kept" } else { "a written" };
-    Str b = if (hex_encode(get_file(profile_file(dir, "b"))) == hex_encode(fb)) { "b kept" } else { "b written" };
-    return f"exit {r}, " + a + ", " + b;
-}
-
-@requires(filesystem, device, declassify, provision, network, environment, clock)
-test "a change writes profile_a, then profile_b, under either PIN" {
-    expect(order_under("1111")).toEqual("exit 1, a written, b kept");
-    expect(order_under("2222")).toEqual("exit 1, a written, b kept");
-}
-
-@requires(filesystem, device, declassify, provision, network, environment, clock)
-test "a fill policy change under either PIN shows one pattern" {
-    Str dir = fresh_dir();
-    DeviceConfig c = made(dir);
-    Str want = want_pattern(dir);
-    List(List(Int)) b1 = pattern_before(dir);
-    expect(pattern_after(dir, b1, key_fills_pin(dir, "keys", "1111"))).toEqual(want);
-    List(List(Int)) b2 = pattern_before(dir);
-    expect(pattern_after(dir, b2, key_fills_pin(dir, "any", "2222"))).toEqual(want);
-}
