@@ -1184,14 +1184,17 @@ pub Int home_pair_serve(Str dir, Str keyfile, Str self) {
     HomeCfg c = oc else { HomeCfg {.base = 0, .hosts = [], .bind = ""} };
     Int lfd = http_listen_at(c.bind, c.base);
     if (lfd < 0) { eprintln(f"home: cannot listen on {c.base}"); return 1; }
-    return pair_children(self + " home pair-child " + dir + f" {lfd} " + keyfile);
+    return pair_children(self + " home pair-child " + dir + f" {lfd} " + keyfile, lfd);
 }
 
+// The child inherits only the listening socket `lfd` (every other runtime
+// descriptor is close-on-exec). -2: the runtime refused to pass it.
 @requires(process)
-Int pair_children(Str cmd) {
-    Int rc = process.run(cmd);
+Int pair_children(Str cmd, Int lfd) {
+    Int rc = process.run_with_fds(cmd, [lfd]);
+    if (rc == -2) { eprintln(f"home: cannot pass the listening socket (fd {lfd}) to the pairing server; not serving"); return 1; }
     if (rc != 0) { return 1; }
-    return pair_children(cmd);
+    return pair_children(cmd, lfd);
 }
 
 // `symbolon home pair-child DIR FD KEYFILE` (run by `home pair-serve`).

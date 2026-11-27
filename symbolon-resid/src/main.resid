@@ -221,8 +221,9 @@ TlsCfg tls_cfg_none() {
 }
 
 // A server listens once and answers in child processes, batch_conns()
-// connections each, on the listening socket they inherit (opened without
-// close-on-exec): there is no collector, and an accept loop that ran
+// connections each, on the listening socket they inherit: every runtime
+// descriptor is close-on-exec, and process.run_with_fds keeps exactly the
+// listening socket open in the child, at the same number. There is no collector, and an accept loop that ran
 // forever kept its per-connection state (gigabytes within minutes under
 // TLS), regions included. Connections that arrive between two children
 // wait in the listen backlog. `self` is this program's path; paths may not
@@ -235,17 +236,21 @@ Str tls_args(Str cert, Str key) { return if (str_len(cert) == 0) { "" } else { "
 // replaced after a back-off that doubles from 100 ms to 10 s while
 // children keep failing: one bad request no longer stops the server
 // (R2W-1).
+// `lfd` is the listening socket: the only descriptor the child inherits.
+// The runtime refuses (-2) to pass a descriptor it does not own as a TCP or
+// unix socket; that is a startup failure, not a child to restart.
 @requires(process, clock)
-Int supervise_children(Str cmd) { return supervise_from(cmd, 0); }
+Int supervise_children(Str cmd, Int lfd) { return supervise_from(cmd, lfd, 0); }
 
 @requires(process, clock)
-Int supervise_from(Str cmd, Int fails) {
-    Int rc = process.run(cmd);
-    if (rc == 0) { return supervise_from(cmd, 0); }
+Int supervise_from(Str cmd, Int lfd, Int fails) {
+    Int rc = process.run_with_fds(cmd, [lfd]);
+    if (rc == -2) { eprintln(f"server: cannot pass the listening socket (fd {lfd}) to a child; not serving"); return 1; }
+    if (rc == 0) { return supervise_from(cmd, lfd, 0); }
     Int wait = restart_delay_ms(fails);
     eprintln(f"server: a child exited with {rc}; another starts in {wait} ms");
     _ = clock_sleep_ms(wait);
-    return supervise_from(cmd, fails + 1);
+    return supervise_from(cmd, lfd, fails + 1);
 }
 
 pub Int restart_delay_ms(Int fails) { return if (fails >= 7) { 10000 } else { 100 * pow2(fails) }; }
@@ -278,7 +283,7 @@ Int relay_serve(Str dir, Int port, Str bind, Str cert, Str key, Str ca, Str spec
     if (lfd < 0) { eprintln(f"relay: cannot listen on {port}"); return 1; }
     println(f"relay listening on {bind}:{http_bound_port(lfd)}" + if (t.on) { " (TLS)" } else { "" });
     if (any_name) { eprintln("relay: --insecure-any-name: a device's sign-in is not bound to this relay's name"); }
-    return supervise_children(self + " relay child " + dir + f" {lfd}" + tls_args(cert, key) + opt("--ca", ca) + opt("--store", spec) + opt("--store-ca", store_ca) + opt("--console-origin", console) + opt("--name", names) + if (private_witnesses) { " --allow-private-witnesses" } else { "" } + opt("--allow-witness", allowed));
+    return supervise_children(self + " relay child " + dir + f" {lfd}" + tls_args(cert, key) + opt("--ca", ca) + opt("--store", spec) + opt("--store-ca", store_ca) + opt("--console-origin", console) + opt("--name", names) + if (private_witnesses) { " --allow-private-witnesses" } else { "" } + opt("--allow-witness", allowed), lfd);
 }
 
 // `symbolon relay child DIR FD [--tls CERT KEY] [--ca FILE] [--store SPEC] [--store-ca FILE]`
@@ -325,7 +330,7 @@ Int witness_serve(Str dir, Int port, Str keyfile, Int offset, Str bind, Str cert
     Int lfd = http_listen_at(bind, port);
     if (lfd < 0) { eprintln(f"witness: cannot listen on {port}"); return 1; }
     println(f"witness listening on {bind}:{http_bound_port(lfd)} key {hex_encode(ec_public_keyg(P256, priv))}" + if (t.on) { " (TLS)" } else { "" });
-    return supervise_children(self + " witness child " + dir + f" {lfd} " + keyfile + f" {offset}" + tls_args(cert, key));
+    return supervise_children(self + " witness child " + dir + f" {lfd} " + keyfile + f" {offset}" + tls_args(cert, key), lfd);
 }
 
 // `symbolon witness child DIR FD KEYFILE OFFSET [--tls CERT KEY]` (run by `witness serve`).
