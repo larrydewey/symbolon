@@ -238,9 +238,10 @@ test "a witness answers how far it co-signed a log, signed for the nonce (R2W-5)
     List(Option(WitnessHead)) hs = [h1, None, Some(WitnessHead {.seq = 0, .digest = dig(e0), .time = 0})];
     expect(str_len(heads_problem(hs, 3, 0, dig(e0))) > 0).toBeTrue();
     expect(heads_problem(hs, 3, 1, dig(r1))).toEqual("");
-    // Only sequence files count; no temporary file is left behind (R2W-8).
+    // Only sequence files count; no temporary file is left behind (R2W-8):
+    // the two sequences and the two events kept beside them (e0, e1, R5-1).
     List(Str) names = filesystem.list_dir(root + "/seen/" + hex_encode(l));
-    expect(names.len()).toEqual(2);
+    expect(names.len()).toEqual(4);
     expect(witness_handle(root, wpriv, 0, post("/head", nonce)).status).toEqual(400);
 }
 
