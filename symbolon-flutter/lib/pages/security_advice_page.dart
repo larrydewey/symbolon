@@ -79,6 +79,10 @@ class _SecurityAdvicePageState extends State<SecurityAdvicePage> {
           'Your household key may be known to someone else',
           'A check of your recent messages found a problem. Treat your household key as known to someone else, and make a new one now.'
         ),
+      'unknown' => (
+          'Symbolon could not check your household key',
+          'Until it can, follow the stricter advice: a new household key is strongly recommended.'
+        ),
       'strongly-recommended' => (
           'A new household key is strongly recommended',
           'An older version of Symbolon had a flaw that could, in rare cases, reveal your household key. We strongly recommend a new one.'

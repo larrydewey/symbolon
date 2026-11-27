@@ -69,6 +69,15 @@ void main() {
     expect((await agent.argsLog.readAsString()).contains('device security-advice ${agent.dir.path}/dev --report lost'), isTrue);
   });
 
+  // MR-8: a status without the rotation line fails strict.
+  testWidgets('a status cut short before the advice shows the strict card', (t) async {
+    File('${agent.dir.path}/no-rotation').writeAsStringSync('');
+    await start(t);
+    expect(find.byKey(const Key('security-advice')), findsOneWidget);
+    expect(find.text('Symbolon could not check your household key'), findsOneWidget);
+    expect(find.byKey(const Key('security-advice-avoid')), findsOneWidget);
+  });
+
   testWidgets('no rollover once a device was reported lost', (t) async {
     File('${agent.dir.path}/rotation').writeAsStringSync('strongly-recommended');
     File('${agent.dir.path}/rollover').writeAsStringSync('avoid');

@@ -115,10 +115,17 @@ void main() {
     final done = DeviceStatus.parse(const CliResult(0, 'party ab\nprofile TPM\nsecurity-reshare done\nrotation none\nrotation-rollover ok\n', ''))!;
     expect(done.refreshDue, isFalse);
     expect(done.rotationAdvised, isFalse);
-    // A build before it prints none of these.
-    final old = DeviceStatus.parse(const CliResult(0, 'party ab\nprofile TPM\n', ''))!;
-    expect(old.refreshDue, isFalse);
-    expect(old.rotationAdvised, isFalse);
+    // Before an identity there is nothing to advise.
+    final none = DeviceStatus.parse(const CliResult(0, 'party ab\nprofile TPM\n', ''))!;
+    expect(none.refreshDue, isFalse);
+    expect(none.rotationAdvised, isFalse);
+    // MR-8: an identity whose status has no rotation line (an agent that
+    // stopped early, or an older one) fails strict.
+    final cut = DeviceStatus.parse(const CliResult(0, 'party ab\nprofile TPM\nlog fa8f\nhead sequence 3 epoch 2 parties 4 threshold 2 pending 0\n', ''))!;
+    expect(cut.rotationLevel, 'unknown');
+    expect(cut.rotationAdvised, isTrue);
+    expect(cut.rolloverOk, isFalse);
+    expect(done.rolloverOk, isTrue);
     await cli.securityReport('/d', 'lost');
     expect((await agent.argsLog.readAsString()).trim().split('\n').last, 'device security-advice /d --report lost');
   });

@@ -727,8 +727,17 @@ class DeviceStatus {
   /// The key refresh still has to run (or wait for an update elsewhere).
   bool get refreshDue => securityReshare != null && securityReshare != 'done' && securityReshare != 'unknown';
 
+  /// The advice level the app shows. Fails strict (MR-8): an identity
+  /// whose status has no `rotation` line (the agent stopped early, or is
+  /// older than the app) reads as 'unknown', which shows the strictest
+  /// advice, never none.
+  String? get rotationLevel => rotation ?? (log != null ? 'unknown' : null);
+
+  /// The rollover may be used only when the agent said so.
+  bool get rolloverOk => rotation != null && rollover == 'ok';
+
   /// The master key should be replaced.
-  bool get rotationAdvised => rotation != null && rotation != 'none';
+  bool get rotationAdvised => rotationLevel != null && rotationLevel != 'none';
 
   static DeviceStatus? parse(CliResult r) {
     final party = r.field('party');

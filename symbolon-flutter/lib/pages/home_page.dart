@@ -200,18 +200,18 @@ class _HomePageState extends State<HomePage> {
             Card(
               key: const Key('security-advice'),
               margin: const EdgeInsets.only(bottom: 16),
-              color: Color.alphaBlend((s.rotation == 'compromised' ? Colors.red : Colors.orange).withValues(alpha: 0.18), Theme.of(context).colorScheme.surfaceContainerLow),
+              color: Color.alphaBlend((s.rotationLevel == 'compromised' ? Colors.red : Colors.orange).withValues(alpha: 0.18), Theme.of(context).colorScheme.surfaceContainerLow),
               child: Padding(
                 padding: const EdgeInsets.all(16),
                 child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
                   Row(children: [
-                    Icon(Icons.key_off, color: s.rotation == 'compromised' ? Colors.red : Colors.orange),
+                    Icon(Icons.key_off, color: s.rotationLevel == 'compromised' ? Colors.red : Colors.orange),
                     const SizedBox(width: 12),
-                    Expanded(child: Text(adviceSummary(s.rotation!).$1, key: const Key('security-advice-title'), style: t.titleMedium)),
+                    Expanded(child: Text(adviceSummary(s.rotationLevel!).$1, key: const Key('security-advice-title'), style: t.titleMedium)),
                   ]),
                   const SizedBox(height: 8),
-                  Text(adviceSummary(s.rotation!).$2),
-                  if (s.rollover == 'avoid')
+                  Text(adviceSummary(s.rotationLevel!).$2),
+                  if (!s.rolloverOk)
                     const Padding(
                       padding: EdgeInsets.only(top: 8),
                       child: Text('Don\'t use the rollover browser extension to move your logins: use each site\'s own account recovery instead.', key: Key('security-advice-avoid')),

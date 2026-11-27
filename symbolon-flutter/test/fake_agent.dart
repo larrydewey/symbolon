@@ -75,7 +75,9 @@ case "$1 $2" in
     echo "head sequence 3 epoch 2 parties 4 threshold 2 pending 1"
     [ -f "$D/protection-off" ] && echo "protected off" || echo "protected on 04aa"
     [ -f "$D/reshare" ] && echo "security-reshare $(cat "$D/reshare")"
-    if [ -f "$D/rotation" ]; then echo "rotation $(cat "$D/rotation")"; echo "rotation-rollover $(cat "$D/rollover" 2>/dev/null || echo ok)"; fi
+    # The advice (a household made after the fix unless told otherwise);
+    # "$D/no-rotation": an agent that stopped before these lines.
+    if [ ! -f "$D/no-rotation" ]; then echo "rotation $(cat "$D/rotation" 2>/dev/null || echo none)"; echo "rotation-rollover $(cat "$D/rollover" 2>/dev/null || echo ok)"; fi
     exit 0 ;;
   "device security-advice")
     [ "$4" = "--report" ] && { echo "$5" > "$D/reported"; echo avoid > "$D/rollover"; echo "report kept: the advice below takes it into account"; }
