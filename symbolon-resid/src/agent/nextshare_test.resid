@@ -105,3 +105,33 @@ test "MR-13: ssh-agent and ssh-agent-stdio settle as device commands do; nothing
     expect(settle_positions("browser").len()).toEqual(0);
     expect(settle_positions("relay").len()).toEqual(0);
 }
+
+// ─── MR-14: a record with nothing left to settle ────────────────
+
+test "MR-14: a record whose kept share is gone, or already in use, is an orphan" {
+    SharePending p = next_share_of(5, tr(4), bytes_n(1, 40), bytes_n(2, 90), []);
+    expect(next_share_orphan(p, false, bytes_n(8, 40), bytes_n(8, 90))).toEqual(true);
+    expect(next_share_orphan(p, true, bytes_n(1, 40), bytes_n(2, 90))).toEqual(true);
+    expect(next_share_orphan(p, true, bytes_n(8, 40), bytes_n(8, 90))).toEqual(false);
+}
+
+// A promotion stopped after the swap and before its clean-up, with the old
+// order (kept share removed, record left): the record is cleared without a
+// log fetch, and clearing removes the record first.
+@requires(filesystem, declassify)
+test "MR-14: a stopped clean-up leaves no record that never settles" {
+    Str d = tmp_dir();
+    Str pd = next_share_dir(d);
+    _ = filesystem.create_dir(pd);
+    _ = put_secret_file(pd + "/share.enc", bytes_n(1, 40));
+    _ = filesystem.write_bytes(pd + "/dshare", bytes_n(2, 90));
+    expect(next_share_record(d, 5, tr(4))).toEqual(true);
+    _ = filesystem.remove(pd + "/share.enc");
+    expect(next_share_tidy(d, next_share_parse(filesystem.read_all(next_share_meta(d))))).toEqual(true);
+    expect(filesystem.exists(next_share_meta(d))).toEqual(false);
+    // Clearing a whole kept set removes the record even if the files stay.
+    _ = put_secret_file(pd + "/share.enc", bytes_n(1, 40));
+    expect(next_share_record(d, 5, tr(4))).toEqual(true);
+    expect(next_share_clear(d)).toEqual(true);
+    expect(filesystem.exists(next_share_meta(d))).toEqual(false);
+}

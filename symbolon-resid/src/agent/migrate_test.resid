@@ -10,6 +10,11 @@ import "../net/proto.resid";
 import "migrate.resid";
 import "leakscan.resid";
 import "nfmark.resid";
+import "nextshare.resid";
+import "device.resid";
+import "state.resid";
+import "common.resid";
+import "../duress/duress.resid";
 import "enroll.resid";
 import "ecdsa.resid";
 import "crypto.resid";
@@ -273,4 +278,37 @@ test "MR-6: the joiner signs only an event with the invitation's parties, thresh
     expect(reshare_event_problem(rs_ev(q4().parties, 3, pubk(9), 5, 4).payload, tr, inv, pubk(9))).toEqual("another threshold or root key");
     expect(reshare_event_problem(rs_ev(q4().parties, 2, pubk(8), 5, 4).payload, tr, inv, pubk(9))).toEqual("another threshold or root key");
     expect(reshare_event_problem(rs_ev(q4().parties, 2, pubk(9), 5, 7).payload, tr, inv, pubk(9))).toEqual("another session or epoch");
+}
+
+// MR-15 (SPEC 9.2): a signature settles a kept-aside share before it looks
+// at which PIN opened the device: the same under the PIN, the duress PIN or
+// a wrong one. Here a wrong PIN (no network is reached): the orphan record
+// is cleared all the same.
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+Str sign_dir() {
+    Str d = "/tmp/symbolon-mr15-test-" + hex_encode(random_bytes(8));
+    _ = filesystem.create_dir(d);
+    _ = filesystem.create_dir(next_share_dir(d));
+    SharePending p = next_share_of(5, [4, 4], [1, 1, 1], [2, 2, 2], []);
+    _ = filesystem.write_all(next_share_meta(d), next_share_line(p));
+    return d;
+}
+
+DeviceConfig no_config() {
+    return DeviceConfig {.relay_host = "", .relay_port = 0, .ca = "", .witnesses = [], .unprotected = true, .argon_m_kib = 0, .argon_t = 0, .salt = [], .tpm_dk = 0, .tpm_unlock_a = 0, .tpm_unlock_b = 0,
+                         .party = [], .dk_pub = [], .hpke_pub = [], .log_id = [], .mbox_next = 0, .peers = []};
+}
+
+Unlocked opened(Int kind) {
+    List(Secret(UInt(8))) none = [];
+    return Unlocked {.kind = kind, .real = RealProfile {.share = none, .cc = none, .vault_key = none, .dek = none, .duress_hpke_pub = []},
+                     .duress = DuressFull {.share = none, .subkey = none, .vault_key = none, .hpke_priv = none, .tweaks = []}, .st = none, .wrap = none, .ukey = none};
+}
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+test "MR-15: a signature settles before the PIN's kind is looked at" {
+    Str d = sign_dir();
+    Result(List(Int), Str) r = sign_unlocked_raw(d, no_config(), opened(0), "x", [], []);
+    expect(match r { Err(m) => m, Ok(_) => "" }).toEqual("wrong PIN");
+    expect(filesystem.exists(next_share_meta(d))).toEqual(false);
 }

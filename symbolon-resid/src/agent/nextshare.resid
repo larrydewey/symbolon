@@ -115,14 +115,35 @@ pub List(Int) settle_positions(Str a1) {
 
 // Removes the kept files and the meta (after a promotion or a drop, and
 // before a new share is kept aside: no stale file is left to be mixed in).
+// The record goes first (MR-14): a stop half way leaves kept files with no
+// record, which nothing reads and the next keeping-aside removes, never a
+// record whose files are gone.
 @requires(filesystem)
 pub Bool next_share_clear(Str dir) {
     Str pd = next_share_dir(dir);
+    _ = filesystem.remove(next_share_meta(dir));
     _ = filesystem.remove(pd + "/share.enc");
     _ = filesystem.remove(pd + "/dshare");
     _ = filesystem.remove(pd + "/kv.enc");
-    _ = filesystem.remove(next_share_meta(dir));
     return !filesystem.exists(pd + "/share.enc") && !filesystem.exists(next_share_meta(dir));
+}
+
+// A record with nothing left to settle (MR-14): its kept share is gone, or
+// the share in use is already the one it names (a promotion stopped before
+// its clean-up). Cleared without asking the log.
+pub Bool next_share_orphan(SharePending p, Bool kept_share, List(Int) live_share, List(Int) live_dshare) {
+    if (!kept_share) { return true; }
+    return live_share.len() > 0 && bytes_eq(sha256_bytes(live_share), p.share_d) && bytes_eq(sha256_bytes(live_dshare), p.dshare_d);
+}
+
+@requires(filesystem)
+pub Bool next_share_tidy(Str dir, SharePending p) {
+    Bool kept = filesystem.exists(next_share_dir(dir) + "/share.enc");
+    List(Int) live = if (filesystem.exists(dir + "/share.enc")) { get_file(dir + "/share.enc") } else { [] };
+    List(Int) dlive = if (filesystem.exists(dir + "/dshare")) { filesystem.read_bytes(dir + "/dshare") } else { [] };
+    if (!next_share_orphan(p, kept, live, dlive)) { return false; }
+    _ = next_share_clear(dir);
+    return true;
 }
 
 // The meta for the files now in DIR/share-next, written last.
@@ -183,6 +204,7 @@ pub Str settle_pending(Str dir) {
     if (!filesystem.exists(next_share_meta(dir))) { return ""; }
     SharePending p = next_share_parse(filesystem.read_all(next_share_meta(dir)));
     if (p.epoch < 0) { _ = next_share_clear(dir); return ""; }
+    if (next_share_tidy(dir, p)) { return ""; }
     Option(DeviceConfig) oc = device_of_cbor(get_file(dir + "/config.cbor"));
     return match oc { None => "", Some(c) => settle_next_share(dir, c, p) };
 }

@@ -926,12 +926,14 @@ Int print_sig(List(Int) sig, Int form) {
 // certificate (SPEC 16.1.2) is signed this way.
 @requires(filesystem, network, device, declassify, clock, provision, environment)
 pub Result(List(Int), Str) sign_unlocked_raw(Str dir, DeviceConfig c, Unlocked u, Str rp, List(Int) cid, List(Int) m) {
+    // A joined re-share's share kept aside goes into use first, whatever
+    // started this signature (MR-13), and under any PIN alike (MR-15, SPEC
+    // 9.2: it needs none, so the duress PIN must not tell by skipping it);
+    // one file check when there is none.
+    _ = settle_pending(dir);
     if (u.kind == 2) { return duress_sign(dir, c, u, cid, m); }
     if (u.kind != 1) { return Err("wrong PIN"); }
     Option(List(Int)) nonce = credential_nonce(u.real.cc, rp, cid);
-    // A joined re-share's share kept aside goes into use first, whatever
-    // started this signature (MR-13); one file check when there is none.
-    _ = settle_pending(dir);
     Option(CgConfig) cg = load_share(dir, u.real.dek);
     Result(VerifiedHead, SymbolonError) v = verified_log_dir(dir, relay_ep(c), c.log_id);
     return match nonce {
