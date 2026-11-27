@@ -380,28 +380,38 @@ PY
 done
 [ "$(printf '1111\n' | run 300 "$BIN" device vault get "$W/dev2" mail 2>&1)" = "c0rrect-horse" ] || fail "vault from the enrolled device"
 echo "enrollment: epoch 2, both devices sign under the same credential key (OpenSSL), the new one reads the vault"
-# Kit recovery (SPEC 13.2, 13.4) up to the delay: a new device reveals the
-# kit; the cosigner refuses to release its half before the delay; a device
-# vetoes; the release is still refused.
 PLAIN=$(sed -n 's/^RECOVERY KIT (write it down; it is shown once): //p' "$W/init.log")
-# The kit was made without a passphrase (init read only the PIN); it is
-# written again under one (SPEC 13.2): the same kit, sealed. A kit that is
-# not this identity's is refused.
-[ "$(run 60 "$BIN" device kit status "$W/dev")" = "kit: no passphrase" ] || fail "kit status (plain)"
+# The kit was made without a passphrase (init read only the PIN). `device
+# kit status` says so and points at the replacement (SPEC 13.2).
+run 60 "$BIN" device kit status "$W/dev" > "$W/kstat.log" 2>&1 || fail "kit status"
+[ "$(head -1 "$W/kstat.log")" = "kit: no passphrase" ] && grep -q "kit renew $W/dev\$" "$W/kstat.log" || fail "kit status (plain): $(cat "$W/kstat.log")"
+# The kit replaced by a new one under a passphrase: the rotate-recovery,
+# signed by this device (immediate here: policy[1] is still 1), then a
+# re-share with the cosigner to the new kit in which the second device
+# takes part, as it did in the enrollment.
 KP='lantern orchard pebble'
-printf '%s\n%s\n%s\n' "$(printf '%064d' 7)" "$KP" "$KP" | run 300 "$BIN" device kit renew "$W/dev" > "$W/renew-bad.log" 2>&1 && fail "renewed a kit that is not this identity's"
-grep -q "not this identity's current recovery kit" "$W/renew-bad.log" || fail "renew (wrong kit): $(cat "$W/renew-bad.log")"
-printf '%s\n%s\n%s\n' "$PLAIN" "$KP" "$KP" | run 1200 "$BIN" device kit renew "$W/dev" > "$W/renew.log" 2>&1 || fail "kit renew: $(cat "$W/renew.log")"
-KIT=$(sed -n 's/^RECOVERY KIT (write it down; it is shown once): //p' "$W/renew.log")
-[ "${#KIT}" = 136 ] && [ "${KIT:0:2}" = 01 ] || fail "the renewed kit is not a protected sheet: $KIT"
-case "$KIT" in *"$PLAIN"*) fail "the protected sheet carries the seed";; esac
-[ "$(run 60 "$BIN" device kit status "$W/dev")" = "kit: protected by a passphrase" ] || fail "kit status (protected)"
-echo "kit: written again under a passphrase; a kit not this identity's refused"
+printf '1111\n' | run 1800 "$BIN" device join "$W/dev2" "$DEV" "$W/dev2.primes" > "$W/kjoin.log" 2>&1 & KJ=$!
+echo "kit replacement (rotate-recovery, re-share with both devices; a minute or two)..."
+printf '2468\n%s\n%s\n' "$KP" "$KP" | run 1800 "$BIN" device kit renew "$W/dev" "$W/devrs.primes" > "$W/renew.log" 2>&1 || fail "kit renew: $(tail -3 "$W/renew.log")"
+wait $KJ || fail "the second device in the kit's re-share: $(tail -3 "$W/kjoin.log")"
+KIT=$(sed -n 's/^NEW RECOVERY KIT (write it down; it is shown once): //p' "$W/renew.log")
+[ "${#KIT}" = 136 ] && [ "${KIT:0:2}" = 01 ] || fail "the new kit is not a protected sheet: $KIT"
+grep -q '^kit replaced' "$W/renew.log" || fail "kit renew: $(cat "$W/renew.log")"
+[ "$(run 60 "$BIN" device kit status "$W/dev" | head -1)" = "kit: protected by a passphrase" ] || fail "kit status (protected)"
+run 120 "$BIN" device status "$W/dev2" | grep -q 'epoch 3 parties 4 threshold 2 pending 0' || fail "status after the kit replacement"
+MSGK=$(python3 -c 'import hashlib; print(hashlib.sha256(b"after the kit replacement").hexdigest())')
+printf '1111\n' | run 600 "$BIN" device sign "$W/dev2" login.example.com "$CID" "$MSGK" > "$W/signk.log" 2>&1 || fail "sign at epoch 3: $(tail -2 "$W/signk.log")"
+echo "kit: replaced by a new one under a passphrase (epoch 3, both devices re-shared)"
 DEV3=$(printf '3333\n\n' | run 120 "$BIN" device new "$W/dev3" 127.0.0.1 "$RP" --unprotected --fast-kdf "${CA[@]}") || fail "device new (recovering)"
+# The old sheet is dead: the log refuses its recover.
+printf '\n' | run 600 "$BIN" device recover "$W/dev3" "$PLAIN" "$LOG" > "$W/recover-old.log" 2>&1 && fail "the replaced kit started a recovery"
 # A protected kit with the wrong passphrase: refused before anything is sent.
 printf 'lantern orchard pebbles\n\n' | run 600 "$BIN" device recover "$W/dev3" "$KIT" "$LOG" > "$W/recover-bad.log" 2>&1 && fail "recovered with a wrong passphrase"
 grep -q 'wrong passphrase' "$W/recover-bad.log" || fail "recover (wrong passphrase): $(cat "$W/recover-bad.log")"
 run 120 "$BIN" device status "$W/dev" | grep -q 'pending 0' || fail "a refused recovery left a pending event"
+# Kit recovery (SPEC 13.2, 13.4) up to the delay: a new device reveals the
+# kit; the cosigner refuses to release its half before the delay; a device
+# vetoes; the release is still refused.
 printf '%s\n\n' "$KP" | run 600 "$BIN" device recover "$W/dev3" "$KIT" "$LOG" > "$W/recover.log" 2>&1 || fail "recover: $(cat "$W/recover.log")"
 grep -q 'recovery pending: 1' "$W/recover.log" || fail "recover: $(cat "$W/recover.log")"
 grep -q 'NEW RECOVERY KIT' "$W/recover.log" || fail "no new kit"

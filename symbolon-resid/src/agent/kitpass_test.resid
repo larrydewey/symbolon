@@ -1,6 +1,5 @@
 // The kit's passphrase on the command line (src/agent/kitpass.resid): the
-// sheet a new kit gets, the marker the app reads, and the check that a kit
-// typed in for `device kit renew` is the quorum's own.
+// sheet a new kit gets, and the marker the app reads.
 
 import "../types.resid";
 import "../recovery/kitsheet.resid";
@@ -9,13 +8,6 @@ import "kitpass.resid";
 import "crypto.resid";
 
 List(Int) seed1() { return sha256_bytes(rt [1]); }
-List(Int) seed2() { return sha256_bytes(rt [2]); }
-
-KitKeys keys_of(List(Int) s) { return kit_keys(s) else { KitKeys {.sign_priv = [], .sign_pub = [], .hpke_priv = [], .hpke_pub = []} }; }
-
-Party kit_party(KitKeys k) {
-    return Party {.id = recovery_key_digest(k.sign_pub), .kind = party_kind_kit(), .auth_key = k.sign_pub, .hpke_key = k.hpke_pub, .label = "recovery kit", .attestation = NoAttestation};
-}
 
 @requires(filesystem, declassify)
 Str tmp_dir() {
@@ -40,13 +32,4 @@ test "DIR/kit-sheet says which sheet the principal holds; none is unknown" {
     expect(kit_sheet_kind(d)).toEqual("plain");
     expect(mark_kit_sheet(d, kit_sheet_seal(seed1(), "pw", sha256_bytes([3])[0..16], 3, 1))).toEqual(true);
     expect(kit_sheet_kind(d)).toEqual("protected");
-}
-
-test "renew takes only the quorum's current kit" {
-    KitKeys k1 = keys_of(seed1());
-    KitKeys k2 = keys_of(seed2());
-    expect(is_current_kit(Some(k1), Some(kit_party(k1)))).toEqual(true);
-    expect(is_current_kit(Some(k2), Some(kit_party(k1)))).toEqual(false);
-    expect(is_current_kit(None, Some(kit_party(k1)))).toEqual(false);
-    expect(is_current_kit(Some(k1), None)).toEqual(false);
 }

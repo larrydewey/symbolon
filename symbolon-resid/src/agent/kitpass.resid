@@ -44,7 +44,7 @@ pub Str kit_sheet_note(List(Int) sheet) {
     if (kit_sheet_protected(sheet)) {
         return "This kit is protected by your passphrase. Recovery needs both the kit and the passphrase: keep the passphrase somewhere else than the kit. If the passphrase is forgotten, the kit cannot be used.";
     }
-    return "This kit has no passphrase: whoever reads it holds your recovery kit. `symbolon device kit renew DIR` writes it again under a passphrase.";
+    return "This kit has no passphrase: whoever reads it holds your recovery kit. `symbolon device kit renew DIR` replaces it with a new kit under a passphrase.";
 }
 
 // DIR/kit-sheet says which kind of sheet the principal holds, for `device
@@ -81,12 +81,4 @@ pub Result(KitKeys, Str) read_kit(Str text) {
 pub Str kit_sheet_kind(Str dir) {
     Str s = filesystem.read_all(dir + "/kit-sheet");
     return if (s == "protected\n") { "protected" } else { if (s == "plain\n") { "plain" } else { "unknown" } };
-}
-
-// Whether the kit's recovery key is the one the quorum's kit party holds.
-pub Bool is_current_kit(Option(KitKeys) okk, Option(Party) okp) {
-    return match okk {
-        None => false,
-        Some(k) => match okp { None => false, Some(p) => bytes_eq(p.id, recovery_key_digest(k.sign_pub)) && bytes_eq(p.auth_key, k.sign_pub) }
-    };
 }

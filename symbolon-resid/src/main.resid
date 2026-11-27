@@ -128,8 +128,11 @@
 //   symbolon device recover-finish DIR KIT [PRIMES]  PIN on stdin (then the kit's passphrase if it has one);
 //                                              after the delay: release, re-share
 //   symbolon device kit status DIR             whether the kit's sheet has a passphrase
-//   symbolon device kit renew DIR              stdin: the kit, its passphrase if any, a new passphrase twice;
-//                                              prints the same kit sealed under the new passphrase
+//   symbolon device kit renew DIR [PRIMES]     replaces the kit (a lost or seen sheet, or to add a passphrase):
+//                                              stdin: the PIN, then the new kit's passphrase twice (empty: none);
+//                                              prints the new kit; a rotate-recovery (delayed and vetoable unless
+//                                              policy[1] devices sign), then once in force a re-share to the new
+//                                              kit (run it again after the delay); every old sheet is then dead
 //
 // Services listen on 127.0.0.1 only; put a TLS terminator in front of them
 // for anything else (SPEC 20.2: envelopes are end to end, objects signed).
@@ -572,8 +575,8 @@ Int main_cmd() {
         return device_witnesses(args.get(3), add, rm);
     }
     if (a1 == "device" && a2 == "kit" && args.get(3) == "status" && n == 5) { return device_kit_status(args.get(4)); }
-    if (a1 == "device" && a2 == "kit" && args.get(3) == "renew" && n == 5) { return device_kit_renew(args.get(4)); }
     if (a1 == "device" && a2 == "kit-escape" && n == 5) { return device_kit_escape(args.get(3), args.get(4)); }
+    if (a1 == "device" && a2 == "kit" && args.get(3) == "renew" && (n == 5 || n == 6)) { return device_kit_renew(args.get(4), if (n == 6) { args.get(5) } else { "" }); }
     if (a1 == "device" && a2 == "sequence" && (n == 4 || n == 5)) { return device_sequence(args.get(3), if (n == 5) { args.get(4) } else { "" }); }
     if (a1 == "device" && a2 == "recover-release" && n == 4) { return device_recover_release(args.get(3)); }
     if (a1 == "device" && a2 == "recover-finish" && (n == 5 || n == 6)) { return device_recover_finish(args.get(3), args.get(4), if (n == 6) { args.get(5) } else { "" }); }

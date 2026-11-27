@@ -44,15 +44,31 @@ Int count_devices(List(Party) ps, Int i, Int acc) {
     return count_devices(ps, i + 1, acc + (if (ps[i].kind == party_kind_device()) { 1 } else { 0 }));
 }
 
-// Field 6 in force: the digests of the latest event that is not pending (a
-// pending recover carries the new kit's digest, in force only once it
-// takes effect).
+// Field 6 in force: that of the latest event that set it (the inception,
+// a rotate-recovery or a recover) and is neither pending nor vetoed. A
+// pending rotate-recovery or recover carries the new digests, in force only
+// once it takes effect; events made while it was pending carry the old
+// ones, so the latest event alone is not enough once it has.
 pub List(List(Int)) field6(List(SignedEvent) es) { return field6_in_force(es, [], es.len() - 1); }
 
 pub List(List(Int)) field6_in_force(List(SignedEvent) es, List(UInt(64)) pending, Int i) {
+    List(List(Int)) f = field6_from(es, pending, vetoed_seqs(es, 0, []), i);
+    return f;
+}
+
+List(List(Int)) field6_from(List(SignedEvent) es, List(UInt(64)) pending, List(UInt(64)) vetoed, Int i) {
     if (i < 0) { return []; }
-    Bool is_pending = in_seqs(pending, es[i].payload.sequence, 0);
-    return if (is_pending) { field6_in_force(es, pending, i - 1) } else { es[i].payload.next_recovery_key_digests };
+    UInt(64) sq = es[i].payload.sequence;
+    EventBody b = es[i].payload.body;
+    Bool sets = match b { InceptionBody(_, _) => true, RotateRecoveryBody => true, RecoverBody(_) => true, _ => false };
+    Bool skip = !sets || in_seqs(pending, sq, 0) || in_seqs(vetoed, sq, 0);
+    return if (skip) { field6_from(es, pending, vetoed, i - 1) } else { es[i].payload.next_recovery_key_digests };
+}
+
+List(UInt(64)) vetoed_seqs(List(SignedEvent) es, Int i, List(UInt(64)) acc) {
+    if (i >= es.len()) { return acc; }
+    EventBody b = es[i].payload.body;
+    return vetoed_seqs(es, i + 1, match b { VetoBody(t) => acc.concat([t]), _ => acc });
 }
 
 Bool in_seqs(List(UInt(64)) xs, UInt(64) s, Int i) {

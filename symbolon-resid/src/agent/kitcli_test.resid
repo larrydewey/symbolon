@@ -1,0 +1,69 @@
+// `device kit renew` (src/agent/kitcli.resid): where a kit replacement
+// stands in the log, and field 6 in force (enroll.resid field6_in_force),
+// which the re-share's event must carry.
+
+import "../types.resid";
+import "../core/log.resid";
+import "../recovery/recovery.resid";
+import "enroll.resid";
+import "kitcli.resid";
+import "ecdsa.resid";
+import "crypto.resid";
+
+List(Int) key_n(Int n) {
+    List(Int) z = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    return ec_public_key(P256, z.concat([n]));
+}
+
+List(Int) dg(Int n) { return recovery_key_digest(key_n(n)); }
+
+Party kitp(Int n) { return Party {.id = dg(n), .kind = party_kind_kit(), .auth_key = key_n(n), .hpke_key = key_n(n + 1), .label = "k", .attestation = NoAttestation}; }
+Party devp(Int n) { return Party {.id = dg(n), .kind = party_kind_device(), .auth_key = key_n(n), .hpke_key = key_n(n + 1), .label = "d", .attestation = NoAttestation}; }
+
+Quorum quorum_with(Party kit) {
+    return Quorum {.parties = [devp(1), kit, devp(3)], .t = 2, .root_pubkey = key_n(9), .epoch = 1, .transcript_digest = [], .kv_commits = []};
+}
+
+Policy pol() {
+    return Policy {.device_sigs_for_authority = 2, .recovery_delay_sec = 86400, .guardians = [], .guardian_threshold = 0, .witnesses = [], .duress_window_sec = 0, .sequencer = [], .cosigner_policy = NoCosignerPolicy};
+}
+
+SignedEvent ev(UInt(64) seq, EventBody b, List(List(Int)) ds) {
+    return SignedEvent {.payload = EventPayload {.log_id = None, .sequence = seq, .predecessor_digest = None, .suite = 1, .body = b, .next_recovery_key_digests = ds, .advisory_time = 0},
+                        .encoded = [], .sigs = [], .cosigs = []};
+}
+
+List(SignedEvent) log_rot() {
+    return [ev(0, InceptionBody(quorum_with(kitp(20)), pol()), [dg(20)]), ev(1, RotateRecoveryBody, [dg(50)]), ev(2, PartyKeyBody(dg(1), key_n(30)), [dg(20)])];
+}
+
+test "a replacement is pending, then in force once its delay has run, and gone when vetoed" {
+    Quorum q = quorum_with(kitp(20));
+    expect(rotation_state(log_rot(), [1], q, dg(50))).toEqual("pending");
+    expect(rotation_state(log_rot(), [], q, dg(50))).toEqual("in force");
+    List(SignedEvent) vetoed = [log_rot()[0], log_rot()[1], ev(2, VetoBody(1), [dg(20)])];
+    expect(rotation_state(vetoed, [], q, dg(50))).toEqual("gone");
+    expect(rotation_state(log_rot(), [], quorum_with(kitp(50)), dg(50))).toEqual("done");
+    expect(rotation_state(log_rot(), [], q, dg(51))).toEqual("gone");
+}
+
+test "field 6 in force is that of the latest event that set it, not pending, not vetoed" {
+    // The rotation took effect after event 2 was made: event 2 carries the old field 6.
+    expect(hex_encode(field6_in_force(log_rot(), [], 2)[0])).toEqual(hex_encode(dg(50)));
+    expect(hex_encode(field6_in_force(log_rot(), [1], 2)[0])).toEqual(hex_encode(dg(20)));
+    List(SignedEvent) vetoed = [log_rot()[0], log_rot()[1], ev(2, VetoBody(1), [dg(20)])];
+    expect(hex_encode(field6_in_force(vetoed, [], 2)[0])).toEqual(hex_encode(dg(20)));
+}
+
+test "the new kit takes the old one's place; its keys survive DIR/kit-next" {
+    List(Party) np = with_kit(quorum_with(kitp(20)).parties, kitp(50), 0, []);
+    expect(np.len()).toEqual(3);
+    expect(hex_encode(np[1].id)).toEqual(hex_encode(dg(50)));
+    expect(hex_encode(np[0].id)).toEqual(hex_encode(dg(1)));
+    NextKit k = NextKit {.sign_pub = key_n(50), .hpke_pub = key_n(51), .protected = true};
+    NextKit back = next_kit_parse(next_kit_line(k));
+    expect(hex_encode(next_kit_party(back).id)).toEqual(hex_encode(dg(50)));
+    expect(hex_encode(back.hpke_pub)).toEqual(hex_encode(key_n(51)));
+    expect(back.protected).toEqual(true);
+    expect(next_kit_parse("").sign_pub.len()).toEqual(0);
+}

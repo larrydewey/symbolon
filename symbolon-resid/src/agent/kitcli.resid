@@ -1,22 +1,40 @@
 // `symbolon device kit status|renew DIR` (SPEC 13.2): which kind of sheet
-// the principal holds, and a plain sheet written again under a passphrase.
+// the principal holds, and the kit replaced by a new one.
 //
-// Renewing re-seals the same kit: the seed, and so the kit's keys, its
-// material at the relay and the cosigner, and the log's field 6, do not
-// change; only the sheet does. A copy of the old plain sheet therefore
-// still works: the old sheet must be destroyed. (Replacing the kit itself,
-// so that every old sheet is dead, is a change of the quorum: a
-// rotate-recovery event and a re-share to a new kit party. The log admits
-// those events; the agent does not make them yet.)
+// Renewing replaces the kit, so that every sheet of the old one, plain or
+// sealed, is dead: a fresh seed, a rotate-recovery event whose field 6 is
+// the new kit's party id (SHA-256 of its recovery key), then, once that
+// event is in force, a re-share in which the new kit party takes the old
+// one's place (this device and the cosigner deal; the new kit's material
+// is computed and wrapped as at every re-share, enroll.resid
+// finish_enroll). From the moment the event is in force the log refuses a
+// recover by the old kit (its key is not in field 6); after the re-share
+// the old kit's material is of a dead epoch and the relay holds only the
+// new kit's.
+//
+// The event is signed by this device alone: immediate while the policy
+// asks for one device signature (policy[1] = 1, as at inception), otherwise
+// delayed by the recovery delay and vetoable like any authority event
+// (SPEC 8.2). Running `device kit renew DIR` again then reports the wait,
+// and once the event is in force runs the re-share. Between the two runs
+// DIR/kit-next holds the new kit's public keys (nothing secret: the sheet
+// is printed once, when the event is published).
 
 import "../types.resid";
+import "../core/log.resid";
+import "../core/event.resid";
 import "../recovery/kitsheet.resid";
 import "../recovery/recovery.resid";
 import "common.resid";
 import "device.resid";
 import "enroll.resid";
+import "cosignerd.resid";
 import "kitpass.resid";
 import "crypto.resid";
+import "cose.resid";
+import "clock.resid";
+
+pub Str kit_renew_hint(Str dir) { return "if this kit was lost or seen by someone else: symbolon device kit renew " + dir; }
 
 @requires(filesystem)
 pub Int device_kit_status(Str dir) {
@@ -24,51 +42,187 @@ pub Int device_kit_status(Str dir) {
     if (match oc { None => true, Some(_) => false }) { return dfail("not set up"); }
     Str k = kit_sheet_kind(dir);
     println(if (k == "protected") { "kit: protected by a passphrase" } else { if (k == "plain") { "kit: no passphrase" } else { "kit: unknown (made before passphrases, so most likely none)" } });
+    if (next_kit_of(dir).sign_pub.len() > 0) { println("kit: a replacement is under way; `symbolon device kit renew " + dir + "` finishes it"); }
+    println(kit_renew_hint(dir));
     return 0;
 }
 
-// Standard input: the kit as written (hex, groups allowed), its passphrase
-// if it has one, then the new passphrase twice. Needs no PIN: nothing on
-// this device is opened or changed but DIR/kit-sheet. The kit is checked
-// against this device's verified log (it must be the quorum's kit), so a
-// mistyped kit is not sealed.
-@requires(filesystem, network, clock(readonly), declassify)
-pub Int device_kit_renew(Str dir) {
+// The new kit of a replacement under way: its public keys, and whether its
+// sheet is protected. Empty keys when none.
+pub type NextKit = { List(Int) sign_pub; List(Int) hpke_pub; Bool protected; };
+
+pub NextKit no_next_kit() { return NextKit {.sign_pub = [], .hpke_pub = [], .protected = false}; }
+
+@requires(filesystem)
+pub NextKit next_kit_of(Str dir) {
+    NextKit k = next_kit_parse(filesystem.read_all(dir + "/kit-next"));
+    return k;
+}
+
+pub NextKit next_kit_parse(Str s) {
+    List(Str) f = str_split(str_trim(s), " ");
+    if (f.len() != 3) { return no_next_kit(); }
+    List(Int) sp = cose_hex_decode(f[0]);
+    List(Int) hp = cose_hex_decode(f[1]);
+    if (sp.len() != 65 || hp.len() != 65) { return no_next_kit(); }
+    return NextKit {.sign_pub = sp, .hpke_pub = hp, .protected = f[2] == "protected"};
+}
+
+pub Str next_kit_line(NextKit k) { return hex_encode(k.sign_pub) + " " + hex_encode(k.hpke_pub) + (if (k.protected) { " protected" } else { " plain" }) + "\n"; }
+
+// The new kit as a party of the quorum: its id is SHA-256 of its recovery
+// key, the digest the rotate-recovery puts in field 6.
+pub Party next_kit_party(NextKit k) {
+    return Party {.id = recovery_key_digest(k.sign_pub), .kind = party_kind_kit(), .auth_key = k.sign_pub, .hpke_key = k.hpke_pub, .label = "recovery kit", .attestation = NoAttestation};
+}
+
+// Where a replacement whose new kit has party id `d` stands in the log `es`
+// (verified, with `pending` its pending sequences, `q` its quorum):
+// "done" (the kit is the quorum's), "in force" (the rotate-recovery took
+// effect; the re-share is still to run), "pending" (the rotate-recovery
+// waits out its delay) or "gone" (never published, vetoed, or overtaken
+// by a recovery).
+pub Str rotation_state(List(SignedEvent) es, List(UInt(64)) pending, Quorum q, List(Int) d) {
+    Party k = kit_of(q.parties, 0) else { none_party() };
+    if (bytes_eq(k.id, d)) { return "done"; }
+    if (digest_in(field6_in_force(es, pending, es.len() - 1), d, 0)) { return "in force"; }
+    if (rotation_pending(es, pending, d, 0)) { return "pending"; }
+    return "gone";
+}
+
+Bool digest_in(List(List(Int)) ds, List(Int) d, Int i) { return i < ds.len() && (bytes_eq(ds[i], d) || digest_in(ds, d, i + 1)); }
+
+Bool seq_in(List(UInt(64)) xs, UInt(64) s, Int i) { return i < xs.len() && (xs[i] == s || seq_in(xs, s, i + 1)); }
+
+Bool rotation_pending(List(SignedEvent) es, List(UInt(64)) pending, List(Int) d, Int i) {
+    if (i >= es.len()) { return false; }
+    EventBody b = es[i].payload.body;
+    Bool rot = match b { RotateRecoveryBody => true, _ => false };
+    if (rot && seq_in(pending, es[i].payload.sequence, 0) && digest_in(es[i].payload.next_recovery_key_digests, d, 0)) { return true; }
+    return rotation_pending(es, pending, d, i + 1);
+}
+
+// The quorum's parties with the kit party replaced, in its place, by `nk`.
+pub List(Party) with_kit(List(Party) ps, Party nk, Int i, List(Party) acc) {
+    if (i >= ps.len()) { return acc; }
+    return with_kit(ps, nk, i + 1, acc.concat([if (ps[i].kind == party_kind_kit()) { nk } else { ps[i] }]));
+}
+
+Int other_devices_of(List(Party) ps, List(Int) me, Int i, Int acc) {
+    if (i >= ps.len()) { return acc; }
+    Bool other = ps[i].kind == party_kind_device() && !bytes_eq(ps[i].id, me);
+    return other_devices_of(ps, me, i + 1, acc + (if (other) { 1 } else { 0 }));
+}
+
+// ─── `device kit renew DIR [PRIMES]` ─────────────────────────────
+// Standard input: the PIN, then (when a new kit is made) its passphrase and
+// the same again, an empty line for none. PRIMES as for `device enroll`.
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+pub Int device_kit_renew(Str dir, Str primes_file) {
     Option(DeviceConfig) oc = load_config(dir);
     return match oc {
         None => dfail("not set up"),
-        Some(c) => if (c.log_id.len() == 0) { dfail("not in a log yet") } else { renew_kit(dir, c, read_kit_seed(read_secret_line())) }
+        Some(c) => if (c.log_id.len() == 0) { dfail("not in a log yet") } else { renew_unlocked(dir, c, read_pin(), primes_file) }
     };
 }
 
-@requires(filesystem, network, clock(readonly), declassify)
-Int renew_kit(Str dir, DeviceConfig c, Result(List(Int), Str) rk) {
-    return match rk {
-        Err(m) => dfail(m),
-        Ok(seed) => renew_checked(dir, c, seed, read_new_kit_pass())
-    };
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+Int renew_unlocked(Str dir, DeviceConfig c, Str pin, Str primes_file) {
+    Unlocked u = unlock_dir(dir, c, pin);
+    if (u.kind == 2) { return dfail(duress_refusal(dir, c)); }
+    if (u.kind != 1) { return dfail("wrong PIN"); }
+    return renew_step(dir, c, u, pin, primes_file, true);
 }
 
-@requires(filesystem, network, clock(readonly), declassify)
-Int renew_checked(Str dir, DeviceConfig c, List(Int) seed, NewKitPass np) {
-    if (!np.ok) { return dfail(kit_pass_mismatch()); }
-    if (str_len(np.pass) == 0) { return dfail("a renewed kit needs a passphrase"); }
-    Result(VerifiedHead, SymbolonError) rv = verified_log(relay_ep(c), c.log_id);
+// One step: the log read again, and whatever the replacement under way
+// needs next. `may_make`: whether a new kit may be made (not right after
+// one was).
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+Int renew_step(Str dir, DeviceConfig c, Unlocked u, Str pin, Str primes_file, Bool may_make) {
+    Result(LogView, SymbolonError) rv = log_view_dir(dir, relay_ep(c), c.log_id, "");
+    Option(CgConfig) cg = load_share(dir, u.real.dek);
     return match rv {
         Err(e) => dfail(err_text(e)),
-        Ok(vh) => renew_sealed(dir, seed, vh, np.pass)
+        Ok(v) => match cg {
+            None => dfail("no share"),
+            Some(x) => renew_at(dir, c, u, x, v, pin, primes_file, may_make)
+        }
     };
 }
 
-@requires(filesystem, declassify)
-Int renew_sealed(Str dir, List(Int) seed, VerifiedHead vh, Str pass) {
-    if (!is_current_kit(kit_keys(seed), kit_of(vh.head.quorum.parties, 0))) { return dfail("that is not this identity's current recovery kit"); }
-    println("device: sealing the kit under its passphrase (Argon2id; this takes a while)...");
-    List(Int) sheet = new_kit_sheet(seed, pass);
-    if (!kit_sheet_protected(sheet)) { return dfail("cannot seal the kit"); }
-    if (!mark_kit_sheet(dir, sheet)) { return dfail("cannot store DIR/kit-sheet"); }
-    println("RECOVERY KIT (write it down; it is shown once): " + kit_sheet_text(sheet));
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+Int renew_at(Str dir, DeviceConfig c, Unlocked u, CgConfig x, LogView v, Str pin, Str primes_file, Bool may_make) {
+    Quorum q = v.vh.head.quorum;
+    if (match cosigner_of(q.parties, 0) { None => true, Some(_) => false }) { return dfail("replacing the kit needs a cosigner (SPEC 10.6)"); }
+    if (match kit_of(q.parties, 0) { None => true, Some(_) => false }) { return dfail("this identity has no recovery kit"); }
+    NextKit nk = next_kit_of(dir);
+    Str st = if (nk.sign_pub.len() == 0) { "none" } else { rotation_state(v.events, v.vh.pending, q, recovery_key_digest(nk.sign_pub)) };
+    if (st == "done") { return replaced(dir, nk); }
+    if (st == "pending") {
+        println(f"kit replacement pending: it takes effect after {v.vh.head.policy.recovery_delay_sec} s of witness time from its event, unless a device vetoes it; until then the old kit still works.");
+        println("Then run `symbolon device kit renew " + dir + "` again to finish it.");
+        return 0;
+    }
+    if (st == "in force") { return replace_kit(dir, c, u, x, v.vh, nk, pin, primes_file); }
+    if (!may_make) { return dfail("the kit replacement is not in the log"); }
+    if (st == "gone") { println("device: the earlier kit replacement did not take effect (vetoed, or never published); making a new kit"); }
+    return new_kit(dir, c, u, v.vh, pin, primes_file, read_new_kit_pass());
+}
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+Int new_kit(Str dir, DeviceConfig c, Unlocked u, VerifiedHead vh, Str pin, Str primes_file, NewKitPass np) {
+    if (!np.ok) { return dfail(kit_pass_mismatch()); }
+    List(Int) seed = random_bytes(32);
+    if (str_len(np.pass) > 0) { println("device: sealing the new kit under its passphrase (Argon2id; this takes a while)..."); }
+    List(Int) sheet = new_kit_sheet(seed, np.pass);
+    if (sheet.len() == 0) { return dfail("cannot seal the new kit"); }
+    KitKeys k = kit_keys(seed) else { KitKeys {.sign_priv = [], .sign_pub = [], .hpke_priv = [], .hpke_pub = []} };
+    NextKit nk = NextKit {.sign_pub = k.sign_pub, .hpke_pub = k.hpke_pub, .protected = kit_sheet_protected(sheet)};
+    EventPayload p = EventPayload {.log_id = Some(vh.head.log_id), .sequence = vh.head.sequence + 1, .predecessor_digest = Some(vh.head.digest),
+                                   .suite = 1, .body = RotateRecoveryBody, .next_recovery_key_digests = [recovery_key_digest(k.sign_pub)],
+                                   .advisory_time = (UInt(64))clock_now_seconds()};
+    List(Int) enc = payload_cbor(p) else { [] };
+    Result(List(Int), Str) s = dk_sign(c, u.real, u.st, enc);
+    List(Int) sig = match s { Ok(b) => b, Err(_) => [] };
+    if (enc.len() == 0 || sig.len() != 64) { return dfail("the device key did not sign the rotate-recovery event"); }
+    // Kept before the event is published: a run cut short after it still
+    // knows the new kit's keys.
+    if (!filesystem.write_all(dir + "/kit-next", next_kit_line(nk))) { return dfail("cannot store DIR/kit-next"); }
+    return match publish_event(c, p, enc, [EventSig {.signer = c.party, .sig = sig}]) {
+        Err(m) => dfail("rotate-recovery: " + m),
+        Ok(_) => rotated(dir, c, u, pin, primes_file, sheet)
+    };
+}
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+Int rotated(Str dir, DeviceConfig c, Unlocked u, Str pin, Str primes_file, List(Int) sheet) {
+    println("NEW RECOVERY KIT (write it down; it is shown once): " + kit_sheet_text(sheet));
     println(kit_sheet_note(sheet));
-    println("This is the same kit, written again: destroy the old sheet, which still works for whoever holds it.");
+    println("It replaces the old kit once the replacement is in force and the quorum has re-shared to it: then every old sheet, with or without a passphrase, is useless.");
+    return renew_step(dir, c, u, pin, primes_file, false);
+}
+
+// The re-share: this device and the cosigner deal to the quorum with the
+// new kit in the old one's place; the cosigner checks the rotate-recovery
+// is in force (cosigner.resid reshare_plan_problem).
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+Int replace_kit(Str dir, DeviceConfig c, Unlocked u, CgConfig x, VerifiedHead vh, NextKit nk, Str pin, Str primes_file) {
+    Quorum q = vh.head.quorum;
+    List(Party) np = with_kit(q.parties, next_kit_party(nk), 0, []);
+    if (other_devices_of(q.parties, c.party, 0, 0) > 0) {
+        println("device: every other device of this identity takes part in this re-share: on each, run now");
+        println("  symbolon device join DIR " + hex_encode(cbor_of_keys(PartyKeys {.party = c.party, .auth_key = c.dk_pub, .hpke_key = c.hpke_pub})));
+    }
+    println("device: the kit replacement is in force; re-sharing to the new kit...");
+    Int r = reshare_in(dir, c, u, x, vh, np, pin, primes_file, kv_mode_of(dir, u, q, c.party, false));
+    return if (r != 0) { r } else { replaced(dir, nk) };
+}
+
+@requires(filesystem)
+Int replaced(Str dir, NextKit nk) {
+    _ = filesystem.write_all(dir + "/kit-sheet", if (nk.protected) { "protected\n" } else { "plain\n" });
+    _ = filesystem.write_all(dir + "/kit-next", "");
+    println("kit replaced: the new kit is the quorum's; every sheet of the old kit is useless now.");
     return 0;
 }
