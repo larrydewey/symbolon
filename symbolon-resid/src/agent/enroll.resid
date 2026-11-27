@@ -759,8 +759,9 @@ Int finish_enroll(Str dir, DeviceConfig c, Unlocked u, VerifiedHead vh, CgConfig
         && send_secrets(relay, me, rem, cos.id, u, fix_mark_bytes(fix_mark_read(dir)), 0)
         && save_config(dir, with_log(c, c.witnesses, c.log_id, mailbox_end(relay, c.party, c.mbox_next), c.peers));
     if (!ok) { return dfail("cannot finish the enrollment"); }
-    // This build made the epoch (SPEC 6.2.2): the nonce-fix marker.
-    _ = mark_fixed_quorum(dir, u, []);
+    // This build made the epoch (SPEC 6.2.2): the nonce-fix marker, over
+    // that epoch and transcript, once the verified log is there (MR-1).
+    _ = mark_fixed_quorum(dir, u, (Int)nq.epoch, res.transcript, [], false);
     _ = filesystem.write_all(reshare_fail_file(dir), "");
     // The kit's blobs: a, k_a, the secrets under k_K, and a_v.
     Bool kit_ok = blob_put(relay, kit_a_blob(c.log_id, (Int)nq.epoch), cbor_of_blob(WrappedBlob {.enc = wa.enc, .ct = wa.ct}))
@@ -845,6 +846,12 @@ Waited wait_more(Endpoint relay, Local me, List(Remote) from, Cursor cur, Int si
 
 @requires(filesystem, network, device, declassify, clock, provision, environment)
 pub Int join_session(Str dir, DeviceConfig c, Unlocked u, Remote x, ReshareInvite inv, Waited w, Str pin, Str primes_file) {
+    // A device already in a log joins re-shares of that log only (MR-4):
+    // another household's re-share would replace its share, chain code and
+    // vault key and move it out of its own household.
+    Str other = join_log_problem(c.log_id, inv.log_id);
+    if (str_len(other) > 0) { return dfail(other); }
+    Bool member = c.log_id.len() > 0;
     DeviceConfig c1 = with_log(c, c.witnesses, inv.log_id, w.cur.next, c.peers);
     // Not one of the log's devices yet: a mail session as a proposed party.
     Endpoint relay = mail_ep(dir, c1, u);
@@ -860,14 +867,14 @@ pub Int join_session(Str dir, DeviceConfig c, Unlocked u, Remote x, ReshareInvit
         .old = [], .root = vh.head.quorum.root_pubkey, .session_id = inv.session_id, .seed = random_bytes(32), .primes = primes_of(primes_file)};
     return match rs_start(rc) {
         Err(e) => dfail("re-share: " + e.why),
-        Ok(s0) => join_after(dir, c1, u, x, inv, vh, pin, w.cur,
+        Ok(s0) => join_after(dir, c1, u, x, inv, vh, pin, w.cur, member,
             run_session(relay, inv.session_id, [Seat {.me = me, .st = s0.state, .round = 1, .out = s0.out, .done = false}], rem, [w.cur], w.all,
                         lambda(t, msgs) { rs_adapt(t, msgs) }, 1800))
     };
 }
 
 @requires(filesystem, network, device, declassify, clock, provision, environment)
-Int join_after(Str dir, DeviceConfig c, Unlocked u, Remote x, ReshareInvite inv, VerifiedHead vh, Str pin, Cursor before, Run(RsState) r) {
+Int join_after(Str dir, DeviceConfig c, Unlocked u, Remote x, ReshareInvite inv, VerifiedHead vh, Str pin, Cursor before, Bool member, Run(RsState) r) {
     if (str_len(r.fail) > 0) { _ = note_reshare_fail(dir, r.fail); return dfail("re-share: " + r.fail); }
     RsResult res = rs_result(r.seats[0].st) else { RsResult {.cfg = None, .offline = [], .transcript = []} };
     Option(CgConfig) ocfg = res.cfg;
@@ -880,11 +887,11 @@ Int join_after(Str dir, DeviceConfig c, Unlocked u, Remote x, ReshareInvite inv,
     Option(Packet) evw = ev.w;
     List(Int) enc = match evw { Some(wv) => sign_event_of(wv), None => [] };
     Option(EventPayload) op = payload_decode(enc);
-    Bool ok = match op {
-        None => false,
-        Some(p) => reshare_matches(p, res, inv)
+    Str bad = match op {
+        None => "no reshare event",
+        Some(p) => reshare_event_problem(p, res.transcript, inv, vh.head.quorum.root_pubkey)
     };
-    if (!ok) { return dfail("not the reshare event of this re-share"); }
+    if (str_len(bad) > 0) { return dfail("not the reshare event of this re-share: " + bad); }
     // The vault OPRF key (SPEC 18.10.1): when the event names one, a
     // dealing from each dealer, read from before the session (its drains
     // skip them), that add up to the event's field 6.
@@ -903,7 +910,7 @@ Int join_after(Str dir, DeviceConfig c, Unlocked u, Remote x, ReshareInvite inv,
     Waited sec = wait_wire(relay, me, [x], ev.cur, clock_now_seconds(), 600, 3);
     Option(Packet) sw = sec.w;
     return match sw {
-        Some(wv) => match wv { WEnrollSecrets(es) => joined(dir, c, u, pin, ncfg, es, vh, sec.cur, kvo, inv), _ => dfail("no secrets") },
+        Some(wv) => match wv { WEnrollSecrets(es) => joined(dir, c, u, pin, ncfg, es, vh, sec.cur, kvo, inv, res.transcript, member), _ => dfail("no secrets") },
         None => dfail("no secrets from the enrolling device")
     };
 }
@@ -917,24 +924,54 @@ List(List(Int)) kv_named(EventPayload p) {
 
 List(Int) flat_keys(List(List(Int)) xs, Int i, List(Int) acc) { return if (i >= xs.len()) { acc } else { flat_keys(xs, i + 1, acc.concat(xs[i])) }; }
 
-Bool reshare_matches(EventPayload p, RsResult res, ReshareInvite inv) {
+// Whether the event a joiner is asked to sign is the re-share it vetted
+// (MR-6): a reshare event with the session's transcript, the invitation's
+// epoch, exactly its parties (ids, kinds and keys), its threshold
+// (degree + 1) and the log's root key. "" when it is.
+pub Str reshare_event_problem(EventPayload p, List(Int) transcript, ReshareInvite inv, List(Int) root) {
     EventBody b = p.body;
-    return match b { ReshareBody(nq) => bytes_eq(nq.transcript_digest, res.transcript) && (Int)nq.epoch == inv.epoch, _ => false };
+    return match b {
+        ReshareBody(nq) => if (!bytes_eq(nq.transcript_digest, transcript) || (Int)nq.epoch != inv.epoch) { "another session or epoch" } else {
+            if (!parties_same(nq.parties, inv.new_parties, 0)) { "other parties than the invitation's" } else {
+                if ((Int)nq.t != inv.degree + 1 || !bytes_eq(nq.root_pubkey, root)) { "another threshold or root key" } else { "" } } },
+        _ => "not a reshare event"
+    };
+}
+
+// The same parties in the same order: ids, kinds and both keys.
+pub Bool parties_same(List(Party) a, List(Party) b, Int i) {
+    if (a.len() != b.len()) { return false; }
+    if (i >= a.len()) { return true; }
+    Bool same = bytes_eq(a[i].id, b[i].id) && a[i].kind == b[i].kind && bytes_eq(a[i].auth_key, b[i].auth_key) && bytes_eq(a[i].hpke_key, b[i].hpke_key);
+    return same && parties_same(a, b, i + 1);
+}
+
+// MR-4: "" when a device whose log is `mine` ("" for none) may join a
+// re-share of `theirs`.
+pub Str join_log_problem(List(Int) mine, List(Int) theirs) {
+    if (mine.len() == 0 || bytes_eq(mine, theirs)) { return ""; }
+    return "that re-share is for another identity log than this device's: refused, nothing changed (to join another household, set this device up again in a new directory)";
 }
 
 // The new device's profile, resealed with the quorum's chain code and vault
 // key, and its share and configuration stored.
 @requires(filesystem, network, device, declassify, clock, provision, environment)
-Int joined(Str dir, DeviceConfig c, Unlocked u, Str pin, CgConfig ncfg, EnrollSecrets es, VerifiedHead vh, Cursor cur, Option(KvOut) kvo, ReshareInvite inv) {
+Int joined(Str dir, DeviceConfig c, Unlocked u, Str pin, CgConfig ncfg, EnrollSecrets es, VerifiedHead vh, Cursor cur, Option(KvOut) kvo, ReshareInvite inv, List(Int) transcript, Bool member) {
     if (es.cc.len() != 32 || es.vault_key.len() != 32) { return dfail("malformed secrets"); }
-    // A party of the quorum already holds the household's chain code and
-    // vault key: one that leads a re-share it joins must not swap them
-    // (every credential's key would change, the vault would be sealed to
-    // a key the leader chose). Refused before anything is stored.
-    if (!keeps_secrets(pos1(vh.head.quorum.parties, c.party, 0) != 0, es.cc, es.vault_key, reveal(u.real.cc), reveal(u.real.vault_key))) {
-        return dfail("the device that led the re-share sent another chain code or vault key than this device holds: refused, nothing changed");
+    // A device already in this log holds the household's chain code and
+    // vault key: it keeps its own whatever the leader sends (MR-5: nothing
+    // to refuse after its signature, so no device is left behind).
+    List(Int) cc = chosen_secret(member, es.cc, reveal(u.real.cc));
+    List(Int) vk = chosen_secret(member, es.vault_key, reveal(u.real.vault_key));
+    if (member && (!bytes_eq(es.cc, cc) || !bytes_eq(es.vault_key, vk))) { eprintln("device: the device that led the re-share sent another chain code or vault key; this device keeps its own"); }
+    // The new share only once the verified log, held against the
+    // witnesses, is at the epoch this session made (MR-1, MR-5): a leader
+    // that never publishes leaves this device with the share it had.
+    if (!landed_now(dir, c, inv.epoch, transcript)) {
+        _ = note_reshare_fail(dir, "the re-share's event is not in the log");
+        return dfail("the re-share's event is not in the verified log: nothing was stored (run it again)");
     }
-    RealProfile real = RealProfile {.share = u.real.share, .cc = secret_bytes(es.cc), .vault_key = secret_bytes(es.vault_key), .dek = u.real.dek, .duress_hpke_pub = u.real.duress_hpke_pub};
+    RealProfile real = RealProfile {.share = u.real.share, .cc = secret_bytes(cc), .vault_key = secret_bytes(vk), .dek = u.real.dek, .duress_hpke_pub = u.real.duress_hpke_pub};
     List(Secret(UInt(8))) k = u.ukey;
     List(Secret(UInt(8))) rp = encode_real(real) else { [] };
     // Which file held the real profile: the one this key opens.
@@ -946,9 +983,10 @@ Int joined(Str dir, DeviceConfig c, Unlocked u, Str pin, CgConfig ncfg, EnrollSe
         && send_duress_key(dir, mail_ep(dir, c, u), Local {.party = c.party, .cg = 0, .hpke_sk = device_transport(c, u.real.dek).sk}, cos_remote(vh))
         && save_config(dir, with_log(c, eps_of(vh.head.policy.witnesses, 0, []), c.log_id, cur.next, c.peers));
     if (!ok) { return dfail("cannot store the enrollment"); }
-    // This build took part in the epoch (SPEC 6.2.2); the inception's
-    // marker, when the enrolling device handed one on, is kept instead.
-    _ = mark_fixed_quorum(dir, u, es.fix_mark);
+    // This build took part in the epoch (SPEC 6.2.2); a new device keeps
+    // the inception's marker instead when the enrolling device handed one
+    // on, an existing one never (MR-2).
+    _ = mark_fixed_quorum(dir, u, inv.epoch, transcript, es.fix_mark, !member);
     _ = filesystem.write_all(reshare_fail_file(dir), "");
     println("joined the quorum: log " + hex_encode(c.log_id));
     return 0;
@@ -977,11 +1015,16 @@ Bool ep_key_in(List(WitnessEp) eps, List(Int) k, Int i) {
     return bytes_eq(eps[i].key, k) || ep_key_in(eps, k, i + 1);
 }
 
-// Whether the chain code and vault key a re-share's leader sent may be
-// taken: by a new party, any; by a party already in the quorum, only its
-// own (joined).
-pub Bool keeps_secrets(Bool member, List(Int) cc, List(Int) vk, List(Int) my_cc, List(Int) my_vk) {
-    return !member || (bytes_eq(cc, my_cc) && bytes_eq(vk, my_vk));
+// The chain code or vault key a joining device keeps: a new device takes
+// what the leader sent; one already in the log keeps its own (M-3, MR-5).
+pub List(Int) chosen_secret(Bool member, List(Int) sent, List(Int) mine) { return if (member) { mine } else { sent }; }
+
+// Whether the verified log of `c`'s identity, held against the witnesses,
+// is at `epoch` with `transcript`.
+@requires(filesystem, network, clock(readonly), declassify)
+Bool landed_now(Str dir, DeviceConfig c, Int epoch, List(Int) transcript) {
+    Result(LogView, SymbolonError) rv = log_view_dir(dir, relay_ep(c), c.log_id, "");
+    return match rv { Ok(v) => epoch_landed(v.vh.head.quorum, epoch, transcript), Err(_) => false };
 }
 
 // The last re-share's failure, for `device status` (migrate.resid: an old

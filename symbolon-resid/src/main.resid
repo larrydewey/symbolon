@@ -527,7 +527,7 @@ Int main_cmd() {
     if (a1 == "device" && a2 == "sign" && n == 7) { return device_sign(args.get(3), args.get(4), args.get(5), args.get(6)); }
     if (a1 == "device" && a2 == "status" && n == 4) { return device_status_plus(args.get(3)); }
     if (a1 == "device" && a2 == "security-advice" && (n == 4 || (n == 6 && args.get(4) == "--report"))) { return device_security_advice(args.get(3), if (n == 6) { args.get(5) } else { "" }); }
-    if (a1 == "device" && a2 == "scan-leaks" && n == 4) { return device_scan_leaks(args.get(3)); }
+    if (a1 == "device" && a2 == "scan-leaks" && n == 4) { return device_scan_leaks_kept(args.get(3)); }
     if (a1 == "cosigner" && a2 == "scan-leaks" && n == 4) { return cosigner_scan_leaks(args.get(3)); }
     if (a1 == "device" && a2 == "security-update" && (n == 4 || n == 5)) { return device_security_update(args.get(3), if (n == 5) { args.get(4) } else { "" }); }
     if (a1 == "device" && a2 == "openings" && n == 4) { return device_openings(args.get(3)); }

@@ -152,3 +152,30 @@ FixFacts facts_from(List(SignedEvent) es, FixState st, Int i, FixFacts acc) {
     Int rm = match b { RemovePartyBody(_) => 1, _ => 0 };
     return facts_from(es, st, i + 1, FixFacts {.prefix_reshares = acc.prefix_reshares + rs, .recovers = acc.recovers + rc, .removals = acc.removals + rm});
 }
+
+// What to write after a session that made `epoch` with `transcript`
+// (MR-1, MR-2), given the marker the device holds (`have`, checked), one
+// another device handed on (`offered`, checked), whether this device may
+// take that one (`may_adopt`: only a device that was in no log before,
+// joining for the first time), and the verified head held against the
+// witnesses (`head`):
+//   "keep"  a valid marker is there already (the first one stays);
+//   "none"  the head is not that epoch with that transcript (the event
+//           never landed, or a stale view): nothing is marked, and the
+//           refresh stays due;
+//   "adopt" the handed-on inception marker, on a new device only;
+//   "sign"  this device signs the epoch the session made, never the head
+//           it happens to see.
+pub Str mark_choice(FixState have, FixState offered, Bool may_adopt, Quorum head, Int epoch, List(Int) transcript) {
+    if (have.ok) { return "keep"; }
+    if (!epoch_landed(head, epoch, transcript)) { return "none"; }
+    if (may_adopt && offered.ok && offered.born) { return "adopt"; }
+    return "sign";
+}
+
+// Whether the verified head is the epoch a session made, with its transcript.
+pub Bool epoch_landed(Quorum head, Int epoch, List(Int) transcript) {
+    return epoch >= 0 && (Int)head.epoch == epoch && bytes_eq(head.transcript_digest, transcript);
+}
+
+pub List(Int) fix_device_key(List(Party) ps, List(Int) id) { return device_key(ps, id, 0); }

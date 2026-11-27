@@ -455,18 +455,26 @@ did. Two steps follow the upgrade.
   invitation that is a refresh of the quorum in force (same parties and
   keys, the requester and the cosigner dealing, the threshold kept,
   version 2 or later, signed by the requester's device key) or, after two
-  minutes without one, leads. A device already in the quorum refuses a
-  chain code or vault key other than its own from the leader.
+  minutes without one, leads. A device already in a log joins re-shares
+  of that log only, and keeps its own chain code and vault key whatever
+  the leader sends. A joiner signs the reshare event only when it is
+  exactly the invitation's re-share (its parties with their keys, its
+  threshold, the epoch, the session's transcript and the log's root key),
+  and stores its new share only once the verified log, held against the
+  witnesses, is at that epoch with that transcript.
   It is done on a device once that device holds a **nonce-fix marker**:
   its device key's signature over the log id, an epoch, that epoch's
-  transcript digest and its own id, written by this build after each
-  epoch it made (the inception, or a re-share it took part in), the first
-  kept. A marker counts only when it verifies under this device's key in
-  the quorum in force, and the verified log holds the event that made that
+  transcript digest and its own id. This build writes it for the epoch a
+  session it took part in made (the inception, or a re-share), with that
+  session's transcript, and only once the verified log is there: never
+  for whatever head a relay serves afterwards. The first is kept. A
+  marker counts only when it verifies under this device's key in the
+  quorum in force, and the verified log holds the event that made that
   epoch with that transcript. The enrolling device hands its marker to a
-  new device (`EnrollSecrets.fix_mark`); there it counts only as an
-  inception marker signed by the inception's device. A missing marker
-  makes the refresh run again, never less.
+  device joining its first log (`EnrollSecrets.fix_mark`); there it counts
+  only as an inception marker signed by the inception's device. A device
+  already in the log never takes another device's marker. A missing
+  marker makes the refresh run again, never less.
 - **The rotation advice.** The refresh does not undo a root key already
   worked out, so a household made before the fix (no inception marker)
   is advised to replace its root key: a new identity, then each Threshold
@@ -478,11 +486,16 @@ did. Two steps follow the upgrade.
   device. When a recover or a remove-party is in the log (the log keeps
   no reason, so every removal counts), the person reports a device lost
   or stolen, or the cosigner's operator reported an incident, or the log
-  cannot be verified now, or a mail scan found a ciphertext of 6.2.1, the
-  rollover (26.5 method 1) is not advised: each relying party's own
-  recovery (A-19). A scan hit makes the advice "compromised". The advice
-  rests on the verified log and the device's own files only; without a
-  verified log it is the strictest.
+  cannot be verified now or the witnesses hold events the relay does not
+  serve, or a mail scan found a ciphertext of 6.2.1, the rollover (26.5
+  method 1) is not advised: each relying party's own recovery (A-19).
+  These signals outweigh an inception marker: a marker is a fact about an
+  epoch, not evidence that no one else holds a device. A scan hit makes
+  the advice "compromised", and every hit is kept: a later scan never
+  lowers it. A clean scan counts only when this device's key signed its
+  result and it is no older than the 30 days of mail it read; otherwise
+  the scan reads as not run. The advice rests on the verified log and the
+  device's own files only; without a verified log it is the strictest.
 
 ---
 

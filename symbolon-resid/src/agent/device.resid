@@ -492,36 +492,42 @@ pub Str security_update_reminder(Str dir) {
 }
 
 // ─── The nonce-fix marker (nfmark.resid, SPEC 6.2.2) ────────────
-// Written by this build after every quorum epoch it made with the
-// cosigner (the inception, a re-share it led or joined): every party of
-// that session ran the Paillier nonce fix, or the session ended. The
-// first valid marker is kept. `offered`: a marker another device handed
-// on (EnrollSecrets.fix_mark), kept instead when it is the inception's,
-// signed by the inception's device.
+// Written by this build after a quorum epoch it made with the cosigner
+// (the inception, a re-share it led or joined): every party of that
+// session ran the Paillier nonce fix, or the session ended. It signs the
+// epoch and transcript that session made, and only once the verified log,
+// held against the witnesses, is at that epoch with that transcript
+// (MR-1: never whatever head a relay serves afterwards); otherwise
+// nothing is marked and the refresh stays due. The first valid marker is
+// kept. `offered`: a marker another device handed on
+// (EnrollSecrets.fix_mark), taken only by a device joining its first log
+// (`may_adopt`) and only as the inception's, signed by the inception's
+// device (MR-2: an existing member relies on its own markers alone).
 @requires(filesystem, network, device, declassify, clock, environment)
-pub Bool mark_fixed_quorum(Str dir, Unlocked u, List(Int) offered) {
+pub Bool mark_fixed_quorum(Str dir, Unlocked u, Int epoch, List(Int) transcript, List(Int) offered, Bool may_adopt) {
     Option(DeviceConfig) oc = load_config(dir);
-    return match oc { None => false, Some(c) => mark_fixed_in(dir, c, u, offered) };
+    return match oc { None => false, Some(c) => mark_fixed_in(dir, c, u, epoch, transcript, offered, may_adopt) };
 }
 
 @requires(filesystem, network, device, declassify, clock, environment)
-Bool mark_fixed_in(Str dir, DeviceConfig c, Unlocked u, List(Int) offered) {
+Bool mark_fixed_in(Str dir, DeviceConfig c, Unlocked u, Int epoch, List(Int) transcript, List(Int) offered, Bool may_adopt) {
     if (c.log_id.len() == 0) { return false; }
     Result(LogView, SymbolonError) rv = log_view_dir(dir, relay_ep(c), c.log_id, "");
-    return match rv { Err(_) => false, Ok(v) => mark_fixed_at(dir, c, u, v, offered) };
+    return match rv { Err(_) => false, Ok(v) => mark_fixed_at(dir, c, u, v, epoch, transcript, offered, may_adopt) };
 }
 
 @requires(filesystem, device, declassify, network, environment)
-Bool mark_fixed_at(Str dir, DeviceConfig c, Unlocked u, LogView v, List(Int) offered) {
+Bool mark_fixed_at(Str dir, DeviceConfig c, Unlocked u, LogView v, Int epoch, List(Int) transcript, List(Int) offered, Bool may_adopt) {
     Quorum q = v.vh.head.quorum;
-    if (fix_mark_check(fix_mark_read(dir), c.log_id, c.party, q, v.events).ok) { return true; }
     FixMark om = fix_mark_of_bytes(offered);
-    FixState os = fix_mark_check(om, c.log_id, c.party, q, v.events);
-    if (os.ok && os.born) { return fix_mark_write(dir, om); }
-    List(Int) tbs = fix_mark_tbs(c.log_id, (Int)q.epoch, q.transcript_digest, c.party);
+    Str choice = mark_choice(fix_mark_check(fix_mark_read(dir), c.log_id, c.party, q, v.events), fix_mark_check(om, c.log_id, c.party, q, v.events), may_adopt, q, epoch, transcript);
+    if (choice == "keep") { return true; }
+    if (choice == "adopt") { return fix_mark_write(dir, om); }
+    if (choice != "sign") { return false; }
+    List(Int) tbs = fix_mark_tbs(c.log_id, epoch, transcript, c.party);
     Result(List(Int), Str) s = dk_sign(c, u.real, u.st, tbs);
     List(Int) sig = match s { Ok(x) => x, Err(_) => [] };
-    return sig.len() == 64 && fix_mark_write(dir, FixMark {.log_id = c.log_id, .epoch = (Int)q.epoch, .transcript = q.transcript_digest, .signer = c.party, .sig = sig});
+    return sig.len() == 64 && fix_mark_write(dir, FixMark {.log_id = c.log_id, .epoch = epoch, .transcript = transcript, .signer = c.party, .sig = sig});
 }
 
 DeviceConfig with_identity(DeviceConfig c, List(Int) dk_pub) {
@@ -730,7 +736,7 @@ Int sign_inception_event(Str dir, DeviceConfig c, Unlocked u, KitKeys kit, List(
     Result(VerifiedHead, SymbolonError) v = il_verify(l, [se], last_time([se], policy_of_e0([se])), lambda(p) { false });
     return match v {
         Err(e) => dfail("the inception does not verify: " + err_text(e)),
-        Ok(vh) => publish(dir, c, u, kit, parties, cr, a, mine, kitc, StoredEvent {.encoded = enc, .sigs = sigs, .cosigs = cs}, l, sheet, kv)
+        Ok(vh) => publish(dir, c, u, kit, parties, cr, a, mine, kitc, StoredEvent {.encoded = enc, .sigs = sigs, .cosigs = cs}, l, sheet, kv, q)
     };
 }
 
@@ -808,7 +814,7 @@ pub Str duress_refusal_for(Result(VerifiedHead, SymbolonError) v) {
 // and prints the kit's sheet.
 @requires(filesystem, network, device, declassify, clock, environment)
 Int publish(Str dir, DeviceConfig c, Unlocked u, KitKeys kit, List(PartyKeys) parties, Remote cr, InitArgs a,
-            CgConfig mine, CgConfig kitc, StoredEvent se, List(Int) l, List(Int) sheet, KvInit kv) {
+            CgConfig mine, CgConfig kitc, StoredEvent se, List(Int) l, List(Int) sheet, KvInit kv, Quorum q0) {
     if (!log_put(relay_ep(c), l, 0, cbor_of_event(se))) { return dfail("the relay refused the inception"); }
     // The relay takes the kit's blobs only from a signed-in device of the
     // log (SPEC 29.4): this one, now that its log is there.
@@ -833,7 +839,7 @@ Int publish(Str dir, DeviceConfig c, Unlocked u, KitKeys kit, List(PartyKeys) pa
     if (!ok) { return dfail("cannot store the result"); }
     // This build made the inception with the cosigner: the household's
     // keys never ran without the nonce fix (SPEC 6.2.2).
-    _ = mark_fixed_quorum(dir, u, []);
+    _ = mark_fixed_quorum(dir, u, (Int)q0.epoch, q0.transcript_digest, [], false);
     println("log " + hex_encode(l));
     println("root key " + hex_encode(cfg_root_pubkey(mine, [1, 2, 3])));
     _ = mark_kit_sheet(dir, sheet);

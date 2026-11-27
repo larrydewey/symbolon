@@ -97,3 +97,30 @@ test "the re-shares before the fix are those before the marker's epoch, all of t
     expect(d.removals).toEqual(1);
     expect(d.recovers).toEqual(1);
 }
+
+// MR-1: a marker is written only over the epoch the session made, once the
+// verified head is that epoch with that transcript; never over the head a
+// stale view shows.
+test "MR-1: no marker over a stale head; the session's epoch once it landed" {
+    FixState none = fix_none();
+    // The session made epoch 2 (transcript 2); the relay still serves epoch 1.
+    expect(mark_choice(none, none, false, q([dev(1), kit(), cos()], 1, 1), 2, tr(2))).toEqual("none");
+    // The head is epoch 2, but with another transcript.
+    expect(mark_choice(none, none, false, q([dev(1), kit(), cos()], 2, 9), 2, tr(2))).toEqual("none");
+    expect(mark_choice(none, none, false, q([dev(1), kit(), cos()], 2, 2), 2, tr(2))).toEqual("sign");
+    expect(mark_choice(FixState {.ok = true, .epoch = 2, .born = false}, none, false, q([dev(1), kit(), cos()], 3, 3), 3, tr(3))).toEqual("keep");
+    expect(epoch_landed(q([dev(1), kit(), cos()], 2, 2), 2, tr(2))).toEqual(true);
+    expect(epoch_landed(q([dev(1), kit(), cos()], 2, 2), 1, tr(2))).toEqual(false);
+}
+
+// MR-2: a handed-on inception marker is taken by a device joining its
+// first log only, never by an existing member.
+test "MR-2: an existing member never adopts another device's inception marker" {
+    FixState none = fix_none();
+    FixState born = FixState {.ok = true, .epoch = 1, .born = true};
+    Quorum head = q([dev(1), kit(), cos(), dev(2)], 3, 3);
+    expect(mark_choice(none, born, false, head, 3, tr(3))).toEqual("sign");
+    expect(mark_choice(none, born, true, head, 3, tr(3))).toEqual("adopt");
+    // Not even when the head is stale.
+    expect(mark_choice(none, born, true, head, 4, tr(4))).toEqual("none");
+}

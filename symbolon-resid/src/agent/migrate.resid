@@ -29,8 +29,8 @@
 //    joined only when it is a refresh of this quorum (refresh_problem): a
 //    device that sent anything else (a party added, another threshold,
 //    other dealers) is refused, and a leader that sends another chain code
-//    or vault key than this device holds is refused (enroll.resid
-//    keeps_secrets).
+//    or vault key than this device holds is ignored: a device already in
+//    the log keeps its own (enroll.resid chosen_secret).
 //
 // 2. The advice (security_advice): the re-share does not undo a root key
 //    that was already worked out, so every household made before the fix
@@ -65,6 +65,8 @@ import "leakscan.resid";
 import "ecdsa.resid";
 import "crypto.resid";
 import "clock.resid";
+import "cose.resid";
+import "../vault/vault.resid";
 
 // ─── What the user reported (DIR/security-reports) ──────────────
 // `device security-advice DIR --report lost|cosigner`: a device of the
@@ -99,12 +101,92 @@ pub type ScanSeen = { Int checked; Int hits; Int unreadable; };
 
 pub ScanSeen scan_none() { return ScanSeen {.checked = -1, .hits = -1, .unreadable = -1}; }
 
-// The scan's kept result (leakscan.resid scan_result: DIR/nonce-scan, -1
-// when no scan completed).
-@requires(filesystem)
-pub ScanSeen scan_seen(Str dir) {
+// What the advice takes from the scan (MR-3, MR-7):
+//   - a hit counts from any source, and stays: every hit seen is kept in
+//     DIR/nonce-hits, and a later clean or empty scan never lowers it;
+//   - a clean result counts only when this device's key signed it
+//     (DIR/nonce-scan.sig, written by `device scan-leaks` here) and it is
+//     no older than the 30 days of mail it read (and not from the
+//     future); otherwise the scan reads as not run.
+pub Int scan_window_s() { return 30 * 86400; }
+
+pub ScanSeen scan_effective(ScanResult raw, Bool signed_ok, Int now, Int sticky) {
+    Int hits = if (raw.hits > sticky) { raw.hits } else { sticky };
+    if (hits > 0) { return ScanSeen {.checked = if (raw.checked > 0) { raw.checked } else { 0 }, .hits = hits, .unreadable = if (raw.unreadable > 0) { raw.unreadable } else { 0 }}; }
+    Bool fresh = raw.time > 0 && raw.time <= now + 300 && now - raw.time <= scan_window_s();
+    if (!signed_ok || !fresh || raw.checked <= 0) { return scan_none(); }
+    return ScanSeen {.checked = raw.checked, .hits = 0, .unreadable = raw.unreadable};
+}
+
+pub Str hits_file(Str dir) { return dir + "/nonce-hits"; }
+pub Str scan_sig_file(Str dir) { return dir + "/nonce-scan.sig"; }
+
+// The most hits any scan of this device has shown ("hits N time T" lines).
+pub Int sticky_parse(Str s) { return sticky_from(str_split(s, "\n"), 0, 0); }
+
+Int sticky_from(List(Str) ls, Int i, Int best) {
+    if (i >= ls.len()) { return best; }
+    List(Str) f = str_split(str_trim(ls[i]), " ");
+    Int n = if (f.len() >= 2 && f[0] == "hits") { str_parse_int(f[1]) } else { 0 };
+    return sticky_from(ls, i + 1, if (n > best) { n } else { best });
+}
+
+@requires(filesystem, clock(readonly))
+pub Int sticky_hits(Str dir, Int seen) {
+    Str before = if (filesystem.exists(hits_file(dir))) { filesystem.read_all(hits_file(dir)) } else { "" };
+    Int kept = sticky_parse(before);
+    if (seen > kept) { _ = filesystem.write_all(hits_file(dir), before + f"hits {seen} time {clock_now_seconds()}\n"); }
+    return if (seen > kept) { seen } else { kept };
+}
+
+// What this device's key signs over a kept scan line.
+pub List(Int) scan_tbs(List(Int) log_id, List(Int) party, Str line) {
+    return utf8("symbolon v1 nonce-scan").concat([0, log_id.len() & 255]).concat(log_id).concat([party.len() & 255]).concat(party).concat(utf8(str_trim(line)));
+}
+
+// The scan as the advice takes it, `key` this device's key in the
+// verified quorum ([] when the log could not be had: no clean result
+// counts then).
+@requires(filesystem, clock(readonly))
+pub ScanSeen scan_seen(Str dir, List(Int) log_id, List(Int) party, List(Int) key) {
     ScanResult r = scan_result(dir);
-    return ScanSeen {.checked = r.checked, .hits = r.hits, .unreadable = r.unreadable};
+    Str line = if (filesystem.exists(scan_file(dir))) { filesystem.read_all(scan_file(dir)) } else { "" };
+    List(Int) sig = if (filesystem.exists(scan_sig_file(dir))) { cose_hex_decode(str_trim(filesystem.read_all(scan_sig_file(dir)))) } else { [] };
+    Bool signed_ok = key.len() == 65 && sig.len() == 64 && str_len(line) > 0 && ecdsa_verify_raw(P256, Sha256, key, scan_tbs(log_id, party, line), sig);
+    Int sticky = sticky_hits(dir, if (r.hits > 0) { r.hits } else { 0 });
+    return scan_effective(r, signed_ok, clock_now_seconds(), sticky);
+}
+
+// `symbolon device scan-leaks DIR` (the PIN on standard input): the scan
+// (leakscan.resid), its line kept and signed by this device's key, a hit
+// kept for good, then its words.
+@requires(filesystem, network, device, declassify, clock, environment, provision)
+pub Int device_scan_leaks_kept(Str dir) {
+    Str pin = read_pin();
+    LeakScan r = device_scan_result(dir, pin);
+    _ = keep_scan(dir, pin, r);
+    _ = print_lines(scan_words(r), 0);
+    return scan_exit(r);
+}
+
+@requires(filesystem, network, device, declassify, clock, environment, provision)
+Bool keep_scan(Str dir, Str pin, LeakScan r) {
+    if (str_len(r.problem) > 0) { return false; }
+    Str line = scan_line(r, clock_now_seconds());
+    _ = filesystem.write_all(scan_sig_file(dir), "");
+    if (!filesystem.write_all(scan_file(dir), line + "\n")) { return false; }
+    _ = sticky_hits(dir, r.hits);
+    Option(DeviceConfig) oc = load_config(dir);
+    return match oc { None => false, Some(c) => sign_scan(dir, c, pin, line) };
+}
+
+@requires(filesystem, network, device, declassify, clock, environment, provision)
+Bool sign_scan(Str dir, DeviceConfig c, Str pin, Str line) {
+    Unlocked u = unlock_dir(dir, c, pin);
+    if (u.kind != 1) { return false; }
+    Result(List(Int), Str) s = dk_sign(c, u.real, u.st, scan_tbs(c.log_id, c.party, line));
+    List(Int) sig = match s { Ok(x) => x, Err(_) => [] };
+    return sig.len() == 64 && filesystem.write_all(scan_sig_file(dir), hex_encode(sig) + "\n");
 }
 
 // ─── The advice ─────────────────────────────────────────────────
@@ -159,7 +241,9 @@ pub Str adv_born() { return "Your household key was made after the fix. There is
 pub Advice security_advice(AdviceIn a, Str dir) {
     Bool hit = a.scan.hits > 0;
     Bool other_hands = a.lost_log || a.lost || a.incident;
-    if (a.born && a.log_ok && !hit) { return Advice {.level = "none", .rollover = "ok", .lines = [adv_born()]}; }
+    // A marker is a fact about an epoch: it never outweighs a sign that
+    // someone else may hold a device or the key (MR-2).
+    if (a.born && a.log_ok && !hit && !other_hands && a.hidden == 0) { return Advice {.level = "none", .rollover = "ok", .lines = [adv_born()]}; }
     Bool avoid = hit || other_hands || !a.log_ok || a.hidden > 0;
     Str level = if (hit) { "compromised" } else {
         if (a.prefix_reshares > 0 || a.sigs < 0 || a.sigs > many_sigs() || other_hands || !a.log_ok) { "strongly-recommended" } else { "recommended" } };
@@ -220,19 +304,19 @@ pub Known known_now(Str dir, DeviceConfig c) {
     Str fail = filesystem.read_all(reshare_fail_file(dir));
     return match rv {
         Err(_) => Known {.log_ok = false, .reshare = if (fix_mark_present(dir)) { "unknown" } else { reshare_state(false, fail, []) },
-            .advice = security_advice(AdviceIn {.log_ok = false, .hidden = 0, .born = false, .prefix_reshares = 0, .sigs = -1, .lost_log = false, .lost = rp.lost, .incident = rp.incident, .scan = scan_seen(dir)}, dir)},
+            .advice = security_advice(AdviceIn {.log_ok = false, .hidden = 0, .born = false, .prefix_reshares = 0, .sigs = -1, .lost_log = false, .lost = rp.lost, .incident = rp.incident, .scan = scan_seen(dir, c.log_id, c.party, [])}, dir)},
         Ok(w) => known_in(dir, c, w, rp, fail)
     };
 }
 
-@requires(filesystem)
+@requires(filesystem, clock(readonly))
 Known known_in(Str dir, DeviceConfig c, WitnessedView w, Reports rp, Str fail) {
     Quorum q = w.view.vh.head.quorum;
     FixState st = fix_mark_check(fix_mark_read(dir), c.log_id, c.party, q, w.view.events);
     FixFacts f = fix_facts(w.view.events, st);
     Party cos = cosigner_of(q.parties, 0) else { none_party() };
     AdviceIn a = AdviceIn {.log_ok = true, .hidden = w.hidden, .born = st.ok && st.born, .prefix_reshares = f.prefix_reshares, .sigs = if (st.ok && st.born) { 0 } else { -1 },
-                           .lost_log = f.recovers + f.removals > 0, .lost = rp.lost, .incident = rp.incident, .scan = scan_seen(dir)};
+                           .lost_log = f.recovers + f.removals > 0, .lost = rp.lost, .incident = rp.incident, .scan = scan_seen(dir, c.log_id, c.party, fix_device_key(q.parties, c.party))};
     return Known {.log_ok = true, .advice = security_advice(a, dir), .reshare = reshare_state(st.ok, fail, cos.id)};
 }
 
@@ -312,7 +396,7 @@ pub Str refresh_problem(ReshareInvite inv, List(Int) l, List(Int) me, Quorum q, 
         return "the invitation is not signed by the device it names";
     }
     List(Party) keep = kept_parties(q.parties, removed, 0, []);
-    if (!same_parties_as(inv.new_parties, keep, 0)) { return "the invitation changes who is in the household: it is not a refresh, refused"; }
+    if (!parties_same(inv.new_parties, keep, 0)) { return "the invitation changes who is in the household: it is not a refresh, refused"; }
     Party cos = cosigner_of(q.parties, 0) else { none_party() };
     List(Int) dealers = [pos1(q.parties, inv.requester, 0), pos1(q.parties, cos.id, 0)];
     if (cos.id.len() == 0 || !ints_same(inv.dealers, dealers) || inv.degree != (Int)q.t - 1) { return "the invitation changes the dealers or the threshold: refused"; }
@@ -334,12 +418,6 @@ pub List(Party) kept_parties(List(Party) ps, List(List(Int)) removed, Int i, Lis
 
 Bool id_in(List(List(Int)) xs, List(Int) id, Int i) { return i < xs.len() && (bytes_eq(xs[i], id) || id_in(xs, id, i + 1)); }
 
-Bool same_parties_as(List(Party) a, List(Party) b, Int i) {
-    if (a.len() != b.len()) { return false; }
-    if (i >= a.len()) { return true; }
-    Bool same = bytes_eq(a[i].id, b[i].id) && a[i].kind == b[i].kind && bytes_eq(a[i].auth_key, b[i].auth_key) && bytes_eq(a[i].hpke_key, b[i].hpke_key);
-    return same && same_parties_as(a, b, i + 1);
-}
 
 Bool ints_same(List(Int) a, List(Int) b) { return a.len() == b.len() && ints_same_from(a, b, 0); }
 
