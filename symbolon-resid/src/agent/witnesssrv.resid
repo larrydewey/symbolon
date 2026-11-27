@@ -37,6 +37,12 @@
 //                  20.3). A relay that hides an event cannot hide it from
 //                  the witnesses that co-signed it (agent/common.resid
 //                  witness_head_check).
+//   POST /event    a 32-byte log id || an 8-byte sequence (big-endian);
+//                  answers CBOR [event, [time, r || s]]: the event this
+//                  witness co-signed there (without co-signatures) and its
+//                  co-signature, 404 when it holds none (witness_event,
+//                  R5-1): devices and the cosigner take from the witnesses
+//                  what the relay does not serve.
 //
 // A /cosign or /catchup request is at most max_cosign_bytes() and
 // max_cosign_events() events (413 beyond): what it carries is verified on
@@ -71,8 +77,9 @@
 // (agent/common.resid verified_events).
 //
 // Files: state/<log>, the kept state (above); seen/<log>/c<seq>, the
-// relay's claim it co-signed with (SPEC
-// 20.3); seen/<log>/<seq>, the digest the witness co-signed there (32
+// relay's claim it co-signed with (SPEC 20.3); seen/<log>/e<seq>, the
+// event itself (at most 16 KiB, POST /event); seen/<log>/<seq>, the
+// digest the witness co-signed there (32
 // bytes) and its answer; written once (to a temporary file, then renamed
 // into place, so a write cut short never holds a sequence), never changed. A request re-verifies
 // the log it carries: an agent does the same on every fetch (SPEC 8.4), and
@@ -106,6 +113,10 @@ pub HttpReply witness_handle(Str root, List(Secret(UInt(8))) wpriv, Int offset, 
         if (r.body.len() != 64) { return http_reply_status(400); }
         return witness_head(root, wpriv, offset, r.body[32..64], r.body[0..32]);
     }
+    if (r.method == "POST" && r.path == "/event") {
+        if (r.body.len() != 40 || r.body[32] >= 64) { return http_reply_status(400); }
+        return witness_event(root, r.body[0..32], be_seq(r.body, 32, 0));
+    }
     if (r.method != "POST" || (r.path != "/cosign" && r.path != "/catchup")) { return http_reply_status(404); }
     if (r.body.len() > max_cosign_bytes()) { return http_reply_status(413); }
     Option(CoReq) oq = parse_cosign(r.body);
@@ -137,6 +148,51 @@ HttpReply witness_head(Str root, List(Secret(UInt(8))) wpriv, Int offset, List(I
     Int t = clock_now_seconds() + offset;
     List(Int) sig = ecdsag_sign_raw(P256, Sha256, wpriv, head_message(l, seq, d, nonce, t));
     return http_reply_bytes(200, "application/cbor", cbe_bytes(sig, cbe_uint(t, cbe_bytes(d, cbe_uint(seq, cbe_array(4, []))))));
+}
+
+// The event this witness co-signed at (log `l`, `seq`), as it was shown
+// (POST /event, R5-1): CBOR [event, answer], the event without
+// co-signatures (StoredEvent CBOR) and the answer it gave the co-sign
+// request, [time, r || s]; 404 when it co-signed none there, or did not
+// keep it (one larger than max_kept_event(), or co-signed before events
+// were kept). A relay that hides an event from the devices and the
+// cosigner cannot hide it from them: they take it from the witnesses.
+@requires(filesystem)
+HttpReply witness_event(Str root, List(Int) l, Int seq) {
+    Str dir = root + "/seen/" + hex_encode(l);
+    Str f = dir + "/" + f"{seq}";
+    Str ef = dir + "/e" + f"{seq}";
+    if (!filesystem.exists(f) || !filesystem.exists(ef)) { return http_reply_status(404); }
+    List(Int) held = filesystem.read_bytes(f);
+    List(Int) ev = filesystem.read_bytes(ef);
+    Option(StoredEvent) se = event_of_cbor(ev);
+    Bool same = held.len() > 32 && match se { None => false, Some(x) => bytes_eq(sha256_bytes(x.encoded), held[0..32]) };
+    if (!same) { return http_reply_status(404); }
+    return http_reply_bytes(200, "application/cbor", cbe_bytes(ev, cbe_array(2, [])).concat(held[32..held.len()]));
+}
+
+Int be_seq(List(Int) b, Int i, Int acc) { return if (i >= b.len()) { acc } else { be_seq(b, i + 1, acc * 256 + b[i]) }; }
+
+// The largest event a witness keeps to show (POST /event): a veto, a
+// recover or a policy is a few kilobytes at most.
+pub Int max_kept_event() { return 16384; }
+
+// The event co-signed at `seq`, kept beside its digest ("e<seq>", not a
+// sequence name), written before the sequence is held. One per sequence,
+// as the digest, and at most max_kept_event() bytes, so it adds a bounded
+// amount to what the witness already keeps per co-signed event.
+@requires(filesystem)
+Bool keep_event(Str dir, UInt(64) seq, SignedEvent e) {
+    List(Int) b = cbor_of_event(StoredEvent {.encoded = e.encoded, .sigs = e.sigs, .cosigs = []});
+    if (b.len() == 0 || b.len() > max_kept_event()) { return false; }
+    _ = filesystem.create_dir(str_slice(dir, 0, str_len(dir) - 65));
+    _ = filesystem.create_dir(dir);
+    Str tmp = dir + "/.e" + f"{seq}" + ".tmp-" + hex_encode(random_bytes(8));
+    if (!filesystem.write_bytes(tmp, b) || !filesystem.rename(tmp, dir + "/e" + f"{seq}")) {
+        _ = filesystem.remove(tmp);
+        return false;
+    }
+    return true;
 }
 
 // The largest decimal name (a sequence file; temporary files start with
@@ -396,6 +452,7 @@ HttpReply witness_claimed(Str f, Str dir, List(Secret(UInt(8))) wpriv, CoReq q, 
     if (str_len(why) > 0 && !at.claimless) { return http_reply_text(403, "text/plain", why); }
     Option(RelayClaim) qc = q.claim;
     List(Int) ck = match qc { None => [], Some(c) => claim_cbor(c) };
+    _ = keep_event(dir, seq, q.e);
     return witness_store(f, dir, wpriv, q.l, seq, d, at.time, if (at.sequencer.len() > 0 && str_len(why) == 0) { ck } else { [] });
 }
 

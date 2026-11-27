@@ -692,7 +692,7 @@ Int events_fitting(List(List(Int)) es, Int i, Int upto, Int count, Int bytes) {
     return events_fitting(es, i + 1, upto, count + 1, b);
 }
 
-Option(WitnessCosignature) cosig_of(List(Int) b, List(Int) wkey, List(Int) l, UInt(64) seq, List(Int) d) {
+pub Option(WitnessCosignature) cosig_of(List(Int) b, List(Int) wkey, List(Int) l, UInt(64) seq, List(Int) d) {
     // [uint time, bytes(64)]
     if (b.len() < 3 || b[0] != 130) { return None; }
     Int ib = b[1];
