@@ -1,0 +1,298 @@
+// The mailbox scan (agent/leakscan.resid): a device's mailbox holding the
+// cosigner's real round-1 and round-2 batches of a signing session, sealed
+// as the relay carries them; planted nonce-1 ciphertexts, envelopes that
+// do not open, and batches of an epoch not held. Fixtures are those of
+// threshold_ref_test.resid.
+
+import "../types.resid";
+import "../core/log.resid";
+import "../threshold/threshold.resid";
+import "../threshold/rsmsg.resid";
+import "../net/proto.resid";
+import "../net/envelope.resid";
+import "session.resid";
+import "leakscan.resid";
+import "hpkeg.resid";
+import "paillier.resid";
+import "crypto.resid";
+import "ecdsa.resid";
+import "cose.resid";
+import "word.resid";
+
+Str hx(List(Int) b) { return hex_encode(b); }
+
+List(UInt(64)) nat(Str h) { return bn_from_be(cose_hex_decode(h)); }
+
+CvPt pt(Str h) { return match cv_dec(cose_hex_decode(h)) { Some(p) => p, None => cv_inf() }; }
+
+List(Secret(UInt(8))) chain_code() { return secret_bytes(rt [180, 32, 220, 232, 175, 131, 197, 200, 20, 214, 12, 52, 0, 135, 246, 4, 161, 218, 117, 121, 183, 226, 123, 17, 191, 180, 175, 100, 122, 18, 64, 170]); }
+
+Party party_of(List(Int) id, UInt(8) kind) {
+    return Party { .id = id, .kind = kind, .auth_key = [], .hpke_key = [], .label = "p", .attestation = NoAttestation };
+}
+
+Quorum quorum() {
+    return Quorum { .parties = [party_of([12, 201, 97, 213, 187, 45, 176, 173, 225, 34, 33, 242, 136, 32, 83, 104, 116, 216, 241, 101, 151, 3, 58, 6, 128, 109, 190, 241, 109, 170, 205, 19], party_kind_device()), party_of([212, 166, 176, 3, 55, 10, 159, 24, 111, 1, 17, 25, 196, 237, 97, 45, 141, 202, 178, 19, 33, 155, 159, 26, 226, 237, 208, 170, 46, 129, 215, 191], party_kind_device()),
+                                 party_of([50, 193, 193, 90, 151, 15, 15, 97, 64, 114, 44, 3, 216, 218, 213, 216, 65, 78, 192, 235, 134, 75, 38, 20, 123, 65, 36, 8, 70, 62, 65, 149], party_kind_cosigner())],
+                     .t = 2, .root_pubkey = [4, 28, 46, 244, 29, 171, 122, 106, 51, 151, 132, 124, 190, 95, 52, 241, 152, 190, 33, 117, 178, 29, 71, 105, 184, 126, 141, 11, 0, 125, 120, 171, 211, 162, 22, 17, 181, 109, 175, 12, 189, 181, 106, 183, 251, 18, 210, 8, 93, 234, 35, 85, 223, 122, 72, 43, 66, 212, 245, 85, 101, 25, 96, 36, 76], .epoch = 3, .transcript_digest = [], .kv_commits = [] };
+}
+
+List(CgPublicCfg) publics() { return [CgPublicCfg { .id = 1, .ecdsa = pt("03f394cdebf414f02d27f71d56a66c8393995700be1e6944d021bb372d89520700"), .elgamal = pt("02442740efb73dd60dce2b6a8ca30b198c0c7c3a4493df511096dafba94a36e66e"), .n = nat("9b2ea78ac4676322c181fea5e5f96de746fa5c060e27cb1f664f7afeda65b7128f1d84627411763a4ae475793cd1169f50bec9b5f487edf195330475cd19bfb372d31cbebde021065197cee51256f64189d4913b1735c33b9777153428ced95e3e17953cfccebc9e0c6af8dd3fb16fa262ece9e7aa884906b8a8106e9c0c37176c471ed26b71469c2a0f3901058f16cb30b8111ebde4851d3c1fad566f8e24a89337792219802b2b2804f9fbc2783c187d0e12cddb2ac925ad9be942d3970c5510b68b9332af9d5c1b77cf2c4c56e75931a6e51ddfcbdc9c834bdd0829c77e1054b36e43cebeb0d0e8e6111ec9471ac1b53724c93447dba0742bb6cddabd1215"), .ped = Pedersen { .n = nat("9b2ea78ac4676322c181fea5e5f96de746fa5c060e27cb1f664f7afeda65b7128f1d84627411763a4ae475793cd1169f50bec9b5f487edf195330475cd19bfb372d31cbebde021065197cee51256f64189d4913b1735c33b9777153428ced95e3e17953cfccebc9e0c6af8dd3fb16fa262ece9e7aa884906b8a8106e9c0c37176c471ed26b71469c2a0f3901058f16cb30b8111ebde4851d3c1fad566f8e24a89337792219802b2b2804f9fbc2783c187d0e12cddb2ac925ad9be942d3970c5510b68b9332af9d5c1b77cf2c4c56e75931a6e51ddfcbdc9c834bdd0829c77e1054b36e43cebeb0d0e8e6111ec9471ac1b53724c93447dba0742bb6cddabd1215"), .s = nat("86b74f9f60690cea5aea79c575a494206ff5dd91897be65a7652d280ea0e375ecb4de6b5f8cc6d8acb83eeabe5d48b487f0b88188c6030afbbc649c42fecf504f8dd3b02ae2b7299dd0488329a15b97771e2726eedf6a3c31f2b23f4624f83fe983a4bb2c6791f3535b2e09026b49972ed6cf869a027072379b72d95a45c8b0c5e2b1c661a9c1eb2a70090151ca1aba7bd24afd1fd82e78dddc5044ca282204bd6a273c08647e49ca51a1dc2a0c899c86f96d2351a619681dfcf9ac2a11e458f2b0e2e14514cc6a194346d372194bbd6df01d605223f7b2feafd980bc098026888546474969e3e1e78bfe8ffa958eac61085f0782980118926501bdf39c653d6"), .t = nat("298f4985c52f08c72357887f5dbfa0685770fb390300815e7d4c27540ac8bcda1e69328280be7ae82e09f1356833abe441bfcafd82925efcc53410e5d9487c73c83bd009a223ba3f602d929a3fb1967d83a374f7b390eb19dc4d018fed36922a760af3389c7e83e892cbbfbb2346c637453364f3f02b9abf2e2fcc29ab085330972cf5d7b6007dd29a90d2b45ee1fdbea06c1ff4babff64a481c12b267c702732dcfa542b35a4e248e61633d69fdf50e117910366937f310f7e6edc63d962de40ec099de7105e594fb32d44697f043f69824bdcef4a1532823e971a8efc5935b44b04503a89a4effbe1dd38667c4387f070fde33cd42e34409bcf617e05dbe98") } }, CgPublicCfg { .id = 2, .ecdsa = pt("03eed386a2eff2a46435f8a2f5dda4fbd78861fd4ba321c8094afc703de315d18c"), .elgamal = pt("03b08386ea09f9ef50adee236b1b396c479c89be03119b271e0397b8f9b9dcf9d6"), .n = nat("bbe79b36541755dc64e104982f14428956d00cfb424c5c6710c423a4a2c95438348fa92b6bd895023bb37f4662337e3307c9f69d5643b7bcea39ba5b3eb920cc77f41f313270e9d19937911074cec44ea7f93744c60eb53a7f01dd138928d81b196f220476905ab0ca3cc1a5c5e1a7fb95e3015b140ddd8c740e9a91cb88ccfbc9c6fe8fd63c11043a4e78a8a3e12cfbf1a03bcefcf00df50a51c72662db881dcc0b091ad8e82412a65dddcdbfcb541785ce82607ffcea986e5abc3ddd985e3883efe9de78975853ba3c2a11e758e10d7f014e1a8c19a8d8845e0c4d93ac8e265bafa5dd3dfedc32506be9fb6eb37a611f460e8ffbad8a5672538bad82d107a9"), .ped = Pedersen { .n = nat("bbe79b36541755dc64e104982f14428956d00cfb424c5c6710c423a4a2c95438348fa92b6bd895023bb37f4662337e3307c9f69d5643b7bcea39ba5b3eb920cc77f41f313270e9d19937911074cec44ea7f93744c60eb53a7f01dd138928d81b196f220476905ab0ca3cc1a5c5e1a7fb95e3015b140ddd8c740e9a91cb88ccfbc9c6fe8fd63c11043a4e78a8a3e12cfbf1a03bcefcf00df50a51c72662db881dcc0b091ad8e82412a65dddcdbfcb541785ce82607ffcea986e5abc3ddd985e3883efe9de78975853ba3c2a11e758e10d7f014e1a8c19a8d8845e0c4d93ac8e265bafa5dd3dfedc32506be9fb6eb37a611f460e8ffbad8a5672538bad82d107a9"), .s = nat("b64e719b54766ff89362f0f731e2b22d996de8dfd157ab39e532dae07b3b14176ab8c8f68c691ff04ee6edec8e41a2ca0933ba7f95e0cd5e624a0c277327748a3d178fc894af7f21e9e84cf30df19c911c33a0309496bf1fb29191acdd510da44fbbfa1cff7395abc7885fafc4cc2e86b4d4877361c789e95891499f7026c7874501d495aa70ddc1ff49e7ac16d76234110fac8c0a3aa046a1e8d5d72e261f5152c52c4f8050cb4df4eb888e71b2ab3ac1bcb1e5c3c405a1590094f969f41993fe599ffdc34e77941233a6a87bdb1859a701e6c73eebb3d3db9bf457ed64380f8d6a0db01cf8c97e711d31f07c9be77b74e9531c09145efcabece8c4bcad0487"), .t = nat("6d90b3065d23d6c7de92e37b8a826c894efc4d92b5df9856b56ef843bf9544295b375d1107f8e4b7c0f02face37f3f13d59aa0d4e9aefc22c61c5ba372f266384096e5c3a39133beb7e5553d780e4a11db63b3798515b541b1f058c772e3d2684dd019e31d6eaca50d87418fe5a4392195bb4ec0ff6203dc3e20b871327ba5761b50315809b3085d4f9698018b2e078e25b2ffea62106148a69a655ec7731ce42a236484551dc88fc793d42198d536208667d5450d62f2e32f129eddfff38c28a2860667483605101d42164505597f18030eeff7feb11f58a650ec4d6cc917519af799f8eb3eb92bc26ee00fd4c87746b1f52d505ff47b425eafd6c36048de4c") } }, CgPublicCfg { .id = 3, .ecdsa = pt("03190d7e87cc1479ae9fae2368ef487c272755eb703d67c97c33c92fd285201d9a"), .elgamal = pt("03668c6d48b15156dbaab81cf1ae826ce41a9ec171480ff6336c6424cea5dfbe06"), .n = nat("c3702f8b337dfd8985866e44fab60deb25e488531875e7708ebd7d74d70bbb189dd9f6ad51d5dc87803668a5b9d207d806ebc39c6d3d3df10c8afe0171b3c5dc337c013866391e9d49e1a5a33fa94c43ef1c2e4f0dda0a320697d788e9bc00ec19117782879fc2da658e335f757a8bb7cd6303ebb15a8620e87e434c71bd9b6ffb502d16a4b2e7a7dad0e0cd0342c221494ddc71ee6f7478326f21f6fb5aeef3cac3a2703749ceb9b24dc036d8ed6c25798de1f1722e89ba7575b8f8131adf568b0302184e42964debd4fb3dbff113a37914ff2b055402631120d63b6f2e922699c6c2dd8d4b2cd5e0cdf7b34cddee4b7417122730c6509c67f9f153703b8645"), .ped = Pedersen { .n = nat("c3702f8b337dfd8985866e44fab60deb25e488531875e7708ebd7d74d70bbb189dd9f6ad51d5dc87803668a5b9d207d806ebc39c6d3d3df10c8afe0171b3c5dc337c013866391e9d49e1a5a33fa94c43ef1c2e4f0dda0a320697d788e9bc00ec19117782879fc2da658e335f757a8bb7cd6303ebb15a8620e87e434c71bd9b6ffb502d16a4b2e7a7dad0e0cd0342c221494ddc71ee6f7478326f21f6fb5aeef3cac3a2703749ceb9b24dc036d8ed6c25798de1f1722e89ba7575b8f8131adf568b0302184e42964debd4fb3dbff113a37914ff2b055402631120d63b6f2e922699c6c2dd8d4b2cd5e0cdf7b34cddee4b7417122730c6509c67f9f153703b8645"), .s = nat("14d40632b6b0b9317f62da6341169abc88396c2cc4376e5e8d64993f6784b9536a408018ce643df50b22cac5c6e45333a49931fef3cdeb62ea32fffbf540e1b727ba63f47fa721db13a798b2e12acab3f20c50b4d49471358216dc529693ede62bb8d32b2cd975bfeebe0ba5a44e2c1047566d1e5748faa448d026b429482c97dab58881081936e82c50486ea00bcd3a1f504e8505328f646e01f6d003f88eabc332a43bd57338776e2219b7383713c00d721515291a0cf5a3eb2c380586411a5fb0b5ffc11248f2a1af6e36942b2fa5193218f8ca97fa1d653064ee174b742eb23a783df834f17edc7ad98a9bf50f37b17684752162fa3fc8e52056e85a3b38"), .t = nat("5366522736d8326bf3d6bb3fe6b4c6cef443dfe2458b82972ab67be6eb6785e66e624abd71c17a1554fc984d75f6f3ae770ca912a098cfbda123b2c107c7d16a19334602cfe2b1832ae1335779e2fa896d4af95461ac8cfdeb15ec751972be5695f49898c1032791c4199ca655ea8981fe22e40caacf5207bc6c24c3fdc488e38cf0a1b358947f3b88cbb9643226546cbd6020496fcd25f703f7f9c1cb79fe408a93f265f36dc2a46db9ab2635246e93bee32d30154d8d36b3a71fb8cad66176a142d126d2b69a3aefe42729bc1f7fa3068e478181192d50641d81382940971765c2ff67769778c49d0f9823a43fc75b5401d3c3a28a6c3a3d8b1139ef9ca482") } }]; }
+
+CgConfig config(Int i) {
+    if (i == 1) { return CgConfig { .id = 1, .threshold = 1, .ecdsa = nat("4abdd223646ed1dccd4671599eaff1484b3d2dcf44438624aacf0f92d97a75f1"), .elgamal = nat("be7526b89f574580dad64c0317daac42eee124a8d0f265c51bda40a5d9e13f47"), .p = nat("c7a0a26d66491aa191e208dacad5e78e23c25b4ba562ef4b3b221ff8145257be0fa8ed3d39a016c37525162e12a61ebadecb27eb243f3a34fc42d1d0b9166d8fdcb4e7811efe5f11ad35501c444f9d0675e9af4a0ceceadda6b85f5875aa5704ec6ec283301faa4bf44de4b5ec0fa15447042f413cf862f1978ffebc030cd8b3"), .q = nat("c701021e91631cbcb4777dbcb122eae89fd1c3c3bff6621ecefd132929afbbdc64468d3fddfd3cb4c7a4f5c8c014916f8a3eb850e8d38089f9e5f58922ccbdd12912e610192914bd7d841f86e12a53d30a70f41290f85a11639f5c4f45d11ed12ea3d76ed22012dbe8b73a90fa3bea819dcc99b2a7378dc48019b415561cfe17"), .rid = [], .chain_key = [], .public = publics() }; }
+    if (i == 2) { return CgConfig { .id = 2, .threshold = 1, .ecdsa = nat("303d9a7201458ee40a7d4714ed731c401a9678707e426978c4e122e52a96ead2"), .elgamal = nat("9c51c26267848e8a3dc697a5b210ca507cff7e5e2d616987b83a016f497282f8"), .p = nat("f90233cda18f309bd2ccb22e617dc9963f1b9866d7f02b854f4d9e30ec0d12981e60395b58845807f3ce4401723869f2533d790ac64cdeb5c0524e956e99a42c575cb6790f97e8dc7f53b4ab8c6f3a3427c4fb7cfc6e0061165d247efb403dcfe5d289fe45aea3bd221b38a2f438bfed2f2b37a4a1c89561ecdc2713e0f84fe7"), .q = nat("c12e35370a6d8ecc176a17150877d3b0ebfef52ba4fc1431f6d4945b59f8e144b16d5973544318faa40611bfce8ee72f9867258aa926fd2044e132dfbde15cfab284940d99c338bf1e6ad582cb9431cedfccd2574ad8909edbf7fae45082a3bca84c63f0b17903a10f71dc257578becd9849a3ef294c9728b871b0ba2eac39ef"), .rid = [], .chain_key = [], .public = publics() }; }
+    if (i == 3) { return CgConfig { .id = 3, .threshold = 1, .ecdsa = nat("15bd62c09e1c4beb47b41cd03c364737e9efc311b8414cccdef336377bb35fb3"), .elgamal = nat("0ef8347d67d0cfd3454441863acf42c17da4aad1e971b305b07f9658b8c40964"), .p = nat("f859b2dec115412a690d45d00c683e33233e09ab7d7aec6ed44798dc9743b91959c93d6cec66279846cbd519234a379c267b535464a073607221daf0dc2419e31991d0af903c4e744a00dfff2d577ba9caac5c58e1089cd1f3fb98e3bb015fe1758cda4440eefd3694b87841f8d5e48ebede66232dd12035911e56914ff500ff"), .q = nat("c975431cf1aefae6c7cfc517303b6980fcc49bae30e18808c3f6e3b52bfcce94422e88602458044488a2e41963fd70052a9b7ede945060ad9e06db7e35c88aa0a5fe17e2c80ce2a1ccfa05bf97ec00fbde00a818ecbdd2ed4fdd979d961ae380e757678e0c112ea49beba271fac9e8ff56edf17ac2845ed4d0a6d76babf034bb"), .rid = [], .chain_key = [], .public = publics() }; }
+    return CgConfig { .id = 0, .threshold = 0, .ecdsa = [], .elgamal = [], .p = [], .q = [], .rid = [], .chain_key = [], .public = [] };
+}
+
+// ─── Seeds and sessions ─────────────────────────────────────────
+
+// The 32-byte seed i (4 bytes big-endian, then zeros). The seeds below
+// were found by a search (Python, SHA-256 counter mode as cg_rng) for
+// which Resid master 1458799c's cg_unit runs out of its 8 chunks under the
+// device's Paillier modulus (publics()[0].n, about 1 call in 1,728):
+//   1245: ps/kn (K)   385: ps/mta-d/3/r (the Delta F)   730: ps/mta-x/3/r (the Chi F)
+//   457: bl/tn (the tweak T)   1775: rsh/d1/1/1 (a re-share part to party 1)
+// A fixed Resid (cg_unit without the fallback) gives these seeds ordinary
+// nonces; every test below holds on both.
+List(Int) seed_n(Int i) { return [(i >> 24) & 255, (i >> 16) & 255, (i >> 8) & 255, i & 255].concat(zeros(28)); }
+List(Int) zeros(Int n) { return if (n == 0) { [] } else { [0].concat(zeros(n - 1)) }; }
+
+List(Int) dev() { return [12, 201, 97, 213, 187, 45, 176, 173, 225, 34, 33, 242, 136, 32, 83, 104, 116, 216, 241, 101, 151, 3, 58, 6, 128, 109, 190, 241, 109, 170, 205, 19]; }
+List(Int) cos() { return [50, 193, 193, 90, 151, 15, 15, 97, 64, 114, 44, 3, 216, 218, 213, 216, 65, 78, 192, 235, 134, 75, 38, 20, 123, 65, 36, 8, 70, 62, 65, 149]; }
+List(Int) digest() { return [83, 130, 189, 108, 162, 154, 7, 175, 26, 54, 117, 52, 16, 94, 216, 116, 224, 173, 64, 236, 204, 89, 25, 75, 15, 53, 26, 252, 214, 81, 119, 232]; }
+List(Int) sid() { return [51, 55, 17, 188, 174, 75, 0, 133, 179, 81, 20, 211, 246, 165, 75, 136, 131, 169, 209, 57, 105, 90, 118, 144, 125, 235, 174, 79, 184, 57, 74, 90]; }
+
+@requires(declassify)
+List(UInt(64)) tau() { return tweak_scalar(chain_code(), "login.example.com", [50, 185, 196, 129, 49, 116, 171, 111, 241, 56, 213, 180, 146, 122, 133, 182]); }
+
+type SPty = { CgCtx ctx; ThState st; };
+
+// Party `who` of the device-and-cosigner session, the device initiating.
+@requires(declassify)
+SPty party(List(Int) who, List(Int) seed) {
+    Quorum q = quorum();
+    Bool d = bytes_eq(who, dev());
+    List(UInt(64)) mine = if (d) { tau() } else { [] };
+    CgCtx none = CgCtx {.self = 0, .ids = [], .pubs = [], .x = [], .elg = [], .psec = PaillierSec {.p = [], .q = [], .phi = [], .phi_inv = []}, .pubkey = cv_inf(), .base = tr_new(), .seed = [], .digest = []};
+    CgCtx c = th_ctx(config(cg_id_of(q, who, 0)), q, [dev(), cos()], dev(), mine, sid(), digest(), seed) else { none };
+    return SPty {.ctx = c, .st = th_start(c, th_role(c, q, dev(), mine)).state};
+}
+
+Bool for_me(ThMsg m, Int me) {
+    return match m {
+        ThCg(c) => c.from != me && (c.to == 0 || c.to == me),
+        ThTw(t) => t.to == me,
+        ThVerdict(v) => v.to == me,
+        ThRs(r) => r.from != me && (r.to == 0 || r.to == me)
+    };
+}
+
+List(ThMsg) inbox(List(ThMsg) all, Int me, Int i, ListBuf(ThMsg) acc) {
+    if (i >= all.len()) { return acc.finish(); }
+    return inbox(all, me, i + 1, if (for_me(all[i], me)) { acc.push(all[i]) } else { acc });
+}
+
+// A run: the parties, the last round's messages, everything sent so far.
+type TRun = { List(SPty) ps; List(ThMsg) out; List(ThMsg) sent; Str fail; List(Int) culprits; };
+
+TRun step_all(List(SPty) ps, List(ThMsg) in, Int i, ListBuf(SPty) acc, List(ThMsg) out) {
+    if (i >= ps.len()) { return TRun {.ps = acc.finish(), .out = out, .sent = [], .fail = "", .culprits = []}; }
+    SPty p = ps[i];
+    return match th_step(p.st, inbox(in, p.ctx.self, 0, ListBuf())) {
+        Err(e) => failed(acc, e),
+        Ok(s) => step_all(ps, in, i + 1, acc.push(SPty {.ctx = p.ctx, .st = s.state}), out.concat(s.out))
+    };
+}
+
+TRun failed(ListBuf(SPty) acc, CgFail e) {
+    _ = acc.finish();
+    return TRun {.ps = [], .out = [], .sent = [], .fail = e.why, .culprits = e.culprits};
+}
+
+TRun run(List(SPty) ps, List(ThMsg) in, List(ThMsg) sent, Int rounds) {
+    if (rounds == 0) { return TRun {.ps = ps, .out = in, .sent = sent, .fail = "", .culprits = []}; }
+    TRun r = step_all(ps, in, 0, ListBuf(), []);
+    if (str_len(r.fail) > 0) { return r; }
+    return run(r.ps, r.out, sent.concat(r.out), rounds - 1);
+}
+
+List(ThMsg) first_out(SPty p) {
+    ThState st = p.st;
+    return match st { ThR1(s, _) => wrap(s.out, 0, ListBuf()), _ => [] };
+}
+
+List(ThMsg) wrap(List(CgMsg) ms, Int i, ListBuf(ThMsg) acc) {
+    if (i >= ms.len()) { return acc.finish(); }
+    return wrap(ms, i + 1, acc.push(ThCg(ms[i])));
+}
+
+Str sig_of(List(SPty) ps, Int i) {
+    if (i >= ps.len()) { return ""; }
+    ThState st = ps[i].st;
+    return match st { ThSigned(sig) => hx(th_sig_raw(sig)), _ => sig_of(ps, i + 1) };
+}
+
+// A whole session with the device drawing from `seed`: the signature (hex)
+// when it is valid under SPty and nothing sent carries a nonce-1 ciphertext.
+@requires(declassify)
+Str session(List(Int) seed) {
+    SPty d = party(dev(), seed);
+    SPty c = party(cos(), sha256_bytes([3, 3, 3]));
+    if (d.ctx.self == 0 || c.ctx.self == 0) { return "no context"; }
+    List(ThMsg) start = first_out(d).concat(first_out(c));
+    TRun r = run([d, c], start, start, 8);
+    if (str_len(r.fail) > 0) { return "fail: " + r.fail; }
+    if (th_nonce_one(d.ctx, r.sent, 0)) { return "sent a ciphertext with the nonce 1"; }
+    Str sig = sig_of(r.ps, 0);
+    if (str_len(sig) != 128) { return "no signature"; }
+    Bool ok = ecdsa_verify_digest(P256, credential_pubkey(quorum().root_pubkey, tau()), digest(), ecdsa_sig_raw(P256, cose_hex_decode(sig)));
+    return if (ok) { "valid" } else { "invalid signature" };
+}
+
+// Messages with every K, MtA F and tweak T replaced by a nonce-1 ciphertext.
+List(ThMsg) forged(List(ThMsg) ms, List(UInt(64)) n, Int i, ListBuf(ThMsg) acc) {
+    if (i >= ms.len()) { return acc.finish(); }
+    List(UInt(64)) bad = pa_enc(paillier_pub(n), zi_from_nat([7]), [1]);
+    ThMsg m = ms[i];
+    ThMsg f = match m {
+        ThCg(c) => ThCg(CgMsg {.from = c.from, .to = c.to, .body = forged_body(c.body, bad)}),
+        ThTw(t) => ThTw(BlTwMsg {.from = t.from, .to = t.to, .t = bad, .d = t.d, .f = t.f, .proof = t.proof}),
+        _ => m
+    };
+    return forged(ms, n, i + 1, acc.push(f));
+}
+
+CgBody forged_body(CgBody b, List(UInt(64)) bad) {
+    return match b {
+        PsB2(x) => PsB2(PsB2R {.k = bad, .g = x.g, .zl = x.zl, .zm = x.zm, .commit = x.commit}),
+        PsM3(x) => PsM3(PsM3R {.delta_f = x.delta_f, .delta_proof = x.delta_proof, .chi_f = bad, .chi_proof = x.chi_proof}),
+        _ => b
+    };
+}
+
+// ─── Mailboxes ──────────────────────────────────────────────────
+
+type Keys = { HpkeKeyPairG(Secret(UInt(8))) dev; HpkeKeyPairG(Secret(UInt(8))) cos; HpkeKeyPairG(Secret(UInt(8))) other; };
+
+@requires(declassify)
+Keys tkeys() {
+    return Keys {.dev = hpkeg_derive_keypair(16, secret_bytes(rt sha256_bytes([1]))), .cos = hpkeg_derive_keypair(16, secret_bytes(rt sha256_bytes([3]))),
+                 .other = hpkeg_derive_keypair(16, secret_bytes(rt sha256_bytes([5])))};
+}
+
+// The cosigner's batch for `round` to the device, sealed to `to_pk`.
+@requires(declassify)
+List(Int) env(Keys k, List(Int) to_pk, Int round, List(ThMsg) msgs) {
+    List(Secret(UInt(8))) fresh = [];
+    Option(Envelope) oe = seal(cos(), k.cos.sk, dev(), to_pk, WSession(SessionMsg {.session_id = sid(), .round = round, .msgs = msgs, .proto = session_proto()}), fresh);
+    return match oe { None => [], Some(e) => envelope_encode(e) };
+}
+
+// The cosigner's real round-1 and round-2 messages to the device.
+type Two = { List(ThMsg) r1; List(ThMsg) r2; };
+
+@requires(declassify)
+Two cos_rounds() {
+    SPty d = party(dev(), seed_n(9));
+    SPty c = party(cos(), sha256_bytes([3, 3, 3]));
+    List(ThMsg) start = first_out(d).concat(first_out(c));
+    TRun r = run([d, c], start, start, 1);
+    List(ThMsg) r2 = inbox(r.out, 1, 0, ListBuf());
+    return Two {.r1 = inbox(first_out(c), 1, 0, ListBuf()), .r2 = from_cos(r2, 0, ListBuf())};
+}
+
+List(ThMsg) from_cos(List(ThMsg) ms, Int i, ListBuf(ThMsg) acc) {
+    if (i >= ms.len()) { return acc.finish(); }
+    ThMsg m = ms[i];
+    Bool keep = match m { ThCg(x) => x.from == 3, ThTw(t) => t.from == 3, _ => false };
+    return from_cos(ms, i + 1, if (keep) { acc.push(m) } else { acc });
+}
+
+@requires(declassify)
+LeakScan scan_dev(Keys k, List(List(Int)) envs, List(CgConfig) held) {
+    Local me = Local {.party = dev(), .cg = 0, .hpke_sk = k.dev.sk};
+    return scan_envelopes(me, [Remote {.party = cos(), .cg = 0, .hpke_pub = k.cos.pk}], envs, held);
+}
+
+Str counts(LeakScan r) { return f"checked {r.checked} hits {r.hits} unreadable {r.unreadable}"; }
+
+Bool says(List(Str) ls, Str part, Int i) {
+    if (i >= ls.len()) { return false; }
+    return str_contains(ls[i], part) || says(ls, part, i + 1);
+}
+
+@requires(declassify)
+test "a clean mailbox is not flagged, and the words never call the household safe" {
+    Keys k = tkeys();
+    Two t = cos_rounds();
+    LeakScan r = scan_dev(k, [env(k, k.dev.pk, 1, t.r1), env(k, k.dev.pk, 2, t.r2)], [config(1)]);
+    expect(counts(r)).toEqual("checked 2 hits 0 unreadable 0");
+    List(Str) w = scan_words(r);
+    expect(says(w, "Nothing found in the 2 message batch(es) that could be checked", 0)).toBeTrue();
+    expect(says(w, "does not prove the household is safe", 0)).toBeTrue();
+    expect(says(w, "compromised", 0)).toBeFalse();
+    expect(scan_exit(r)).toEqual(0);
+}
+
+@requires(declassify)
+test "a planted nonce-1 K or MtA F is found, and the words say the household is compromised" {
+    Keys k = tkeys();
+    Two t = cos_rounds();
+    List(UInt(64)) n3 = publics()[2].n;
+    LeakScan rk = scan_dev(k, [env(k, k.dev.pk, 1, forged(t.r1, n3, 0, ListBuf())), env(k, k.dev.pk, 2, t.r2)], [config(1)]);
+    expect(counts(rk)).toEqual("checked 1 hits 1 unreadable 0");
+    LeakScan rf = scan_dev(k, [env(k, k.dev.pk, 1, t.r1), env(k, k.dev.pk, 2, forged(t.r2, n3, 0, ListBuf()))], [config(1)]);
+    expect(counts(rf)).toEqual("checked 1 hits 1 unreadable 0");
+    List(Str) w = scan_words(rk);
+    expect(says(w, "compromised", 0)).toBeTrue();
+    expect(says(w, "new household key", 0)).toBeTrue();
+    expect(says(w, "account recovery", 0)).toBeTrue();
+    expect(scan_exit(rk)).toEqual(3);
+}
+
+@requires(declassify)
+test "a batch that cannot be opened, a damaged one, or one of an epoch not held is 'could not check', never clean" {
+    Keys k = tkeys();
+    Two t = cos_rounds();
+    // Sealed to another key; bytes that are no envelope; a batch whose envelope opens but holds no valid packet.
+    List(Int) good = env(k, k.dev.pk, 2, t.r2);
+    List(Int) damaged = good[0..good.len() - 1].concat([(good[good.len() - 1] + 1) % 256]);
+    LeakScan r = scan_dev(k, [env(k, k.other.pk, 1, forged(t.r1, publics()[2].n, 0, ListBuf())), [1, 2, 3], damaged], [config(1)]);
+    expect(counts(r)).toEqual("checked 0 hits 0 unreadable 3");
+    expect(says(scan_words(r), "3 message(s) could not be checked", 0)).toBeTrue();
+    expect(says(scan_words(r), "does not prove the household is safe", 0)).toBeTrue();
+    // The session's epoch is not one this party holds (its own key opens no D): nothing is checked.
+    LeakScan e = scan_dev(k, [env(k, k.dev.pk, 1, t.r1), env(k, k.dev.pk, 2, t.r2)], [config(2)]);
+    expect(counts(e)).toEqual("checked 0 hits 0 unreadable 2");
+    // Nothing held at all.
+    LeakScan none = scan_dev(k, [env(k, k.dev.pk, 1, t.r1)], []);
+    expect(counts(none)).toEqual("checked 0 hits 0 unreadable 1");
+}
+
+@requires(declassify)
+test "a re-share part with the nonce 1 is found under its addressee's announced modulus" {
+    Keys k = tkeys();
+    List(UInt(64)) n2 = publics()[1].n;
+    List(UInt(64)) none = [];
+    RsAnnMsg a = RsAnnMsg {.id = 2, .n = n2, .ped = Pedersen {.n = n2, .s = [5], .t = [7]}, .modp = ModProof {.w = none, .responses = []}, .prm = PrmProof {.as = [], .zs = []},
+                           .elgamal = cv_mul_base([3]), .elg_proof = SchProof {.c = cv_inf(), .z = none}};
+    ThMsg ann = ThRs(RsMsg {.from = 2, .to = 0, .body = RsAnn(a)});
+    RsPartMsg bad = RsPartMsg {.to = 2, .ct = pa_enc(paillier_pub(n2), zi_from_nat([9]), [1])};
+    RsPartMsg fine = RsPartMsg {.to = 2, .ct = pa_enc(paillier_pub(n2), zi_from_nat([9]), [12345])};
+    ThMsg dealt = ThRs(RsMsg {.from = 3, .to = 0, .body = RsDeal(RsDealMsg {.dealer = 3, .commits = [], .parts = [bad]})});
+    ThMsg clean = ThRs(RsMsg {.from = 3, .to = 0, .body = RsDeal(RsDealMsg {.dealer = 3, .commits = [], .parts = [fine]})});
+    expect(counts(scan_dev(k, [env(k, k.dev.pk, 1, [ann]), env(k, k.dev.pk, 2, [dealt])], [config(1)]))).toEqual("checked 0 hits 1 unreadable 0");
+    expect(counts(scan_dev(k, [env(k, k.dev.pk, 1, [ann]), env(k, k.dev.pk, 2, [clean])], [config(1)]))).toEqual("checked 1 hits 0 unreadable 0");
+}
+
+test "the kept result reads back, and a missing or garbled one reads as never run" {
+    LeakScan r = LeakScan {.checked = 4, .hits = 1, .unreadable = 2, .problem = ""};
+    ScanResult s = scan_parse(scan_line(r, 1700000000));
+    expect(f"{s.checked} {s.hits} {s.unreadable} {s.time}").toEqual("4 1 2 1700000000");
+    ScanResult g = scan_parse("checked x");
+    expect(f"{g.checked} {g.hits} {g.unreadable}").toEqual("-1 -1 -1");
+    expect(scan_exit(scan_problem("wrong PIN"))).toEqual(1);
+    expect(says(scan_words(scan_problem("wrong PIN")), "Nothing was checked", 0)).toBeTrue();
+}

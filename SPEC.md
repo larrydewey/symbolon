@@ -417,6 +417,23 @@ so `c = 1 (mod N)` exactly when `r = 1`. Therefore:
   upgrade it`. Neither is an abort. Upgrade the cosigner first, then the
   devices: until a device is upgraded it cannot sign with an upgraded
   cosigner.
+- **Scan.** No transcript keeps these ciphertexts; the only copy is the
+  relay mailbox (30 days), sealed to its recipient. `symbolon device
+  scan-leaks DIR` (PIN on stdin) and `symbolon cosigner scan-leaks DIR`
+  read the party's own mailbox from its start with its own HPKE key,
+  posting nothing, and test every received K, G, F, T (under the sender's
+  modulus of the session's epoch: the epoch whose own key decrypts one of
+  the session's D ciphertexts to a value of under 1,800 bits) and re-share
+  part (under the addressee's announced modulus). A batch is "checked",
+  a "hit", or "could not check" (an envelope that does not open or decode,
+  an unknown sender, an epoch whose configuration is no longer held). A
+  hit means the household must be treated as compromised: rotate to a new
+  root key and move each site's login with that site's own account
+  recovery (not the rollover of Section 26.5, which a holder of the old
+  key can also use). Since the relay can withhold or delete mail, a scan
+  never reports the household safe, only that nothing was found in the N
+  batches it could check. The counts are kept in `DIR/nonce-scan`
+  (`checked N hits N unreadable N time T`).
 
 ---
 

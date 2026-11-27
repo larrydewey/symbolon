@@ -449,6 +449,33 @@ Option(Quorum) quorum_of_epoch(List(SignedEvent) es, UInt(32) e, Int i, Option(Q
 @requires(filesystem)
 Option(CgConfig) cg_at(Cosigner c, Int e) { return cg_cfg_decode(get_file(c.dir + "/cg-" + f"{e}" + ".cfg")); }
 
+// What agent/leakscan.resid needs to read this cosigner's own mailbox: the
+// relay with its mail session, its HPKE key, the parties it knows, and
+// every epoch's configuration it still holds (their Paillier keys).
+pub type CosMailbox = { Endpoint relay; Local me; List(Remote) known; List(CgConfig) held; };
+
+@requires(network, filesystem, declassify, clock, provision)
+pub Option(CosMailbox) cos_mailbox(Str dir) {
+    Option(Cosigner) oc = load(dir);
+    return match oc {
+        None => None,
+        Some(c0) => cos_mailbox_of(cos_mail_ready(c0))
+    };
+}
+
+@requires(filesystem, declassify)
+Option(CosMailbox) cos_mailbox_of(Cosigner c) {
+    if (c.cfg.log_id.len() == 0) { return None; }
+    return Some(CosMailbox {.relay = mail_of(c), .me = me_of(c), .known = known_of(c), .held = held_cfgs(c, 1, [])});
+}
+
+@requires(filesystem)
+List(CgConfig) held_cfgs(Cosigner c, Int e, List(CgConfig) acc) {
+    if (e > 1024) { return acc; }
+    Option(CgConfig) x = cg_at(c, e);
+    return held_cfgs(c, e + 1, match x { Some(y) => acc.concat([y]), None => acc });
+}
+
 // The inception event: signed only when it is the log of the key the
 // cosigner just generated, with the cosigner as one of its parties.
 @requires(network, filesystem, declassify, clock)

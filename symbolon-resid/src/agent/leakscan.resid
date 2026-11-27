@@ -1,0 +1,402 @@
+// `symbolon device scan-leaks DIR` and `symbolon cosigner scan-leaks DIR`
+// (SPEC 6.2.1): look through the round batches still in this party's
+// relay mailbox for a Paillier ciphertext with the nonce 1, which a build
+// from before the nonce fix could send (Resid's cg_unit fallback). Such a
+// ciphertext shows its plaintext: a counterparty's k, gamma, MtA mask or
+// tau, or a re-share dealer's part. With two signers several of these give
+// the receiver the household's root key, so one hit means the household
+// must be treated as compromised.
+//
+// Read only: the mailbox is read from its start with this party's own
+// HPKE key (the relay keeps mail for 30 days) and nothing is posted,
+// moved at the relay. The commands print the result in plain words and
+// keep its counts in DIR/nonce-scan ("checked N hits N unreadable N time
+// T"), which scan_result(dir) reads without the PIN: that is what the
+// rotation advice and `device status` use.
+//
+// Which modulus a ciphertext is under. A signer's K, G and F are under its
+// own Paillier key, which this party knows only from the configuration of
+// that session's epoch, and a session does not say its epoch. A session's
+// round-2 broadcast holds a D addressed to this party, under this party's
+// own key of that epoch: under the right key it decrypts to a value of
+// under 1,800 bits, under any other to one spread over all of N (2048
+// bits; the chance of looking right is about 2^-248). So a signing
+// session is checked against the epoch whose own key opens one of its D's,
+// and against nothing when none does ("could not check"). A re-share part
+// is checked against the modulus its addressee announced in the same
+// session, or, for a part to this party (its own announcement is not in
+// its mailbox), against every Paillier key of its own it holds.
+//
+// Counting is by batch: a batch that carries Paillier ciphertexts is
+// "checked" when every one of them could be tested and none had the nonce
+// 1, a "hit" when one had it, "could not check" otherwise; an envelope this
+// party cannot open or decode, or from a party it does not know, is "could
+// not check" too. Batches without ciphertexts (later rounds, other mail)
+// are not counted. The relay can withhold or delete mail, and mail older
+// than 30 days is gone, so no result ever says the household is safe.
+
+import "../types.resid";
+import "../threshold/threshold.resid";
+import "../threshold/rsmsg.resid";
+import "../net/proto.resid";
+import "../net/proto_serial.resid";
+import "../net/envelope.resid";
+import "../net/services.resid" as svc;
+import "session.resid";
+import "state.resid";
+import "device.resid";
+import "cosignerd.resid";
+import "common.resid";
+import "paillier.resid";
+import "crypto.resid";
+import "clock.resid";
+
+pub type LeakScan = {
+    Int checked;                         // batches with ciphertexts, all tested, none with the nonce 1
+    Int hits;                            // batches with a ciphertext with the nonce 1
+    Int unreadable;                      // batches or envelopes that could not be checked
+    Str problem;                         // why the mailbox could not be read at all ("" when it was)
+};
+
+pub LeakScan scan_problem(Str why) { return LeakScan {.checked = 0, .hits = 0, .unreadable = 0, .problem = why}; }
+
+// ─── The scan itself ────────────────────────────────────────────
+
+// One configuration this party holds: its own id and Paillier keys, and
+// every party's public data (moduli among it).
+pub type HeldKey = { Int id; PaillierSec sec; PaillierPub pk; List(CgPublicCfg) public; };
+
+pub List(HeldKey) held_keys(List(CgConfig) cs, Int i, List(HeldKey) acc) {
+    if (i >= cs.len()) { return acc; }
+    CgConfig c = cs[i];
+    Option(PaillierSec) os = if (c.p.len() == 0 || c.q.len() == 0) { None } else { paillier_sec(c.p, c.q) };
+    List(HeldKey) next = match os {
+        None => acc,
+        Some(s) => acc.concat([HeldKey {.id = c.id, .sec = s, .pk = paillier_pub(bn_mul(c.p, c.q)), .public = c.public}])
+    };
+    return held_keys(cs, i + 1, next);
+}
+
+type Opened = { List(SessionMsg) batches; Int unreadable; };
+
+// Every session batch in `envs`; an envelope that does not open or decode,
+// or comes from a party not in `known`, is counted as unreadable. Mail the
+// relay replaced after 30 days is left out.
+@requires(declassify)
+@robust_exempt(reason = "declassifies only envelope plaintext that HPKE mode_auth authenticated under this party's key; nothing is disclosed outward")
+Opened open_all(Local me, List(Remote) known, List(List(Int)) envs, Int i, ListBuf(SessionMsg) acc, Int bad) {
+    if (i >= envs.len()) { return Opened {.batches = acc.finish(), .unreadable = bad}; }
+    if (svc.mail_expired(envs[i])) { return open_all(me, known, envs, i + 1, acc, bad); }
+    Option(Got) og = open_env(me, known, envs[i]);
+    return match og {
+        None => open_all(me, known, envs, i + 1, acc, bad + 1),
+        Some(g) => open_all(me, known, envs, i + 1, push_session(acc, g.w), bad)
+    };
+}
+
+ListBuf(SessionMsg) push_session(ListBuf(SessionMsg) acc, Packet w) {
+    return match w { WSession(m) => acc.push(m), _ => acc };
+}
+
+// The scan of the mailbox contents `envs`, read with `me`'s key, from the
+// parties `known`, against the configurations `held`.
+@requires(declassify)
+pub LeakScan scan_envelopes(Local me, List(Remote) known, List(List(Int)) envs, List(CgConfig) held) {
+    Opened o = open_all(me, known, envs, 0, ListBuf(), 0);
+    LeakScan r = scan_batches(o.batches, held_keys(held, 0, []), 0, LeakScan {.checked = 0, .hits = 0, .unreadable = 0, .problem = ""});
+    return LeakScan {.checked = r.checked, .hits = r.hits, .unreadable = r.unreadable + o.unreadable, .problem = ""};
+}
+
+LeakScan scan_batches(List(SessionMsg) bs, List(HeldKey) hs, Int i, LeakScan acc) {
+    if (i >= bs.len()) { return acc; }
+    Int v = batch_verdict(bs[i], bs, hs);
+    LeakScan next = LeakScan {.checked = acc.checked + (if (v == 0) { 1 } else { 0 }), .hits = acc.hits + (if (v == 1) { 1 } else { 0 }),
+                              .unreadable = acc.unreadable + (if (v == 2) { 1 } else { 0 }), .problem = ""};
+    return scan_batches(bs, hs, i + 1, next);
+}
+
+// A Paillier ciphertext a sender made under its own key (`part` false: the
+// sender's CGGMP id is `from`) or a re-share part to new party `to`.
+type Ct = { Int from; Int to; Bool part; List(UInt(64)) c; };
+
+List(Ct) cts_of(List(ThMsg) ms, Int i, List(Ct) acc) {
+    if (i >= ms.len()) { return acc; }
+    ThMsg m = ms[i];
+    List(Ct) more = match m {
+        ThCg(x) => cg_cts(x),
+        ThTw(t) => [Ct {.from = t.from, .to = 0, .part = false, .c = t.t}, Ct {.from = t.from, .to = 0, .part = false, .c = t.f}],
+        ThRs(r) => rs_cts(r.body),
+        _ => []
+    };
+    return cts_of(ms, i + 1, acc.concat(more));
+}
+
+List(Ct) cg_cts(CgMsg m) {
+    CgBody b = m.body;
+    return match b {
+        PsB2(x) => [Ct {.from = m.from, .to = 0, .part = false, .c = x.k}, Ct {.from = m.from, .to = 0, .part = false, .c = x.g}],
+        PsM3(x) => [Ct {.from = m.from, .to = 0, .part = false, .c = x.delta_f}, Ct {.from = m.from, .to = 0, .part = false, .c = x.chi_f}],
+        _ => []
+    };
+}
+
+List(Ct) rs_cts(RsBody b) {
+    return match b { RsDeal(d) => part_cts(d.parts, 0, []), _ => [] };
+}
+
+List(Ct) part_cts(List(RsPartMsg) ps, Int i, List(Ct) acc) {
+    if (i >= ps.len()) { return acc; }
+    return part_cts(ps, i + 1, acc.concat([Ct {.from = 0, .to = ps[i].to, .part = true, .c = ps[i].ct}]));
+}
+
+// 0: checked, nothing found; 1: a ciphertext with the nonce 1; 2: could
+// not check; 3: no ciphertexts (not counted).
+Int batch_verdict(SessionMsg b, List(SessionMsg) all, List(HeldKey) hs) {
+    List(Ct) cts = cts_of(b.msgs, 0, []);
+    if (cts.len() == 0) { return 3; }
+    List(SessionMsg) same = same_session(all, b.session_id, 0, []);
+    Option(HeldKey) ep = epoch_of(same, hs, 0);
+    List(RsAnnMsg) anns = anns_in(same, 0, []);
+    return worst(cts, ep, anns, hs, 0, 0);
+}
+
+Int worst(List(Ct) cts, Option(HeldKey) ep, List(RsAnnMsg) anns, List(HeldKey) hs, Int i, Int acc) {
+    if (i >= cts.len()) { return acc; }
+    Int v = ct_verdict(cts[i], ep, anns, hs);
+    Int next = if (v == 1 || acc == 1) { 1 } else if (v == 2 || acc == 2) { 2 } else { 0 };
+    return worst(cts, ep, anns, hs, i + 1, next);
+}
+
+Int ct_verdict(Ct x, Option(HeldKey) ep, List(RsAnnMsg) anns, List(HeldKey) hs) {
+    if (x.part) {
+        Option(RsAnnMsg) oa = ann_of(anns, x.to, 0);
+        return match oa {
+            Some(a) => test_under([a.n], x.c),
+            None => test_under(own_moduli(hs, 0, []), x.c)
+        };
+    }
+    return match ep {
+        None => 2,
+        Some(h) => test_under(modulus_of(h.public, x.from, 0), x.c)
+    };
+}
+
+// 1 when c = 1 mod one of `ns`, 0 when `ns` holds a modulus c is a valid
+// ciphertext under and none flags it, 2 when there is nothing to test it
+// against.
+Int test_under(List(List(UInt(64))) ns, List(UInt(64)) c) {
+    if (any_nonce_one(ns, c, 0)) { return 1; }
+    return if (any_valid(ns, c, 0)) { 0 } else { 2 };
+}
+
+Bool any_nonce_one(List(List(UInt(64))) ns, List(UInt(64)) c, Int i) {
+    if (i >= ns.len()) { return false; }
+    return pa_nonce_one(ns[i], c) || any_nonce_one(ns, c, i + 1);
+}
+
+Bool any_valid(List(List(UInt(64))) ns, List(UInt(64)) c, Int i) {
+    if (i >= ns.len()) { return false; }
+    return (bn_cmp(ns[i], [2]) >= 0 && pa_ct_ok(paillier_pub(ns[i]), c)) || any_valid(ns, c, i + 1);
+}
+
+List(List(UInt(64))) modulus_of(List(CgPublicCfg) ps, Int id, Int i) {
+    if (i >= ps.len()) { return []; }
+    if (ps[i].id == id) { return [ps[i].n]; }
+    return modulus_of(ps, id, i + 1);
+}
+
+List(List(UInt(64))) own_moduli(List(HeldKey) hs, Int i, List(List(UInt(64))) acc) {
+    if (i >= hs.len()) { return acc; }
+    return own_moduli(hs, i + 1, acc.concat([hs[i].pk.n]));
+}
+
+List(SessionMsg) same_session(List(SessionMsg) bs, List(Int) sid, Int i, List(SessionMsg) acc) {
+    if (i >= bs.len()) { return acc; }
+    return same_session(bs, sid, i + 1, if (bytes_eq(bs[i].session_id, sid)) { acc.concat([bs[i]]) } else { acc });
+}
+
+List(RsAnnMsg) anns_in(List(SessionMsg) bs, Int i, List(RsAnnMsg) acc) {
+    if (i >= bs.len()) { return acc; }
+    return anns_in(bs, i + 1, acc.concat(anns_of_msgs(bs[i].msgs, 0, [])));
+}
+
+List(RsAnnMsg) anns_of_msgs(List(ThMsg) ms, Int i, List(RsAnnMsg) acc) {
+    if (i >= ms.len()) { return acc; }
+    ThMsg m = ms[i];
+    List(RsAnnMsg) more = match m { ThRs(r) => ann_body(r.body), _ => [] };
+    return anns_of_msgs(ms, i + 1, acc.concat(more));
+}
+
+List(RsAnnMsg) ann_body(RsBody b) { return match b { RsAnn(a) => [a], _ => [] }; }
+
+Option(RsAnnMsg) ann_of(List(RsAnnMsg) as, Int id, Int i) {
+    if (i >= as.len()) { return None; }
+    if (as[i].id == id) { return Some(as[i]); }
+    return ann_of(as, id, i + 1);
+}
+
+// The held configuration whose own Paillier key opens a D of the session's
+// round-2 broadcasts to a small value: the session's epoch.
+Option(HeldKey) epoch_of(List(SessionMsg) bs, List(HeldKey) hs, Int i) {
+    if (i >= hs.len()) { return None; }
+    if (opens_a_d(bs, hs[i], 0)) { return Some(hs[i]); }
+    return epoch_of(bs, hs, i + 1);
+}
+
+Bool opens_a_d(List(SessionMsg) bs, HeldKey h, Int i) {
+    if (i >= bs.len()) { return false; }
+    return ds_open(ds_of(bs[i].msgs, 0, []), h, 0) || opens_a_d(bs, h, i + 1);
+}
+
+List(List(UInt(64))) ds_of(List(ThMsg) ms, Int i, List(List(UInt(64))) acc) {
+    if (i >= ms.len()) { return acc; }
+    ThMsg m = ms[i];
+    List(List(UInt(64))) more = match m { ThCg(x) => b3_ds(x.body), _ => [] };
+    return ds_of(ms, i + 1, acc.concat(more));
+}
+
+List(List(UInt(64))) b3_ds(CgBody b) { return match b { PsB3(x) => x.delta_d.concat(x.chi_d), _ => [] }; }
+
+Bool ds_open(List(List(UInt(64))) ds, HeldKey h, Int i) {
+    if (i >= ds.len()) { return false; }
+    Option(BnInt) m = cg_dec(h.sec, h.pk, ds[i]);
+    Bool small = match m { None => false, Some(x) => bn_bit_len(x.mag) < 1800 };
+    return small || ds_open(ds, h, i + 1);
+}
+
+// ─── Reading the mailbox ────────────────────────────────────────
+
+// Every envelope in `party`'s mailbox from index `next` on, page by page.
+@requires(network, clock(readonly), declassify)
+List(List(Int)) read_all(svc.Endpoint relay, List(Int) party, Int next, Int pages, List(List(Int)) acc) {
+    List(svc.Post) none = [];
+    svc.Fetched f = svc.relay_read(relay, none, party, [next]);
+    List(List(Int)) got = acc.concat(f.envs);
+    if (f.envs.len() == 0 || f.nexts.len() == 0 || f.nexts[0] <= next || pages >= 100000) { return got; }
+    return read_all(relay, party, f.nexts[0], pages + 1, got);
+}
+
+List(Remote) remotes_of_keys(List(PartyKeys) ps, Int i, List(Remote) acc) {
+    if (i >= ps.len()) { return acc; }
+    return remotes_of_keys(ps, i + 1, acc.concat([Remote {.party = ps[i].party, .cg = 0, .hpke_pub = ps[i].hpke_key}]));
+}
+
+// The scan of this party's mailbox: a cosigner's (`dir` holds
+// cosigner.cbor) or a device's, unlocked with `pin`.
+@requires(filesystem, network, device, declassify, clock, environment, provision)
+pub LeakScan run_scan(Str dir, Str pin) {
+    if (filesystem.exists(dir + "/cosigner.cbor")) { return cosigner_scan_result(dir); }
+    return device_scan_result(dir, pin);
+}
+
+@requires(filesystem, network, device, declassify, clock, environment, provision)
+pub LeakScan device_scan_result(Str dir, Str pin) {
+    Option(DeviceConfig) oc = load_config(dir);
+    return match oc {
+        None => scan_problem("this device is not set up"),
+        Some(c) => device_scan_with(dir, c, pin)
+    };
+}
+
+@requires(filesystem, network, device, declassify, clock, environment, provision)
+LeakScan device_scan_with(Str dir, DeviceConfig c, Str pin) {
+    if (c.log_id.len() == 0) { return scan_problem("this device is not in a household yet"); }
+    Unlocked u = unlock_dir(dir, c, pin);
+    if (u.kind == 2) { return scan_problem(duress_refusal(dir, c)); }
+    if (u.kind != 1) { return scan_problem("wrong PIN"); }
+    Option(CgConfig) cfg = load_share(dir, u.real.dek);
+    List(CgConfig) held = match cfg { None => [], Some(x) => [x] };
+    svc.Endpoint relay = mail_ep(dir, c, u);
+    Local me = Local {.party = c.party, .cg = 0, .hpke_sk = device_transport(c, u.real.dek).sk};
+    return scan_envelopes(me, remotes_of_keys(c.peers, 0, []), read_all(relay, c.party, 0, 0, []), held);
+}
+
+@requires(filesystem, network, declassify, clock, provision)
+pub LeakScan cosigner_scan_result(Str dir) {
+    Option(CosMailbox) om = cos_mailbox(dir);
+    return match om {
+        None => scan_problem("this cosigner is not set up, or not in a household yet"),
+        Some(m) => scan_envelopes(m.me, m.known, read_all(m.relay, m.me.party, 0, 0, []), m.held)
+    };
+}
+
+// ─── In plain words ─────────────────────────────────────────────
+
+pub List(Str) scan_words(LeakScan r) {
+    if (str_len(r.problem) > 0) { return ["The check could not run: " + r.problem + ".", "Nothing was checked, so nothing can be said about this household yet."]; }
+    List(Str) unread = if (r.unreadable > 0) { [f"{r.unreadable} message(s) could not be checked (this device or cosigner could not open them, or they were damaged). They might hide a problem."] } else { [] };
+    if (r.hits > 0) {
+        return [f"PROBLEM FOUND: {r.hits} message(s) in this mailbox exposed secret key material.",
+                "Treat this household as compromised: whoever holds these messages may be able to sign as you, without your other devices or the cosigner.",
+                "What to do now:",
+                "  1. Update Symbolon on every device and on the cosigner.",
+                "  2. Create a new household key (a root-key rotation) and stop using the old one.",
+                "  3. For each website or service, move your login to the new key using that site's own account recovery or security settings.",
+                "     Do not rely on moving the old key over: someone who has the old key could do the same.",
+                "  4. If a device was lost or stolen recently, remove it from the household."].concat(unread);
+    }
+    return [f"Nothing found in the {r.checked} message batch(es) that could be checked."].concat(unread).concat([
+            "This does not prove the household is safe: only messages from the last 30 days are kept, and the relay could have held some back.",
+            "Run this check on every device and on the cosigner."]);
+}
+
+// ─── The kept result ────────────────────────────────────────────
+
+// The last completed scan's counts; all -1 when none has completed.
+pub type ScanResult = { Int checked; Int hits; Int unreadable; Int time; };
+
+pub Str scan_file(Str dir) { return dir + "/nonce-scan"; }
+
+pub Str scan_line(LeakScan r, Int time) { return f"checked {r.checked} hits {r.hits} unreadable {r.unreadable} time {time}"; }
+
+pub ScanResult scan_never() { return ScanResult {.checked = -1, .hits = -1, .unreadable = -1, .time = -1}; }
+
+pub ScanResult scan_parse(Str line) {
+    List(Str) w = str_split(str_trim(line), " ");
+    if (w.len() != 8 || w[0] != "checked" || w[2] != "hits" || w[4] != "unreadable" || w[6] != "time") { return scan_never(); }
+    return ScanResult {.checked = str_parse_int(w[1]), .hits = str_parse_int(w[3]), .unreadable = str_parse_int(w[5]), .time = str_parse_int(w[7])};
+}
+
+// What the last completed scan of `dir`'s mailbox found (no PIN needed).
+@requires(filesystem)
+pub ScanResult scan_result(Str dir) {
+    if (!filesystem.exists(scan_file(dir))) { return scan_never(); }
+    return scan_parse(filesystem.read_all(scan_file(dir)));
+}
+
+// Keeps a completed scan's counts; a scan that could not run keeps nothing.
+@requires(filesystem, clock(readonly))
+Bool keep_scan(Str dir, LeakScan r) {
+    if (str_len(r.problem) > 0) { return false; }
+    return filesystem.write_all(scan_file(dir), scan_line(r, clock_now_seconds()) + "\n");
+}
+
+// Exit status: 0 nothing found, 3 a problem found, 1 the check could not run.
+pub Int scan_exit(LeakScan r) {
+    if (str_len(r.problem) > 0) { return 1; }
+    return if (r.hits > 0) { 3 } else { 0 };
+}
+
+Int print_all(List(Str) ls, Int i) {
+    if (i >= ls.len()) { return 0; }
+    println(ls[i]);
+    return print_all(ls, i + 1);
+}
+
+// `symbolon device scan-leaks DIR`: the PIN on standard input.
+@requires(filesystem, network, device, declassify, clock, environment, provision)
+pub Int device_scan_leaks(Str dir) {
+    LeakScan r = device_scan_result(dir, read_pin());
+    _ = keep_scan(dir, r);
+    _ = print_all(scan_words(r), 0);
+    return scan_exit(r);
+}
+
+// `symbolon cosigner scan-leaks DIR`.
+@requires(filesystem, network, declassify, clock, provision)
+pub Int cosigner_scan_leaks(Str dir) {
+    LeakScan r = cosigner_scan_result(dir);
+    _ = keep_scan(dir, r);
+    _ = print_all(scan_words(r), 0);
+    return scan_exit(r);
+}
