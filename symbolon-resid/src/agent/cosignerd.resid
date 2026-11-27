@@ -310,6 +310,8 @@ Int serve_once(Cosigner c0, List(List(UInt(64))) primes, List(List(UInt(64))) pr
     // Duress alerts (SPEC 14.4): a window that ran out, the queue, and
     // alerts other people's cosigners left for this person.
     _ = check_window(hc);
+    // Held vetoes not in the log yet, published (R4-2).
+    _ = spread_held(hc);
     _ = send_queued(hc.dir, relay);
     _ = deliver_inbox(hc.dir, relay, hc.cfg.log_id, cos_hpke(hc.root).sk, cos_hpke(hc.root).pk, cos_dk(hc.root));
     return 0;
@@ -1115,8 +1117,9 @@ Cosigner on_release(Cosigner c, List(Int) from, List(Int) l) {
 // A device's veto sent here directly (SPEC 13.4, R3P-3): kept when it is
 // valid, at witness time now, as the next event of the log the cosigner
 // verified (signed by enough devices of the quorum, its target pending),
-// with that time, as "veto-<target>-<seq>" ("TIME HEX"). The release
-// refuses while one of the recovery is kept and the log does not show it
+// with that time, as "veto-<target>-<seq>" ("TIME HEX"), and published
+// to the witnesses and the relay (spread_held, R4-2). The release refuses
+// while one of the recovery is kept that can still land in the log
 // (recovery.resid release_target_held). Only a valid veto is kept, one
 // per target and sequence.
 @requires(network, filesystem, declassify, clock)
@@ -1154,7 +1157,79 @@ Cosigner veto_check(Cosigner c, LogView lv, SignedEvent v, List(Int) raw, Str f)
     if (!valid) { return cos_fail(c, "a veto that is not valid as the log's next event; not kept"); }
     _ = filesystem.write_all(f, f"{now} " + hex_encode(raw));
     println("cosigner: holds a device's veto of event " + f"{target_of(v)}");
+    // Published at the end of this turn (R4-2), and again each turn while
+    // it can still land (serve_once spread_held).
     return c;
+}
+
+// The held vetoes published (R4-2): a veto a device sent only here is
+// carried to the witnesses as a device carries one (enroll.resid
+// publish_event): the relay's claim if it gives one, else without (a veto
+// of what the kit filed, with advisory time 0, is co-signed claim-less:
+// core/log.resid il_claimless), then stored at the relay. A thief who
+// sends the cosigner a veto of the owner's kit recovery, and nobody else,
+// then makes an ordinary public veto, which the contest rule counts. The
+// cosigner tries again each turn while the veto can still land
+// (recovery.resid held_veto_live: no other event at its sequence, its
+// target pending); a veto that cannot (the log moved on, or its target
+// took effect) is marked "spread-<target>-<seq>" and left alone.
+@requires(network, filesystem, declassify, clock)
+Int spread_held(Cosigner c) {
+    if (c.cfg.log_id.len() == 0) { return 0; }
+    List(HeldVeto) todo = held_open(c.dir, held_vetoes(c.dir), 0, []);
+    if (todo.len() == 0) { return 0; }
+    Result(LogView, SymbolonError) rv = cos_view(c);
+    return match rv { Err(_) => 0, Ok(v) => spread_each(c, v, todo, 0) };
+}
+
+Str spread_mark(Str dir, SignedEvent v) { return dir + "/spread-" + f"{target_of(v)}-{v.payload.sequence}"; }
+
+@requires(filesystem)
+List(HeldVeto) held_open(Str dir, List(HeldVeto) hs, Int i, List(HeldVeto) acc) {
+    if (i >= hs.len()) { return acc; }
+    Bool done = filesystem.exists(spread_mark(dir, hs[i].veto));
+    return held_open(dir, hs, i + 1, if (done) { acc } else { acc.concat([hs[i]]) });
+}
+
+@requires(network, filesystem, declassify, clock)
+Int spread_each(Cosigner c, LogView v, List(HeldVeto) hs, Int i) {
+    if (i >= hs.len()) { return 0; }
+    Bool live = held_veto_live(c.cfg.log_id, v.events, v.vh.pending, hs[i]);
+    _ = if (live) { veto_spread(c, hs[i].veto) } else { filesystem.write_all(spread_mark(c.dir, hs[i].veto), "done\n") };
+    return spread_each(c, v, hs, i + 1);
+}
+
+// One attempt to put the veto `v` in the log as its next event; whether
+// it is stored there now.
+@requires(network, filesystem, clock(readonly), declassify)
+Bool veto_spread(Cosigner c, SignedEvent v) {
+    Endpoint relay = relay_of(c.cfg);
+    List(Int) l = c.cfg.log_id;
+    List(List(Int)) before = log_raw(relay, l);
+    UInt(64) seq = v.payload.sequence;
+    if (before.len() != (Int)seq) { return false; }
+    List(Int) bare = cbor_of_event(StoredEvent {.encoded = v.encoded, .sigs = v.sigs, .cosigs = []});
+    List(Int) d = sha256_bytes(v.encoded);
+    ClaimOut co = claim_post(relay, l, seq, bare);
+    Option(RelayClaim) cl = if (co.status == 200) { co.claim } else { None };
+    List(WitnessRef) ws = witnesses_at(il_witnesses(l, events_of_raw(before, 0, [])), local_host(c.dir));
+    List(WitnessCosignature) cs = cosign_refs(ws, c.cfg.ca, l, seq, d, before.concat([bare]), cl, 0, []);
+    if (cs.len() * 2 <= ws.len() || cs.len() < 2) {
+        eprintln(f"cosigner: the veto it holds of event {target_of(v)} is not co-signed by a majority of the witnesses yet; trying again");
+        return false;
+    }
+    Bool put = log_put(relay, l, seq, cbor_of_event(StoredEvent {.encoded = v.encoded, .sigs = v.sigs, .cosigs = cs}));
+    println(f"cosigner: published the veto it holds of event {target_of(v)} at sequence {seq}" + if (put) { "" } else { " (witnessed; the relay did not store it)" });
+    return put;
+}
+
+// Each witness of `ws` asked to co-sign the event with digest `d` at `seq`.
+@requires(network, clock(readonly), declassify)
+List(WitnessCosignature) cosign_refs(List(WitnessRef) ws, Str ca, List(Int) l, UInt(64) seq, List(Int) d, List(List(Int)) events, Option(RelayClaim) cl, Int i, List(WitnessCosignature) acc) {
+    if (i >= ws.len()) { return acc; }
+    Option(Endpoint) oe = endpoint_of_url(ws[i].url, ca);
+    Option(WitnessCosignature) w = match oe { None => None, Some(e) => cosign_try(e, ws[i].key, l, seq, d, events, cl).cosig };
+    return cosign_refs(ws, ca, l, seq, d, events, cl, i + 1, match w { None => acc, Some(x) => acc.concat([x]) });
 }
 
 Int target_of(SignedEvent v) { EventBody b = v.payload.body; return match b { VetoBody(t) => (Int)t, _ => -1 }; }

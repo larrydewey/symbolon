@@ -1323,9 +1323,17 @@ after the delay, measured by witness time, without a valid `veto`.
   relay's claim, and the device also leaves its signed veto in the
   cosigner's mailbox (`WVeto`). The cosigner keeps a veto that is valid,
   at witness time when it arrives, as the next event of the log it
-  verified, and refuses the release while it keeps a veto of that
-  recovery that the log does not show: a relay that refuses to claim the
-  veto, or to store it, has nothing released (R3P-3).
+  verified, and publishes it as a device does: with the relay's claim if
+  it gives one, else to the witnesses without one, then to the relay, and
+  again at each of its turns while the veto can still land (no other event
+  at its sequence, its target still pending). A veto a device sent only
+  to the cosigner thus becomes an ordinary veto in the log, which the
+  contest rule counts (R4-2). The cosigner refuses the release while it
+  keeps such a live veto of that recovery; once another event took the
+  veto's sequence or the recovery took effect, the held veto is moot and
+  the release follows the log. A relay that refuses to claim or to store
+  a veto that the witnesses co-signed has nothing released: their heads
+  are past the log it serves (R2W-5, R3P-3).
 - **One at a time.** A `recover` filed while another `recover` is pending
   is invalid. Otherwise whoever holds the kit could take every next
   sequence with another `recover` as soon as the last was witnessed, and
