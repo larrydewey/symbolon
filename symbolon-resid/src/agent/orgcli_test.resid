@@ -10,6 +10,7 @@ import "../vault/vault.resid";
 import "cose.resid";
 import "crypto.resid";
 import "hash.resid";
+import "scim.resid";
 
 List(Int) lg(Int n) { return sha256_bytes([n]); }
 List(Int) gid(Int n) { return sha256_bytes([100 + n])[0..16]; }
@@ -74,4 +75,29 @@ test "the directory takes people out of groups at once but adds only when confir
     expect(additions_digest(adds) == additions_digest(adds[0..1])).toBeFalse();
     // nothing added: nothing to confirm
     expect(additions(was, r, ms, 0, ListBuf()).len()).toEqual(0);
+}
+
+// R4-4: the directory's new people were invited on every sync, outside
+// the confirmation, into the groups the directory named. Each invite and
+// its groups is now one of the lines the administrator confirms.
+test "a directory invite and its groups are confirmed with the other additions" {
+    List(OrgMember) ms = [mem(1, "a")];
+    List(OrgGroup) gs = [grp(1, "Eng", [lg(1)]), grp(2, "Ops", [])];
+    DirUser a = DirUser {.id = "1", .user_name = "a", .external_id = "", .display = "A", .active = true};
+    DirUser e = DirUser {.id = "2", .user_name = "erin", .external_id = "", .display = "Erin", .active = true};
+    DirUser f = DirUser {.id = "3", .user_name = "fred", .external_id = "", .display = "Fred", .active = true};
+    List(DirGroup) dgs = [DirGroup {.id = "g1", .display = "Eng", .members = ["a", "erin"]}, DirGroup {.id = "g2", .display = "Ops", .members = ["erin"]}];
+    // a member and a person with an invite waiting are not invited again
+    List(DirUser) fresh = new_users([a, e, f], ms, ["fred"], 0, ListBuf());
+    expect(fresh.len()).toEqual(1);
+    expect(fresh[0].user_name).toEqual("erin");
+    List(Str) lines = invite_lines(fresh, gs, dgs, 0, ListBuf());
+    expect(str_join(lines, ";")).toEqual("invite-new " + hex_encode(utf8("erin")) + " " + hex_encode(utf8("Eng")) + "," + hex_encode(utf8("Ops")));
+    // the relay putting erin into another group: another hash
+    List(DirGroup) dgs2 = [DirGroup {.id = "g1", .display = "Eng", .members = ["a", "erin"]}, DirGroup {.id = "g2", .display = "Ops", .members = []}];
+    List(Str) lines2 = invite_lines(fresh, gs, dgs2, 0, ListBuf());
+    expect(str_join(lines2, ";")).toEqual("invite-new " + hex_encode(utf8("erin")) + " " + hex_encode(utf8("Eng")));
+    expect(additions_digest(lines) == additions_digest(lines2)).toBeFalse();
+    // no group: still confirmed
+    expect(invite_lines([f], gs, dgs, 0, ListBuf())[0]).toEqual("invite-new " + hex_encode(utf8("fred")) + " -");
 }

@@ -272,16 +272,17 @@ class _OrgPageState extends State<OrgPage> {
       toast(context, friendlyError(r));
       return;
     }
-    // The directory comes from the relay, unsigned: what it would add is shown and needs a yes.
-    final adds = r.lines.where((l) => l.startsWith('add ') || l.startsWith('new ')).toList();
+    // The directory comes from the relay, unsigned: what it would add (to groups, and invites for new people) is shown and needs a yes.
+    bool isAdd(String l) => l.startsWith('add ') || l.startsWith('new ') || l.startsWith('invite-new ');
+    final adds = r.lines.where(isAdd).toList();
     final confirm = r.lines.where((l) => l.startsWith('confirm ')).map((l) => l.substring(8).trim()).firstOrNull;
-    final rest = r.lines.where((l) => !l.startsWith('add ') && !l.startsWith('new ') && !l.startsWith('confirm ')).toList();
+    final rest = r.lines.where((l) => !isAdd(l) && !l.startsWith('confirm ')).toList();
     await showOutput(context, 'Synced', rest.isEmpty ? 'Nothing to change.' : rest.join('\n'));
     if (adds.isNotEmpty && confirm != null && mounted) {
       final ok = await showDialog<bool>(
         context: context,
         builder: (ctx) => AlertDialog(
-          title: const Text('The directory adds to groups'),
+          title: const Text('The directory adds people'),
           content: SingleChildScrollView(child: Text('Apply these only if you expect them:\n\n${adds.map(_addition).join('\n')}')),
           actions: [
             TextButton(onPressed: () => Navigator.of(ctx).pop(false), child: const Text('Not now')),
@@ -291,7 +292,15 @@ class _OrgPageState extends State<OrgPage> {
       );
       if (ok == true && mounted) {
         final r2 = await app.withPin(context, (p) => runTask(context, 'Applying the additions', () => app.cli.orgSync(app.dir, p, yes: confirm), usually: 'a minute'));
-        if (r2 != null && mounted) toast(context, r2.ok ? 'Applied.' : friendlyError(r2));
+        if (r2 != null && mounted) {
+          // The invites made now (with their codes) are shown once, as a sync shows them.
+          final made = r2.lines.where((l) => l.startsWith('invite ')).toList();
+          if (r2.ok && made.isNotEmpty) {
+            await showOutput(context, 'Applied', made.join('\n'));
+          } else {
+            toast(context, r2.ok ? 'Applied.' : friendlyError(r2));
+          }
+        }
       }
     }
     load();
@@ -301,6 +310,10 @@ class _OrgPageState extends State<OrgPage> {
     final p = l.split(' ');
     final group = p.length > 1 ? ConsoleChange._t(p[1]) : '';
     if (p[0] == 'new') return 'new group $group';
+    if (p[0] == 'invite-new') {
+      final groups = p.length > 2 && p[2] != '-' ? p[2].split(',').map(ConsoleChange._t).join(', ') : 'no group';
+      return 'invite $group into $groups';
+    }
     final who = p.length > 3 && p[3] != '-' ? ConsoleChange._t(p[3]) : (p.length > 2 ? p[2].substring(0, 12) : '');
     return '$who to $group';
   }

@@ -690,10 +690,15 @@ Bool clear_admits(Ctx x, List(Admit) ads, Int i) {
 //
 // The directory is what the relay serves, unsigned, so it may take away
 // but not give on its own (R3U-4): removals are applied at once; additions
-// (a member put into a group, a new group) are printed, "add NAME-HEX LOG
-// EXT-HEX" and "new NAME-HEX", then "confirm HASH", and applied only by a
-// run given `yes` = that HASH (SHA-256 of exactly those lines), so a relay
-// that changes the directory between the two runs adds nothing.
+// (a member put into a group, a new group, an invite for a new person with
+// the groups it admits them to) are printed, "add NAME-HEX LOG EXT-HEX",
+// "new NAME-HEX" and "invite-new USERNAME-HEX NAME-HEX,...", then "confirm
+// HASH", and applied only by a run given `yes` = that HASH (SHA-256 of
+// exactly those lines), so a relay that changes the directory between the
+// two runs adds nothing. (Invites for new people were made on every sync,
+// outside that gate, with the groups the directory named: a relay could
+// have a signed invite made for a user name it chose, admitting whoever
+// answers it into groups the administrator never confirmed: R4-4.)
 
 @requires(filesystem, network, device, declassify, clock, environment)
 Result(OrgCtx, Str) directory_sync(Str dir, OrgCtx o, Str yes) {
@@ -706,7 +711,9 @@ Result(OrgCtx, Str) directory_sync(Str dir, OrgCtx o, Str yes) {
     List(OrgMember) kept = still_listed(o.st, us, 0, ListBuf());
     List(OrgGroup) gs0 = drop_gone(o.st.org.groups, kept, 0, ListBuf());
     List(OrgGroup) full = set_groups(gs0, dgs, us, kept, 0);
-    List(Str) adds = additions(gs0, full, kept, 0, ListBuf());
+    List(Str) pending = invited(o, blob_list(o.x.ep, "invite-" + hex_encode(o.st.org.org_id) + "-"), 0, ListBuf());
+    List(DirUser) fresh = new_users(us, kept, pending, 0, ListBuf());
+    List(Str) adds = additions(gs0, full, kept, 0, ListBuf()).concat(invite_lines(fresh, full, dgs, 0, ListBuf()));
     Str digest = additions_digest(adds);
     Bool take = adds.len() > 0 && yes == digest;
     List(OrgGroup) gs = if (take) { full } else { removals_only(gs0, full, 0, ListBuf()) };
@@ -714,8 +721,7 @@ Result(OrgCtx, Str) directory_sync(Str dir, OrgCtx o, Str yes) {
     _ = said_groups(o.st.org.groups, gs, 0);
     Bool changed = kept.len() != o.st.org.members.len() || !same_groups(o.st.org.groups, gs, 0);
     OrgCtx o2 = if (changed) { stored_again(dir, o, kept, gs)? } else { o };
-    List(Str) pending = invited(o2, blob_list(o2.x.ep, "invite-" + hex_encode(o2.st.org.org_id) + "-"), 0, ListBuf());
-    Int made = invite_new(dir, o2, us, dgs, pending, 0)?;
+    Int made = if (take) { invite_new(dir, o2, fresh, gs, dgs, 0)? } else { 0 };
     return Ok(o2);
 }
 
@@ -880,15 +886,39 @@ List(Str) invited(OrgCtx o, List(Str) names, Int i, ListBuf(Str) acc) {
     return invited(o, names, i + 1, match v { Some(x) => acc.push(str_to_lower(x.ext_id)), None => acc });
 }
 
-@requires(filesystem, network, device, declassify, clock, environment)
-Result(Int, Str) invite_new(Str dir, OrgCtx o, List(DirUser) us, List(DirGroup) dgs, List(Str) pending, Int i) {
-    if (i >= us.len()) { return Ok(0); }
+// The directory's people who are neither members nor invited yet.
+pub List(DirUser) new_users(List(DirUser) us, List(OrgMember) ms, List(Str) pending, Int i, ListBuf(DirUser) acc) {
+    if (i >= us.len()) { return acc.finish(); }
     DirUser u = us[i];
-    Bool member = members_named(o.st.org.members, [u.user_name], [u], 0, ListBuf()).len() > 0;
-    if (member || has_str(pending, str_to_lower(u.user_name), 0)) { return invite_new(dir, o, us, dgs, pending, i + 1); }
-    Str made = make_invite(dir, o, u.user_name, if (label_ok(u.display)) { u.display } else { str_slice(u.user_name, 0, min_int(64, str_len(u.user_name))) }, groups_for(o.st.org.groups, dgs, u.user_name, 0, ListBuf()))?;
+    Bool member = members_named(ms, [u.user_name], [u], 0, ListBuf()).len() > 0;
+    return new_users(us, ms, pending, i + 1, if (member || has_str(pending, str_to_lower(u.user_name), 0)) { acc } else { acc.push(u) });
+}
+
+// "invite-new USERNAME-HEX NAME-HEX,..." (the groups of `gs` the invite
+// admits to; "-" for none) for each new person: confirmed with the other
+// additions.
+pub List(Str) invite_lines(List(DirUser) fresh, List(OrgGroup) gs, List(DirGroup) dgs, Int i, ListBuf(Str) acc) {
+    if (i >= fresh.len()) { return acc.finish(); }
+    List(Str) names = group_names(gs, groups_for(gs, dgs, fresh[i].user_name, 0, ListBuf()), 0, ListBuf());
+    Str line = "invite-new " + hex_encode(utf8(fresh[i].user_name)) + " " + (if (names.len() == 0) { "-" } else { str_join(names, ",") });
+    return invite_lines(fresh, gs, dgs, i + 1, acc.push(line));
+}
+
+List(Str) group_names(List(OrgGroup) gs, List(List(Int)) ids, Int i, ListBuf(Str) acc) {
+    if (i >= ids.len()) { return acc.finish(); }
+    Int at = group_with_id(gs, ids[i], 0);
+    return group_names(gs, ids, i + 1, if (at >= 0) { acc.push(hex_encode(utf8(gs[at].name))) } else { acc });
+}
+
+// The confirmed invites: each new person's, into the groups of `gs` (the
+// groups as confirmed and stored).
+@requires(filesystem, network, device, declassify, clock, environment)
+Result(Int, Str) invite_new(Str dir, OrgCtx o, List(DirUser) fresh, List(OrgGroup) gs, List(DirGroup) dgs, Int i) {
+    if (i >= fresh.len()) { return Ok(0); }
+    DirUser u = fresh[i];
+    Str made = make_invite(dir, o, u.user_name, if (label_ok(u.display)) { u.display } else { str_slice(u.user_name, 0, min_int(64, str_len(u.user_name))) }, groups_for(gs, dgs, u.user_name, 0, ListBuf()))?;
     println("invite " + hex_encode(utf8(u.user_name)) + " " + made);
-    return invite_new(dir, o, us, dgs, pending, i + 1);
+    return invite_new(dir, o, fresh, gs, dgs, i + 1);
 }
 
 Int min_int(Int a, Int b) { return if (a < b) { a } else { b }; }

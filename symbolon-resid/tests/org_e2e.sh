@@ -226,7 +226,12 @@ scim -X PATCH --data "{\"Operations\":[{\"op\":\"remove\",\"path\":\"members[val
 [ "$(code -H "Authorization: Bearer $(tok "$C")" "$RELAY/blob/wrap-$CLOG-$FID")" = 403 ] || fail "carol kept the group folder after the directory took her out of the group"
 scim -X PATCH --data "{\"Operations\":[{\"op\":\"add\",\"path\":\"members\",\"value\":[{\"value\":\"$UC\"}]}]}" "$RELAY/scim/v2/Groups/$SG" > /dev/null || fail "SCIM group add back"
 [ "$(code -H "Authorization: Bearer $(tok "$C")" "$RELAY/blob/wrap-$CLOG-$FID")" = 200 ] || fail "carol did not get the group folder back"
-pin device org sync "$A" > "$W/dsync.log" 2>&1 || fail "directory sync: $(cat "$W/dsync.log")"
+pin device org sync "$A" > "$W/dsync0.log" 2>&1 || fail "directory sync: $(cat "$W/dsync0.log")"
+# A new person's invite, with its groups, is confirmed like any addition (R4-4).
+grep -qx "invite-new $(hx erin@acme.example) $(hx Engineering)" "$W/dsync0.log" || fail "directory sync did not offer erin's invite: $(cat "$W/dsync0.log")"
+grep -q "^invite " "$W/dsync0.log" && fail "directory sync invited erin without confirmation: $(cat "$W/dsync0.log")"
+INVH=$(awk '/^confirm / {print $2}' "$W/dsync0.log")
+pin device org sync "$A" --yes "$INVH" > "$W/dsync.log" 2>&1 || fail "directory sync --yes: $(cat "$W/dsync.log")"
 grep -q "^invite $(hx erin@acme.example) [0-9a-f]\{32\} [0-9a-f]\{32\}$" "$W/dsync.log" || fail "directory sync did not invite erin: $(cat "$W/dsync.log")"
 grep -q "^removed" "$W/dsync.log" && fail "directory sync removed someone listed: $(cat "$W/dsync.log")"
 pin device org sync "$A" > "$W/dsync2.log" 2>&1 || fail "directory sync again"
