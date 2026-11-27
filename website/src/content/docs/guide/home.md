@@ -99,7 +99,12 @@ The binary listens on the first address given (`--bind ADDR` for another).
 secured. Stop it, run `home secure DATA --witness ... --witness ...` (it
 seals every key and gives people invited from now on the witnesses outside
 the box), and start it again. Identities made before keep the box's three
-witnesses until their devices can move them; the reminder names them.
+witnesses until one of their devices moves them: `home secure` prints the
+command, `symbolon device witnesses DIR --add ... --remove ...`, which
+asks each new witness for a signed time first, then publishes the change.
+It takes effect after the recovery delay (three days by default), during
+which any of that person's devices can veto it. The reminder names them
+until then.
 
 ## On the phone
 

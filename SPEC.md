@@ -2656,8 +2656,14 @@ setup the app reads (`secure`, `reminder`) and `home status` say so until
 principals invited from then on. Principals paired earlier stay on the
 box's three witnesses (the box alone a majority, able to present a forked
 log to devices with no other contact) until a set-policy from their
-devices moves them, which this version cannot make; the reminder names
-them (Section 3.4).
+devices moves them: `home secure` prints the `symbolon device witnesses`
+command (the witnesses outside the box added, the box's second and third
+removed, Section 20.3) that one of each such person's devices runs. It
+removes witnesses, so it waits out the recovery delay and any of that
+person's devices can veto it (Section 8.2); the box's witnesses co-sign
+it, so a box that refuses keeps the person where they are (a stall, not
+a fork). The reminder names a person until their cosigner's verified copy
+of their log names witnesses the box runs fewer than half of (Section 3.4).
 
 ---
 

@@ -53,6 +53,7 @@
 //                         for the device that fetched the setup
 
 import "../types.resid";
+import "../core/log.resid";
 import "../duress/duress.resid";
 import "state.resid";
 import "common.resid";
@@ -483,8 +484,27 @@ List(Str) on_box_people(Str dir, List(Str) names, List(Str) bkeys, Int i, List(S
     Str n = names[i];
     List(Str) ws = person_witnesses(dir, n);
     Bool made = filesystem.exists(dir + "/people/" + n + "/keys");
-    Bool on_box = made && (ws.len() == 0 || !box_minority(count_in(ws, bkeys, 0, 0), ws.len()));
+    Bool on_box = made && (ws.len() == 0 || !box_minority(count_in(ws, bkeys, 0, 0), ws.len()))
+        && !moved_off(dir + "/people/" + n + "/cos", bkeys);
     return on_box_people(dir, names, bkeys, i + 1, if (on_box) { acc.concat([n]) } else { acc });
+}
+
+// Whether the identity whose cosigner is in `cd` has moved its witnesses
+// off the box (`device witnesses`, SPEC 20.5): the log as the cosigner
+// last verified it (its kept copy) names witnesses the box runs fewer than
+// half of. false when the cosigner has no log or kept copy.
+@requires(filesystem)
+Bool moved_off(Str cd, List(Str) bkeys) {
+    Option(CosignerConfig) oc = cosigner_of_cbor(filesystem.read_bytes(cd + "/cosigner.cbor"));
+    List(Int) l = match oc { None => [], Some(x) => x.log_id };
+    if (l.len() == 0) { return false; }
+    List(WitnessRef) ws = il_witnesses(l, events_of_raw(cached_raw(cd + "/logcache/" + hex_encode(l), 0, []), 0, []));
+    return ws.len() > 0 && box_minority(keys_in(ws, bkeys, 0, 0), ws.len());
+}
+
+Int keys_in(List(WitnessRef) ws, List(Str) bkeys, Int i, Int n) {
+    if (i >= ws.len()) { return n; }
+    return keys_in(ws, bkeys, i + 1, if (bkeys.contains(hex_encode(ws[i].key))) { n + 1 } else { n });
 }
 
 pub type HomeStatus = { Bool sealed; Int on_box; Int off_box; List(Str) people_on_box; };
@@ -504,7 +524,8 @@ pub Str status_reminder(HomeStatus s) {
     Str b = if (box_minority(s.on_box, s.on_box + s.off_box)) { "" } else { " The box runs every witness, so it alone can vouch for an identity's log." };
     Str fix = if (str_len(a) > 0 || str_len(b) > 0) { " Run `symbolon home secure` (README: Securing an existing box)." } else { "" };
     Str c = if (s.people_on_box.len() == 0) { "" } else {
-        " Identities made before the witnesses moved still rely on the box's own witnesses: " + str_join(s.people_on_box, ", ") + "; moving them needs a witness change from their own device, which this version cannot make yet."
+        " Identities made before the witnesses moved still rely on the box's own witnesses: " + str_join(s.people_on_box, ", ")
+        + "; each of them moves theirs from one of their devices with `symbolon device witnesses` (`home secure` prints the command; it takes effect after the recovery delay, which any of their devices can veto)."
     };
     return "Symbolon Home is not fully secured." + a + b + fix + c;
 }
@@ -618,7 +639,34 @@ pub Int home_secure(Str dir, List(Str) witnesses, Str witness_ca, SealOpts so) {
     println("home: keys sealed" + if (was) { " (already)" } else { "" } + f"; people invited from now on get the box's witness and {offbox_witnesses(dir).len()} outside it");
     Str r = status_reminder(home_status(dir));
     if (str_len(r) > 0) { eprintln("home: " + r); }
+    Str mv = move_command(dir, c);
+    if (home_status(dir).people_on_box.len() > 0 && str_len(mv) > 0) {
+        println("home: for each person paired before, one of their devices then runs (PIN on stdin): " + mv);
+    }
     return 0;
+}
+
+// The command that moves an identity paired before the witnesses moved
+// off the box (SPEC 20.5): the witnesses outside the box in, the box's
+// second and third out (a set-policy from the person's device, delayed
+// and vetoable, SPEC 8.2). "" when no witnesses outside the box are named.
+@requires(filesystem)
+pub Str move_command(Str dir, HomeCfg c) {
+    List(Str) out = offbox_witnesses(dir);
+    if (out.len() < 2 || c.hosts.len() == 0) { return ""; }
+    Str adds = flag_list("--add", out, 0, StrBuf());
+    Str rms = flag_list("--remove", box_addrs(c.hosts[0], c.base, present_witnesses(dir, 2, []), 0, []), 0, StrBuf());
+    return "symbolon device witnesses DEVICE_DIR" + adds + rms;
+}
+
+Str flag_list(Str f, List(Str) xs, Int i, StrBuf acc) {
+    if (i >= xs.len()) { return acc.finish(); }
+    return flag_list(f, xs, i + 1, acc.push(" " + f + " " + xs[i]));
+}
+
+List(Str) box_addrs(Str host, Int base, List(Int) ids, Int i, List(Str) acc) {
+    if (i >= ids.len()) { return acc; }
+    return box_addrs(host, base, ids, i + 1, acc.concat([host + f":{base + 1 + ids[i]}"]));
 }
 
 // `symbolon home witness-cert DIR HOST OUTDIR`: a server certificate (two

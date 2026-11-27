@@ -191,7 +191,7 @@ pub List(SignedEvent) events_of_raw(List(List(Int)) rs, Int i, List(SignedEvent)
 // This device's copy of a log's events it has verified, from 0 until the
 // first missing one.
 @requires(filesystem)
-List(List(Int)) cached_raw(Str cd, Int seq, List(List(Int)) acc) {
+pub List(List(Int)) cached_raw(Str cd, Int seq, List(List(Int)) acc) {
     Str f = cd + "/" + f"{seq}";
     if (!filesystem.exists(f)) { return acc; }
     List(Int) b = filesystem.read_bytes(f);

@@ -120,9 +120,20 @@ it is secured. Stop the box, then:
 This seals every key on the box (TPM, else the passphrase), and people
 invited from now on get the box's one witness and the two outside it. People
 paired before keep their identities as they are, on the box's three
-witnesses: moving an identity's witnesses needs a change signed by that
-person's device, which this version cannot make yet, so the reminder names
-them until it can.
+witnesses until one of their devices moves them. `home secure` prints the
+command; on one of each such person's devices, with the box running:
+
+    symbolon device witnesses DEVICE_DIR \
+        --add pc.lan:47110:KEY1 --add witness.example.org:443:KEY2 \
+        --remove BOX:47103 --remove BOX:47104
+
+It checks that each new witness answers with a time signed by its key, so
+a typo is refused, then publishes the change. Removing witnesses always
+waits out the recovery delay (three days by default), and any of that
+person's devices can veto it in that time (`device veto`). The new
+witnesses need certificates the device already trusts: under the box's CA
+(`home witness-cert`), or a hosted witness whose CA the device was given.
+The reminder names a person until the change is in force.
 
 ## Network
 
