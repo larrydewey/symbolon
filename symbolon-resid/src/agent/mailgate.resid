@@ -118,7 +118,7 @@ List(MailMember) mg_rows(List(Str) lines, Int i, ListBuf(MailMember) acc) {
 
 @requires(filesystem, network, clock(readonly), declassify)
 List(MailMember) mg_cache(Store root, Str k, List(SignedEvent) evs, VerifiedHead vh, Option(Membership) om, Int now) {
-    Membership m = om else { Membership {.proposed = [], .removed = []} };
+    Membership m = om else { Membership {.proposed = [], .removed = [], .rotated_to = []} };
     List(Party) all = vh.head.quorum.parties.concat(m.proposed).concat(mg_recovering(evs, vh.pending, 0, []));
     List(MailMember) ms = mg_kept(all, m.removed, 0, ListBuf());
     Int until = now + (if (vh.pending.len() > 0) { 300 } else { 86400 });

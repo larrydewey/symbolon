@@ -51,6 +51,10 @@ type LogState = {
     UInt(64) next_seq;
     Int last_time;                       // witness time of the last event
     List(WitnessCosignature) last_cosigs;
+    // The digests of the latest rotate-recovery in force (SPEC 13.2), []
+    // when none or when a recovery has come since: the kit they name may
+    // replace the quorum's kit party at a re-share.
+    List(List(Int)) rotated_to;
 };
 
 // ============================================================================
@@ -570,27 +574,27 @@ LogState apply_effect(LogState s, EventBody body, List(Int) event_digest, List(L
             .quorum = s.quorum, .policy = s.policy, .recovery_digests = s.recovery_digests,
             .proposed = s.proposed.concat([party]), .removed = s.removed, .pending = s.pending,
             .vetoes = s.vetoes, .prev_digest = s.prev_digest, .next_seq = s.next_seq,
-            .last_time = s.last_time, .last_cosigs = s.last_cosigs },
+            .last_time = s.last_time, .last_cosigs = s.last_cosigs, .rotated_to = s.rotated_to },
         RemovePartyBody(id) => LogState {
             .quorum = s.quorum, .policy = s.policy, .recovery_digests = s.recovery_digests,
             .proposed = s.proposed, .removed = s.removed.concat([id]), .pending = s.pending,
             .vetoes = s.vetoes, .prev_digest = s.prev_digest, .next_seq = s.next_seq,
-            .last_time = s.last_time, .last_cosigs = s.last_cosigs },
+            .last_time = s.last_time, .last_cosigs = s.last_cosigs, .rotated_to = s.rotated_to },
         ReshareBody(nq) => LogState {
             .quorum = nq, .policy = s.policy, .recovery_digests = s.recovery_digests,
             .proposed = [], .removed = [], .pending = s.pending,
             .vetoes = s.vetoes, .prev_digest = s.prev_digest, .next_seq = s.next_seq,
-            .last_time = s.last_time, .last_cosigs = s.last_cosigs },
+            .last_time = s.last_time, .last_cosigs = s.last_cosigs, .rotated_to = s.rotated_to },
         SetPolicyBody(np) => LogState {
             .quorum = s.quorum, .policy = np, .recovery_digests = s.recovery_digests,
             .proposed = s.proposed, .removed = s.removed, .pending = s.pending,
             .vetoes = s.vetoes, .prev_digest = s.prev_digest, .next_seq = s.next_seq,
-            .last_time = s.last_time, .last_cosigs = s.last_cosigs },
+            .last_time = s.last_time, .last_cosigs = s.last_cosigs, .rotated_to = s.rotated_to },
         RotateRecoveryBody => LogState {
             .quorum = s.quorum, .policy = s.policy, .recovery_digests = next_digests,
             .proposed = s.proposed, .removed = s.removed, .pending = s.pending,
             .vetoes = s.vetoes, .prev_digest = s.prev_digest, .next_seq = s.next_seq,
-            .last_time = s.last_time, .last_cosigs = s.last_cosigs },
+            .last_time = s.last_time, .last_cosigs = s.last_cosigs, .rotated_to = next_digests },
         RecoverBody(r) => LogState {
             .quorum = Quorum {
                 .parties = r.new_parties, .t = s.quorum.t, .root_pubkey = s.quorum.root_pubkey,
@@ -598,7 +602,7 @@ LogState apply_effect(LogState s, EventBody body, List(Int) event_digest, List(L
             .policy = s.policy, .recovery_digests = next_digests,
             .proposed = [], .removed = [], .pending = s.pending,
             .vetoes = 0, .prev_digest = s.prev_digest, .next_seq = s.next_seq,
-            .last_time = s.last_time, .last_cosigs = s.last_cosigs },
+            .last_time = s.last_time, .last_cosigs = s.last_cosigs, .rotated_to = [] },
         PartyKeyBody(id, k) => LogState {
             .quorum = Quorum {
                 .parties = with_hpke(s.quorum.parties, id, k, 0, ListBuf()), .t = s.quorum.t, .root_pubkey = s.quorum.root_pubkey,
@@ -606,7 +610,7 @@ LogState apply_effect(LogState s, EventBody body, List(Int) event_digest, List(L
             .policy = s.policy, .recovery_digests = s.recovery_digests,
             .proposed = s.proposed, .removed = s.removed, .pending = s.pending,
             .vetoes = s.vetoes, .prev_digest = s.prev_digest, .next_seq = s.next_seq,
-            .last_time = s.last_time, .last_cosigs = s.last_cosigs },
+            .last_time = s.last_time, .last_cosigs = s.last_cosigs, .rotated_to = s.rotated_to },
         _ => s
     };
 }
@@ -616,7 +620,7 @@ LogState with_pending(LogState s, List(Pending) pending) {
         .quorum = s.quorum, .policy = s.policy, .recovery_digests = s.recovery_digests,
         .proposed = s.proposed, .removed = s.removed, .pending = pending,
         .vetoes = s.vetoes, .prev_digest = s.prev_digest, .next_seq = s.next_seq,
-        .last_time = s.last_time, .last_cosigs = s.last_cosigs };
+        .last_time = s.last_time, .last_cosigs = s.last_cosigs, .rotated_to = s.rotated_to };
 }
 
 LogState with_vetoes(LogState s, Int vetoes) {
@@ -624,7 +628,7 @@ LogState with_vetoes(LogState s, Int vetoes) {
         .quorum = s.quorum, .policy = s.policy, .recovery_digests = s.recovery_digests,
         .proposed = s.proposed, .removed = s.removed, .pending = s.pending,
         .vetoes = vetoes, .prev_digest = s.prev_digest, .next_seq = s.next_seq,
-        .last_time = s.last_time, .last_cosigs = s.last_cosigs };
+        .last_time = s.last_time, .last_cosigs = s.last_cosigs, .rotated_to = s.rotated_to };
 }
 
 LogState with_time(LogState s, Int time) {
@@ -632,7 +636,7 @@ LogState with_time(LogState s, Int time) {
         .quorum = s.quorum, .policy = s.policy, .recovery_digests = s.recovery_digests,
         .proposed = s.proposed, .removed = s.removed, .pending = s.pending,
         .vetoes = s.vetoes, .prev_digest = s.prev_digest, .next_seq = s.next_seq,
-        .last_time = time, .last_cosigs = s.last_cosigs };
+        .last_time = time, .last_cosigs = s.last_cosigs, .rotated_to = s.rotated_to };
 }
 
 LogState advance(LogState s, List(Int) digest, Int time, List(WitnessCosignature) cosigs) {
@@ -640,7 +644,7 @@ LogState advance(LogState s, List(Int) digest, Int time, List(WitnessCosignature
         .quorum = s.quorum, .policy = s.policy, .recovery_digests = s.recovery_digests,
         .proposed = s.proposed, .removed = s.removed, .pending = s.pending,
         .vetoes = s.vetoes, .prev_digest = digest, .next_seq = s.next_seq + 1,
-        .last_time = time, .last_cosigs = cosigs };
+        .last_time = time, .last_cosigs = cosigs, .rotated_to = s.rotated_to };
 }
 
 // Applies every pending event whose delay has run by `now`, oldest first.
@@ -691,16 +695,37 @@ Option(Pending) kit_pending(List(Pending) ps, Int i) {
 // Reshare checks (SPEC 8.2, 11.3)
 // ============================================================================
 
-// Every party of the new quorum is a surviving member of the old quorum or a
-// proposed party, and no removed party remains.
+// Every party of the new quorum is a surviving member of the old quorum, a
+// proposed party, or the kit an in-force rotate-recovery names, and no
+// removed party remains.
 Bool reshare_parties_ok(LogState s, List(Party) np, Int i) {
     if (i >= np.len()) { return true; }
     Party p = np[i];
     Bool in_old = known_party(party_by_id(s.quorum.parties, p.id, 0));
     Bool in_proposed = known_party(party_by_id(s.proposed, p.id, 0));
-    if (!in_old && !in_proposed) { return false; }
+    if (!in_old && !in_proposed && !rotated_kit(s, p)) { return false; }
     if (has_bytes(s.removed, p.id, 0)) { return false; }
     return reshare_parties_ok(s, np, i + 1);
+}
+
+// SPEC 13.2: a rotate-recovery in force names the new kit by field 6, its
+// party id (SHA-256 of its recovery key, which party_id_ok checks). Until
+// a re-share puts that kit in the quorum, the quorum's kit party is the old
+// one, whose recovery key is no longer in field 6.
+Bool rotated_kit(LogState s, Party p) {
+    return p.kind == party_kind_kit() && has_bytes(s.rotated_to, p.id, 0) && has_bytes(s.recovery_digests, p.id, 0);
+}
+
+// Whether the new parties bring in the rotated kit (not already a party).
+Bool brings_rotated_kit(LogState s, List(Party) np, Int i) {
+    if (i >= np.len()) { return false; }
+    if (rotated_kit(s, np[i]) && !known_party(party_by_id(s.quorum.parties, np[i].id, 0))) { return true; }
+    return brings_rotated_kit(s, np, i + 1);
+}
+
+Int kit_count(List(Party) ps, Int i, Int acc) {
+    if (i >= ps.len()) { return acc; }
+    return kit_count(ps, i + 1, acc + (if (ps[i].kind == party_kind_kit()) { 1 } else { 0 }));
 }
 
 List(Party) online_parties(List(Party) ps, Int i, List(Party) acc) {
@@ -865,6 +890,8 @@ Result(LogState, SymbolonError) do_reshare(LogState s, SignedEvent e, List(Int) 
     if (nq.epoch != s.quorum.epoch + 1) { return refuse("reshare epoch is not the next epoch"); }
     if (!kv_kept(s.quorum, nq)) { return refuse("reshare changed or dropped the vault OPRF key (C_0)"); }
     if (!reshare_parties_ok(s, nq.parties, 0)) { return refuse("reshare party set"); }
+    // The rotated kit replaces the old one: no other kit stays beside it.
+    if (brings_rotated_kit(s, nq.parties, 0) && kit_count(nq.parties, 0, 0) != 1) { return refuse("reshare keeps another kit beside the rotated one"); }
     List(Party) everyone = s.quorum.parties.concat(nq.parties);
     List(List(Int)) all_signers = valid_signers(e.sigs, everyone, false, e.encoded, 0, []);
     // At least t of the old quorum, and every party that took part (SPEC
@@ -1030,7 +1057,7 @@ Result(LogState, SymbolonError) start_inception(SignedEvent e0, List(Int) l, Lis
     return Ok(LogState {
         .quorum = q, .policy = pol, .recovery_digests = ep.next_recovery_key_digests,
         .proposed = [], .removed = [], .pending = [], .vetoes = 0,
-        .prev_digest = dig, .next_seq = 1, .last_time = t, .last_cosigs = e0.cosigs });
+        .prev_digest = dig, .next_seq = 1, .last_time = t, .last_cosigs = e0.cosigs, .rotated_to = [] });
 }
 
 Result(LogState, SymbolonError) run(LogState s, List(SignedEvent) events, List(Int) l, Bool closure(EventPayload) approvals_ok, Int i) {
@@ -1219,9 +1246,11 @@ pub List(Party) il_proposed(List(Int) l, List(SignedEvent) events, Int now, Bool
 }
 
 // The membership changes in force at `now` and not yet re-shared: the
-// parties proposed and the parties removed, as il_proposed reads them.
-// None when the log does not verify.
-pub type Membership = { List(Party) proposed; List(List(Int)) removed; };
+// parties proposed and the parties removed, as il_proposed reads them, and
+// the field-6 digests of the latest rotate-recovery in force ([] when none,
+// or a recovery came after it): a kit party with one of those ids may
+// replace the quorum's kit (SPEC 13.2). None when the log does not verify.
+pub type Membership = { List(Party) proposed; List(List(Int)) removed; List(List(Int)) rotated_to; };
 
 pub Option(Membership) il_membership(List(Int) l, List(SignedEvent) events, Int now, Bool closure(EventPayload) approvals_ok) {
     if (events.len() < 1) { return None; }
@@ -1235,7 +1264,7 @@ pub Option(Membership) il_membership(List(Int) l, List(SignedEvent) events, Int 
     };
 }
 
-Option(Membership) membership_of(LogState s) { return Some(Membership {.proposed = s.proposed, .removed = s.removed}); }
+Option(Membership) membership_of(LogState s) { return Some(Membership {.proposed = s.proposed, .removed = s.removed, .rotated_to = s.rotated_to}); }
 
 List(UInt(64)) pending_seqs(List(Pending) ps, Int i, ListBuf(UInt(64)) acc) {
     if (i >= ps.len()) { return acc.finish(); }
