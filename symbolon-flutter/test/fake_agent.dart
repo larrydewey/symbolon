@@ -73,7 +73,15 @@ case "$1 $2" in
     echo "profile TPM"
     echo "log fa8f008b293b5457ef989520c8bbcbc959a09c0a8619b1d190f78271bf6b5795"
     echo "head sequence 3 epoch 2 parties 4 threshold 2 pending 1"
-    [ -f "$D/protection-off" ] && echo "protected off" || echo "protected on 04aa" ;;
+    [ -f "$D/protection-off" ] && echo "protected off" || echo "protected on 04aa"
+    [ -f "$D/reshare" ] && echo "security-reshare $(cat "$D/reshare")"
+    if [ -f "$D/rotation" ]; then echo "rotation $(cat "$D/rotation")"; echo "rotation-rollover $(cat "$D/rollover" 2>/dev/null || echo ok)"; fi
+    exit 0 ;;
+  "device security-advice")
+    [ "$4" = "--report" ] && { echo "$5" > "$D/reported"; echo avoid > "$D/rollover"; echo "report kept: the advice below takes it into account"; }
+    echo "What happened: an error in Symbolon's signing software, now fixed, could in rare cases let your cosigner or one of your devices work out your household's master key."
+    echo "What to do: replace your master key. This is strongly recommended for your household."
+    exit 0 ;;
   "device openings")
     [ "$PIN" = "2468" ] || { echo "device: wrong PIN" >&2; exit 1; }
     echo "limit 60"

@@ -9,6 +9,7 @@ import 'devices_page.dart';
 import 'hardware_page.dart';
 import 'provider_card.dart';
 import 'recovery_page.dart';
+import 'security_advice_page.dart';
 import 'security_update_page.dart';
 import 'setup_page.dart';
 import 'tutorial_page.dart';
@@ -164,6 +165,60 @@ class _HomePageState extends State<HomePage> {
                   const SizedBox(height: 12),
                   WideButton('Finish the update', key: const Key('start-security-update'), tonal: true, onPressed: () async {
                     await Navigator.of(context).push(MaterialPageRoute<void>(builder: (_) => SecurityUpdatePage(app: widget.app)));
+                    refresh();
+                  }),
+                ]),
+              ),
+            ),
+          // The key refresh after the signing fix (SPEC 6.2.2), when the
+          // update above is done: the same page runs it.
+          if (!s.securityUpdate && s.refreshDue)
+            Card(
+              key: const Key('security-refresh'),
+              margin: const EdgeInsets.only(bottom: 16),
+              color: Color.alphaBlend(Colors.orange.withValues(alpha: 0.18), Theme.of(context).colorScheme.surfaceContainerLow),
+              child: Padding(
+                padding: const EdgeInsets.all(16),
+                child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+                  Row(children: [
+                    const Icon(Icons.security_update_good, color: Colors.orange),
+                    const SizedBox(width: 12),
+                    Expanded(child: Text('Finish the security update', style: t.titleMedium)),
+                  ]),
+                  const SizedBox(height: 8),
+                  Text(refreshSummary(s.securityReshare ?? 'due'), key: const Key('security-refresh-text')),
+                  const SizedBox(height: 12),
+                  WideButton('Finish the update', key: const Key('start-security-refresh'), tonal: true, onPressed: () async {
+                    await Navigator.of(context).push(MaterialPageRoute<void>(builder: (_) => SecurityUpdatePage(app: widget.app, refreshOnly: true)));
+                    refresh();
+                  }),
+                ]),
+              ),
+            ),
+          // What to do after that fix: replace the master key.
+          if (s.rotationAdvised)
+            Card(
+              key: const Key('security-advice'),
+              margin: const EdgeInsets.only(bottom: 16),
+              color: Color.alphaBlend((s.rotation == 'compromised' ? Colors.red : Colors.orange).withValues(alpha: 0.18), Theme.of(context).colorScheme.surfaceContainerLow),
+              child: Padding(
+                padding: const EdgeInsets.all(16),
+                child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+                  Row(children: [
+                    Icon(Icons.key_off, color: s.rotation == 'compromised' ? Colors.red : Colors.orange),
+                    const SizedBox(width: 12),
+                    Expanded(child: Text(adviceSummary(s.rotation!).$1, key: const Key('security-advice-title'), style: t.titleMedium)),
+                  ]),
+                  const SizedBox(height: 8),
+                  Text(adviceSummary(s.rotation!).$2),
+                  if (s.rollover == 'avoid')
+                    const Padding(
+                      padding: EdgeInsets.only(top: 8),
+                      child: Text('Do not use the automatic passkey move (rollover): use each website\'s own account recovery instead.', key: Key('security-advice-avoid')),
+                    ),
+                  const SizedBox(height: 12),
+                  WideButton('What to do', key: const Key('open-security-advice'), tonal: true, onPressed: () async {
+                    await Navigator.of(context).push(MaterialPageRoute<void>(builder: (_) => SecurityAdvicePage(app: widget.app)));
                     refresh();
                   }),
                 ]),

@@ -103,6 +103,26 @@ void main() {
     expect(await agent.stdinLog.readAsString(), startsWith('2468\n1357\n'));
   });
 
+  test('the key refresh and the master-key advice after the signing fix are read from status; reports go on the command line', () async {
+    const r = CliResult(0, 'party ab\nprofile TPM\nlog fa8f\nhead sequence 3 epoch 2 parties 4 threshold 2 pending 0\n'
+        'security-reshare waiting-cosigner\nrotation strongly-recommended\nrotation-rollover avoid\n', '');
+    final s = DeviceStatus.parse(r)!;
+    expect(s.securityReshare, 'waiting-cosigner');
+    expect(s.refreshDue, isTrue);
+    expect(s.rotation, 'strongly-recommended');
+    expect(s.rotationAdvised, isTrue);
+    expect(s.rollover, 'avoid');
+    final done = DeviceStatus.parse(const CliResult(0, 'party ab\nprofile TPM\nsecurity-reshare done\nrotation none\nrotation-rollover ok\n', ''))!;
+    expect(done.refreshDue, isFalse);
+    expect(done.rotationAdvised, isFalse);
+    // A build before it prints none of these.
+    final old = DeviceStatus.parse(const CliResult(0, 'party ab\nprofile TPM\n', ''))!;
+    expect(old.refreshDue, isFalse);
+    expect(old.rotationAdvised, isFalse);
+    await cli.securityReport('/d', 'lost');
+    expect((await agent.argsLog.readAsString()).trim().split('\n').last, 'device security-advice /d --report lost');
+  });
+
   test('a device before inception has no log', () {
     const r = CliResult(0, 'party ab\nprofile UNPROTECTED (no TPM)\nlog none (run `symbolon device init`)\n', '');
     final s = DeviceStatus.parse(r)!;

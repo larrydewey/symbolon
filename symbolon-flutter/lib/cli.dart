@@ -236,8 +236,20 @@ class SymbolonCli {
   /// The security update (D-4): the PIN, then the duress PIN ("" when this
   /// device has none). The duress profile gets a transport key of its own
   /// and the device a new one, published in the log.
+  /// Then, once per household, the key refresh after the Paillier nonce
+  /// fix: a re-share with the cosigner (and the other devices, which join
+  /// when they run it), so it may take a while.
   Future<CliResult> securityUpdate(String dir, String pin, String duressPin) =>
-      run(['device', 'security-update', dir], input: [pin, duressPin], timeout: const Duration(minutes: 10));
+      run(['device', 'security-update', dir], input: [pin, duressPin], timeout: const Duration(minutes: 40));
+
+  /// What to do after the Paillier nonce fix, in plain words, one line each.
+  Future<CliResult> securityAdvice(String dir) => run(['device', 'security-advice', dir], timeout: const Duration(minutes: 2));
+
+  /// Tells this device that one of the household's devices was lost or
+  /// stolen ([kind] lost), or that the cosigner's operator reported a
+  /// security incident ([kind] cosigner): the advice gets stricter.
+  Future<CliResult> securityReport(String dir, String kind) =>
+      run(['device', 'security-advice', dir, '--report', kind], timeout: const Duration(minutes: 2));
 
   Future<CliResult> register(String dir, String rp, String pin, {bool duress = false}) =>
       run(['device', 'register', dir, rp, if (duress) '--duress'], input: [pin], timeout: const Duration(minutes: 5));
@@ -695,9 +707,28 @@ class DeviceStatus {
   /// the device's files alone, never on a PIN, so it shows the same under
   /// the PIN and the duress PIN (SPEC 9.2).
   final bool securityUpdate;
+
+  /// The household's key refresh after the Paillier nonce fix (SPEC 6.2.2):
+  /// done, due, waiting-cosigner, waiting-device or unknown; null before an
+  /// identity (or from a build before it).
+  final String? securityReshare;
+
+  /// What the household should do after that fix: none, recommended,
+  /// strongly-recommended or compromised (replace the master key), and
+  /// whether passkeys may be moved with the rollover (ok) or only through
+  /// each site's own recovery (avoid). Worked out on this device from the
+  /// verified log and its own files; the relay supplies none of it.
+  final String? rotation;
+  final String? rollover;
   const DeviceStatus(
       {required this.party, required this.unprotected, this.keystore = false, this.log, this.sequence, this.epoch, this.parties, this.threshold, this.pending, this.protectedItems = false,
-      this.securityUpdate = false});
+      this.securityUpdate = false, this.securityReshare, this.rotation, this.rollover});
+
+  /// The key refresh still has to run (or wait for an update elsewhere).
+  bool get refreshDue => securityReshare != null && securityReshare != 'done' && securityReshare != 'unknown';
+
+  /// The master key should be replaced.
+  bool get rotationAdvised => rotation != null && rotation != 'none';
 
   static DeviceStatus? parse(CliResult r) {
     final party = r.field('party');
@@ -723,6 +754,9 @@ class DeviceStatus {
       pending: at('pending'),
       protectedItems: (r.field('protected') ?? '').startsWith('on'),
       securityUpdate: (r.field('security-update') ?? '').startsWith('due'),
+      securityReshare: r.field('security-reshare'),
+      rotation: r.field('rotation'),
+      rollover: r.field('rotation-rollover'),
     );
   }
 }
