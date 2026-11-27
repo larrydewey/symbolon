@@ -73,19 +73,19 @@ class _SecurityAdvicePageState extends State<SecurityAdvicePage> {
   }
 }
 
-/// The home page's card for the advice: a title and one sentence per level.
+/// The home page's card for the advice: a title and a few short sentences.
 (String, String) adviceSummary(String level) => switch (level) {
       'compromised' => (
-          'Your master key was exposed',
-          'A check of your recent messages found that your master key was exposed. Treat your household as compromised and replace your master key now.'
+          'Your household key may be known to someone else',
+          'A check of your recent messages found a problem. Treat your household key as known to someone else, and make a new one now.'
         ),
       'strongly-recommended' => (
-          'Replace your master key (strongly recommended)',
-          'An error in the signing software, now fixed, may have exposed your master key. Replacing it is strongly recommended for your household.'
+          'A new household key is strongly recommended',
+          'An older version of Symbolon had a flaw that could, in rare cases, reveal your household key. We strongly recommend a new one.'
         ),
       _ => (
-          'Replacing your master key is recommended',
-          'An error in the signing software, now fixed, may have exposed your master key. Replacing it is recommended.'
+          'A new household key is recommended',
+          'An older version of Symbolon had a flaw that could, in rare cases, reveal your household key. We recommend a new one.'
         ),
     };
 

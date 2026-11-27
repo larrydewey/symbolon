@@ -79,8 +79,8 @@ case "$1 $2" in
     exit 0 ;;
   "device security-advice")
     [ "$4" = "--report" ] && { echo "$5" > "$D/reported"; echo avoid > "$D/rollover"; echo "report kept: the advice below takes it into account"; }
-    echo "What happened: an error in Symbolon's signing software, now fixed, could in rare cases let your cosigner or one of your devices work out your household's master key."
-    echo "What to do: replace your master key. This is strongly recommended for your household."
+    echo "What happened: an older version of Symbolon had a flaw. In rare cases it could let your cosigner or one of your devices work out your household key."
+    echo "We strongly recommend a new household key."
     exit 0 ;;
   "device openings")
     [ "$PIN" = "2468" ] || { echo "device: wrong PIN" >&2; exit 1; }

@@ -44,20 +44,20 @@ void main() {
     expect(find.byKey(const Key('security-advice')), findsNothing);
   });
 
-  testWidgets('the refresh waiting for the cosigner, and the advice to replace the master key', (t) async {
+  testWidgets('the refresh waiting for the cosigner, and the advice for a new household key', (t) async {
     File('${agent.dir.path}/reshare').writeAsStringSync('waiting-cosigner');
     File('${agent.dir.path}/rotation').writeAsStringSync('strongly-recommended');
     await start(t);
     expect(find.byKey(const Key('security-refresh')), findsOneWidget);
     expect(find.textContaining('waiting for your cosigner to be updated'), findsOneWidget);
     expect(find.byKey(const Key('security-advice')), findsOneWidget);
-    expect(find.text('Replace your master key (strongly recommended)'), findsOneWidget);
+    expect(find.text('A new household key is strongly recommended'), findsOneWidget);
     expect(find.byKey(const Key('security-advice-avoid')), findsNothing);
     await t.ensureVisible(find.byKey(const Key('open-security-advice')));
     await t.tap(find.byKey(const Key('open-security-advice')));
     await t.pump();
     await settle(t);
-    expect(find.textContaining('This is strongly recommended for your household.'), findsOneWidget);
+    expect(find.textContaining('We strongly recommend a new household key.'), findsOneWidget);
     await t.ensureVisible(find.byKey(const Key('report-lost')));
     await t.tap(find.byKey(const Key('report-lost')));
     await t.pump();

@@ -124,42 +124,37 @@ pub type Advice = { Str level; Str rollover; List(Str) lines; };
 pub Int many_sigs() { return 300; }
 
 pub Str adv_what() {
-    return "What happened: an error in Symbolon's signing software, now fixed, could in rare cases let your cosigner or one of your devices work out your household's master key, while signing in somewhere or while a device was added. Nobody can tell for sure whether it happened to your household.";
+    return "What happened: an older version of Symbolon had a flaw. In rare cases it could let your cosigner or one of your devices work out your household key, while signing in somewhere or while a device was added. No one can tell for sure whether it happened to your household.";
 }
-pub Str adv_compromised() {
-    return "A check of your recent messages found that your master key was exposed. Treat your household as compromised: someone else may be able to sign in as you.";
-}
-pub Str adv_do_strong() {
-    return "What to do: replace your master key. This is strongly recommended for your household. Set up a new identity (a new master key) and move each of your passkeys to it.";
-}
-pub Str adv_do_rec() {
-    return "What to do: replacing your master key is recommended. Set up a new identity (a new master key) and move each of your passkeys to it.";
-}
-pub Str adv_do_now() {
-    return "What to do now: set up a new identity (a new master key) and move each of your passkeys to it as soon as you can.";
-}
-pub Str adv_why_unknown() { return "Why strongly: Symbolon did not count signatures before the fix, so it cannot tell how often your key was used."; }
-pub Str adv_why_many() { return "Why strongly: your key signed more than 300 times before the fix."; }
-pub Str adv_why_reshare() { return "Why strongly: a device was added, or your keys were refreshed, before the fix."; }
-pub Str adv_why_lost() { return "Why strongly: someone else may hold one of your devices (see below)."; }
-pub Str adv_rollover_ok() {
-    return "How to move a passkey: on each website, sign in, add a passkey from your new identity in the website's security settings, check that it works, then remove the old passkey.";
-}
-pub Str adv_rollover_avoid() {
-    return "How to move a passkey: do not use the automatic passkey move (rollover) in the browser extension, because someone else could use it too. On each website, use the website's own account recovery or support to remove the old passkey and add the new one.";
-}
+pub Str adv_compromised() { return "A check of your recent messages found that it did happen. Treat your household key as known to someone else: they may be able to sign in as you."; }
+pub Str adv_do_strong() { return "We strongly recommend a new household key."; }
+pub Str adv_do_rec() { return "We recommend a new household key."; }
+pub Str adv_do_now() { return "Make a new household key now."; }
+pub Str adv_why_unknown() { return "Why: Symbolon did not count signatures before the fix, so it cannot tell how often your key was used."; }
+pub Str adv_why_many() { return "Why: your key signed more than 300 times before the fix."; }
+pub Str adv_why_reshare() { return "Why: a device was added, or your keys were refreshed, before the fix."; }
+pub Str adv_why_lost() { return "Why: someone else may hold one of your devices."; }
 pub Str adv_avoid_lost() { return "Your identity log shows a recovery or a removed device, so someone else may hold one of your devices."; }
 pub Str adv_avoid_reported() { return "You reported a lost or stolen device."; }
 pub Str adv_avoid_incident() { return "Your cosigner's operator reported a security incident."; }
 pub Str adv_avoid_unchecked() { return "Symbolon could not check your identity log just now, so it cannot rule out a lost device. Until it can, follow the stricter advice."; }
+pub Str adv_steps() { return "What to do, in this order:"; }
+pub Str adv_step_new() { return "  1. Create a new household key (Symbolon calls this a root-key rotation)."; }
+// Moving each login when the old key is the household's alone (SPEC 26.5
+// methods 2 and 3) ...
+pub Str adv_rollover_ok() { return "  2. For each website or service, sign in and add a passkey from the new key in the site's security settings."; }
+pub Str adv_rollover_ok_2() { return "  3. Check that the new passkey works, then remove the old one."; }
+// ... and when someone else may hold it (A-19): each site's own recovery.
+pub Str adv_rollover_avoid_2() { return "  2. For each website or service, move your login to the new key using that site's own account recovery or security settings."; }
+pub Str adv_rollover_avoid() { return "  3. Don't use the rollover browser extension for this: whoever has the old key could use it too."; }
 pub Str adv_scan_never(Str dir) {
-    return "Check your recent messages soon: the relay keeps them for 30 days only. Run `symbolon device scan-leaks " + dir + "` (it asks for your PIN), or tap \"Check recent messages\" in the app.";
+    return "Also check your recent messages soon: the relay keeps them for 30 days only. Run `symbolon device scan-leaks " + dir + "` (it asks for your PIN).";
 }
 pub Str adv_scan_clean(ScanSeen s) {
     Str part = if (s.unreadable > 0) { f" ({s.unreadable} could not be read)" } else { "" };
-    return f"The check of your recent messages found nothing in the {s.checked} it could read{part}. That lowers the risk but does not rule it out: older messages are gone.";
+    return f"The check of your recent messages found no problem in the {s.checked} it could read{part}. Older messages are gone, so this can't prove nothing happened.";
 }
-pub Str adv_born() { return "Your identity was made after the fix: nothing to do."; }
+pub Str adv_born() { return "Your household key was made after the fix. There is nothing to do."; }
 
 pub Advice security_advice(AdviceIn a, Str dir) {
     Bool hit = a.scan.hits > 0;
@@ -174,7 +169,8 @@ pub Advice security_advice(AdviceIn a, Str dir) {
     List(Str) reasons = (if (a.lost_log) { [adv_avoid_lost()] } else { [] }).concat(if (a.lost) { [adv_avoid_reported()] } else { [] })
         .concat(if (a.incident) { [adv_avoid_incident()] } else { [] }).concat(if (!a.log_ok || a.hidden > 0) { [adv_avoid_unchecked()] } else { [] });
     List(Str) scan = if (hit) { [] } else { if (a.scan.checked <= 0) { [adv_scan_never(dir)] } else { [adv_scan_clean(a.scan)] } };
-    List(Str) lines = head.concat(why).concat(reasons).concat([if (avoid) { adv_rollover_avoid() } else { adv_rollover_ok() }]).concat(scan);
+    List(Str) steps = [adv_steps(), adv_step_new()].concat(if (avoid) { [adv_rollover_avoid_2(), adv_rollover_avoid()] } else { [adv_rollover_ok(), adv_rollover_ok_2()] });
+    List(Str) lines = head.concat(why).concat(reasons).concat(steps).concat(scan);
     return Advice {.level = level, .rollover = if (avoid) { "avoid" } else { "ok" }, .lines = lines};
 }
 

@@ -195,7 +195,7 @@ class _HomePageState extends State<HomePage> {
                 ]),
               ),
             ),
-          // What to do after that fix: replace the master key.
+          // What to do after that fix: a new household key.
           if (s.rotationAdvised)
             Card(
               key: const Key('security-advice'),
@@ -214,7 +214,7 @@ class _HomePageState extends State<HomePage> {
                   if (s.rollover == 'avoid')
                     const Padding(
                       padding: EdgeInsets.only(top: 8),
-                      child: Text('Do not use the automatic passkey move (rollover): use each website\'s own account recovery instead.', key: Key('security-advice-avoid')),
+                      child: Text('Don\'t use the rollover browser extension to move your logins: use each site\'s own account recovery instead.', key: Key('security-advice-avoid')),
                     ),
                   const SizedBox(height: 12),
                   WideButton('What to do', key: const Key('open-security-advice'), tonal: true, onPressed: () async {

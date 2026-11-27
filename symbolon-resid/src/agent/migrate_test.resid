@@ -48,7 +48,7 @@ AdviceIn born() { return AdviceIn {.log_ok = true, .hidden = 0, .born = true, .p
 
 Bool has_line(List(Str) ls, Str l, Int i) { return i < ls.len() && (ls[i] == l || has_line(ls, l, i + 1)); }
 
-test "a household made before the fix: replace the master key, strongly, because the signatures were never counted" {
+test "a household made before the fix: a new household key, strongly, because the signatures were never counted" {
     Advice a = security_advice(legacy(), "/d");
     expect(a.level).toEqual("strongly-recommended");
     expect(a.rollover).toEqual("ok");
@@ -56,6 +56,7 @@ test "a household made before the fix: replace the master key, strongly, because
     expect(a.lines[1]).toEqual(adv_do_strong());
     expect(has_line(a.lines, adv_why_unknown(), 0)).toEqual(true);
     expect(has_line(a.lines, adv_rollover_ok(), 0)).toEqual(true);
+    expect(has_line(a.lines, adv_step_new(), 0)).toEqual(true);
     expect(has_line(a.lines, adv_scan_never("/d"), 0)).toEqual(true);
 }
 
@@ -76,6 +77,7 @@ test "a recover or removal in the log, a reported lost device or cosigner incide
     expect(l.rollover).toEqual("avoid");
     expect(has_line(l.lines, adv_avoid_lost(), 0)).toEqual(true);
     expect(has_line(l.lines, adv_rollover_avoid(), 0)).toEqual(true);
+    expect(has_line(l.lines, adv_rollover_avoid_2(), 0)).toEqual(true);
     expect(has_line(l.lines, adv_rollover_ok(), 0)).toEqual(false);
     expect(security_advice(with_flags(legacy(), true, false, true, false, never()), "/d").rollover).toEqual("avoid");
     Advice i = security_advice(with_flags(legacy(), true, false, false, true, never()), "/d");
@@ -83,7 +85,7 @@ test "a recover or removal in the log, a reported lost device or cosigner incide
     expect(has_line(i.lines, adv_avoid_incident(), 0)).toEqual(true);
 }
 
-test "a scan hit: compromised, replace the master key now, through each site's recovery" {
+test "a scan hit: compromised, a new household key now, through each site's recovery" {
     ScanSeen hit = ScanSeen {.checked = 40, .hits = 1, .unreadable = 0};
     Advice a = security_advice(with_flags(with_sigs(legacy(), 5, 0), true, false, false, false, hit), "/d");
     expect(a.level).toEqual("compromised");
@@ -98,7 +100,7 @@ test "a clean scan says only what it read; a household made after the fix has no
     ScanSeen clean = ScanSeen {.checked = 40, .hits = 0, .unreadable = 3};
     Advice a = security_advice(with_flags(legacy(), true, false, false, false, clean), "/d");
     expect(a.level).toEqual("strongly-recommended");
-    expect(has_line(a.lines, "The check of your recent messages found nothing in the 40 it could read (3 could not be read). That lowers the risk but does not rule it out: older messages are gone.", 0)).toEqual(true);
+    expect(has_line(a.lines, "The check of your recent messages found no problem in the 40 it could read (3 could not be read). Older messages are gone, so this can't prove nothing happened.", 0)).toEqual(true);
     Advice b = security_advice(born(), "/d");
     expect(b.level).toEqual("none");
     expect(b.lines.len()).toEqual(1);

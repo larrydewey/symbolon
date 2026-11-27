@@ -78,7 +78,7 @@ grep -qx 'security-reshare due' "$W/status-old.log" && grep -qx 'rotation strong
   || fail "status of a household from before the fix: $(cat "$W/status-old.log")"
 run 60 "$BIN" device kit status "$W/dev" 2>&1 | grep -q "symbolon device security-update $W/dev" || fail "no reminder of the key refresh"
 run 120 "$BIN" device security-advice "$W/dev" > "$W/advice.log" 2>&1 || fail "security-advice"
-grep -q 'This is strongly recommended for your household' "$W/advice.log" && grep -q 'did not count signatures before the fix' "$W/advice.log" || fail "advice: $(cat "$W/advice.log")"
+grep -q 'We strongly recommend a new household key.' "$W/advice.log" && grep -q 'did not count signatures before the fix' "$W/advice.log" || fail "advice: $(cat "$W/advice.log")"
 echo "key refresh after the nonce fix (a re-share with the cosigner; a minute or two)..."
 printf '9999\n\n' | run 300 "$BIN" device security-update "$W/dev" "$W/devrs.primes" > "$W/refresh-pin.log" 2>&1 && fail "the key refresh ran under a wrong PIN"
 printf '2468\n\n' | run 1800 "$BIN" device security-update "$W/dev" "$W/devrs.primes" > "$W/refresh.log" 2>&1 || fail "security-update (key refresh): $(tail -3 "$W/refresh.log")"
@@ -91,7 +91,7 @@ printf '2468\n\n' | run 300 "$BIN" device security-update "$W/dev" > "$W/refresh
 grep -q '^security re-share: done already$' "$W/refresh2.log" || fail "the key refresh ran twice: $(cat "$W/refresh2.log")"
 # A device reported lost: no rollover, each site's own recovery.
 run 60 "$BIN" device security-advice "$W/dev" --report lost > "$W/advice-lost.log" 2>&1 || fail "security-advice --report lost"
-grep -q "use the website's own account recovery" "$W/advice-lost.log" || fail "advice after a lost device: $(cat "$W/advice-lost.log")"
+grep -q "Don't use the rollover browser extension" "$W/advice-lost.log" || fail "advice after a lost device: $(cat "$W/advice-lost.log")"
 run 120 "$BIN" device status "$W/dev" | grep -qx 'rotation-rollover avoid' || fail "rollover still advised after a lost device"
 rm "$W/dev/security-reports"; mv "$W/nonce-fix.born" "$W/dev/nonce-fix"
 run 120 "$BIN" device status "$W/dev" | grep -qx 'rotation none' || fail "the household's inception marker no longer counts"
