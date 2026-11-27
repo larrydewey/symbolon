@@ -551,9 +551,23 @@ Int propose(Str dir, DeviceConfig c, Unlocked u, CgConfig x, VerifiedHead vh, Pa
         Err(m) => dfail(m),
         Ok(sig) => match publish_event(c, p, enc, [EventSig {.signer = c.party, .sig = sig}]) {
             Err(m) => dfail("propose-party: " + m),
-            Ok(vh2) => reshare_in(dir, c, u, x, vh2, q.parties.concat([np]), pin, primes_file, kv_mode_of(dir, u, q, c.party, false))
+            Ok(vh2) => if (proposal_pending(vh2.pending, p.sequence, 0)) { proposal_delayed(dir, vh2) } else {
+                reshare_in(dir, c, u, x, vh2, q.parties.concat([np]), pin, primes_file, kv_mode_of(dir, u, q, c.party, false)) }
         }
     };
+}
+
+Bool proposal_pending(List(UInt(64)) ps, UInt(64) seq, Int i) {
+    if (i >= ps.len()) { return false; }
+    return ps[i] == seq || proposal_pending(ps, seq, i + 1);
+}
+
+// SPEC 8.2: with two devices or more one device's propose-party is delayed
+// (whatever policy[1] says), so the re-share waits for its delay.
+Int proposal_delayed(Str dir, VerifiedHead vh) {
+    println(f"device: the proposal is pending: it takes effect after {vh.head.policy.recovery_delay_sec} s of witness time, unless a device vetoes it (SPEC 8.2: one device of several cannot add a party at once).");
+    println("Then run `symbolon device enroll " + dir + " ...` again, and `symbolon device join` on the new device, to re-share it in.");
+    return 0;
 }
 
 pub List(Int) receivers_of(List(Party) ps, Int i, List(Int) acc) {

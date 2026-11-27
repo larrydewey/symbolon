@@ -386,17 +386,31 @@ PLAIN=$(sed -n 's/^RECOVERY KIT (write it down; it is shown once): //p' "$W/init
 run 60 "$BIN" device kit status "$W/dev" > "$W/kstat.log" 2>&1 || fail "kit status"
 [ "$(head -1 "$W/kstat.log")" = "kit: no passphrase" ] && grep -q "kit renew $W/dev\$" "$W/kstat.log" || fail "kit status (plain): $(cat "$W/kstat.log")"
 # The kit replaced by a new one under a passphrase: the rotate-recovery,
-# signed by this device (immediate here: policy[1] is still 1), then a
-# re-share with the cosigner to the new kit in which the second device
-# takes part, as it did in the enrollment.
+# signed by this device alone. With two devices it is delayed and
+# vetoable (SPEC 8.2: the floor of policy[1] holds for the quorum in
+# force, though the stored policy[1] is still the inception's 1), so a
+# device holding one device cannot kill the owner's kit at once. Past the
+# delay (witnesses restarted with clocks moved forward), `kit renew` again
+# re-shares with the cosigner to the new kit; the second device takes
+# part, as it did in the enrollment.
 KP='lantern orchard pebble'
-printf '1111\n' | run 1800 "$BIN" device join "$W/dev2" "$DEV" "$W/dev2.primes" > "$W/kjoin.log" 2>&1 & KJ=$!
-echo "kit replacement (rotate-recovery, re-share with both devices; a minute or two)..."
+echo "kit replacement (rotate-recovery: delayed with two devices)..."
 printf '2468\n%s\n%s\n' "$KP" "$KP" | run 1800 "$BIN" device kit renew "$W/dev" "$W/devrs.primes" > "$W/renew.log" 2>&1 || fail "kit renew: $(tail -3 "$W/renew.log")"
-wait $KJ || fail "the second device in the kit's re-share: $(tail -3 "$W/kjoin.log")"
 KIT=$(sed -n 's/^NEW RECOVERY KIT (write it down; it is shown once): //p' "$W/renew.log")
 [ "${#KIT}" = 136 ] && [ "${KIT:0:2}" = 01 ] || fail "the new kit is not a protected sheet: $KIT"
-grep -q '^kit replaced' "$W/renew.log" || fail "kit renew: $(cat "$W/renew.log")"
+grep -q '^kit replacement pending' "$W/renew.log" || fail "one device of two replaced the kit at once: $(cat "$W/renew.log")"
+run 120 "$BIN" device status "$W/dev2" | grep -q 'epoch 2 parties 4 threshold 2 pending 1' || fail "status with the replacement pending"
+for i in 1 2 3; do
+  pkill -f -- "witness (serve|child) $W/w$i " 2>/dev/null
+  for _ in $(seq 50); do (exec 3<>"/dev/tcp/127.0.0.1/${WPORT[$i]}") 2>/dev/null || break; sleep 0.1; done
+  runs 3600 "$BIN" witness serve "$W/w$i" "${WPORT[$i]}" "$W/w$i.key" 267400 "${SERVE_TLS[@]}" > "$W/w$i-renew.log" 2>&1 & PIDS+=($!)
+  wait_port "${WPORT[$i]}" || fail "witness $i did not restart"
+done
+printf '1111\n' | run 1800 "$BIN" device join "$W/dev2" "$DEV" "$W/dev2.primes" > "$W/kjoin.log" 2>&1 & KJ=$!
+echo "kit replacement past the delay (re-share with both devices; a minute or two)..."
+printf '2468\n' | run 1800 "$BIN" device kit renew "$W/dev" "$W/devrs.primes" > "$W/renew2.log" 2>&1 || fail "kit renew (after the delay): $(tail -3 "$W/renew2.log")"
+wait $KJ || fail "the second device in the kit's re-share: $(tail -3 "$W/kjoin.log")"
+grep -q '^kit replaced' "$W/renew2.log" || fail "kit renew: $(cat "$W/renew2.log")"
 [ "$(run 60 "$BIN" device kit status "$W/dev" | head -1)" = "kit: protected by a passphrase" ] || fail "kit status (protected)"
 run 120 "$BIN" device status "$W/dev2" | grep -q 'epoch 3 parties 4 threshold 2 pending 0' || fail "status after the kit replacement"
 MSGK=$(python3 -c 'import hashlib; print(hashlib.sha256(b"after the kit replacement").hexdigest())')
@@ -433,7 +447,7 @@ printf '%s\n\n' "$KP" | run 600 "$BIN" device recover "$W/dev3" "$KIT" "$LOG" > 
 for i in 1 2 3; do
   pkill -f -- "witness (serve|child) $W/w$i " 2>/dev/null; wait "${WPID[$i]}" 2>/dev/null
   for _ in $(seq 50); do (exec 3<>"/dev/tcp/127.0.0.1/${WPORT[$i]}") 2>/dev/null || break; sleep 0.1; done
-  runs 3600 "$BIN" witness serve "$W/w$i" "${WPORT[$i]}" "$W/w$i.key" 263400 "${SERVE_TLS[@]}" > "$W/w$i-later.log" 2>&1 & PIDS+=($!)
+  runs 3600 "$BIN" witness serve "$W/w$i" "${WPORT[$i]}" "$W/w$i.key" 530800 "${SERVE_TLS[@]}" > "$W/w$i-later.log" 2>&1 & PIDS+=($!)
   wait_port "${WPORT[$i]}" || fail "witness $i did not restart"
 done
 echo "recovery finish (release, kit share, re-share; a minute or two)..."
