@@ -118,7 +118,8 @@ pub Option(List(Int)) body_cbor(EventBody b, List(Int) acc) {
         RecoverBody(r) => recover_body_cbor(r, cbe_uint(6, cbe_array(2, acc))),
         VetoBody(seq) => Some(cbe_uint((Int)seq, cbe_uint(7, cbe_array(2, acc)))),
         MigrateBody(s) => Some(cbe_uint(s, cbe_uint(10, cbe_array(2, acc)))),
-        PartyKeyBody(id, k) => cose_key(k, cbe_bytes(id, cbe_uint(11, cbe_array(3, acc))))
+        PartyKeyBody(id, k) => cose_key(k, cbe_bytes(id, cbe_uint(11, cbe_array(3, acc)))),
+        ConfirmBody(seq, d) => Some(cbe_bytes(d, cbe_uint((Int)seq, cbe_uint(12, cbe_array(3, acc)))))
     };
 }
 

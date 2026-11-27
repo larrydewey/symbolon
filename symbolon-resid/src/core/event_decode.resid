@@ -309,6 +309,11 @@ RBody r_body(List(Int) b, Int p) {
         RB hk = if (id.next < 0) { id } else { r_cose_key(b, id.next) };
         return if (id.next < 0 || hk.next < 0) { no_body() } else { RBody {.v = Some(PartyKeyBody(id.v, hk.v)), .next = hk.next} };
     }
+    if (k.v == 12 && n == 3) {
+        RU s = r_uint(b, k.next);
+        RB d = if (s.next < 0) { RB {.v = [], .next = -1} } else { r_bytes(b, s.next) };
+        return if (s.next < 0 || d.next < 0 || d.v.len() != 32) { no_body() } else { RBody {.v = Some(ConfirmBody((UInt(64))s.v, d.v)), .next = d.next} };
+    }
     if (k.v == 10 && n == 2) { RU s = r_uint(b, k.next); return if (s.next < 0 || s.v > 255) { no_body() } else { RBody {.v = Some(MigrateBody((UInt(8))s.v)), .next = s.next} }; }
     return no_body();
 }

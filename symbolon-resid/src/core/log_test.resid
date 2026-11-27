@@ -1044,3 +1044,220 @@ test "the same events witnessed after the cutover: the proposal waits, the re-sh
     List(SignedEvent) edge = third_enrolled((UInt(64))(authority_floor_from() - 1), after(0));
     expect(ok(il_verify(l, edge, now_after(0), lambda(x) { false }))).toBeTrue();
 }
+
+// ─── confirm (SPEC 8.2): further devices make a pending authority event immediate ───
+
+SignedEvent confirm_of(Int tag, UInt(64) seq, List(Int) prev_enc, UInt(64) target, Int target_tag, List(Int) who, UInt(64) time) {
+    return next(tag, seq, prev_enc, ConfirmBody(target, sha256_bytes(enc(target_tag))), who, time);
+}
+
+// As next(), with field 6 given.
+SignedEvent next6(Int tag, UInt(64) seq, List(Int) prev_enc, EventBody body, List(Int) who, UInt(64) time, List(List(Int)) f6) {
+    SignedEvent b = next(tag, seq, prev_enc, body, who, time);
+    EventPayload p = b.payload;
+    EventPayload q = EventPayload {.log_id = p.log_id, .sequence = p.sequence, .predecessor_digest = p.predecessor_digest, .suite = 1,
+                                   .body = p.body, .next_recovery_key_digests = f6, .advisory_time = 0};
+    return SignedEvent {.payload = q, .encoded = b.encoded, .sigs = b.sigs, .cosigs = b.cosigs};
+}
+
+Str why(Result(VerifiedHead, SymbolonError) r) {
+    return match r { Ok(_) => "", Err(e) => match e { ErrInvalidLog(m) => m, _ => "another error" } };
+}
+
+Bool refused_for(Result(VerifiedHead, SymbolonError) r, Str part) { return str_contains(why(r), part); }
+
+// Three devices (2, 3, 4), t = 2, policy[1] = `need`, signed by all three.
+SignedEvent e0_three(Int need) {
+    SignedEvent base = e0([2, 3, 4]);
+    EventPayload p = base.payload;
+    Policy p0 = policy(86400);
+    Policy pn = Policy {.device_sigs_for_authority = (UInt(8))need, .recovery_delay_sec = p0.recovery_delay_sec, .guardians = [],
+                        .guardian_threshold = 0, .witnesses = p0.witnesses, .duress_window_sec = p0.duress_window_sec,
+                        .sequencer = [], .cosigner_policy = NoCosignerPolicy};
+    Quorum q = Quorum {.parties = [test_device(2), test_device(3), test_device(4)], .t = 2, .root_pubkey = pubk(9),
+                       .epoch = 0, .transcript_digest = id32(99), .kv_commits = []};
+    EventPayload op = EventPayload {
+        .log_id = p.log_id, .sequence = 0, .predecessor_digest = None, .suite = 1, .body = InceptionBody(q, pn),
+        .next_recovery_key_digests = p.next_recovery_key_digests, .advisory_time = 0 };
+    return SignedEvent {.payload = op, .encoded = base.encoded, .sigs = base.sigs, .cosigs = base.cosigs};
+}
+
+Bool next_claimless(Result(NextOk, SymbolonError) r) { return match r { Ok(n) => n.claimless, Err(_) => true }; }
+
+Bool is_confirm_body(Option(EventPayload) d, UInt(64) seq, List(Int) dig) {
+    return match d { None => false, Some(x) => confirm_body(x.body, seq, dig) };
+}
+
+Bool confirm_body(EventBody b, UInt(64) seq, List(Int) dig) {
+    return match b { ConfirmBody(s, d) => s == seq && bytes_eq(d, dig), _ => false };
+}
+
+test "a confirm by the other device makes a pending authority event take effect at once" {
+    List(Int) l = log_id();
+    List(SignedEvent) es = enrolled();
+    // Device 3's rotate-recovery waits (R4-1); device 2 confirms it: in force at once.
+    SignedEvent rot = next(3, 3, enc(2), RotateRecoveryBody, [3], after(2000));
+    SignedEvent conf = confirm_of(4, 4, enc(3), 3, 3, [2], after(2100));
+    Result(VerifiedHead, SymbolonError) r = il_verify(l, es.concat([rot, conf]), now_after(2100), lambda(x) { false });
+    expect(why(r)).toEqual("");
+    expect(pending_n(r)).toEqual(0);
+    expect(rotated_of(il_membership(l, es.concat([rot, conf]), now_after(2100), lambda(x) { false })).len()).toEqual(1);
+    // Without the confirm it is still pending then.
+    expect(rotated_of(il_membership(l, es.concat([rot]), now_after(2100), lambda(x) { false })).len()).toEqual(0);
+    // A proposal likewise.
+    SignedEvent prop = next(3, 3, enc(2), ProposePartyBody(test_device(4), id32(44)), [2], after(2000));
+    SignedEvent conf2 = confirm_of(4, 4, enc(3), 3, 3, [3], after(2100));
+    expect(proposed_n(il_membership(l, es.concat([prop, conf2]), now_after(2100), lambda(x) { false }))).toEqual(1);
+    // What a witness checks before co-signing agrees.
+    expect(next_ok(il_check_next(l, es.concat([rot]), bare(conf), now_after(2100), lambda(x) { false }))).toBeTrue();
+    // The pending list a device shows: sequence, digest, confirmable.
+    List(PendingEvent) pe = il_pending_events(l, es.concat([rot]), now_after(2000), lambda(x) { false });
+    expect(pe.len()).toEqual(1);
+    expect((Int)pe[0].seq).toEqual(3);
+    expect(hex_encode(pe[0].digest)).toEqual(hex_encode(sha256_bytes(enc(3))));
+    expect(pe[0].confirmable).toBeTrue();
+    expect(pe[0].ready_at).toEqual(now_after(2000) + 86400);
+}
+
+test "a confirm is bound to its log, the pending event's sequence and its digest" {
+    List(Int) l = log_id();
+    List(SignedEvent) es = enrolled();
+    SignedEvent rot = next(3, 3, enc(2), RotateRecoveryBody, [3], after(2000));
+    // Another digest at that sequence (another log's event 3, say): refused.
+    SignedEvent wrong = confirm_of(4, 4, enc(3), 3, 9, [2], after(2100));
+    expect(refused_for(il_verify(l, es.concat([rot, wrong]), now_after(2100), lambda(x) { false }), "another digest")).toBeTrue();
+    // An event that is not pending (the re-share at 2): refused.
+    SignedEvent notp = confirm_of(4, 4, enc(3), 2, 2, [2], after(2100));
+    expect(refused_for(il_verify(l, es.concat([rot, notp]), now_after(2100), lambda(x) { false }), "not pending")).toBeTrue();
+    // A confirm made for another log: refused.
+    SignedEvent good = confirm_of(4, 4, enc(3), 3, 3, [2], after(2100));
+    EventPayload gp = good.payload;
+    SignedEvent other = SignedEvent {.payload = EventPayload {.log_id = Some(id32(77)), .sequence = gp.sequence, .predecessor_digest = gp.predecessor_digest,
+                                     .suite = 1, .body = gp.body, .next_recovery_key_digests = gp.next_recovery_key_digests, .advisory_time = 0},
+                                     .encoded = good.encoded, .sigs = good.sigs, .cosigs = good.cosigs};
+    expect(refused_for(il_verify(l, es.concat([rot, other]), now_after(2100), lambda(x) { false }), "log id")).toBeTrue();
+    // Replayed once it has taken effect: nothing is pending at 3 any more.
+    SignedEvent again = confirm_of(5, 5, enc(4), 3, 3, [2], after(2200));
+    expect(refused_for(il_verify(l, es.concat([rot, good, again]), now_after(2200), lambda(x) { false }), "not pending")).toBeTrue();
+    // Once the delay has run the event is in force, not pending: refused too.
+    SignedEvent late = confirm_of(4, 4, enc(3), 3, 3, [2], after(2000 + 86400));
+    expect(refused_for(il_verify(l, es.concat([rot, late]), now_after(2000 + 86400), lambda(x) { false }), "not pending")).toBeTrue();
+}
+
+test "a forged confirm counts for nothing" {
+    List(Int) l = log_id();
+    List(SignedEvent) es = enrolled();
+    SignedEvent rot = next(3, 3, enc(2), RotateRecoveryBody, [3], after(2000));
+    SignedEvent good = confirm_of(4, 4, enc(3), 3, 3, [2], after(2100));
+    // Signed by key 5, claimed as device 2.
+    SignedEvent forged = SignedEvent {.payload = good.payload, .encoded = good.encoded,
+                                      .sigs = [EventSig {.signer = id32(2), .sig = sign(5, good.encoded)}], .cosigs = good.cosigs};
+    expect(refused_for(il_verify(l, es.concat([rot, forged]), now_after(2100), lambda(x) { false }), "did not sign")).toBeTrue();
+    // Signed by a key that is no party of the quorum.
+    SignedEvent stranger = confirm_of(4, 4, enc(3), 3, 3, [5], after(2100));
+    expect(refused_for(il_verify(l, es.concat([rot, stranger]), now_after(2100), lambda(x) { false }), "did not sign")).toBeTrue();
+}
+
+test "the device that signed a pending event cannot confirm it" {
+    List(Int) l = log_id();
+    List(SignedEvent) es = enrolled();
+    SignedEvent rot = next(3, 3, enc(2), RotateRecoveryBody, [3], after(2000));
+    SignedEvent self = confirm_of(4, 4, enc(3), 3, 3, [3], after(2100));
+    expect(refused_for(il_verify(l, es.concat([rot, self]), now_after(2100), lambda(x) { false }), "did not sign")).toBeTrue();
+    // Its signature twice counts once.
+    SignedEvent twice = confirm_of(4, 4, enc(3), 3, 3, [3, 3], after(2100));
+    expect(refused_for(il_verify(l, es.concat([rot, twice]), now_after(2100), lambda(x) { false }), "did not sign")).toBeTrue();
+    // With the other device beside it: in force.
+    SignedEvent both = confirm_of(4, 4, enc(3), 3, 3, [3, 2], after(2100));
+    expect(pending_n(il_verify(l, es.concat([rot, both]), now_after(2100), lambda(x) { false }))).toEqual(0);
+}
+
+test "a proposed, a removed, or a device being removed cannot confirm" {
+    List(Int) l = log_id();
+    SignedEvent ev0 = e0_three(2);
+    // Proposed (not yet re-shared in): device 5.
+    SignedEvent prop = next(1, 1, enc(0), ProposePartyBody(test_device(5), id32(45)), [2, 3], 2000);
+    SignedEvent rot = next(2, 2, enc(1), RotateRecoveryBody, [2], 2100);
+    expect(pending_n(il_verify(l, [ev0, prop, rot], 2100, lambda(x) { false }))).toEqual(1);
+    expect(ok(il_verify(l, [ev0, prop, rot, confirm_of(3, 3, enc(2), 2, 2, [5], 2200)], 2200, lambda(x) { false }))).toBeFalse();
+    // Removed: device 4.
+    SignedEvent rm = next(1, 1, enc(0), RemovePartyBody(id32(4)), [2, 3], 2000);
+    expect(refused_for(il_verify(l, [ev0, rm, rot, confirm_of(3, 3, enc(2), 2, 2, [4], 2200)], 2200, lambda(x) { false }), "did not sign")).toBeTrue();
+    expect(pending_n(il_verify(l, [ev0, rm, rot, confirm_of(3, 3, enc(2), 2, 2, [3], 2200)], 2200, lambda(x) { false }))).toEqual(0);
+    // Being removed (a remove-party of it is pending): device 4.
+    SignedEvent rm1 = next(1, 1, enc(0), RemovePartyBody(id32(4)), [2], 2000);
+    SignedEvent rot3 = next(2, 2, enc(1), RotateRecoveryBody, [3], 2100);
+    expect(pending_n(il_verify(l, [ev0, rm1, rot3], 2100, lambda(x) { false }))).toEqual(2);
+    expect(refused_for(il_verify(l, [ev0, rm1, rot3, confirm_of(3, 3, enc(2), 2, 2, [4], 2200)], 2200, lambda(x) { false }), "did not sign")).toBeTrue();
+    Result(VerifiedHead, SymbolonError) by2 = il_verify(l, [ev0, rm1, rot3, confirm_of(3, 3, enc(2), 2, 2, [2], 2200)], 2200, lambda(x) { false });
+    expect(why(by2)).toEqual("");
+    expect(pending_n(by2)).toEqual(1);
+    // A pending event's own signer being removed (or removed since) no longer counts for it.
+    SignedEvent rot4 = next(1, 1, enc(0), RotateRecoveryBody, [4], 2000);
+    SignedEvent rm4 = next(2, 2, enc(1), RemovePartyBody(id32(4)), [2], 2100);
+    expect(refused_for(il_verify(l, [ev0, rot4, rm4, confirm_of(3, 3, enc(2), 1, 1, [3], 2200)], 2200, lambda(x) { false }), "fewer devices")).toBeTrue();
+    SignedEvent rm4now = next(2, 2, enc(1), RemovePartyBody(id32(4)), [2, 3], 2100);
+    expect(refused_for(il_verify(l, [ev0, rot4, rm4now, confirm_of(3, 3, enc(2), 1, 1, [3], 2200)], 2200, lambda(x) { false }), "fewer devices")).toBeTrue();
+    expect(pending_n(il_verify(l, [ev0, rot4, rm4now, confirm_of(3, 3, enc(2), 1, 1, [2, 3], 2200)], 2200, lambda(x) { false }))).toEqual(0);
+}
+
+test "confirms do not accumulate: together with the signer they reach policy[1] or are refused" {
+    List(Int) l = log_id();
+    SignedEvent ev0 = e0_three(3);
+    SignedEvent rot = next(1, 1, enc(0), RotateRecoveryBody, [2], 2000);
+    expect(refused_for(il_verify(l, [ev0, rot, confirm_of(2, 2, enc(1), 1, 1, [3], 2100)], 2100, lambda(x) { false }), "fewer devices")).toBeTrue();
+    expect(pending_n(il_verify(l, [ev0, rot, confirm_of(2, 2, enc(1), 1, 1, [3, 4], 2100)], 2100, lambda(x) { false }))).toEqual(0);
+}
+
+test "a veto and a confirm: whichever the log holds first decides" {
+    List(Int) l = log_id();
+    List(SignedEvent) es = enrolled();
+    SignedEvent rot = next(3, 3, enc(2), RotateRecoveryBody, [3], after(2000));
+    // Vetoed first: a later confirm is refused, and it never takes effect.
+    SignedEvent veto = next(4, 4, enc(3), VetoBody(3), [2], after(2100));
+    expect(refused_for(il_verify(l, es.concat([rot, veto, confirm_of(5, 5, enc(4), 3, 3, [2], after(2200))]), now_after(2200), lambda(x) { false }), "not pending")).toBeTrue();
+    expect(rotated_of(il_membership(l, es.concat([rot, veto]), now_after(92000), lambda(x) { false })).len()).toEqual(0);
+    // Confirmed first: a later veto is refused, and it stays in force.
+    SignedEvent conf = confirm_of(4, 4, enc(3), 3, 3, [2], after(2100));
+    SignedEvent veto2 = next(5, 5, enc(4), VetoBody(3), [3], after(2200));
+    expect(refused_for(il_verify(l, es.concat([rot, conf, veto2]), now_after(2200), lambda(x) { false }), "not pending")).toBeTrue();
+    expect(rotated_of(il_membership(l, es.concat([rot, conf]), now_after(92000), lambda(x) { false })).len()).toEqual(1);
+}
+
+test "a recover and a weakening set-policy cannot be confirmed" {
+    List(Int) l = log_id();
+    // The kit's recover: two devices confirming it are refused (veto or let it run).
+    SignedEvent rec = recover_ev(1, 1, enc(0), 20, 2000);
+    SignedEvent conf = next6(2, 2, enc(1), ConfirmBody(1, sha256_bytes(enc(1))), [2, 3], 2100, [sha256_bytes(pubk(20))]);
+    expect(refused_for(il_verify(l, [e0_kit([2, 3]), rec, conf], 2100, lambda(x) { false }), "recover")).toBeTrue();
+    List(PendingEvent) pe = il_pending_events(l, [e0_kit([2, 3]), rec], 2000, lambda(x) { false });
+    expect(pe.len()).toEqual(1);
+    expect(pe[0].confirmable).toBeFalse();
+    // A weakening set-policy, delayed whatever its signatures.
+    SignedEvent first = next(1, 1, enc(0), SetPolicyBody(policy(172800)), [2, 3], 2000);
+    SignedEvent weaker = next(2, 2, enc(1), SetPolicyBody(policy(86400)), [2], 3000);
+    expect(pending_n(il_verify(l, [e0([2, 3]), first, weaker], 3000, lambda(x) { false }))).toEqual(1);
+    expect(refused_for(il_verify(l, [e0([2, 3]), first, weaker, confirm_of(3, 3, enc(2), 2, 2, [3], 3100)], 3100, lambda(x) { false }), "weakens")).toBeTrue();
+}
+
+test "a confirm needs the relay's claim (never claimless)" {
+    List(Int) l = log_id();
+    List(WitnessRef) one = [WitnessRef {.url = "relay:1", .key = pubk(30)}];
+    SignedEvent add = next(1, 1, enc(0), SetPolicyBody(policy_seq(one)), [2, 3], 2000);
+    SignedEvent rot = next(2, 2, enc(1), RotateRecoveryBody, [2], 3000);
+    SignedEvent conf = confirm_of(3, 3, enc(2), 2, 2, [3], 3100);
+    Result(NextOk, SymbolonError) n = il_next(l, [e0([2, 3]), add, rot], bare(conf), 3100, lambda(x) { false });
+    expect(next_sequencers(n)).toEqual(1);
+    expect(next_claimless(n)).toBeFalse();
+}
+
+test "a confirm event encodes as [12, target-seq, target-digest] and decodes back" {
+    EventPayload p = EventPayload {.log_id = Some(id32(1)), .sequence = 4, .predecessor_digest = Some(id32(2)), .suite = 1,
+                                   .body = ConfirmBody(3, id32(5)), .next_recovery_key_digests = [id32(50)], .advisory_time = 0};
+    List(Int) b = payload_cbor(p) else { [] };
+    expect(is_confirm_body(payload_decode(b), 3, id32(5))).toBeTrue();
+    // A digest that is not 32 bytes does not decode.
+    EventPayload short = EventPayload {.log_id = Some(id32(1)), .sequence = 4, .predecessor_digest = Some(id32(2)), .suite = 1,
+                                       .body = ConfirmBody(3, [1, 2, 3]), .next_recovery_key_digests = [id32(50)], .advisory_time = 0};
+    expect(is_confirm_body(payload_decode(payload_cbor(short) else { [] }), 3, [1, 2, 3])).toBeFalse();
+}

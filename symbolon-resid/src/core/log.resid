@@ -37,6 +37,12 @@ type Pending = {
     // 20.3): one at a time, and a device may veto it without the relay's
     // claim.
     Bool kit;
+    // The devices whose signatures it carried (valid, of the quorum, not
+    // removed, when it was witnessed), and whether it is delayed whatever
+    // its signatures (a weakening set-policy): a confirm (do_confirm)
+    // counts the first and never applies the second.
+    List(List(Int)) signers;
+    Bool forced;
 };
 
 type LogState = {
@@ -780,14 +786,16 @@ Result(LogState, SymbolonError) authority(LogState s, SignedEvent e, List(Int) d
     if (dev_sigs < 1) { return refuse("authority event without a device signature"); }
     EventPayload ep = e.payload;
     // s.last_time is this event's witness time here (step_at: with_time).
-    Int need = authority_sigs(s.policy, not_removed(s.quorum.parties, s.removed, 0, ListBuf()), s.last_time);
+    List(Party) live = not_removed(s.quorum.parties, s.removed, 0, ListBuf());
+    Int need = authority_sigs(s.policy, live, s.last_time);
     Bool immediate = !force_delay && dev_sigs >= need;
     if (immediate) {
         return Ok(apply_effect(s, ep.body, dig, ep.next_recovery_key_digests));
     }
     Pending p = Pending {
         .seq = ep.sequence, .ready_at = s.last_time + (Int)s.policy.recovery_delay_sec,
-        .body = ep.body, .event_digest = dig, .next_digests = ep.next_recovery_key_digests, .kit = false };
+        .body = ep.body, .event_digest = dig, .next_digests = ep.next_recovery_key_digests, .kit = false,
+        .signers = valid_signers(e.sigs, live, true, e.encoded, 0, []), .forced = force_delay };
     return Ok(with_pending(s, s.pending.concat([p])));
 }
 
@@ -829,7 +837,8 @@ Result(LogState, SymbolonError) kit_escape(LogState s, SignedEvent e, List(Int) 
     Int mult = if (s.vetoes >= 2) { 4 } else { 1 };
     Pending p = Pending {
         .seq = e.payload.sequence, .ready_at = s.last_time + (Int)s.policy.recovery_delay_sec * mult,
-        .body = e.payload.body, .event_digest = dig, .next_digests = e.payload.next_recovery_key_digests, .kit = true };
+        .body = e.payload.body, .event_digest = dig, .next_digests = e.payload.next_recovery_key_digests, .kit = true,
+        .signers = [], .forced = true };
     return Ok(with_pending(s, s.pending.concat([p])));
 }
 
@@ -972,7 +981,8 @@ Result(LogState, SymbolonError) do_recover(LogState s, SignedEvent e, List(Int) 
     Pending p = Pending {
         .seq = ep.sequence,
         .ready_at = s.last_time + (Int)s.policy.recovery_delay_sec * mult,
-        .body = ep.body, .event_digest = dig, .next_digests = ep.next_recovery_key_digests, .kit = true };
+        .body = ep.body, .event_digest = dig, .next_digests = ep.next_recovery_key_digests, .kit = true,
+        .signers = [], .forced = true };
     return Ok(with_pending(s, s.pending.concat([p])));
 }
 
@@ -993,6 +1003,72 @@ Result(LogState, SymbolonError) do_veto(LogState s, Int dev_sigs, UInt(64) targe
     };
 }
 
+// confirm (SPEC 8.2): further devices of the household sign for the
+// pending authority event at `target`, whose digest is `tdig`, and it
+// takes effect at once, without waiting out its delay. Its own event at a
+// sequence of its own (signatures sit outside an event's digest, but an
+// event already witnessed and stored cannot take another one that counts:
+// a verifier could not tell when it was added, so an attacker holding the
+// event could add one later or a relay drop it), so its log id, sequence
+// and predecessor bind it to this log at this point, and `tdig` to the one
+// event it confirms.
+//
+// It counts the distinct devices among the pending event's own signers and
+// the confirm's signers that may sign now: devices of the quorum in force,
+// not removed, and not named by a remove-party still pending (a device
+// being removed, perhaps the stolen one, cannot help make anything
+// immediate meanwhile). Proposed parties are not in the quorum and never
+// count. A signer of the pending event counts once, whoever signs again;
+// the confirm must carry at least one device that did not sign the
+// pending event; and the count must reach the signatures an authority
+// event needs now (authority_sigs, at the confirm's witness time), or the
+// confirm is refused: confirms do not accumulate.
+//
+// Never for what the kit or guardians filed (a recover, the kit's escape
+// set-policy: those have their own rules, SPEC 13.4 and 20.3; a device
+// that agrees simply lets the delay run) nor for a set-policy that weakens
+// the policy, which is delayed whatever its signatures. The veto window
+// orders itself by sequence: a vetoed event is no longer pending, so a
+// later confirm of it is refused, and a confirmed event has taken effect,
+// so a later veto of it is refused. The contest counter (vetoes) is not
+// touched.
+Result(LogState, SymbolonError) do_confirm(LogState s, SignedEvent e, UInt(64) target, List(Int) tdig) {
+    Option(Pending) found = pending_by_seq(s.pending, target, 0);
+    return match found {
+        None => refuse("confirm of an event that is not pending"),
+        Some(p) => do_confirm_found(s, e, target, tdig, p)
+    };
+}
+
+Result(LogState, SymbolonError) do_confirm_found(LogState s, SignedEvent e, UInt(64) target, List(Int) tdig, Pending p) {
+    if (!bytes_eq(p.event_digest, tdig)) { return refuse("confirm names another digest than the pending event's"); }
+    if (p.kit || is_recover_body(p.body)) { return refuse("a recover or the kit's set-policy cannot be confirmed"); }
+    if (p.forced) { return refuse("a set-policy that weakens the policy cannot be confirmed: it is always delayed"); }
+    List(Party) live = not_removed(s.quorum.parties, s.removed, 0, ListBuf());
+    List(Party) able = not_removed(live, pending_removals(s.pending, 0, []), 0, ListBuf());
+    List(List(Int)) by = valid_signers(e.sigs, able, true, e.encoded, 0, []);
+    List(List(Int)) orig = ids_among(p.signers, able, 0, []);
+    Int fresh = keys_not_in(by, orig, 0, []);
+    if (fresh < 1) { return refuse("confirm without a device that did not sign the pending event"); }
+    Int need = authority_sigs(s.policy, live, s.last_time);
+    if (orig.len() + fresh < need) { return refuse("confirm: fewer devices than an authority event needs"); }
+    LogState rest = with_pending(s, pending_without(s.pending, target, 0, ListBuf()));
+    return Ok(apply_effect(rest, p.body, p.event_digest, p.next_digests));
+}
+
+// The party ids a pending remove-party names.
+List(List(Int)) pending_removals(List(Pending) ps, Int i, List(List(Int)) acc) {
+    if (i >= ps.len()) { return acc; }
+    EventBody b = ps[i].body;
+    return pending_removals(ps, i + 1, match b { RemovePartyBody(id) => acc.concat([id]), _ => acc });
+}
+
+// The ids of `ids` that name a party of `ps`.
+List(List(Int)) ids_among(List(List(Int)) ids, List(Party) ps, Int i, List(List(Int)) acc) {
+    if (i >= ids.len()) { return acc; }
+    return ids_among(ids, ps, i + 1, if (known_party(party_by_id(ps, ids[i], 0))) { acc.concat([ids[i]]) } else { acc });
+}
+
 Result(LogState, SymbolonError) apply_body(LogState s, SignedEvent e, List(Int) dig, Bool closure(EventPayload) approvals_ok) {
     EventBody body = e.payload.body;
     // Device signatures of the quorum's parties that are not removed: a
@@ -1008,7 +1084,8 @@ Result(LogState, SymbolonError) apply_body(LogState s, SignedEvent e, List(Int) 
         ReshareBody(nq) => do_reshare(s, e, dig, nq),
         RecoverBody(r) => do_recover(s, e, dig, r, approvals_ok),
         VetoBody(target) => do_veto(s, dev_sigs, target),
-        PartyKeyBody(id, k) => do_party_key(s, e, id, k)
+        PartyKeyBody(id, k) => do_party_key(s, e, id, k),
+        ConfirmBody(target, tdig) => do_confirm(s, e, target, tdig)
     };
 }
 
@@ -1294,6 +1371,32 @@ pub Option(Membership) il_membership(List(Int) l, List(SignedEvent) events, Int 
 }
 
 Option(Membership) membership_of(LogState s) { return Some(Membership {.proposed = s.proposed, .removed = s.removed, .rotated_to = s.rotated_to}); }
+
+// The events pending at `now` (no earlier than the last event's time) of
+// a verified log, oldest first: sequence, the witness time it takes effect
+// at, its digest, and whether devices may confirm it (do_confirm: not
+// what the kit or guardians filed, not a weakening set-policy). [] when
+// the log does not verify.
+pub type PendingEvent = { UInt(64) seq; Int ready_at; List(Int) digest; Bool confirmable; };
+
+pub List(PendingEvent) il_pending_events(List(Int) l, List(SignedEvent) events, Int now, Bool closure(EventPayload) approvals_ok) {
+    if (events.len() < 1) { return []; }
+    Result(LogState, SymbolonError) s0 = start(events[0], l);
+    return match s0 {
+        Err(_) => [],
+        Ok(a) => match run(a, events, l, approvals_ok, 1) {
+            Err(_) => [],
+            Ok(s1) => pending_events(settle(s1, if (now < s1.last_time) { s1.last_time } else { now }).pending, 0, ListBuf())
+        }
+    };
+}
+
+List(PendingEvent) pending_events(List(Pending) ps, Int i, ListBuf(PendingEvent) acc) {
+    if (i >= ps.len()) { return acc.finish(); }
+    Pending p = ps[i];
+    Bool c = !p.kit && !p.forced && !is_recover_body(p.body);
+    return pending_events(ps, i + 1, acc.push(PendingEvent {.seq = p.seq, .ready_at = p.ready_at, .digest = p.event_digest, .confirmable = c}));
+}
 
 List(UInt(64)) pending_seqs(List(Pending) ps, Int i, ListBuf(UInt(64)) acc) {
     if (i >= ps.len()) { return acc.finish(); }

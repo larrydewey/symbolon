@@ -108,7 +108,11 @@ type EventBody =
   | MigrateBody(UInt(8))
   // [11, party-id, hpke-key] (SPEC 8.1): a device's new share-transport
   // key, signed by that device's own authentication key.
-  | PartyKeyBody(List(Int), List(Int));
+  | PartyKeyBody(List(Int), List(Int))
+  // [12, target-seq, target-digest] (SPEC 8.2): further devices confirm
+  // the pending authority event at target-seq, whose digest is
+  // target-digest, so that it takes effect at once.
+  | ConfirmBody(UInt(64), List(Int));
 
 type EventPayload = {
     Option(List(Int)) log_id;                // None only in event 0

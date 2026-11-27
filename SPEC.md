@@ -455,6 +455,7 @@ event-body =
   / [8] / [9]                               ; reserved (draft 1 duress events; never used, A-05)
   / [10, new-suite: uint]                    ; migrate
   / [11, party-id, hpke-key: pubkey]         ; party-key: a device's new share-transport key
+  / [12, target-seq: uint, target: digest]   ; confirm: devices make a pending authority event immediate
 
 recover-body = [
   path: uint,                                ; 1 kit, 2 guardians
@@ -497,6 +498,39 @@ recover-body = [
   and two devices remain exposed as before.
   Guardian and kit paths (`recover`, the kit's set-policy of Section 20.3)
   and `veto` keep their own rules (Sections 13, 13.4).
+- `confirm` `[12, target-seq, target]`: further devices make a delayed
+  authority event take effect at once, instead of waiting out its delay.
+  An event already witnessed and stored cannot take another signature
+  that counts (signatures are outside the digest, so a verifier could not
+  tell when one was added: whoever holds the event could add one later,
+  or a relay drop it), so the second device signs an event of its own at
+  the next sequence. It is valid only if: an event is pending at
+  `target-seq` (Section 8.3: not yet in force, not vetoed) and its digest
+  is `target`; it is not a `recover` nor the kit's set-policy (whatever
+  devices think of those, they veto them or let the delay run; Sections
+  13.4, 20.3), nor a `set-policy` that weakens the policy (always
+  delayed); at least one device signs the `confirm` that did not sign the
+  pending event; and the distinct devices among the pending event's
+  signers and the `confirm`'s signers number at least what an authority
+  event needs at the `confirm`'s witness time (`max(policy[1], f)`
+  above). Only devices of the quorum in force count, not removed and not
+  named by a `remove-party` still pending (a device on its way out,
+  perhaps the stolen one, cannot make anything immediate), so a proposed
+  party never counts, and a pending event's own signer that has since
+  been removed or is being removed no longer counts for it. A `confirm`
+  that falls short is refused, not kept: confirmations do not accumulate.
+  The `confirm` then applies the pending event's effect and removes it
+  from the pending events. Log id, sequence and predecessor bind it to
+  one log at one point, and `target` to the one event; a replay names an
+  event no longer pending. A `veto` and a `confirm` of one event are
+  ordered by their sequences (the sequencing relay's claims, Section
+  20.3): whichever the log holds first decides, a vetoed event cannot be
+  confirmed and a confirmed one cannot be vetoed. The contest counter
+  of Section 13.4 is not touched. A `confirm` always needs the relay's
+  claim (it is none of the events of Section 20.3 a witness co-signs
+  without one). Older verifiers do not know the body and refuse a log
+  that holds one: agents, relays, witnesses and cosigners are upgraded
+  together, as for every earlier change to the log's format.
 - A `set-policy` that weakens recovery protection (shorter delay, fewer
   guardians, lower guardian threshold, fewer witnesses, or no sequencing
   relay where there was one) is always delayed. A change of witnesses
@@ -528,8 +562,8 @@ recover-body = [
 
 Given `L` and events, a verifier MUST check `H(E0) = L`; sequence,
 predecessor digest, suite and signing rule of every event against the
-state in force before it; apply `recover` events whose delay has passed
-without a valid `veto`; and output `(L, n, H(En), quorum, policy)`. Any
+state in force before it; apply delayed events whose delay has passed
+without a valid `veto` (or at once, on a valid `confirm`, Section 8.2); and output `(L, n, H(En), quorum, policy)`. Any
 failure is a refusal; the verifier never repairs a log.
 
 Delays are measured from an event's **witness time**: the median of the
