@@ -151,13 +151,15 @@ Option(List(Party)) parties_in(List(List(Int)) xs, Int i, List(Party) acc) {
 Option(Party) party_body(EventBody b) { return match b { ProposePartyBody(q, _) => Some(q), _ => None }; }
 
 // A pending event: [its body as a payload of its sequence and field 6,
-// ready_at, digest, [kit, forced], [signer, ...]].
+// ready_at, digest, [kit, forced], [signer, ...], the witness time it was
+// filed at (R5-2: a recover filed from the release cutover on ends the
+// others, core/log.resid settle)].
 List(List(Int)) pendings_bytes(List(Pending) ps, Int i, List(List(Int)) acc) {
     if (i >= ps.len()) { return acc; }
     Pending x = ps[i];
     List(Int) e = as_payload(x.body, (Int)x.seq, x.next_digests, 0);
-    if (e.len() == 0 || x.ready_at < 0) { return acc; }
-    List(Int) one = bstrs_cbor([e, cbe_uint(x.ready_at, []), x.event_digest, [if (x.kit) { 1 } else { 0 }, if (x.forced) { 1 } else { 0 }], bstrs_cbor(x.signers)]);
+    if (e.len() == 0 || x.ready_at < 0 || x.time < 0) { return acc; }
+    List(Int) one = bstrs_cbor([e, cbe_uint(x.ready_at, []), x.event_digest, [if (x.kit) { 1 } else { 0 }, if (x.forced) { 1 } else { 0 }], bstrs_cbor(x.signers), cbe_uint(x.time, [])]);
     return pendings_bytes(ps, i + 1, acc.concat([one]));
 }
 
@@ -168,14 +170,15 @@ Option(List(Pending)) pendings_in(List(List(Int)) xs, Int i, List(Pending) acc) 
 }
 
 Option(Pending) pending_in(List(List(Int)) f) {
-    if (f.len() != 5 || f[3].len() != 2 || f[3][0] > 1 || f[3][1] > 1) { return None; }
+    if (f.len() != 6 || f[3].len() != 2 || f[3][0] > 1 || f[3][1] > 1) { return None; }
     Option(EventPayload) p = payload_in(f[0]);
     Option(List(List(Int))) signers = bstrs_of(f[4]);
     Int ready = uint_in(f[1]);
-    if (ready < 0) { return None; }
+    Int time = uint_in(f[5]);
+    if (ready < 0 || time < 0) { return None; }
     return match p { None => None, Some(x) => match signers { None => None, Some(sv) => Some(Pending {
         .seq = x.sequence, .ready_at = ready, .body = x.body, .event_digest = f[2], .next_digests = x.next_recovery_key_digests,
-        .kit = f[3][0] == 1, .signers = sv, .forced = f[3][1] == 1 }) } };
+        .kit = f[3][0] == 1, .signers = sv, .forced = f[3][1] == 1, .time = time }) } };
 }
 
 // A co-signature: [log, seq, digest, witness key, r || s, time].

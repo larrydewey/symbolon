@@ -43,6 +43,9 @@ pub type Pending = {
     // counts the first and never applies the second.
     List(List(Int)) signers;
     Bool forced;
+    // The witness time it was filed at (R5-2: a recover filed from the
+    // release cutover on ends every other pending event, settle).
+    Int time;
 };
 
 // A party and a witness time: when a device last named a new transport
@@ -777,8 +780,60 @@ List(PartyTime) key_times_of(List(PartyTime) ts, List(Party) ps, List(Int) id, I
 }
 
 // Applies every pending event whose delay has run by `now`, oldest first.
+// With a recover pending that was witnessed from the release cutover
+// (authority_floor_from) on, they apply in the order their delays run
+// out, and the recover, once it takes effect, ends every other event
+// still pending (settle_by_time, R5-2). Logs without one settle as they
+// always did.
 LogState settle(LogState s, Int now) {
+    if (recover_ends_pending(s.pending, 0)) { return settle_by_time(s, now); }
     return settle_from(s, now, 0, ListBuf());
+}
+
+// SPEC 13.4 (R5-2): the other pending events were authorized by the quorum
+// the recovery replaces, and their veto window was that quorum's: the
+// recovered devices are not parties until it applies and the kit cannot
+// veto. Kept, one a stolen device filed seconds after the owner's kit
+// recover (a rotate-recovery to the thief's kit, a set-policy to the
+// thief's relay) would land seconds after the recovery, with the owner's
+// new device left only that gap to veto it. Events whose delay ran out
+// before the recover's still apply before it.
+Bool recover_ends_pending(List(Pending) ps, Int i) {
+    if (i >= ps.len()) { return false; }
+    Bool here = is_recover_body(ps[i].body) && ps[i].time >= authority_floor_from();
+    return here || recover_ends_pending(ps, i + 1);
+}
+
+LogState settle_by_time(LogState s, Int now) {
+    Option(Pending) first = first_ready(s.pending, now, 0, None);
+    return match first {
+        None => s,
+        Some(p) => settle_one(s, now, p)
+    };
+}
+
+LogState settle_one(LogState s, Int now, Pending p) {
+    if (is_recover_body(p.body)) {
+        // What the replaced quorum left open ends with it: its pending
+        // events, and the vetoed ones still held against their signers'
+        // cap (slots, delayed_cap), so a device of that quorum the
+        // recovery keeps starts afresh and one it drops holds nothing.
+        LogState ended = with_slots(with_pending(s, []), []);
+        return apply_effect(ended, p.body, p.event_digest, p.next_digests);
+    }
+    LogState rest = with_pending(s, pending_without(s.pending, p.seq, 0, ListBuf()));
+    LogState applied = apply_effect(rest, p.body, p.event_digest, p.next_digests);
+    return settle_by_time(applied, now);
+}
+
+// The pending event whose delay ran out first by `now` (the lowest
+// sequence among equals), or None.
+Option(Pending) first_ready(List(Pending) ps, Int now, Int i, Option(Pending) best) {
+    if (i >= ps.len()) { return best; }
+    Pending p = ps[i];
+    Int bt = match best { None => now + 1, Some(b) => b.ready_at };
+    Bool better = p.ready_at <= now && p.ready_at < bt;
+    return first_ready(ps, now, i + 1, if (better) { Some(p) } else { best });
 }
 
 LogState settle_from(LogState s, Int now, Int i, ListBuf(Pending) kept) {
@@ -896,7 +951,7 @@ Result(LogState, SymbolonError) authority(LogState s, SignedEvent e, List(Int) d
     Pending p = Pending {
         .seq = ep.sequence, .ready_at = s.last_time + (Int)s.policy.recovery_delay_sec,
         .body = ep.body, .event_digest = dig, .next_digests = ep.next_recovery_key_digests, .kit = false,
-        .signers = signers, .forced = force_delay };
+        .signers = signers, .forced = force_delay, .time = s.last_time };
     return Ok(with_pending(s, s.pending.concat([p])));
 }
 
@@ -977,7 +1032,7 @@ Result(LogState, SymbolonError) kit_escape(LogState s, SignedEvent e, List(Int) 
     Pending p = Pending {
         .seq = e.payload.sequence, .ready_at = s.last_time + (Int)s.policy.recovery_delay_sec * mult,
         .body = e.payload.body, .event_digest = dig, .next_digests = e.payload.next_recovery_key_digests, .kit = true,
-        .signers = [], .forced = true };
+        .signers = [], .forced = true, .time = s.last_time };
     return Ok(with_pending(s, s.pending.concat([p])));
 }
 
@@ -1153,7 +1208,7 @@ Result(LogState, SymbolonError) do_recover(LogState s, SignedEvent e, List(Int) 
         .seq = ep.sequence,
         .ready_at = s.last_time + (Int)s.policy.recovery_delay_sec * mult,
         .body = ep.body, .event_digest = dig, .next_digests = ep.next_recovery_key_digests, .kit = true,
-        .signers = [], .forced = true };
+        .signers = [], .forced = true, .time = s.last_time };
     return Ok(with_pending(s, s.pending.concat([p])));
 }
 

@@ -1402,3 +1402,102 @@ test "a kept state reads back whole, and extending it reaches the state of the w
     expect(match logstate_of(b[0..b.len() - 1]) { Some(_) => "state", None => "none" }).toEqual("none");
     expect(match logstate_of([128]) { Some(_) => "state", None => "none" }).toEqual("none");
 }
+
+// ─── R5-2: a kit recovery ends what the replaced quorum left pending ───
+// The owner, left with the kit (key 20), recovers to device 4; a thief
+// holding device 2 files a rotate-recovery to its own kit (key 77) ten
+// seconds later. From the release cutover on, the recovery ends it.
+
+SignedEvent thief_rotate(UInt(64) seq, List(Int) prev_enc, UInt(64) time) {
+    return with_digests(next((Int)seq, seq, prev_enc, RotateRecoveryBody, [2], time), [id32(77)]);
+}
+
+SignedEvent thief_kit_recover(UInt(64) time) {
+    return with_digests(recover_ev(3, 3, enc(2), 77, time), [id32(78)]);
+}
+
+test "R5-2: a rotate-recovery a stolen device filed after the owner's kit recover dies with the recovery" {
+    List(Int) l = log_id();
+    SignedEvent r = recover_ev(1, 1, enc(0), 20, after(0));
+    SignedEvent rot = thief_rotate(2, enc(1), after(10));
+    List(SignedEvent) es = [e0_kit([2, 3]), r, rot];
+    // Before the recovery takes effect the rotate is pending beside it.
+    expect(pending_n(il_verify(l, es, now_after(100), lambda(x) { false }))).toEqual(2);
+    // Once it takes effect (device 4's quorum, epoch 1), nothing else is pending.
+    Result(VerifiedHead, SymbolonError) mid = il_verify(l, es, now_after(86405), lambda(x) { false });
+    expect(epoch_of(mid)).toEqual(1);
+    expect(pending_n(mid)).toEqual(0);
+    // Past the rotate's own delay: field 6 is the recovery's, not the thief's kit.
+    expect(rotated_of(il_membership(l, es, now_after(86420), lambda(x) { false })).len()).toEqual(0);
+    // So the thief's kit 77 cannot recover.
+    expect(ok(il_verify(l, es.concat([thief_kit_recover(after(86430))]), now_after(86430), lambda(x) { false }))).toBeFalse();
+    // Nor can anyone veto or confirm the dropped event: it is not pending.
+    SignedEvent v = next(3, 3, enc(2), VetoBody(2), [4], after(86430));
+    expect(ok(il_verify(l, es.concat([v]), now_after(86430), lambda(x) { false }))).toBeFalse();
+}
+
+test "R5-2: events whose delay ran out before the recover's still apply before it; logs from before the cutover are unchanged" {
+    List(Int) l = log_id();
+    // A rotate filed before the recover: applied at its time, then the
+    // recovery's field 6 replaces it.
+    SignedEvent rot0 = thief_rotate(1, enc(0), after(0));
+    SignedEvent r2 = with_digests(next(2, 2, enc(1), RecoverBody(RecoverBodyInner {.path = recover_path_kit(), .new_parties = [test_device(4)],
+                                                                                  .revealed_recovery_key = Some(pubk(20)), .guardian_approvals = []}), [20], after(10)), [id32(50)]);
+    List(SignedEvent) es0 = [e0_kit([2, 3]), rot0, r2];
+    Result(VerifiedHead, SymbolonError) v0 = il_verify(l, es0, now_after(86410), lambda(x) { false });
+    expect(epoch_of(v0)).toEqual(1);
+    expect(pending_n(v0)).toEqual(0);
+    expect(rotated_of(il_membership(l, es0, now_after(86410), lambda(x) { false })).len()).toEqual(0);
+    // The same race witnessed before the cutover verifies as it always did:
+    // the rotate outlives the recovery and lands after it.
+    SignedEvent r = recover_ev(1, 1, enc(0), 20, 2000);
+    SignedEvent rot = thief_rotate(2, enc(1), 2010);
+    List(SignedEvent) es = [e0_kit([2, 3]), r, rot];
+    expect(pending_n(il_verify(l, es, 2000 + 86405, lambda(x) { false }))).toEqual(1);
+    expect(rotated_of(il_membership(l, es, 2010 + 86400, lambda(x) { false })).len()).toEqual(1);
+}
+
+Int state_pending(Result(LogState, SymbolonError) r) { return match r { Ok(s) => s.pending.len(), Err(_) => -1 }; }
+Int state_slots(Result(LogState, SymbolonError) r) { return match r { Ok(s) => s.slots.len(), Err(_) => -1 }; }
+
+// A state written out as a witness keeps it, and read back.
+Result(LogState, SymbolonError) through_bytes(Result(LogState, SymbolonError) r) {
+    Option(LogState) o = match r { Ok(s) => logstate_of(logstate_cbor(s)), Err(_) => None };
+    return match o { Some(s) => Ok(s), None => Err(ErrInvalidLog("no kept state")) };
+}
+
+test "R5-2: a kept state extended event by event reaches the whole log's state across a recovery that ends the others" {
+    List(Int) l = log_id();
+    // The owner's kit recover; the thief's rotate, vetoed by device 3 (a
+    // slot held against device 2); the thief's proposal, pending; then,
+    // once the recovery has taken effect, device 4's party-key.
+    SignedEvent r = recover_ev(1, 1, enc(0), 20, after(0));
+    SignedEvent rot = thief_rotate(2, enc(1), after(10));
+    SignedEvent veto = with_digests(next(3, 3, enc(2), VetoBody(2), [3], after(20)), [sha256_bytes(pubk(20))]);
+    SignedEvent prop = with_digests(next(4, 4, enc(3), ProposePartyBody(test_device(31), id32(71)), [2], after(30)), [sha256_bytes(pubk(20))]);
+    SignedEvent pk = next(5, 5, enc(4), PartyKeyBody(id32(4), pubk(23)), [4], after(86405));
+    List(SignedEvent) es = [e0_kit([2, 3]), r, rot, veto, prop, pk];
+    Result(LogState, SymbolonError) whole = il_state(l, es);
+    Str h = state_hex(whole);
+    expect(str_len(h) > 100).toBeTrue();
+    // The recovery ended the proposal and the slot the old quorum held.
+    expect(state_pending(whole)).toEqual(0);
+    expect(state_slots(whole)).toEqual(0);
+    expect(epoch_of(il_verify(l, es, now_after(86405), lambda(x) { false }))).toEqual(1);
+    expect(pending_n(il_verify(l, es, now_after(86405), lambda(x) { false }))).toEqual(0);
+    expect(proposed_n(il_membership(l, es, now_after(86500), lambda(x) { false }))).toEqual(0);
+    // Before the party-key the recover and the proposal are pending in the kept state.
+    expect(state_pending(il_state(l, es[0..5]))).toEqual(2);
+    // From every point, kept in memory or written out and read back, the
+    // kept state and the rest of the log reach the same state.
+    expect(state_hex(extended(il_state(l, es[0..2]), es[2..6]))).toEqual(h);
+    expect(state_hex(extended(il_state(l, es[0..3]), es[3..6]))).toEqual(h);
+    expect(state_hex(extended(il_state(l, es[0..4]), es[4..6]))).toEqual(h);
+    expect(state_hex(extended(il_state(l, es[0..5]), es[5..6]))).toEqual(h);
+    expect(state_hex(extended(through_bytes(il_state(l, es[0..2])), es[2..6]))).toEqual(h);
+    expect(state_hex(extended(through_bytes(il_state(l, es[0..5])), es[5..6]))).toEqual(h);
+    // What a witness checks next on the kept state agrees with the whole log.
+    SignedEvent nx = bare(next(6, 6, enc(5), RotateRecoveryBody, [4], after(86500)));
+    expect(next_ok(il_check_next(l, es, nx, now_after(86500), lambda(x) { false }))).toBeTrue();
+    expect(match through_bytes(il_state(l, es)) { Ok(s) => match il_next_from(l, s, nx, now_after(86500), lambda(x) { false }) { Ok(_) => true, Err(_) => false }, Err(_) => false }).toBeTrue();
+}

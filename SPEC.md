@@ -1405,6 +1405,24 @@ after the delay, measured by witness time, without a valid `veto`.
   event does. A relay that refuses to claim or to store a veto that the
   witnesses co-signed has nothing released: their heads are past the log
   it serves (R2W-5, R3P-3).
+- **A recovery ends what is pending (R5-2).** When a `recover` whose
+  witness time is at or after the release cutover of Section 8.2 takes
+  effect, every other event still pending is dropped: it never takes
+  effect, and a later `veto` or `confirm` of it is refused (it is not
+  pending); so do the vetoed events still held against their signers'
+  cap of open delayed events (Section 8.2). Those events were authorized
+  by the quorum the recovery replaces, and their veto window was that
+  quorum's: the recovered devices are not parties until the recovery
+  applies, and the kit cannot veto.
+  Kept, a `rotate-recovery` to a thief's kit, or a `set-policy` to a
+  thief's relay, filed with a stolen device seconds after the owner's kit
+  `recover`, landed seconds after the recovery, and the owner's new device
+  had only that gap to veto it. While such a `recover` is pending, pending
+  events apply in the order their delays run out (the lowest sequence
+  first among equal times), so an event whose delay ran out before the
+  recovery's still takes effect before it, whatever else the log holds
+  in between. Logs whose `recover` was witnessed before the cutover verify
+  as before.
 - **One at a time.** A `recover` filed while another `recover` is pending
   is invalid. Otherwise whoever holds the kit could take every next
   sequence with another `recover` as soon as the last was witnessed, and
