@@ -174,9 +174,10 @@ test "a log's records are written only by a signed-in device of that log" {
     expect(refused(may_write(s, names[3], [1], twho(b)))).toBeTrue();
     expect(refused(may_write(s, names[4], [1], twho(b)))).toBeTrue();
     expect(may_write(s, names[0], [1], twho(a))).toEqual("");
-    expect(may_write(s, names[1], [1], twho(a))).toEqual("");
-    expect(may_write(s, names[2], [1], twho(a))).toEqual("");
-    expect(may_write(s, names[3], [1], twho(a))).toEqual("");
+    // the kit's blobs from before epoch names: no longer written by anyone
+    expect(may_write(s, names[1], [1], twho(a))).toEqual(kit_legacy_text());
+    expect(may_write(s, names[2], [1], twho(a))).toEqual(kit_legacy_text());
+    expect(may_write(s, names[3], [1], twho(a))).toEqual(kit_legacy_text());
     expect(may_write(s, names[4], [1], twho(a))).toEqual("");
     // a name the relay has no rule for
     expect(refused(may_write(s, "whatever-1", [1], twho(a)))).toBeTrue();
@@ -1127,6 +1128,45 @@ test "a vault state is stored only signed by its writer and one version up" {
     expect(hex_encode(st_bytes(s, "blob/" + n))).toEqual(hex_encode(a1));
     expect(relay_serve_handle(g, treq("PUT", "/blob/" + n, ta, vstate_by(a, 2, 13))).status).toEqual(200);
     expect(relay_serve_handle(g, treq("PUT", "/blob/" + n, tsession(s, b2, 0), vstate_by(b2, 3, 14))).status).toEqual(200);
+}
+
+// The kit's sealed half and secrets were overwritten by any device of the
+// log: a stolen one could destroy them and with them kit recovery. They
+// are now named by epoch and written once, by a device of the log's
+// quorum, for the log's current epoch.
+@requires(filesystem, network, clock(readonly), declassify)
+test "a kit's blobs are written once per epoch by a device of the quorum" {
+    Store s = tmp_store();
+    RelayCfg g = cfg_of(s, "");
+    StoredEvent e0 = log_e0("w1");
+    List(Int) l = put_e0(s, e0);
+    Str lh = hex_encode(l);
+    TDev d2 = TDev {.log = l, .party = lid(2), .priv = lpriv(2), .pub = lpub(2)};
+    TDev out = TDev {.log = l, .party = random_bytes(32), .priv = lpriv(4), .pub = lpub(4)};
+    Str t2 = tsession(s, d2, 1);
+    expect(kit_log_named("kit-" + lh + "-a-0")).toEqual(lh);
+    expect(kit_log_named("kit-" + lh + "-secrets-12")).toEqual(lh);
+    expect(kit_log_named("kitv-" + lh + "-a-3")).toEqual(lh);
+    expect(kit_log_named("kit-" + lh + "-a-")).toEqual("");
+    expect(kit_log_named("kit-" + lh + "-a")).toEqual("");
+    // the epoch of log_e0's quorum is 0
+    expect(relay_serve_handle(g, treq("PUT", "/blob/kit-" + lh + "-a-0", t2, [1])).status).toEqual(200);
+    expect(relay_serve_handle(g, treq("PUT", "/blob/kit-" + lh + "-secrets-0", t2, [2])).status).toEqual(200);
+    expect(relay_serve_handle(g, treq("PUT", "/blob/kitv-" + lh + "-a-0", t2, [3])).status).toEqual(200);
+    // never replaced, never removed
+    expect(relay_serve_handle(g, treq("PUT", "/blob/kit-" + lh + "-a-0", t2, [9])).status).toEqual(409);
+    expect(relay_serve_handle(g, treq("PUT", "/blob/kit-" + lh + "-a-0", t2, [])).status).toEqual(403);
+    expect(st_bytes(s, "blob/kit-" + lh + "-a-0")).toEqual([1]);
+    // an epoch the log has not reached: refused (no one blocks a later re-share's blobs)
+    expect(relay_serve_handle(g, treq("PUT", "/blob/kit-" + lh + "-a-1", t2, [1])).status).toEqual(403);
+    // the names from before: refused (still served)
+    expect(relay_serve_handle(g, treq("PUT", "/blob/kit-" + lh + "-a", t2, [1])).status).toEqual(403);
+    expect(relay_serve_handle(g, treq("PUT", "/blob/kitv-" + lh + "-a", t2, [1])).status).toEqual(403);
+    // not a device of the quorum, or another log's device
+    expect(relay_serve_handle(g, treq("PUT", "/blob/kit-" + lh + "-secrets-0", tsession(s, out, 1), [1])).status).toEqual(403);
+    TDev other = tdev();
+    expect(relay_serve_handle(g, treq("PUT", "/blob/kit-" + lh + "-a-0", tsession(s, other, 0), [1])).status).toEqual(403);
+    expect(relay_serve_handle(g, treq("GET", "/blob/kit-" + lh + "-a-0", "", [])).status).toEqual(200);
 }
 
 // The new device's (key `k`) rotate-recovery at 2 after the recover at 1

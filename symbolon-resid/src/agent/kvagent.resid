@@ -163,13 +163,37 @@ Result(KvOut, Str) combine_at(Int me, List(KvGot) deals, List(List(Int)) old_com
 
 // ─── The kit's half a_v at the relay (SPEC 10.6) ────────────────
 
-pub Str kitv_blob(List(Int) log_id) { return "kitv-" + hex_encode(log_id) + "-a"; }
+// The kit's sealed blobs at the relay are named by the epoch they were
+// made for ("kit-<log>-a-<epoch>", "kit-<log>-secrets-<epoch>",
+// "kitv-<log>-a-<epoch>") and written once, only by a device of the
+// log's quorum at that epoch (relaysrv.resid kit_write): a stolen device
+// can no longer overwrite the kit's half and break kit recovery. The
+// names without an epoch, from before, are still read when the epoch's
+// is not there (each blob is sealed to its epoch, so an older one only
+// fails to open), never written.
+pub Str kit_a_blob(List(Int) log_id, Int epoch) { return "kit-" + hex_encode(log_id) + f"-a-{epoch}"; }
+pub Str kit_secrets_blob(List(Int) log_id, Int epoch) { return "kit-" + hex_encode(log_id) + f"-secrets-{epoch}"; }
+pub Str kitv_blob(List(Int) log_id, Int epoch) { return "kitv-" + hex_encode(log_id) + f"-a-{epoch}"; }
+pub Str kit_a_legacy(List(Int) log_id) { return "kit-" + hex_encode(log_id) + "-a"; }
+pub Str kit_secrets_legacy(List(Int) log_id) { return "kit-" + hex_encode(log_id) + "-secrets"; }
+pub Str kitv_legacy(List(Int) log_id) { return "kitv-" + hex_encode(log_id) + "-a"; }
+
+// The blob `name`, or the one named `legacy` (from before epoch names)
+// when it is not there.
+@requires(network, clock(readonly), declassify)
+pub Option(List(Int)) kit_blob_get(Endpoint relay, Str name, Str legacy) {
+    Option(List(Int)) b = blob_get(relay, name);
+    Bool there = match b { Some(_) => true, None => false };
+    if (there) { return b; }
+    Option(List(Int)) old = blob_get(relay, legacy);
+    return old;
+}
 
 // a_v wrapped to the kit's HPKE key for epoch `epoch`.
 @requires(network, declassify, clock(readonly))
 pub Bool kv_put_kit_half(Endpoint relay, Party kit, List(Int) log_id, UInt(32) epoch, KvDealing d, Int kit_id) {
     Option(Wrapped) w = offline_wrap(kit.hpke_key, log_id, epoch, kit.id, part_bytes(d, kit_id), random_bytes(32));
-    return match w { None => false, Some(x) => blob_put(relay, kitv_blob(log_id), cbor_of_blob(WrappedBlob {.enc = x.enc, .ct = x.ct})) };
+    return match w { None => false, Some(x) => blob_put(relay, kitv_blob(log_id, (Int)epoch), cbor_of_blob(WrappedBlob {.enc = x.enc, .ct = x.ct})) };
 }
 
 // The cosigner's b_v for a recovered device (WKvHalf), read from `cur` on.
@@ -195,7 +219,7 @@ Option(WrappedBlob) half_in(List(Got) gs, Int i) {
 @requires(network, declassify, clock)
 pub Result(KvScalar, Str) kv_kit_share(Endpoint relay, List(Int) log_id, List(Int) kit_hpke_priv, UInt(32) kit_epoch, List(Int) kit_party,
                                        List(Int) my_hpke_priv, UInt(32) my_epoch, List(Int) me, Option(WrappedBlob) bw, List(List(Int)) commits, Int kit) {
-    Option(WrappedBlob) aw = blob_of_cbor(blob_get(relay, kitv_blob(log_id)) else { [] });
+    Option(WrappedBlob) aw = blob_of_cbor(kit_blob_get(relay, kitv_blob(log_id, (Int)kit_epoch), kitv_legacy(log_id)) else { [] });
     List(Int) a = match aw { None => [], Some(b) => offline_unwrap(kit_hpke_priv, log_id, kit_epoch, kit_party, Wrapped {.enc = b.enc, .ct = b.ct}) else { [] } };
     List(Int) b = match bw { None => [], Some(x) => offline_unwrap(my_hpke_priv, log_id, my_epoch, me, Wrapped {.enc = x.enc, .ct = x.ct}) else { [] } };
     if (a.len() != 32) { return Err("the kit's half of the vault OPRF key is not at the relay"); }

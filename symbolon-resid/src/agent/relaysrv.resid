@@ -648,6 +648,8 @@ pub Str may_write(Store root, Str name, List(Int) body, Who w) {
     if (str_starts_with(name, "conkey-")) { return conkey_write(root, name, body, w); }
     if (str_starts_with(name, "attev-") || str_starts_with(name, "attresp-") || str_starts_with(name, "attchal-")) { return att_write(root, name, body, w); }
     if (str_starts_with(name, "recreq-")) { return recreq_write(root, name, body, w); }
+    if (str_len(kit_log_named(name)) > 0) { return kit_write(root, name, body, w); }
+    if (str_len(kit_legacy_named(name)) > 0) { return kit_legacy_text(); }
     Str owner = log_named(name);
     if (str_len(owner) > 0) { return if (owner == hex_encode(w.log)) { "" } else { "only a device of that log writes it" }; }
     Str cid = folder_of(name);
@@ -655,16 +657,74 @@ pub Str may_write(Store root, Str name, List(Int) body, Who w) {
     return "not a name this relay keeps";
 }
 
-// The log a name is one person's: "vault-<log>", "kit-<log>-a",
-// "kit-<log>-secrets", "kitv-<log>-a", "card-<log>"; "" for any other.
+// The log a name is one person's: "vault-<log>", "card-<log>"; "" for
+// any other. (The kit's blobs are kit_log_named.)
 pub Str log_named(Str n) {
     Int len = str_len(n);
     Str l = if (len == 70 && str_starts_with(n, "vault-")) { str_slice(n, 6, 70) } else {
-        if (len == 70 && str_starts_with(n, "kit-") && str_slice(n, 68, 70) == "-a") { str_slice(n, 4, 68) } else {
-            if (len == 76 && str_starts_with(n, "kit-") && str_slice(n, 68, 76) == "-secrets") { str_slice(n, 4, 68) } else {
-                if (len == 71 && str_starts_with(n, "kitv-") && str_slice(n, 69, 71) == "-a") { str_slice(n, 5, 69) } else {
-                    if (len == 69 && str_starts_with(n, "card-")) { str_slice(n, 5, 69) } else { "" } } } } };
+        if (len == 69 && str_starts_with(n, "card-")) { str_slice(n, 5, 69) } else { "" } };
     return if (hex_len(l, 64)) { l } else { "" };
+}
+
+// The log of a kit blob's name from before epoch names ("kit-<log>-a",
+// "kit-<log>-secrets", "kitv-<log>-a"); "" for any other. Such a blob is
+// still served, never written again.
+pub Str kit_legacy_named(Str n) {
+    Int len = str_len(n);
+    Str l = if (len == 70 && str_starts_with(n, "kit-") && str_slice(n, 68, 70) == "-a") { str_slice(n, 4, 68) } else {
+        if (len == 76 && str_starts_with(n, "kit-") && str_slice(n, 68, 76) == "-secrets") { str_slice(n, 4, 68) } else {
+            if (len == 71 && str_starts_with(n, "kitv-") && str_slice(n, 69, 71) == "-a") { str_slice(n, 5, 69) } else { "" } } };
+    return if (hex_len(l, 64)) { l } else { "" };
+}
+
+pub Str kit_legacy_text() { return "the kit's blobs are named by their epoch now: update this device"; }
+
+// The log of a kit blob's name: "kit-<log>-a-<epoch>",
+// "kit-<log>-secrets-<epoch>", "kitv-<log>-a-<epoch>"; "" for any other.
+pub Str kit_log_named(Str n) {
+    Int len = str_len(n);
+    Str l = if (len > 71 && str_starts_with(n, "kit-") && str_slice(n, 68, 71) == "-a-") { str_slice(n, 4, 68) } else {
+        if (len > 77 && str_starts_with(n, "kit-") && str_slice(n, 68, 77) == "-secrets-") { str_slice(n, 4, 68) } else {
+            if (len > 72 && str_starts_with(n, "kitv-") && str_slice(n, 69, 72) == "-a-") { str_slice(n, 5, 69) } else { "" } } };
+    return if (hex_len(l, 64) && dec_ok(kit_epoch_part(n), 0)) { l } else { "" };
+}
+
+// The epoch in a kit blob's name ("" when it has none).
+Str kit_epoch_part(Str n) {
+    Int at = if (str_starts_with(n, "kitv-")) { 72 } else { if (str_len(n) > 71 && str_slice(n, 68, 71) == "-a-") { 71 } else { 77 } };
+    return if (str_len(n) > at) { str_slice(n, at, str_len(n)) } else { "" };
+}
+
+// The kit's sealed half and secrets (SPEC 10.6, 18.10.1) are what kit
+// recovery opens; the relay took any write of them from any device of the
+// log, so a stolen device could overwrite them with garbage and make the
+// kit useless for good (no device keeps a copy). A kit blob is now named
+// by the epoch it was made for and written once (stored_reply), only by a
+// device of the log's verified quorum whose epoch that is: at inception
+// (epoch 1) and after each re-share (enrolment, removal, recovery), the
+// device finishing it writes the new epoch's blobs; no one replaces them,
+// and no one writes an epoch the log has not reached. The log is
+// verified offline at its own last witness time (as a sign-in starts):
+// the epoch moves only with a witnessed event.
+@requires(filesystem, network, clock(readonly), declassify)
+pub Str kit_write(Store root, Str name, List(Int) body, Who w) {
+    if (kit_log_named(name) != hex_encode(w.log)) { return "only a device of that log writes it"; }
+    if (body.len() == 0) { return "a kit's blob is never removed"; }
+    List(SignedEvent) evs = log_dir(root, w.log, (UInt(64))0, []);
+    if (evs.len() == 0) { return "no log at this relay"; }
+    Result(VerifiedHead, SymbolonError) rv = il_verify(w.log, evs, last_time(evs, policy_of_e0(evs)), lambda(x) { false });
+    return match rv {
+        Err(_) => "the log does not verify",
+        Ok(vh) => kit_write_at(vh, name, w)
+    };
+}
+
+Str kit_write_at(VerifiedHead vh, Str name, Who w) {
+    Option(Party) d = device_party(vh.head.quorum.parties, w.party, 0);
+    Bool dev = match d { None => false, Some(x) => bytes_eq(x.auth_key, w.key) };
+    if (!dev) { return "only a device of the log's quorum writes the kit's blobs"; }
+    if (str_parse_int(kit_epoch_part(name)) != (Int)vh.head.quorum.epoch) { return "a kit's blob is written only for the log's current epoch"; }
+    return "";
 }
 
 pub Int max_alert() { return 65536; }
@@ -1146,7 +1206,7 @@ Int int_or_none(Str s) { return if (str_len(s) > 0 && str_len(s) < 19 && dec_ok(
 // free, but two writers can both pass that check; the write itself is
 // write-once (st_put_new), so only one lands and the other gets 409.
 pub Bool write_once(Str name) {
-    return str_starts_with(name, "alrt-") || str_starts_with(name, "orggov-") || str_starts_with(name, "audit-") || str_starts_with(name, "accept-") || str_starts_with(name, "recreq-");
+    return str_len(kit_log_named(name)) > 0 || str_starts_with(name, "alrt-") || str_starts_with(name, "orggov-") || str_starts_with(name, "audit-") || str_starts_with(name, "accept-") || str_starts_with(name, "recreq-");
 }
 
 // Stores a write may_write allowed: a write-once name once (409 when it is

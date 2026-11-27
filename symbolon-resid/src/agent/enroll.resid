@@ -716,8 +716,8 @@ Int finish_enroll(Str dir, DeviceConfig c, Unlocked u, VerifiedHead vh, CgConfig
     List(Int) ka = kit_key(kk, kb);
     Wrapped wa = offline_wrap(kit.hpke_key, c.log_id, nq.epoch, kit.id, half_bytes(res.offline[0].share, ka), random_bytes(32)) else { Wrapped {.enc = [], .ct = []} };
     Bool ok = wa.ct.len() > 0
-        && blob_put(relay, "kit-" + hex_encode(c.log_id) + "-a", cbor_of_blob(WrappedBlob {.enc = wa.enc, .ct = wa.ct}))
-        && blob_put(relay, "kit-" + hex_encode(c.log_id) + "-secrets", kit_secrets_seal(secret_bytes(kk), c.log_id, nq.epoch, u.real.cc, u.real.vault_key))
+        && blob_put(relay, kit_a_blob(c.log_id, (Int)nq.epoch), cbor_of_blob(WrappedBlob {.enc = wa.enc, .ct = wa.ct}))
+        && blob_put(relay, kit_secrets_blob(c.log_id, (Int)nq.epoch), kit_secrets_seal(secret_bytes(kk), c.log_id, nq.epoch, u.real.cc, u.real.vault_key))
         && send_to(relay, me, Remote {.party = cos.id, .cg = 0, .hpke_pub = cos.hpke_key}, WKitKey(kb))
         && send_secrets(relay, me, rem, cos.id, u, 0)
         && store_share(dir, u.real.dek, ncfg) && store_dshare(dir, u.real, ncfg)

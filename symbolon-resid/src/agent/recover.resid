@@ -521,13 +521,13 @@ Int release_then(Str dir, DeviceConfig c, Unlocked u, KitKeys kit, VerifiedHead 
         None => []
     };
     if (theirs.len() != 64) { return dfail("the cosigner did not release its half"); }
-    Option(WrappedBlob) oa = blob_of_cbor(blob_get(relay, "kit-" + hex_encode(c.log_id) + "-a") else { [] });
+    Option(WrappedBlob) oa = blob_of_cbor(kit_blob_get(relay, kit_a_blob(c.log_id, (Int)pre.epoch), kit_a_legacy(c.log_id)) else { [] });
     List(Int) mine = match oa { Some(b) => offline_unwrap(kit.hpke_priv, c.log_id, pre.epoch, oldkit.id, Wrapped {.enc = b.enc, .ct = b.ct}) else { [] }, None => [] };
     Half hb = half_of(theirs) else { Half {.share = [], .key = []} };
     Half ha = half_of(mine) else { Half {.share = [], .key = []} };
     Half full = kit_assemble(ha, hb) else { Half {.share = [], .key = []} };
     if (full.key.len() != 32) { return dfail("the kit's halves do not assemble"); }
-    Result(KitSecrets, SymbolonError) ks = kit_secrets_open(secret_bytes(full.key), c.log_id, pre.epoch, blob_get(relay, "kit-" + hex_encode(c.log_id) + "-secrets") else { [] });
+    Result(KitSecrets, SymbolonError) ks = kit_secrets_open(secret_bytes(full.key), c.log_id, pre.epoch, kit_blob_get(relay, kit_secrets_blob(c.log_id, (Int)pre.epoch), kit_secrets_legacy(c.log_id)) else { [] });
     // The kit's share of the vault OPRF key (SPEC 18.10.1): a_v from the
     // relay and the cosigner's b_v, released with its kit half.
     Bool has_kv = vh.head.quorum.kv_commits.len() > 0;

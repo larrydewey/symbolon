@@ -772,8 +772,8 @@ Int publish(Str dir, DeviceConfig c, Unlocked u, KitKeys kit, List(PartyKeys) pa
     Wrapped wb = offline_wrap(cr.hpke_pub, l, 1, cr.party, half_bytes(halves.b, halves.kb), random_bytes(32)) else { Wrapped {.enc = [], .ct = []} };
     List(Int) secrets = kit_secrets_seal(secret_bytes(kk), l, 1, u.real.cc, u.real.vault_key);
     Local dev = Local {.party = c.party, .cg = 1, .hpke_sk = device_transport(c, u.real.dek).sk};
-    Bool ok = blob_put(relay, "kit-" + hex_encode(l) + "-a", cbor_of_blob(WrappedBlob {.enc = wa.enc, .ct = wa.ct}))
-           && blob_put(relay, "kit-" + hex_encode(l) + "-secrets", secrets)
+    Bool ok = blob_put(relay, kit_a_blob(l, 1), cbor_of_blob(WrappedBlob {.enc = wa.enc, .ct = wa.ct}))
+           && blob_put(relay, kit_secrets_blob(l, 1), secrets)
            && send_to(relay, dev, cr, WKitHalf(WrappedBlob {.enc = wb.enc, .ct = wb.ct}))
            && store_share(dir, u.real.dek, mine) && store_dshare(dir, u.real, mine)
            // k_v: this device's share (never in the duress profile), and
