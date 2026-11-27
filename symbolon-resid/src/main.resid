@@ -528,7 +528,7 @@ Int main_cmd() {
     if (a1 == "device" && a2 == "alerts" && args.get(3) == "register" && n == 5) { return device_alerts_register(args.get(4)); }
     if (a1 == "device" && a2 == "alerts" && args.get(3) == "inbox" && n == 5) { return device_alerts_inbox(args.get(4)); }
     if (a1 == "device" && a2 == "duress" && args.get(3) == "end" && n == 5) { return device_duress_end(args.get(4)); }
-    if (a1 == "home" && a2 == "alerts" && n >= 4) { return home_alerts(args.get(3), arg_list(4, n, ListBuf())); }
+    if (a1 == "home" && a2 == "alerts" && n >= 4) { return home_alerts_cmd(args.get(3), arg_list(4, n, ListBuf())); }
     if (a1 == "device" && a2 == "vault" && args.get(3) == "signin-lastpass" && n >= 5) {
         return vault_signin_lastpass(args.get(4), has_flag("--dry-run", 5), share);
     }

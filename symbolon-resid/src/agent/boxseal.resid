@@ -8,7 +8,7 @@
 //   "SYMBSEAL" || IV (12) || AES-256-GCM(box key, IV, plaintext,
 //                                        "symbolon v1 home sealed file")
 //
-// A cosigner directory on a sealed box holds `box-seal.path`, naming the
+// A cosigner directory on a sealed box holds `.box-seal.path`, naming the
 // box key's file in memory. While it is there, every secret file the
 // cosigner writes (put_secret_file) is sealed, and one it cannot seal (the
 // key is not in memory) is not written at all; get_file opens sealed files
@@ -20,7 +20,8 @@ import "aesgcm.resid";
 import "crypto.resid";
 
 pub List(Int) seal_magic() { return [83, 89, 77, 66, 83, 69, 65, 76]; }   // "SYMBSEAL"
-pub Str seal_ptr_name() { return "box-seal.path"; }
+// Hidden, so no listing of a directory (the relay store's) shows it.
+pub Str seal_ptr_name() { return ".box-seal.path"; }
 // "symbolon v1 home sealed file"
 List(Int) seal_aad() { return [115, 121, 109, 98, 111, 108, 111, 110, 32, 118, 49, 32, 104, 111, 109, 101, 32, 115, 101, 97, 108, 101, 100, 32, 102, 105, 108, 101]; }
 
@@ -52,7 +53,7 @@ Int seal_last_slash(Str s, Int i) {
     return if (str_slice(s, i, i + 1) == "/") { i } else { seal_last_slash(s, i - 1) };
 }
 
-// Whether `dir` is sealed (its box-seal.path is there), and the box key
+// Whether `dir` is sealed (its .box-seal.path is there), and the box key
 // when the file it names holds one ([] when it does not: the box is not
 // serving, so nothing is written and nothing sealed opens).
 pub type SealAt = { Bool on; List(Int) key; };
@@ -85,6 +86,37 @@ pub List(Int) seal_get(Str path) {
     // files, whatever their first bytes).
     if (!s.on) { return b; }
     return match unseal_bytes(s.key, b) { Some(p) => p, None => [] };
+}
+
+// ─── A tree sealed at its root (the relay's directory store) ────
+
+// What to write under `root` for the bytes `b`: sealed when the root names
+// the box key (its .box-seal.path), else `b`; None when it is sealed and the
+// key is not in memory (nothing is written then).
+@requires(filesystem)
+pub Option(List(Int)) seal_wrap(Str root, List(Int) b) {
+    SealAt s = seal_at(root);
+    if (!s.on) { return Some(b); }
+    List(Int) x = seal_bytes(s.key, b);
+    return if (x.len() > 0) { Some(x) } else { None };
+}
+
+// The bytes read under `root`, opened: sealed ones under the box key the
+// root names (None when they do not open), others as they are.
+@requires(filesystem)
+pub Option(List(Int)) seal_unwrap(Str root, List(Int) b) {
+    if (!is_sealed(b)) { return Some(b); }
+    SealAt s = seal_at(root);
+    if (!s.on) { return Some(b); }
+    return unseal_bytes(s.key, b);
+}
+
+// The text of a small file's bytes (a token, a settings file; ASCII).
+pub Str seal_text(List(Int) b) { return seal_text_at(b, 0, StrBuf()); }
+
+Str seal_text_at(List(Int) b, Int i, StrBuf acc) {
+    if (i >= b.len()) { return acc.finish(); }
+    return seal_text_at(b, i + 1, acc.push(str_from_code(b[i])));
 }
 
 // ─── Memory only ────────────────────────────────────────────────

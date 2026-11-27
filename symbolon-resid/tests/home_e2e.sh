@@ -146,4 +146,17 @@ done
 run 60 "$BIN" home status "$W/box" > "$W/hstatus.log" 2>&1 || fail "home status"
 grep -q '"secure": true' "$W/hstatus.log" || fail "home status: $(cat "$W/hstatus.log")"
 echo "at rest: the cosigner's root key, share and kit half are sealed; home status: secure"
+
+# The rest of the box's secrets: the relay's store (its claim and
+# challenge keys, sessions, logs), the cosigner's mail token, and the
+# alert channels' settings, written by `home alerts` with the passphrase.
+[ -e "$W/box/relay/auth/claim-key" ] || fail "the relay has no claim key"
+PLAIN=$(find "$W/box/relay" -type f ! -name '.*' -exec sh -c '[ "$(head -c 8 "$1")" = SYMBSEAL ] || echo "$1"' _ {} \;)
+[ -z "$PLAIN" ] || fail "relay objects not sealed: $PLAIN"
+[ -e "$W/box/people/alice/cos/relay.mtoken" ] && { sealed "$W/box/people/alice/cos/relay.mtoken" || fail "the cosigner's mail token is not sealed"; }
+SYMBOLON_HOME_PASSPHRASE_FILE="$W/pass" run 120 "$BIN" home alerts "$W/box" set smtp_pass hunter2-secret > "$W/alerts.log" 2>&1 || fail "home alerts: $(cat "$W/alerts.log")"
+sealed "$W/box/alerts.conf" && ! grep -q hunter2 "$W/box/alerts.conf" || fail "alerts.conf is not sealed"
+SYMBOLON_HOME_PASSPHRASE_FILE="$W/pass" run 120 "$BIN" home alerts "$W/box" | grep -qx 'smtp_pass (set)' || fail "home alerts does not read the sealed settings"
+SYMBOLON_HOME_PASSPHRASE_FILE="$W/wrong" run 120 "$BIN" home alerts "$W/box" > /dev/null 2>&1 && fail "home alerts with a wrong passphrase"
+echo "at rest: the relay's store, the cosigner's mail token and the alert settings are sealed"
 echo "PASS home_e2e"

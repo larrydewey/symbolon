@@ -59,6 +59,7 @@ import "state.resid";
 import "common.resid";
 import "cosignerd.resid";
 import "boxseal.resid";
+import "alerts.resid";
 import "crypto.resid";
 import "cose.resid";
 import "ecdsa.resid";
@@ -391,9 +392,10 @@ pub List(Int) box_file(Str path, List(Int) k) {
 
 // The secret files of a cosigner's directory (cosignerd.resid,
 // epochfiles.resid): its root key, its shares and the kit's halves, the
-// vault OPRF shares, the duress keys, and a re-share's pending ones.
+// vault OPRF shares, the duress keys, a re-share's pending ones, and its
+// mail session at the relay.
 pub Bool cos_secret_name(Str n) {
-    return n == "root" || n == "duress-keys" || n == "duress-transport"
+    return n == "root" || n == "duress-keys" || n == "duress-transport" || n == "relay.mtoken"
         || (str_starts_with(n, "cg-") && str_ends_with(n, ".cfg")) || str_starts_with(n, "kit-b-") || str_starts_with(n, "kit-half")
         || str_starts_with(n, "kv-") || str_starts_with(n, "kitv-b-") || str_starts_with(n, "kvpend-")
         || (str_starts_with(n, "pending-") && (str_ends_with(n, ".cfg") || str_ends_with(n, ".kitb") || str_ends_with(n, ".kb") || str_ends_with(n, ".kv")));
@@ -413,13 +415,38 @@ Bool seal_people(Str dir, List(Str) people, Int i, List(Int) k) {
     return seal_cos_dir(cos, filesystem.list_dir(cos), 0, k) && seal_people(dir, people, i + 1, k);
 }
 
-// Every key of the box sealed under `k`: the CA's, the server
-// certificate's, the witnesses', and each cosigner's secret files.
+// Every object of the relay's directory store (its claim and challenge
+// keys, sign-in sessions, mailboxes, logs, blobs), sealed where it lies;
+// the claims and temporary files beside them (names starting with ".")
+// hold no data and stay.
+@requires(filesystem)
+pub Bool seal_tree(Str d, List(Str) names, Int i, List(Int) k) {
+    if (i >= names.len()) { return true; }
+    Str n = names[i];
+    Str p = d + "/" + n;
+    Bool ok = str_starts_with(n, ".") || (if (filesystem.is_dir(p)) { seal_tree(p, filesystem.list_dir(p), 0, k) } else { seal_in_place(p, k) });
+    return ok && seal_tree(d, names, i + 1, k);
+}
+
+// Every secret of the box sealed under `k`: the CA's key, the server
+// certificate's, the witnesses', each cosigner's secret files, the relay's
+// store and the alert channels' settings (SMTP and ntfy credentials).
 @requires(filesystem)
 pub Bool seal_box_files(Str dir, List(Int) k) {
     return seal_in_place(dir + "/tls/ca.key", k) && seal_in_place(dir + "/tls/server.key", k)
         && seal_in_place(dir + "/w1.key", k) && seal_in_place(dir + "/w2.key", k) && seal_in_place(dir + "/w3.key", k)
-        && seal_people(dir, filesystem.list_dir(dir + "/people"), 0, k);
+        && seal_people(dir, filesystem.list_dir(dir + "/people"), 0, k)
+        && seal_tree(dir + "/relay", filesystem.list_dir(dir + "/relay"), 0, k)
+        && seal_in_place(dir + "/alerts.conf", k);
+}
+
+// `symbolon home alerts DIR [set KEY VALUE]`: on a sealed box, with the
+// box key (the TPM, or the passphrase) to open and seal the settings.
+@requires(filesystem, environment, device, declassify)
+pub Int home_alerts_cmd(Str dir, List(Str) args) {
+    if (!home_sealed(dir)) { return home_alerts(dir, args); }
+    List(Int) k = open_box_key(dir, "");
+    return if (k.len() == 32) { home_alerts_with(dir, args, k) } else { 1 };
 }
 
 // ─── What the box's devices are told ────────────────────────────
@@ -837,6 +864,15 @@ Bool put_unsealed(Str from, Str to, List(Int) k) {
     return b.len() > 0 && filesystem.write_secret(to, b);
 }
 
+// The cosigners, the relay's directory store and the box's own settings
+// (alerts.conf, read by the cosigners) name the box key in memory.
+@requires(filesystem)
+Bool point_all(Str dir, Str keyfile) {
+    _ = filesystem.create_dir(dir + "/relay");
+    return point_people(dir, filesystem.list_dir(dir + "/people"), 0, keyfile)
+        && filesystem.write_all(dir + "/relay/" + seal_ptr_name(), keyfile) && filesystem.write_all(dir + "/" + seal_ptr_name(), keyfile);
+}
+
 // Each cosigner directory names the box key in memory (boxseal.resid).
 @requires(filesystem)
 Bool point_people(Str dir, List(Str) people, Int i, Str keyfile) {
@@ -863,7 +899,7 @@ pub Int home_serve(Str dir, Str self, Str pass_flag, Str run_base) {
         ServeKeys {.run = "", .server_key = dir + "/tls/server.key", .witness_keys = [dir + "/w1.key", dir + "/w2.key", dir + "/w3.key"]} };
     if (str_len(sk.server_key) == 0) { eprintln("home: cannot unseal the keys into " + run); return 1; }
     Str keyfile = if (sealed) { run + "/box.key" } else { "" };
-    if (sealed && !point_people(dir, filesystem.list_dir(dir + "/people"), 0, keyfile)) { eprintln("home: cannot point the cosigners at the box key"); return 1; }
+    if (sealed && !point_all(dir, keyfile)) { eprintln("home: cannot point the cosigners and the relay at the box key"); return 1; }
     if (!local_hosts(dir, filesystem.list_dir(dir + "/people"), 0, local_witnesses(dir, c))) { eprintln("home: cannot tell the cosigners where the witnesses are"); return 1; }
     Str tls = " --tls " + dir + "/tls/server.pem " + sk.server_key + " --bind " + c.bind;
     List(Str) cmds = [

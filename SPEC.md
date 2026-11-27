@@ -2635,10 +2635,13 @@ can neither co-sign an event nor answer a head for a log (Section 20.3).
 The rule is checked at setup (`on_box * 2 < total`); the witnesses a
 principal was given are recorded with their cosigner.
 
-**Keys at rest.** The box seals every key it holds, the cosigners' (their
-root keys, shares, kit halves, vault OPRF shares, duress keys), its
-witness's, its CA's and its server certificate's, under one box key
-(AES-256-GCM), and seals the box key to the box's TPM (a TPM-held HMAC key
+**Keys at rest.** The box seals every secret it holds, the cosigners'
+keys (their root keys, shares, kit halves, vault OPRF shares, duress keys)
+and mail sessions at the relay, its witness's key, its CA's and its server
+certificate's, every object of its relay's directory store (the relay's
+claim and challenge keys, sign-in sessions, mailboxes, logs and blobs) and
+its alert channels' settings (SMTP and ntfy credentials), under one box
+key (AES-256-GCM), and seals the box key to the box's TPM (a TPM-held HMAC key
 over a salt), or, without one, to a passphrase (Argon2id). The box key is
 unsealed into memory (a tmpfs) when the box starts and nowhere else; a
 cosigner that cannot reach it neither reads nor writes a secret file. A

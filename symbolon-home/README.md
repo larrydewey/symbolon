@@ -19,8 +19,11 @@ no Let's Encrypt. Phones pin the box's certificate through the QR code.
 
 ## The keys are sealed
 
-The cosigners' keys, the witness key and the certificate keys are stored
-**sealed** on the box's disk: encrypted under a box key that is itself
+Everything secret on the box is stored **sealed** on its disk: the
+cosigners' keys and relay sessions, the witness key, the certificate keys,
+the relay's store (its claim and sign-in keys, sessions, mailboxes, logs)
+and the alert settings (`home alerts`, which asks for the passphrase on a
+box without a TPM). They are encrypted under a box key that is itself
 sealed to the box's **TPM** (a TPM 2.0 chip, when the box has one) or, without
 one, to a **passphrase** (stretched with Argon2id). `home serve` unseals the
 keys into memory (`/dev/shm`) when it starts, and only then. A copy of the
@@ -117,7 +120,8 @@ it is secured. Stop the box, then:
         --witness pc.lan:47110:KEY1 --witness witness.example.org:443:KEY2
     docker compose up -d
 
-This seals every key on the box (TPM, else the passphrase), and people
+This seals every secret on the box in place (the keys, the relay's store,
+the alert settings; TPM, else the passphrase), and people
 invited from now on get the box's one witness and the two outside it. People
 paired before keep their identities as they are, on the box's three
 witnesses until one of their devices moves them. `home secure` prints the

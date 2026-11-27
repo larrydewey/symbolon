@@ -31,6 +31,10 @@ hx() { printf '%s' "$1" | od -An -tx1 | tr -d ' \n'; }
 unhx() { printf '%s' "$1" | xxd -r -p; }
 BASE=$(python3 -c 'import random; print(random.randrange(20000, 60000, 10))')
 BLOB="$W/box/relay/blob"
+# The relay's store is sealed under the box key: to play a malicious relay,
+# objects are opened, changed and sealed again with the key the running box
+# holds in memory (tests/relay_seal.py).
+rs() { python3 "$PWD/tests/relay_seal.py" "$(cat "$W/box/run.path")/box.key" "$@"; }
 
 python3 - "$W" <<'EOF'
 import json, os, sys
@@ -91,11 +95,7 @@ grep -qx "$BLOG $(hx Bob) $BFP -" "$W/people.log" && grep -qx "$ALOG $(hx Alice)
 [[ "$AFP" =~ ^[0-9]{5}(-[0-9]{5}){5}$ ]] || fail "fingerprint $AFP"
 # A card someone else signed is not listed.
 cp "$BLOB/card-$BLOG" "$W/bobcard"
-python3 - "$BLOB/card-$BLOG" <<'EOF'
-import sys
-p = sys.argv[1]; b = open(p, 'rb').read()
-open(p, 'wb').write(b.replace(b'Bob', b'Eve'))
-EOF
+rs replace "$BLOB/card-$BLOG" Bob Eve
 run 120 "$BIN" device share people "$A" > "$W/people2.log" 2>&1
 grep -q "$(hx Eve)" "$W/people2.log" && fail "a card altered at the relay was listed"
 cp "$W/bobcard" "$BLOB/card-$BLOG"
@@ -174,11 +174,7 @@ echo "leave: bob leaves Work; alice's device removes him and gives it a new key"
 
 # What the relay could try.
 cp "$BLOB/roster-$ID" "$W/roster.v2"
-python3 - "$BLOB/roster-$ID" <<'EOF'
-import sys
-p = sys.argv[1]; b = open(p, 'rb').read()
-open(p, 'wb').write(b.replace(b'Bob', b'Bot'))
-EOF
+rs replace "$BLOB/roster-$ID" Bob Bot
 pin device vault list "$B" --share "$ID" > "$W/tamper.log" 2>&1 || fail "bob's copy: $(cat "$W/tamper.log")"
 grep -q "local copy: .*signature does not verify" "$W/tamper.log" || fail "tampered roster: $(cat "$W/tamper.log")"
 cp "$W/roster.v2" "$BLOB/roster-$ID"

@@ -28,6 +28,7 @@ import "../net/proto.resid";
 import "../net/services.resid";
 import "state.resid";
 import "common.resid";
+import "boxseal.resid";
 import "session.resid";
 import "cggmp_store.resid";
 import "kvagent.resid";
@@ -72,7 +73,7 @@ Local me_of(Cosigner c) { return Local {.party = c.cfg.party, .cg = 0, .hpke_sk 
 
 @requires(filesystem, clock(readonly))
 Str cos_token(Str dir) {
-    List(Str) p = str_split(str_trim(filesystem.read_all(dir + "/relay.mtoken")), " ");
+    List(Str) p = str_split(str_trim(seal_text(get_file(dir + "/relay.mtoken"))), " ");
     return if (p.len() == 2 && str_len(p[0]) == 64 && str_parse_int(p[1]) > clock_now_seconds() + 3600) { p[0] } else { "" };
 }
 
@@ -94,7 +95,7 @@ Cosigner cos_mail_ready(Cosigner c) {
     Str chal = relay_challenge(e);
     Str name = relay_name(c.cfg.relay_host, c.cfg.relay_port);
     Str t = if (str_len(chal) == 0) { "" } else { mail_session_from(e, chal, c.cfg.log_id, c.cfg.party, sw_sign(cos_dk(c.root), mail_auth_message(name, cose_hex_decode(chal))), name) };
-    if (str_len(t) == 0 || !filesystem.write_secret(c.dir + "/relay.mtoken", str_to_bytes(t))) { return c; }
+    if (str_len(t) == 0 || !put_secret_file(c.dir + "/relay.mtoken", str_to_bytes(t))) { return c; }
     return Cosigner {.dir = c.dir, .cfg = c.cfg, .root = c.root, .mail = cos_token(c.dir)};
 }
 

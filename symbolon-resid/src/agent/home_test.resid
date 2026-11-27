@@ -8,6 +8,8 @@ import "common.resid";
 import "boxseal.resid";
 import "device.resid";
 import "home.resid";
+import "alerts.resid";
+import "../net/store.resid";
 import "httpserv.resid";
 import "ecdsa.resid";
 import "crypto.resid";
@@ -120,6 +122,97 @@ test "home secure seals every key file of an existing box in place, and leaves t
     List(Int) once = filesystem.read_bytes(cos + "/root");
     expect(seal_box_files(d, k)).toBeTrue();
     expect(filesystem.read_bytes(cos + "/root")).toEqual(once);
+}
+
+@requires(filesystem, declassify)
+test "home secure seals the relay's store, the alert settings and the cosigner's mail token in place" {
+    Str d = tmp_dir();
+    Str cos = d + "/people/bob/cos";
+    _ = filesystem.create_dir(d + "/people");
+    _ = filesystem.create_dir(d + "/people/bob");
+    _ = filesystem.create_dir(cos);
+    _ = filesystem.create_dir(d + "/relay");
+    _ = filesystem.create_dir(d + "/relay/auth");
+    _ = filesystem.create_dir(d + "/relay/log");
+    _ = filesystem.create_dir(d + "/relay/log/ab");
+    List(Int) k = key32(60);
+    List(Int) claim = key32(61);
+    List(Int) chal = key32(62);
+    _ = filesystem.write_bytes(d + "/relay/auth/claim-key", claim);
+    _ = filesystem.write_bytes(d + "/relay/auth/challenge-key", chal);
+    _ = filesystem.write_bytes(d + "/relay/log/ab/0", [1, 2, 3]);
+    _ = filesystem.write_all(d + "/relay/log/ab/.1.claim", "1700000000");
+    _ = filesystem.write_all(d + "/alerts.conf", "smtp_pass=hunter2-secret\nntfy_token=tk_abcdef\n");
+    _ = filesystem.write_all(cos + "/relay.mtoken", "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef 1900000000");
+    expect(seal_box_files(d, k)).toBeTrue();
+    List(Int) ck = filesystem.read_bytes(d + "/relay/auth/claim-key");
+    expect(is_sealed(ck)).toBeTrue();
+    expect(contains_bytes(ck, claim[0..8], 0)).toBeFalse();
+    expect(contains_bytes(filesystem.read_bytes(d + "/relay/auth/challenge-key"), chal[0..8], 0)).toBeFalse();
+    expect(is_sealed(filesystem.read_bytes(d + "/relay/log/ab/0"))).toBeTrue();
+    // A claim beside an object holds no data and is left as it is.
+    expect(filesystem.read_all(d + "/relay/log/ab/.1.claim")).toEqual("1700000000");
+    List(Int) conf = filesystem.read_bytes(d + "/alerts.conf");
+    expect(is_sealed(conf)).toBeTrue();
+    expect(contains_bytes(conf, str_to_bytes("hunter2"), 0)).toBeFalse();
+    expect(contains_bytes(conf, str_to_bytes("tk_abc"), 0)).toBeFalse();
+    List(Int) mt = filesystem.read_bytes(cos + "/relay.mtoken");
+    expect(is_sealed(mt)).toBeTrue();
+    expect(contains_bytes(mt, str_to_bytes("0123456789abcdef"), 0)).toBeFalse();
+    expect(box_file(d + "/relay/auth/claim-key", k)).toEqual(claim);
+}
+
+@requires(filesystem, declassify, network, clock(readonly))
+test "the relay's directory store on a sealed box writes every object sealed, and none without the key" {
+    Str d = tmp_dir();
+    Str run = tmp_dir();
+    List(Int) k = key32(70);
+    List(Int) claim = key32(71);
+    Store st = FsStore(d);
+    // Not sealed: objects as they are.
+    expect(st_put(st, "blob/x", [5, 6])).toBeTrue();
+    expect(filesystem.read_bytes(d + "/blob/x")).toEqual([5, 6]);
+    // Sealed: written sealed, read opened; an object from before is read as it is.
+    _ = filesystem.write_secret(run + "/box.key", k);
+    _ = filesystem.write_all(d + "/" + seal_ptr_name(), run + "/box.key");
+    expect(st_put_new(st, "auth/claim-key", claim)).toEqual(1);
+    List(Int) disk = filesystem.read_bytes(d + "/auth/claim-key");
+    expect(is_sealed(disk)).toBeTrue();
+    expect(contains_bytes(disk, claim[0..8], 0)).toBeFalse();
+    expect(st_bytes(st, "auth/claim-key")).toEqual(claim);
+    expect(st_put(st, "auth/challenge-key", key32(72))).toBeTrue();
+    expect(contains_bytes(filesystem.read_bytes(d + "/auth/challenge-key"), key32(72)[0..8], 0)).toBeFalse();
+    expect(st_bytes(st, "auth/challenge-key")).toEqual(key32(72));
+    expect(st_bytes(st, "blob/x")).toEqual([5, 6]);
+    // The listing does not show the pointer.
+    expect(st_list(st, "", "", 100).contains(seal_ptr_name())).toBeFalse();
+    // The box key gone from memory: nothing opens, nothing is written.
+    _ = filesystem.write_secret(run + "/box.key", []);
+    expect(st_get(st, "auth/claim-key")).toEqual(None);
+    expect(st_put(st, "blob/y", [1])).toBeFalse();
+    expect(st_put_new(st, "blob/z", [1])).toEqual(-1);
+    expect(filesystem.exists(d + "/blob/y")).toBeFalse();
+}
+
+@requires(filesystem, declassify)
+test "the alert settings on a sealed box are written sealed and read by the cosigners through the box key" {
+    Str d = tmp_dir();
+    Str run = tmp_dir();
+    List(Int) k = key32(80);
+    _ = filesystem.write_all(d + "/home.txt", "47100\n192.168.1.20\n");
+    expect(home_alerts_with(d, ["set", "smtp_pass", "hunter2-secret"], k)).toEqual(0);
+    List(Int) conf = filesystem.read_bytes(d + "/alerts.conf");
+    expect(is_sealed(conf)).toBeTrue();
+    expect(contains_bytes(conf, str_to_bytes("hunter2"), 0)).toBeFalse();
+    expect(home_alerts_with(d, ["set", "ntfy_token", "tk_abcdef"], k)).toEqual(0);
+    // Another key opens nothing and changes nothing.
+    expect(home_alerts_with(d, ["set", "smtp_user", "x"], key32(81))).toEqual(1);
+    // The cosigners read it through the box key the box's directory names.
+    _ = filesystem.write_secret(run + "/box.key", k);
+    _ = filesystem.write_all(d + "/" + seal_ptr_name(), run + "/box.key");
+    BoxAlerts b = box_alerts(d);
+    expect(setting(b, "smtp_pass")).toEqual("hunter2-secret");
+    expect(setting(b, "ntfy_token")).toEqual("tk_abcdef");
 }
 
 test "the unsealed keys go only to a directory in memory" {

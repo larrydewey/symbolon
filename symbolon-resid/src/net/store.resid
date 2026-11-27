@@ -12,10 +12,17 @@
 //   --store postgres://USER:PASSWORD@HOST:PORT/DB[?sslmode=verify-full]   table symbolon_objects (made on start);
 //                                                TLS under --store-ca FILE
 //   --store s3://KEY-ID:SECRET@HOST:PORT/BUCKET?region=R   (--store-ca FILE for HTTPS)
+//
+// A directory store on a sealed Symbolon Home box names the box key in
+// memory at its root (.box-seal.path, agent/boxseal.resid): every object is
+// then written sealed under it, and nothing at all when the key is not in
+// memory; objects read are opened (one written before the box was sealed
+// is read as it is).
 
 import "pg.resid";
 import "s3.resid";
 import "crypto.resid";
+import "../agent/boxseal.resid";
 
 pub type StoreCfg = Fs(Str) | Pg(PgCfg) | S3(S3Cfg);
 pub type Store = FsStore(Str) | PgStore(PgConn) | PgTlsStore(PgCfg) | S3Store(S3Cfg);
@@ -95,7 +102,7 @@ List(Int) utf(Str s) { return str_to_bytes(s); }
 @requires(filesystem, network, clock(readonly), declassify)
 pub Option(List(Int)) st_get(Store s, Str k) {
     return match s {
-        FsStore(d) => if (filesystem.exists(d + "/" + k) && !filesystem.is_dir(d + "/" + k)) { Some(filesystem.read_bytes(d + "/" + k)) } else { None },
+        FsStore(d) => if (filesystem.exists(d + "/" + k) && !filesystem.is_dir(d + "/" + k)) { seal_unwrap(d, filesystem.read_bytes(d + "/" + k)) } else { None },
         PgStore(c) => first_col(pgq(s, "SELECT v FROM " + pg_table() + " WHERE k = $1", [utf(k)])),
         PgTlsStore(c) => first_col(pgq(s, "SELECT v FROM " + pg_table() + " WHERE k = $1", [utf(k)])),
         S3Store(c) => s3_get(c, k)
@@ -114,7 +121,7 @@ pub List(Int) st_bytes(Store s, Str k) { return st_get(s, k) else { [] }; }
 @requires(filesystem, network, clock(readonly), declassify)
 pub Bool st_put(Store s, Str k, List(Int) b) {
     return match s {
-        FsStore(d) => fs_dirs(d, str_split(k, "/"), 0) && fs_replace(d + "/" + k, b),
+        FsStore(d) => match seal_wrap(d, b) { None => false, Some(x) => fs_dirs(d, str_split(k, "/"), 0) && fs_replace(d + "/" + k, x) },
         PgStore(c) => str_len(pgq(s, "INSERT INTO " + pg_table() + " (k, v) VALUES ($1, $2) ON CONFLICT (k) DO UPDATE SET v = EXCLUDED.v", [utf(k), b]).err) == 0,
         PgTlsStore(c) => str_len(pgq(s, "INSERT INTO " + pg_table() + " (k, v) VALUES ($1, $2) ON CONFLICT (k) DO UPDATE SET v = EXCLUDED.v", [utf(k), b]).err) == 0,
         S3Store(c) => s3_put(c, k, b)
@@ -125,7 +132,7 @@ pub Bool st_put(Store s, Str k, List(Int) b) {
 @requires(filesystem, network, clock(readonly), declassify)
 pub Int st_put_new(Store s, Str k, List(Int) b) {
     return match s {
-        FsStore(d) => fs_put_new(d, k, b),
+        FsStore(d) => match seal_wrap(d, b) { None => -1, Some(x) => fs_put_new(d, k, x) },
         PgStore(c) => pg_new(pgq(s, "INSERT INTO " + pg_table() + " (k, v) VALUES ($1, $2) ON CONFLICT (k) DO NOTHING", [utf(k), b])),
         PgTlsStore(c) => pg_new(pgq(s, "INSERT INTO " + pg_table() + " (k, v) VALUES ($1, $2) ON CONFLICT (k) DO NOTHING", [utf(k), b])),
         S3Store(c) => s3_put_new(c, k, b)

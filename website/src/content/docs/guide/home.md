@@ -22,8 +22,9 @@ name and no Let's Encrypt. Phones pin the box's certificate from the QR code.
 
 ## The keys are sealed
 
-The cosigners' keys, the witness key and the certificate keys are sealed on
-the box's disk to its **TPM** (when it has one) or to a **passphrase**
+Every secret on the box (the cosigners' keys, the witness and certificate
+keys, the relay's store with its claim and sign-in keys, and the alert
+settings) is sealed on the box's disk to its **TPM** (when it has one) or to a **passphrase**
 (Argon2id). `home serve` unseals them into memory at start, and only then:
 a copy of the disk or a backup of `data/` is useless without the TPM or the
 passphrase. With a passphrase, give it from a file you mount at start (a

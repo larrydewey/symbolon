@@ -26,6 +26,10 @@ hx() { printf '%s' "$1" | od -An -tx1 | tr -d ' \n'; }
 unhx() { printf '%s' "$1" | xxd -r -p; }
 BASE=$(python3 -c 'import random; print(random.randrange(20000, 60000, 10))')
 BLOB="$W/box/relay/blob"
+# The relay's store is sealed under the box key: to play a malicious relay,
+# objects are opened, changed and sealed again with the key the running box
+# holds in memory (tests/relay_seal.py).
+rs() { python3 "$PWD/tests/relay_seal.py" "$(cat "$W/box/run.path")/box.key" "$@"; }
 
 python3 - "$W" <<'EOF'
 import json, os, sys
@@ -122,11 +126,7 @@ echo "group folder: made for Engineering; carol writes, the owner reads; no one 
 
 # What the server could try.
 cp "$BLOB/org-$ORG" "$W/org.saved"
-python3 - "$BLOB/org-$ORG" <<'PY'
-import sys
-p = sys.argv[1]; b = open(p, 'rb').read()
-open(p, 'wb').write(b.replace(b'Carol', b'Mallo'))
-PY
+rs replace "$BLOB/org-$ORG" Carol Mallo
 run 120 "$BIN" device org show "$C" > "$W/tamper.log" 2>&1 && fail "a tampered membership record was accepted"
 grep -q "signature does not verify" "$W/tamper.log" || fail "tampered record: $(cat "$W/tamper.log")"
 cp "$W/org.saved" "$BLOB/org-$ORG"
@@ -163,12 +163,7 @@ run 120 "$BIN" device org audit "$A" > "$W/audit.log" 2>&1 || fail "audit: $(cat
 grep -q " share $FID " "$W/audit.log" && ! grep -q broken "$W/audit.log" || fail "audit: $(cat "$W/audit.log")"
 [ "$(grep -c " ok$" "$W/audit.log")" -ge 8 ] || fail "audit: $(cat "$W/audit.log")"
 EV=$(ls "$BLOB" | grep "^audit-$ORG-$ALOG-" | sort | sed -n 2p)
-python3 - "$BLOB/$EV" <<'PY'
-import sys
-p = sys.argv[1]; b = bytearray(open(p, 'rb').read())
-b[-1] ^= 1
-open(p, 'wb').write(bytes(b))
-PY
+rs flip-last "$BLOB/$EV"
 run 120 "$BIN" device org audit "$A" > "$W/audit2.log" 2>&1 || fail "audit: $(cat "$W/audit2.log")"
 grep -q broken "$W/audit2.log" || fail "a tampered event was not shown: $(cat "$W/audit2.log")"
 echo "audit: every device's events verify in order; a tampered one shows as broken"
@@ -183,8 +178,9 @@ tok() { cut -d' ' -f1 "$1/relay.token"; }
 [ "$(code -H "Authorization: Bearer $(tok "$C")" -X PUT --data junk "$RELAY/blob/coll-$FID")" = 403 ] || fail "someone out of the group wrote to its folder"
 [ "$(code -H "Authorization: Bearer $(tok "$C")" "$RELAY/blob/wrap-$CLOG-$FID")" = 403 ] || fail "someone out of the group read its folder"
 NEXTGOV=$(( $(ls "$BLOB" | grep -c "^orggov-$ORG-") + 1 ))
-[ "$(code -H "Authorization: Bearer $(tok "$B")" -X PUT --data-binary @"$BLOB/orggov-$ORG-1" "$RELAY/blob/orggov-$ORG-$NEXTGOV")" = 403 ] || fail "the relay stored a governance record out of order"
-[ "$(code -H "Authorization: Bearer $(tok "$B")" -X PUT --data-binary @"$BLOB/org-$ORG" "$RELAY/blob/org-$ORG")" = 403 ] || fail "the relay stored an old membership record again"
+rs open "$BLOB/orggov-$ORG-1" "$W/gov1.plain"; rs open "$BLOB/org-$ORG" "$W/org.plain"
+[ "$(code -H "Authorization: Bearer $(tok "$B")" -X PUT --data-binary @"$W/gov1.plain" "$RELAY/blob/orggov-$ORG-$NEXTGOV")" = 403 ] || fail "the relay stored a governance record out of order"
+[ "$(code -H "Authorization: Bearer $(tok "$B")" -X PUT --data-binary @"$W/org.plain" "$RELAY/blob/org-$ORG")" = 403 ] || fail "the relay stored an old membership record again"
 [ "$(code -X PUT --data junk "$RELAY/blob/audit-$ORG-$BLOG-000000000099")" = 401 ] || fail "the relay stored an audit event from nobody"
 curl -s --cacert "$W/box/tls/ca.pem" "$RELAY/list/org" | grep -q . && fail "the relay listed an organization's records to nobody"
 echo "relay: only members read the membership, only administrators the audit log; people out of a group neither read nor write its folder; records out of order are refused"
@@ -211,7 +207,7 @@ run 120 "$BIN" device org members "$A" | grep -qx "$CLOG $(hx Carol) $(hx carol@
 pin device vault show "$C" Deploy --share "$FID" > "$W/cback.log" 2>&1 || fail "carol reads again: $(cat "$W/cback.log")"
 grep -qx "text $(hx 'deploy key')" "$W/cback.log" || fail "carol reads again: $(cat "$W/cback.log")"
 pin device org join "$C" "$ORG" "$FOUNDER" "$ICODE" > /dev/null 2>&1
-[ "$(ls "$BLOB" | grep -c "^invite-$ORG-")" -ge 1 ] && [ ! -s "$BLOB/invite-$ORG-$IID" ] || fail "the used invite was not cleared"
+[ "$(ls "$BLOB" | grep -c "^invite-$ORG-")" -ge 1 ] && [ "$(rs size "$BLOB/invite-$ORG-$IID")" = 0 ] || fail "the used invite was not cleared"
 echo "invites: a wrong code does nothing; the right one brings carol back with her directory id and group, once"
 
 # The company directory over SCIM (SPEC 29.7).
@@ -340,7 +336,7 @@ echo "export: verified events as JSON lines, to an HTTP collector and to syslog 
 pin device org policy "$A" allow_offline_copy yes > /dev/null 2>&1 && pin device org policy "$A" max_offline_days 1 > /dev/null 2>&1 || fail "policy max_offline_days"
 pin device vault show "$B" Deploy --share "$FID" > /dev/null 2>&1 || fail "bob reads online"
 cp "$BLOB/coll-$FID" "$W/coll.saved"
-python3 -c 'import sys; p=sys.argv[1]; b=bytearray(open(p,"rb").read()); b[len(b)//2]^=1; open(p,"wb").write(b)' "$BLOB/coll-$FID"
+rs flip-mid "$BLOB/coll-$FID"
 pin device vault show "$B" Deploy --share "$FID" > "$W/off1.log" 2>&1 || fail "bob's local copy within the limit: $(cat "$W/off1.log")"
 echo 0 > "$B/share-$FID.seen"
 pin device vault show "$B" Deploy --share "$FID" > "$W/off2.log" 2>&1 && fail "bob read a copy older than the policy allows"
