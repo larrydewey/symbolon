@@ -61,6 +61,7 @@ import "cosignerd.resid";
 import "device.resid";
 import "enroll.resid";
 import "nfmark.resid";
+import "leakscan.resid";
 import "ecdsa.resid";
 import "crypto.resid";
 import "clock.resid";
@@ -92,23 +93,18 @@ pub Reports reports_of(Str dir) {
     return r;
 }
 
-// ─── The mail scan's result (leakscan.resid writes DIR/nonce-scan) ──
+// ─── The mail scan's result (leakscan.resid) ─────────────────
 
 pub type ScanSeen = { Int checked; Int hits; Int unreadable; };
 
 pub ScanSeen scan_none() { return ScanSeen {.checked = -1, .hits = -1, .unreadable = -1}; }
 
-// "checked N hits N unreadable N time T"
-pub ScanSeen scan_seen_parse(Str s) {
-    List(Str) f = str_split(str_trim(s), " ");
-    if (f.len() < 6 || f[0] != "checked" || f[2] != "hits" || f[4] != "unreadable") { return scan_none(); }
-    return ScanSeen {.checked = str_parse_int(f[1]), .hits = str_parse_int(f[3]), .unreadable = str_parse_int(f[5])};
-}
-
+// The scan's kept result (leakscan.resid scan_result: DIR/nonce-scan, -1
+// when no scan completed).
 @requires(filesystem)
 pub ScanSeen scan_seen(Str dir) {
-    ScanSeen r = if (filesystem.exists(dir + "/nonce-scan")) { scan_seen_parse(filesystem.read_all(dir + "/nonce-scan")) } else { scan_none() };
-    return r;
+    ScanResult r = scan_result(dir);
+    return ScanSeen {.checked = r.checked, .hits = r.hits, .unreadable = r.unreadable};
 }
 
 // ─── The advice ─────────────────────────────────────────────────

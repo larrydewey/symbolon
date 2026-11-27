@@ -8,6 +8,7 @@ import "../cosigner/cosigner.resid";
 import "../threshold/threshold.resid";
 import "../net/proto.resid";
 import "migrate.resid";
+import "leakscan.resid";
 import "enroll.resid";
 import "ecdsa.resid";
 import "crypto.resid";
@@ -137,16 +138,16 @@ test "the refresh's state: done, waiting for the cosigner's or a device's update
     expect(reshare_state(false, "", c)).toEqual("due");
 }
 
-test "reports and the scan's file read back" {
+test "reports and the scan's kept line read back" {
     Reports r = reports_parse("lost 1700000000\n");
     expect(r.lost).toEqual(true);
     expect(r.incident).toEqual(false);
     expect(reports_parse("lost 1\ncosigner 2\n").incident).toEqual(true);
     expect(reports_parse("").lost).toEqual(false);
-    ScanSeen s = scan_seen_parse("checked 12 hits 0 unreadable 1 time 99");
+    ScanResult s = scan_parse("checked 12 hits 0 unreadable 1 time 99");
     expect(s.checked).toEqual(12);
     expect(s.unreadable).toEqual(1);
-    expect(scan_seen_parse("junk").checked).toEqual(-1);
+    expect(scan_parse("junk").checked).toEqual(-1);
 }
 
 // ─── Which invitation is the household's refresh ────────────────
