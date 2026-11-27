@@ -451,12 +451,22 @@ Int main() {
 }
 
 // A re-share's share kept aside is taken into use (or dropped) as the
-// verified log says, before any device command (enroll.resid, MR-9).
+// verified log says, before any device command, `ssh-agent` and
+// `ssh-agent-stdio` (nextshare.resid; MR-9, MR-13).
 @requires(args, filesystem, network, clock(readonly), declassify)
 Bool settle() {
-    if (args.get(1) != "device") { return false; }
-    Str d = device_dir_arg(3);
+    Str d = dir_at(settle_positions(args.get(1)), 0);
     return str_len(d) > 0 && str_len(settle_pending(d)) > 0;
+}
+
+// The first of the arguments at `ps` that is a device directory.
+@requires(args, filesystem)
+Str dir_at(List(Int) ps, Int i) {
+    if (i >= ps.len()) { return ""; }
+    Int k = ps[i];
+    Str a = if (k < args.count()) { args.get(k) } else { "" };
+    if (str_len(a) > 0 && filesystem.exists(a + "/config.cbor")) { return a; }
+    return dir_at(ps, i + 1);
 }
 
 @requires(args, filesystem)

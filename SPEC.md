@@ -469,6 +469,12 @@ did. Two steps follow the upgrade.
   log is there, or drops it once the log made that epoch otherwise or
   moved past it (then a kit renewal from another device gives the device
   a share again).
+  The kept files are written, with a record binding each to that epoch
+  and transcript by its digest, before the log is asked; they are checked
+  against the record before they replace the share in use (each by a
+  temporary name and a rename), and removed after a promotion or a drop.
+  Settling runs before every device command, the SSH agents, and every
+  signature.
   It is done on a device once that device holds a **nonce-fix marker**:
   its device key's signature over the log id, an epoch, that epoch's
   transcript digest and its own id. This build writes it for the epoch a

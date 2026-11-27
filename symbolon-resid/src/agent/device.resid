@@ -35,6 +35,7 @@ import "keystore.resid";
 import "cggmp_store.resid";
 import "kvagent.resid";
 import "nfmark.resid";
+import "nextshare.resid";
 import "../vault/kvshare.resid";
 import "dev/tpm.resid";
 import "dev/tpm_wire.resid";
@@ -928,6 +929,9 @@ pub Result(List(Int), Str) sign_unlocked_raw(Str dir, DeviceConfig c, Unlocked u
     if (u.kind == 2) { return duress_sign(dir, c, u, cid, m); }
     if (u.kind != 1) { return Err("wrong PIN"); }
     Option(List(Int)) nonce = credential_nonce(u.real.cc, rp, cid);
+    // A joined re-share's share kept aside goes into use first, whatever
+    // started this signature (MR-13); one file check when there is none.
+    _ = settle_pending(dir);
     Option(CgConfig) cg = load_share(dir, u.real.dek);
     Result(VerifiedHead, SymbolonError) v = verified_log_dir(dir, relay_ep(c), c.log_id);
     return match nonce {

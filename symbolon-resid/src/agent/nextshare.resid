@@ -1,0 +1,226 @@
+// A joined re-share's new share, kept aside until the identity log shows
+// its epoch (SPEC 6.2.2; MR-9, MR-11, MR-12, MR-13).
+//
+// A device that joins a re-share takes its new share into use only once
+// the verified log, held against the witnesses, is at the epoch the
+// session made, with its transcript. The share, its duress copy and its
+// vault OPRF share are first written to DIR/share-next/, sealed exactly as
+// the ones in use (share.enc and kv.enc under the DEK, dshare to the
+// duress key), together with DIR/share-next/meta:
+//   epoch E transcript T share D1 dshare D2 kv D3
+// (hex; T "-" when empty; each D the SHA-256 of that file as kept, D3 "-"
+// when there is no vault OPRF share). Only then does the joiner ask the
+// log, a few times over about two minutes: an interruption while it waits
+// loses nothing (MR-11).
+//
+// settle_pending, run by every device command, `ssh-agent`,
+// `ssh-agent-stdio` and before every signature (MR-13), then:
+//   - promotes, needing no PIN, when the log is at E with T and every
+//     kept file is there and is the one the meta names (MR-12: never an
+//     empty or stale file over a share in use); each file goes into place
+//     by a write to a temporary name and a rename;
+//   - drops, when the log made E with another transcript or moved past E;
+//   - otherwise waits.
+// After a promotion or a drop the kept files are removed (SPEC 11.3: no
+// share of an old epoch is kept).
+
+import "../types.resid";
+import "../core/log.resid";
+import "../net/services.resid";
+import "state.resid";
+import "common.resid";
+import "nfmark.resid";
+import "crypto.resid";
+import "cose.resid";
+import "clock.resid";
+
+pub Str next_share_dir(Str dir) { return dir + "/share-next"; }
+pub Str next_share_meta(Str dir) { return next_share_dir(dir) + "/meta"; }
+// The epoch of a share promoted since, for its nonce-fix marker (it needs
+// the PIN: migrate.resid writes it at the next security-update).
+pub Str next_share_promoted(Str dir) { return dir + "/share-promoted"; }
+
+// The last re-share's failure, for `device status` (migrate.resid: an old
+// build's refusal names the party to upgrade); emptied when one succeeds.
+pub Str reshare_fail_file(Str dir) { return dir + "/reshare-failed"; }
+
+@requires(filesystem)
+pub Bool note_reshare_fail(Str dir, Str why) { return filesystem.write_all(reshare_fail_file(dir), why + "\n"); }
+
+pub type SharePending = { Int epoch; List(Int) transcript; List(Int) share_d; List(Int) dshare_d; List(Int) kv_d; };
+
+pub SharePending next_share_none() { return SharePending {.epoch = -1, .transcript = [], .share_d = [], .dshare_d = [], .kv_d = []}; }
+
+Str hex_dash(List(Int) b) { return if (b.len() == 0) { "-" } else { hex_encode(b) }; }
+List(Int) dash_hex(Str s) { return if (s == "-") { [] } else { cose_hex_decode(s) }; }
+
+pub Str next_share_line(SharePending p) {
+    return f"epoch {p.epoch} transcript " + hex_dash(p.transcript) + " share " + hex_dash(p.share_d) + " dshare " + hex_dash(p.dshare_d) + " kv " + hex_dash(p.kv_d) + "\n";
+}
+
+pub SharePending next_share_parse(Str s) {
+    List(Str) f = str_split(str_trim(s), " ");
+    if (f.len() != 10 || f[0] != "epoch" || f[2] != "transcript" || f[4] != "share" || f[6] != "dshare" || f[8] != "kv") { return next_share_none(); }
+    SharePending p = SharePending {.epoch = str_parse_int(f[1]), .transcript = dash_hex(f[3]), .share_d = dash_hex(f[5]), .dshare_d = dash_hex(f[7]), .kv_d = dash_hex(f[9])};
+    return if (p.share_d.len() != 32 || p.dshare_d.len() != 32) { next_share_none() } else { p };
+}
+
+// The epoch's meta for the files as they were written.
+pub SharePending next_share_of(Int epoch, List(Int) transcript, List(Int) share, List(Int) dshare, List(Int) kv) {
+    return SharePending {.epoch = epoch, .transcript = transcript, .share_d = sha256_bytes(share), .dshare_d = sha256_bytes(dshare), .kv_d = if (kv.len() == 0) { [] } else { sha256_bytes(kv) }};
+}
+
+// "" when the kept files are the ones the meta names (MR-12): the share
+// and its duress copy there and non-empty, each with the meta's digest; a
+// vault OPRF share exactly when the meta names one.
+pub Str next_share_ready(SharePending p, List(Int) share, List(Int) dshare, List(Int) kv) {
+    if (p.epoch < 0) { return "nothing is kept aside"; }
+    if (share.len() < 28 || !bytes_eq(sha256_bytes(share), p.share_d)) { return "the kept share is missing or not the one its record names"; }
+    if (dshare.len() == 0 || !bytes_eq(sha256_bytes(dshare), p.dshare_d)) { return "the kept duress share is missing or not the one its record names"; }
+    if (p.kv_d.len() == 0 && kv.len() > 0) { return "a vault OPRF share is kept that its record does not name"; }
+    if (p.kv_d.len() > 0 && !bytes_eq(sha256_bytes(kv), p.kv_d)) { return "the kept vault OPRF share is missing or not the one its record names"; }
+    return "";
+}
+
+// "promote", "drop" or "wait", against the verified head and its events.
+pub Str next_share_action(Quorum head, List(SignedEvent) es, Int epoch, List(Int) transcript) {
+    if (epoch < 0) { return "drop"; }
+    if ((Int)head.epoch == epoch && bytes_eq(head.transcript_digest, transcript)) { return "promote"; }
+    if (next_share_other(es, epoch, transcript, 0) || (Int)head.epoch > epoch) { return "drop"; }
+    return "wait";
+}
+
+Bool next_share_other(List(SignedEvent) es, Int epoch, List(Int) transcript, Int i) {
+    if (i >= es.len()) { return false; }
+    EventBody b = es[i].payload.body;
+    Bool hit = match b { ReshareBody(nq) => (Int)nq.epoch == epoch && !bytes_eq(nq.transcript_digest, transcript), _ => false };
+    return hit || next_share_other(es, epoch, transcript, i + 1);
+}
+
+pub Str next_share_words() {
+    return "This device joined the re-share, but your identity log did not show its new epoch yet. The new share is kept aside, sealed, and taken into use by itself as soon as this device sees the log there (any symbolon command checks).";
+}
+
+// Which arguments of a command line may name a device directory to settle
+// (MR-13): `device ...` (the first of the 3rd to 5th), `ssh-agent DIR` and
+// `ssh-agent-stdio DIR ...` (the 2nd). `browser host` names none: it holds
+// no share and signs nothing (the app's `device` commands do).
+pub List(Int) settle_positions(Str a1) {
+    if (a1 == "device") { return [3, 4, 5]; }
+    if (a1 == "ssh-agent" || a1 == "ssh-agent-stdio") { return [2]; }
+    return [];
+}
+
+// ─── Keeping aside, settling ────────────────────────────────────
+
+// Removes the kept files and the meta (after a promotion or a drop, and
+// before a new share is kept aside: no stale file is left to be mixed in).
+@requires(filesystem)
+pub Bool next_share_clear(Str dir) {
+    Str pd = next_share_dir(dir);
+    _ = filesystem.remove(pd + "/share.enc");
+    _ = filesystem.remove(pd + "/dshare");
+    _ = filesystem.remove(pd + "/kv.enc");
+    _ = filesystem.remove(next_share_meta(dir));
+    return !filesystem.exists(pd + "/share.enc") && !filesystem.exists(next_share_meta(dir));
+}
+
+// The meta for the files now in DIR/share-next, written last.
+@requires(filesystem)
+pub Bool next_share_record(Str dir, Int epoch, List(Int) transcript) {
+    Str pd = next_share_dir(dir);
+    List(Int) kv = if (filesystem.exists(pd + "/kv.enc")) { get_file(pd + "/kv.enc") } else { [] };
+    SharePending p = next_share_of(epoch, transcript, get_file(pd + "/share.enc"), filesystem.read_bytes(pd + "/dshare"), kv);
+    return filesystem.write_all(next_share_meta(dir), next_share_line(p));
+}
+
+// Into place by a temporary name and a rename.
+@requires(filesystem)
+Bool swap_secret(Str dst, List(Int) b) {
+    Str tmp = dst + ".next-tmp";
+    if (put_secret_file(tmp, b) && filesystem.rename(tmp, dst)) { return true; }
+    _ = filesystem.remove(tmp);
+    return false;
+}
+
+@requires(filesystem)
+Bool swap_bytes(Str dst, List(Int) b) {
+    Str tmp = dst + ".next-tmp";
+    if (filesystem.write_bytes(tmp, b) && filesystem.rename(tmp, dst)) { return true; }
+    _ = filesystem.remove(tmp);
+    return false;
+}
+
+// The kept files into use, when they are the ones the meta names.
+@requires(filesystem)
+pub Str next_share_promote(Str dir, SharePending p) {
+    Str pd = next_share_dir(dir);
+    List(Int) share = if (filesystem.exists(pd + "/share.enc")) { get_file(pd + "/share.enc") } else { [] };
+    List(Int) dshare = if (filesystem.exists(pd + "/dshare")) { filesystem.read_bytes(pd + "/dshare") } else { [] };
+    List(Int) kv = if (filesystem.exists(pd + "/kv.enc")) { get_file(pd + "/kv.enc") } else { [] };
+    Str bad = next_share_ready(p, share, dshare, kv);
+    if (str_len(bad) > 0) { return bad; }
+    Bool ok = swap_secret(dir + "/share.enc", share) && swap_bytes(dir + "/dshare", dshare) && (kv.len() == 0 || swap_secret(dir + "/kv.enc", kv))
+        && filesystem.write_all(next_share_promoted(dir), f"{p.epoch} " + hex_dash(p.transcript) + "\n");
+    if (!ok) { return "cannot put the kept share into use"; }
+    _ = next_share_clear(dir);
+    _ = filesystem.write_all(reshare_fail_file(dir), "");
+    return "";
+}
+
+// The epoch and transcript of a share promoted since (-1 for none).
+@requires(filesystem)
+pub SharePending next_share_promoted_of(Str dir) {
+    List(Str) f = str_split(str_trim(filesystem.read_all(next_share_promoted(dir))), " ");
+    if (f.len() != 2) { return next_share_none(); }
+    return SharePending {.epoch = str_parse_int(f[0]), .transcript = dash_hex(f[1]), .share_d = [], .dshare_d = [], .kv_d = []};
+}
+
+// One file check when nothing is kept aside; otherwise the verified log
+// says what happens. Returns the action taken ("" for none).
+@requires(filesystem, network, clock(readonly), declassify)
+pub Str settle_pending(Str dir) {
+    if (!filesystem.exists(next_share_meta(dir))) { return ""; }
+    SharePending p = next_share_parse(filesystem.read_all(next_share_meta(dir)));
+    if (p.epoch < 0) { _ = next_share_clear(dir); return ""; }
+    Option(DeviceConfig) oc = device_of_cbor(get_file(dir + "/config.cbor"));
+    return match oc { None => "", Some(c) => settle_next_share(dir, c, p) };
+}
+
+pub Endpoint next_share_relay(DeviceConfig c) { return Endpoint {.host = c.relay_host, .port = c.relay_port, .ca = c.ca, .token = ""}; }
+
+@requires(filesystem, network, clock(readonly), declassify)
+Str settle_next_share(Str dir, DeviceConfig c, SharePending p) {
+    Result(LogView, SymbolonError) rv = log_view_dir(dir, next_share_relay(c), c.log_id, "");
+    Str act = match rv { Ok(v) => next_share_action(v.vh.head.quorum, v.events, p.epoch, p.transcript), Err(_) => "wait" };
+    if (act == "promote") {
+        Str bad = next_share_promote(dir, p);
+        if (str_len(bad) > 0) { eprintln("device: the re-share this device joined is in your identity log, but " + bad + "; the share in use is kept."); return "wait"; }
+        eprintln("device: the re-share this device joined is in your identity log now; its new share is in use.");
+        return act;
+    }
+    if (act == "drop") {
+        _ = next_share_clear(dir);
+        _ = note_reshare_fail(dir, "the re-share this device joined never reached the log");
+        eprintln("device: the re-share this device joined never reached your identity log, so its new share was dropped. If this device can no longer sign, replace the recovery kit from another device (`symbolon device kit renew DIR`): this device then gets a new share.");
+    }
+    return act;
+}
+
+// Whether the verified log of `c`'s identity, held against the witnesses,
+// is at `epoch` with `transcript`.
+@requires(filesystem, network, clock(readonly), declassify)
+pub Bool landed_now(Str dir, DeviceConfig c, Int epoch, List(Int) transcript) {
+    Result(LogView, SymbolonError) rv = log_view_dir(dir, next_share_relay(c), c.log_id, "");
+    return match rv { Ok(v) => epoch_landed(v.vh.head.quorum, epoch, transcript), Err(_) => false };
+}
+
+// landed_now, asked again after 5, 10, 20, 40 and 60 seconds.
+@requires(filesystem, network, clock, declassify)
+pub Bool landed_retry(Str dir, DeviceConfig c, Int epoch, List(Int) transcript, Int i) {
+    if (landed_now(dir, c, epoch, transcript)) { return true; }
+    List(Int) waits = [5, 10, 20, 40, 60];
+    if (i >= waits.len()) { return false; }
+    _ = clock_sleep_ms(waits[i] * 1000);
+    return landed_retry(dir, c, epoch, transcript, i + 1);
+}

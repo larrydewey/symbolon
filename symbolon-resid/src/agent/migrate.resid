@@ -61,6 +61,7 @@ import "cosignerd.resid";
 import "device.resid";
 import "enroll.resid";
 import "nfmark.resid";
+import "nextshare.resid";
 import "leakscan.resid";
 import "ecdsa.resid";
 import "crypto.resid";
@@ -466,7 +467,7 @@ Int reshare_at(Str dir, DeviceConfig c, LogView v, Str pin, Str primes) {
     if (u.kind != 1) { return dfail("wrong PIN"); }
     // A share kept aside and taken into use since (MR-9): its epoch is
     // marked now, the PIN given.
-    SharePending pr = next_share_parse(filesystem.read_all(next_share_promoted(dir)));
+    SharePending pr = next_share_promoted_of(dir);
     if (pr.epoch >= 0 && mark_fixed_quorum(dir, u, pr.epoch, pr.transcript, [], false)) {
         _ = filesystem.write_all(next_share_promoted(dir), "");
         println("security re-share: done already");

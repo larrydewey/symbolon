@@ -1,0 +1,107 @@
+// A joined re-share's share kept aside (nextshare.resid): what the log
+// decides (MR-9), the kept files checked against their record and swapped
+// in with the kept-aside directory cleared (MR-11, MR-12), and which entry
+// points settle (MR-13). Bool, Int, Str and hex comparisons only.
+
+import "../types.resid";
+import "../core/log.resid";
+import "nextshare.resid";
+import "common.resid";
+import "crypto.resid";
+
+List(Int) tr(Int n) { return [n, n, n, n, n, n, n, n]; }
+
+Quorum head_at(Int epoch, Int tn) {
+    return Quorum {.parties = [], .t = 2, .root_pubkey = [4, 1], .epoch = (UInt(32))epoch, .transcript_digest = tr(tn), .kv_commits = []};
+}
+
+SignedEvent rs_at(Int epoch, Int tn) {
+    return SignedEvent {.payload = EventPayload {.log_id = None, .sequence = 5, .predecessor_digest = None, .suite = 1, .body = ReshareBody(head_at(epoch, tn)), .next_recovery_key_digests = [], .advisory_time = 0},
+                        .encoded = [], .sigs = [], .cosigs = []};
+}
+
+@requires(filesystem, declassify)
+Str tmp_dir() {
+    Str d = "/tmp/symbolon-nextshare-test-" + hex_encode(random_bytes(8));
+    _ = filesystem.create_dir(d);
+    return d;
+}
+
+List(Int) bytes_n(Int n, Int len) { return if (len <= 0) { [] } else { [n].concat(bytes_n(n, len - 1)) }; }
+
+// ─── MR-9: the log decides ──────────────────────────────────────
+
+test "MR-9: a kept share waits while the log is not there, then is promoted" {
+    expect(next_share_action(head_at(4, 1), [], 5, tr(4))).toEqual("wait");
+    expect(next_share_action(head_at(5, 4), [rs_at(5, 4)], 5, tr(4))).toEqual("promote");
+}
+
+test "MR-9: a kept share is dropped when the log made that epoch otherwise or moved past it" {
+    expect(next_share_action(head_at(5, 7), [rs_at(5, 7)], 5, tr(4))).toEqual("drop");
+    expect(next_share_action(head_at(6, 8), [rs_at(6, 8)], 5, tr(4))).toEqual("drop");
+    expect(next_share_action(head_at(4, 1), [rs_at(5, 7)], 5, tr(4))).toEqual("drop");
+}
+
+// ─── MR-12: the kept files and their record ─────────────────────
+
+test "MR-12: the record binds each kept file; it reads back" {
+    SharePending p = next_share_of(5, tr(4), bytes_n(1, 40), bytes_n(2, 90), bytes_n(3, 50));
+    SharePending q = next_share_parse(next_share_line(p));
+    expect(q.epoch).toEqual(5);
+    expect(hex_encode(q.transcript)).toEqual("0404040404040404");
+    expect(hex_encode(q.share_d)).toEqual(hex_encode(sha256_bytes(bytes_n(1, 40))));
+    expect(hex_encode(q.kv_d)).toEqual(hex_encode(sha256_bytes(bytes_n(3, 50))));
+    expect(next_share_parse("epoch 5 transcript -").epoch).toEqual(-1);
+}
+
+test "MR-12: a missing, empty or other share, duress copy or vault OPRF share is refused before any swap" {
+    SharePending p = next_share_of(5, tr(4), bytes_n(1, 40), bytes_n(2, 90), []);
+    expect(next_share_ready(p, bytes_n(1, 40), bytes_n(2, 90), [])).toEqual("");
+    expect(str_len(next_share_ready(p, [], bytes_n(2, 90), [])) > 0).toEqual(true);
+    expect(str_len(next_share_ready(p, bytes_n(1, 40), [], [])) > 0).toEqual(true);
+    expect(str_len(next_share_ready(p, bytes_n(9, 40), bytes_n(2, 90), [])) > 0).toEqual(true);
+    // A stale vault OPRF share from an earlier attempt, which the record does not name.
+    expect(str_len(next_share_ready(p, bytes_n(1, 40), bytes_n(2, 90), bytes_n(3, 50))) > 0).toEqual(true);
+    SharePending k = next_share_of(5, tr(4), bytes_n(1, 40), bytes_n(2, 90), bytes_n(3, 50));
+    expect(str_len(next_share_ready(k, bytes_n(1, 40), bytes_n(2, 90), bytes_n(7, 50))) > 0).toEqual(true);
+    expect(next_share_ready(k, bytes_n(1, 40), bytes_n(2, 90), bytes_n(3, 50))).toEqual("");
+}
+
+// MR-11, MR-12: what is kept aside on disk, with its record, is complete
+// by itself (a process ended while asking the log loses nothing), goes
+// into use by a checked swap, and leaves nothing behind.
+@requires(filesystem, declassify)
+test "MR-11, MR-12: kept files promote from disk alone; a damaged one leaves the share in use; nothing stays kept" {
+    Str d = tmp_dir();
+    Str pd = next_share_dir(d);
+    _ = filesystem.create_dir(pd);
+    _ = put_secret_file(d + "/share.enc", bytes_n(8, 40));
+    _ = filesystem.write_bytes(d + "/dshare", bytes_n(8, 90));
+    _ = put_secret_file(pd + "/share.enc", bytes_n(1, 40));
+    _ = filesystem.write_bytes(pd + "/dshare", bytes_n(2, 90));
+    expect(next_share_record(d, 5, tr(4))).toEqual(true);
+    SharePending p = next_share_parse(filesystem.read_all(next_share_meta(d)));
+    expect(p.epoch).toEqual(5);
+    // Damaged before the swap: the share in use stays.
+    _ = filesystem.write_bytes(pd + "/dshare", []);
+    expect(str_len(next_share_promote(d, p)) > 0).toEqual(true);
+    expect(hex_encode(get_file(d + "/share.enc"))).toEqual(hex_encode(bytes_n(8, 40)));
+    // Whole again: swapped in, and the kept-aside files are gone.
+    _ = filesystem.write_bytes(pd + "/dshare", bytes_n(2, 90));
+    expect(next_share_promote(d, p)).toEqual("");
+    expect(hex_encode(get_file(d + "/share.enc"))).toEqual(hex_encode(bytes_n(1, 40)));
+    expect(hex_encode(filesystem.read_bytes(d + "/dshare"))).toEqual(hex_encode(bytes_n(2, 90)));
+    expect(filesystem.exists(pd + "/share.enc")).toEqual(false);
+    expect(filesystem.exists(next_share_meta(d))).toEqual(false);
+    expect(next_share_promoted_of(d).epoch).toEqual(5);
+}
+
+// ─── MR-13: which entry points settle ───────────────────────────
+
+test "MR-13: ssh-agent and ssh-agent-stdio settle as device commands do; nothing else names a device" {
+    expect(hex_encode(settle_positions("device"))).toEqual("030405");
+    expect(hex_encode(settle_positions("ssh-agent"))).toEqual("02");
+    expect(hex_encode(settle_positions("ssh-agent-stdio"))).toEqual("02");
+    expect(settle_positions("browser").len()).toEqual(0);
+    expect(settle_positions("relay").len()).toEqual(0);
+}
