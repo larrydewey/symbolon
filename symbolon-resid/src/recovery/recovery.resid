@@ -244,44 +244,59 @@ pub Result(List(Int), SymbolonError) release_target(List(SignedEvent) events, Ve
 // verified (cosignerd.resid on_veto).
 pub type HeldVeto = { SignedEvent veto; Int time; };
 
-// release_target, and no live veto in `held` of that recovery
-// (cosigner_release, held_veto_live).
+// release_target, and no veto in `held` of that recovery that still
+// blocks it (cosigner_release, held_veto_blocks).
 //
-// A held veto is not a veto of its own (R4-2): the log is the record, and
-// one the cosigner keeps to itself that never lands must not block a
-// recovery that took effect by the log's rules forever (a thief with a
-// stolen device would send its veto of the owner's kit recovery only
-// here: the recovery takes effect, the old kit drops out of field 6, the
-// new kit gets no material, and the identity is lost). So the cosigner
-// publishes every held veto to the witnesses, claim-less (cosignerd.resid
-// spread_held): it lands in the log like any device's veto (and counts
-// toward the contest rule), or the witnesses hold it at its sequence and
-// a relay that keeps it out of the log is caught by `heads` (R2W-5). The
-// held veto itself refuses only while it can still land: no other event
-// at its sequence and its target still pending.
+// A veto a device sent the cosigner while the recovery was pending blocks
+// its release until a majority of the witnesses co-signed another event at
+// the veto's sequence (R5-1): the log `events` the cosigner verified holds
+// one there (every event of a verified log carries a majority's
+// co-signatures, and a witness never co-signs two events at one sequence,
+// so the veto can then never land). Not "until the recovery took effect":
+// a relay working with whoever holds the kit could otherwise keep the veto
+// from the witnesses until the delay ran, and the release would follow.
+// The cosigner publishes every veto it holds to the witnesses itself
+// (cosignerd.resid spread_held), without the relay's claim, so a veto that
+// can land does: it is then an ordinary veto in the log, which the contest
+// rule counts (R4-2), and a thief's veto sent only to the cosigner does
+// not lose the owner the identity. A held veto that could not land before
+// the delay ran (the cosigner got it in its last moments) blocks until the
+// log's next event takes its sequence: the recovered device's next event
+// does.
 pub Result(List(Int), SymbolonError) release_target_held(List(SignedEvent) events, VerifiedHead v, List(Int) dev, List(Option(WitnessHead)) heads, List(HeldVeto) held) {
     Option(SignedEvent) oe = kit_recover_for(events, dev, 0, None);
     Int r = match oe { None => -1, Some(e) => (Int)e.payload.sequence };
-    if (r > 0 && vetoed_aside(v.head.log_id, events, v.pending, r, held, 0)) {
-        return Err(ErrRecoveryFailed("a device vetoed this recovery (the cosigner holds its veto and is publishing it)"));
+    if (r > 0 && vetoed_aside(v.head.log_id, events, r, held, 0)) {
+        return Err(ErrRecoveryFailed("a device vetoed this recovery: the cosigner holds its veto, publishes it to the witnesses, and releases nothing until the witnesses settle another event at its sequence"));
     }
     return release_target(events, v, dev, heads);
 }
 
-Bool vetoed_aside(List(Int) l, List(SignedEvent) events, List(UInt(64)) pending, Int r, List(HeldVeto) held, Int i) {
+Bool vetoed_aside(List(Int) l, List(SignedEvent) events, Int r, List(HeldVeto) held, Int i) {
     if (i >= held.len()) { return false; }
-    EventBody b = held[i].veto.payload.body;
-    Bool of_r = match b { VetoBody(t) => (Int)t == r, _ => false };
-    Bool hit = of_r && held_veto_live(l, events, pending, held[i]);
-    return hit || vetoed_aside(l, events, pending, r, held, i + 1);
+    Bool hit = held_veto_blocks(l, events, r, held[i]);
+    return hit || vetoed_aside(l, events, r, held, i + 1);
+}
+
+// Whether the held veto `h` of the event at `r` blocks its release, the
+// log standing at `events` (verified): it was valid at its time as the
+// event after the log's first `n` events (veto_held_ok), and the log holds
+// nothing at its sequence `n`, or the veto itself. Another event there,
+// which a majority of the witnesses co-signed, settles it.
+pub Bool held_veto_blocks(List(Int) l, List(SignedEvent) events, Int r, HeldVeto h) {
+    Int n = (Int)h.veto.payload.sequence;
+    if (!veto_held_ok(l, events, r, h)) { return false; }
+    if (n >= events.len()) { return true; }
+    return bytes_eq(sha256_bytes(events[n].encoded), sha256_bytes(h.veto.encoded));
 }
 
 // Whether a held veto can still land in the log `events` (whose pending
 // sequences are `pending`, as the log stands now): it was valid at its time
 // as the event after the log's first `n` events (veto_held_ok), the log has
 // no event at its sequence `n` yet, and its target is still pending. Once
-// another event took its sequence, or its target took effect, it is moot:
-// the cosigner stops publishing it, and the release follows the log.
+// another event took its sequence, or its target took effect, it can no
+// longer land: the cosigner stops publishing it (held_veto_blocks decides
+// the release).
 pub Bool held_veto_live(List(Int) l, List(SignedEvent) events, List(UInt(64)) pending, HeldVeto h) {
     EventBody b = h.veto.payload.body;
     Int t = match b { VetoBody(x) => (Int)x, _ => -1 };
@@ -328,9 +343,9 @@ pub Option(Half) half_of(List(Int) b) {
 // The cosigner wraps b || k_b to the released device, bound to the log, the
 // epoch and the device. `held`: the vetoes devices sent the cosigner
 // directly (R3P-3), which the cosigner publishes to the witnesses (R4-2):
-// one of this recovery refuses the release while it can still land
-// (release_target_held); a relay that keeps a witnessed veto out of the
-// log is caught by `heads`.
+// one of this recovery refuses the release until the witnesses settle
+// another event at its sequence (release_target_held, R5-1); a relay that
+// keeps a witnessed veto out of the log is caught by `heads`.
 pub Result(Wrapped, SymbolonError) cosigner_release(List(SignedEvent) events, VerifiedHead v, List(Int) dev, Half b, List(Int) ikm_e, List(Option(WitnessHead)) heads, List(HeldVeto) held) {
     List(Int) to = release_target_held(events, v, dev, heads, held)?;
     Option(Wrapped) w = offline_wrap(to, v.head.log_id, v.head.quorum.epoch, dev, half_bytes(b.share, b.key), ikm_e);

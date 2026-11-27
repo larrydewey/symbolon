@@ -1,8 +1,8 @@
 // The cosigner's release (recovery.resid release_target_held) against a
-// veto a device sent it directly (SPEC 13.4, R3P-3, R4-2): the cosigner
-// publishes it to the witnesses; while it can still land it refuses the
-// release, and once the log has settled without it (another event at its
-// sequence, or the recovery took effect) the release follows the log.
+// veto a device sent it directly (SPEC 13.4, R3P-3, R4-2, R5-1): the
+// cosigner publishes it to the witnesses while it can still land, and
+// refuses the release until a majority of the witnesses co-signed another
+// event at its sequence; then the release follows the log.
 
 import "../types.resid";
 import "../core/log.resid";
@@ -75,22 +75,39 @@ List(Option(WitnessHead)) heads_at(Int seq, SignedEvent e) {
     return [Some(h), Some(h), Some(h)];
 }
 
-test "a held veto of a recovery that took effect without it does not block the release (R4-2)" {
+test "a held veto still blocks the release past the recovery's delay until the witnesses settle another event at its sequence (R5-1)" {
     SignedEvent e0 = signed(e0p(), [2, 3], [], 1000);
     List(Int) l = sha256_bytes(e0.encoded);
     SignedEvent r1 = signed(next_p(l, 1, e0, RecoverBody(kit_rb()), [id32(51)]), [20], l, 2000);
     List(SignedEvent) es = [e0, r1];
-    // A thief's veto, by device 2, sent only to the cosigner while the
-    // delay ran, and never in the log: the recovery took effect by the
-    // log's rules. Before R4-2 this refused the release forever.
+    // A device's veto, sent to the cosigner while the delay ran, that never
+    // reached the witnesses (a relay working with whoever holds the kit
+    // kept it out): the recovery took effect by the log's rules, and the
+    // witnesses hold nothing at the veto's sequence. Between R4-2 and R5-1
+    // this released the kit's half.
     SignedEvent veto = bare(signed(next_p(l, 2, r1, VetoBody(1), [sha256_bytes(pubk(20))]), [2], l, 0));
     HeldVeto h = HeldVeto {.veto = veto, .time = 2000 + 50};
     VerifiedHead v = head_at(l, es, 2000 + 86400 + 5);
     expect(v.head.sequence).toEqual(1);
     expect(v.pending.len()).toEqual(0);
+    // It can no longer land (the cosigner stops publishing it), and it
+    // still blocks.
     expect(held_veto_live(l, es, v.pending, h)).toBeFalse();
-    expect(outcome(release_target_held(es, v, id32(4), heads_at(1, r1), [h]))).toEqual("released");
+    expect(held_veto_blocks(l, es, 1, h)).toBeTrue();
+    expect(outcome(release_target_held(es, v, id32(4), heads_at(1, r1), [h])) == "released").toBeFalse();
     expect(outcome(release_target_held(es, v, id32(4), heads_at(1, r1), []))).toEqual("released");
+    // Not one the cosigner got once the delay had run.
+    expect(outcome(release_target_held(es, v, id32(4), heads_at(1, r1), [HeldVeto {.veto = veto, .time = 2000 + 86400 + 1}]))).toEqual("released");
+    // Once a majority of the witnesses co-signed another event at its
+    // sequence (here the recovered device's next event), the veto can never
+    // land, and the release follows the log (a thief's veto sent only to
+    // the cosigner does not cost the owner the identity, R4-2).
+    SignedEvent pk = signed(next_p(l, 2, r1, PartyKeyBody(id32(4), pubk(21)), [id32(51)]), [4], l, 2000 + 86400 + 10);
+    List(SignedEvent) es2 = [e0, r1, pk];
+    VerifiedHead v2 = head_at(l, es2, 2000 + 86400 + 20);
+    expect(v2.head.sequence).toEqual(2);
+    expect(held_veto_blocks(l, es2, 1, h)).toBeFalse();
+    expect(outcome(release_target_held(es2, v2, id32(4), heads_at(2, pk), [h]))).toEqual("released");
 }
 
 test "a held veto refuses the release only while it can still land, and a witnessed veto the relay hides refuses it for good (R3P-3)" {
@@ -104,7 +121,7 @@ test "a held veto refuses the release only while it can still land, and a witnes
     // the release is refused for it.
     VerifiedHead early = head_at(l, es, 2000 + 100);
     expect(held_veto_live(l, es, early.pending, h)).toBeTrue();
-    expect(outcome(release_target_held(es, early, id32(4), heads_at(1, r1), [h]))).toEqual("a device vetoed this recovery (the cosigner holds its veto and is publishing it)");
+    expect(outcome(release_target_held(es, early, id32(4), heads_at(1, r1), [h]))).toEqual("a device vetoed this recovery: the cosigner holds its veto, publishes it to the witnesses, and releases nothing until the witnesses settle another event at its sequence");
     // Not one sent after the delay had run, one signed by a key that is
     // not a device of the quorum, or a veto of another event.
     expect(held_veto_live(l, es, early.pending, HeldVeto {.veto = veto, .time = 2000 + 86400 + 1})).toBeFalse();
