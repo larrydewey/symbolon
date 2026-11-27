@@ -1315,3 +1315,58 @@ test "a confirm event encodes as [12, target-seq, target-digest] and decodes bac
                                        .body = ConfirmBody(3, [1, 2, 3]), .next_recovery_key_digests = [id32(50)], .advisory_time = 0};
     expect(is_confirm_body(payload_decode(payload_cbor(short) else { [] }), 3, [1, 2, 3])).toBeFalse();
 }
+
+// ─── R3P-2: per-device caps on what one device can append ─────────
+// Events witnessed after the release cutover (after(x), now_after(x)).
+
+SignedEvent at(Int seq, EventBody b, List(Int) who, Int t) { return next(seq, (UInt(64))seq, enc(seq - 1), b, who, (UInt(64))t); }
+
+Result(VerifiedHead, SymbolonError) verify_at(List(SignedEvent) es, Int now) { return il_verify(log_id(), [e0([2, 3])].concat(es), now, lambda(x) { false }); }
+
+EventBody prop_of(Int n) { return ProposePartyBody(test_device(n), id32(n + 40)); }
+
+test "a device names a new transport key at most once in 24 hours of witness time (R3P-2)" {
+    SignedEvent k1 = at(1, PartyKeyBody(id32(2), pubk(20)), [2], now_after(0));
+    // A second one by the same device within 24 hours: refused.
+    expect(ok(verify_at([k1, at(2, PartyKeyBody(id32(2), pubk(21)), [2], now_after(86399))], now_after(86399)))).toBeFalse();
+    // And by a witness, before it co-signs (il_check_next).
+    expect(next_ok(il_check_next(log_id(), [e0([2, 3]), k1], bare(at(2, PartyKeyBody(id32(2), pubk(21)), [2], now_after(100))), now_after(100), lambda(x) { false }))).toBeFalse();
+    // 24 hours later: accepted, and it takes effect.
+    Result(VerifiedHead, SymbolonError) r = verify_at([k1, at(2, PartyKeyBody(id32(2), pubk(21)), [2], now_after(86400))], now_after(86400));
+    expect(ok(r)).toBeTrue();
+    expect(hpke_of(r, 2)).toEqual(pubk(21));
+    // Another device's in between is its own.
+    expect(ok(verify_at([k1, at(2, PartyKeyBody(id32(3), pubk(22)), [3], now_after(10))], now_after(10)))).toBeTrue();
+    // A log witnessed before the cutover still verifies as it did.
+    expect(ok(verify_at([at(1, PartyKeyBody(id32(2), pubk(20)), [2], 2000), at(2, PartyKeyBody(id32(2), pubk(21)), [2], 2010)], 2010))).toBeTrue();
+}
+
+test "a device has at most four delayed events open; remove-party and veto are never held back (R3P-2)" {
+    List(SignedEvent) four = [at(1, prop_of(31), [2], now_after(10)), at(2, prop_of(32), [2], now_after(20)),
+                              at(3, prop_of(33), [2], now_after(30)), at(4, prop_of(34), [2], now_after(40))];
+    expect(pending_n(verify_at(four, now_after(40)))).toEqual(4);
+    // A fifth delayed event by the same device: refused.
+    expect(ok(verify_at(four.concat([at(5, prop_of(35), [2], now_after(50))]), now_after(50)))).toBeFalse();
+    expect(ok(verify_at(four.concat([at(5, RotateRecoveryBody, [2], now_after(50))]), now_after(50)))).toBeFalse();
+    // The other device's is its own.
+    expect(ok(verify_at(four.concat([at(5, prop_of(35), [3], now_after(50))]), now_after(50)))).toBeTrue();
+    // A remove-party is never refused for it, nor counted.
+    List(SignedEvent) rm = four.concat([at(5, RemovePartyBody(id32(3)), [2], now_after(50))]);
+    expect(pending_n(verify_at(rm, now_after(50)))).toEqual(5);
+    // Nor a veto, even of its own event; but the vetoed event keeps its
+    // place until its delay would have run, so filing and vetoing in turn
+    // does not get around the cap.
+    List(SignedEvent) vetoed = four.concat([at(5, VetoBody(1), [2], now_after(50))]);
+    expect(pending_n(verify_at(vetoed, now_after(50)))).toEqual(3);
+    expect(ok(verify_at(vetoed.concat([at(6, prop_of(36), [2], now_after(60))]), now_after(60)))).toBeFalse();
+    // Once its delay would have run, the place is free again.
+    expect(ok(verify_at(vetoed.concat([at(6, prop_of(36), [2], now_after(86410))]), now_after(86410)))).toBeTrue();
+    // A confirm by the other device frees a place at once (the event took effect).
+    List(SignedEvent) confirmed = four.concat([at(5, ConfirmBody(1, sha256_bytes(enc(1))), [3], now_after(50))]);
+    expect(pending_n(verify_at(confirmed, now_after(50)))).toEqual(3);
+    expect(ok(verify_at(confirmed.concat([at(6, prop_of(36), [2], now_after(60))]), now_after(60)))).toBeTrue();
+    // Before the cutover, no cap: logs written then still verify.
+    List(SignedEvent) old = [at(1, prop_of(31), [2], 2000), at(2, prop_of(32), [2], 2010), at(3, prop_of(33), [2], 2020),
+                             at(4, prop_of(34), [2], 2030), at(5, prop_of(35), [2], 2040)];
+    expect(pending_n(verify_at(old, 2040))).toEqual(5);
+}

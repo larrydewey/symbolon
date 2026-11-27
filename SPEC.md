@@ -559,6 +559,35 @@ recover-body = [
   profile already reads what the old key opened; another device cannot
   move it (that would redirect the device's wraps). A device uses it to
   retire a transport key someone else may hold (Section 9.2).
+- **Per-device caps (R3P-2).** One device's key alone must not be able to
+  grow the log without end, as fast as each event is witnessed: a thief
+  with an unlocked device could otherwise pad the log until no co-sign
+  request could carry it (Section 20.3) and no later event, the
+  `remove-party` of that device included, could be witnessed. So:
+  - a `party-key` is refused within 24 hours of witness time of the last
+    `party-key` naming the same device;
+  - a delayed authority event (signed by fewer devices than it needs at
+    once, or a weakening `set-policy`) is refused when one of the devices
+    that sign it already has four delayed events **open**: pending events
+    it signed (not yet in force, confirmed or vetoed), and vetoed ones it
+    signed whose delay would not yet have run at the new event's witness
+    time. A vetoed event keeps its signers' place until then, so filing
+    and vetoing in turn gains nothing; a `confirm` that applies the event,
+    or the delay running out, frees it;
+  - `remove-party` is never refused under the cap nor counted by it, so a
+    device can always be revoked; `veto`, `confirm`, `reshare`, `recover`
+    and the kit's set-policy (Section 20.3) are not capped (the kit's are
+    one at a time already, Section 13.4).
+
+  The caps hold for events witnessed from the release cutover above
+  (Unix time 1796083200) on, with the same argument; a verifier records
+  the last `party-key` time per device and the vetoed events' places
+  whatever the time, so that the caps apply from the first event after
+  the cutover. **Residual:** a device may still file a `remove-party` of a
+  party and veto it in turn without limit; each such pair is two events,
+  and the log stays co-signable however long it grows (incremental
+  co-sign requests, Section 20.3), so this costs verification time, not
+  the log.
 - Field 6 MUST hold the digests of the recovery keys a future `recover`
   may reveal; a revealed key whose digest is not in the predecessor's field
   6 is invalid.

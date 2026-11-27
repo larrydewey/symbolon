@@ -45,6 +45,15 @@ type Pending = {
     Bool forced;
 };
 
+// A party and a witness time: when a device last named a new transport
+// key (party-key).
+pub type PartyTime = { List(Int) id; Int time; };
+
+// A vetoed delayed event's signers, who keep it against their cap of open
+// delayed events (delayed_cap) until `until`, the witness time at which
+// its delay would have run.
+pub type Slot = { List(List(Int)) signers; Int until; };
+
 type LogState = {
     Quorum quorum;
     Policy policy;
@@ -61,6 +70,11 @@ type LogState = {
     // when none or when a recovery has come since: the kit they name may
     // replace the quorum's kit party at a re-share.
     List(List(Int)) rotated_to;
+    // The witness time of each device's last party-key (party_key_secs).
+    List(PartyTime) key_times;
+    // Vetoed delayed events whose delay has not run, held against their
+    // signers' cap (delayed_cap).
+    List(Slot) slots;
 };
 
 // ============================================================================
@@ -206,6 +220,18 @@ pub Int authority_sigs(Policy p, List(Party) live, Int t) {
 // SPEC 8.2: the release cutover of the quorum-in-force floor,
 // 2026-12-01T00:00:00Z as Unix seconds of witness time.
 pub Int authority_floor_from() { return 1796083200; }
+
+// SPEC 8.2: the per-device caps (R3P-2) hold for events witnessed from the
+// same release cutover on, so logs written before it still verify.
+pub Int rate_caps_from() { return authority_floor_from(); }
+
+// SPEC 8.2: a device names a new transport key (party-key) at most once in
+// this many seconds of witness time.
+pub Int party_key_secs() { return 86400; }
+
+// SPEC 8.2: the delayed events a device may have open at once, pending or
+// vetoed before their delay ran; remove-party is not counted.
+pub Int delayed_cap() { return 4; }
 
 // SPEC 8.2 and 20.3: policy[1] >= 2 when the quorum holds two devices or more,
 // recovery delay at least 24 hours.
@@ -636,27 +662,32 @@ LogState apply_effect(LogState s, EventBody body, List(Int) event_digest, List(L
             .quorum = s.quorum, .policy = s.policy, .recovery_digests = s.recovery_digests,
             .proposed = s.proposed.concat([party]), .removed = s.removed, .pending = s.pending,
             .vetoes = s.vetoes, .prev_digest = s.prev_digest, .next_seq = s.next_seq,
-            .last_time = s.last_time, .last_cosigs = s.last_cosigs, .rotated_to = s.rotated_to },
+            .last_time = s.last_time, .last_cosigs = s.last_cosigs, .rotated_to = s.rotated_to,
+            .key_times = s.key_times, .slots = s.slots },
         RemovePartyBody(id) => LogState {
             .quorum = s.quorum, .policy = s.policy, .recovery_digests = s.recovery_digests,
             .proposed = s.proposed, .removed = s.removed.concat([id]), .pending = s.pending,
             .vetoes = s.vetoes, .prev_digest = s.prev_digest, .next_seq = s.next_seq,
-            .last_time = s.last_time, .last_cosigs = s.last_cosigs, .rotated_to = s.rotated_to },
+            .last_time = s.last_time, .last_cosigs = s.last_cosigs, .rotated_to = s.rotated_to,
+            .key_times = s.key_times, .slots = s.slots },
         ReshareBody(nq) => LogState {
             .quorum = nq, .policy = s.policy, .recovery_digests = s.recovery_digests,
             .proposed = [], .removed = [], .pending = s.pending,
             .vetoes = s.vetoes, .prev_digest = s.prev_digest, .next_seq = s.next_seq,
-            .last_time = s.last_time, .last_cosigs = s.last_cosigs, .rotated_to = s.rotated_to },
+            .last_time = s.last_time, .last_cosigs = s.last_cosigs, .rotated_to = s.rotated_to,
+            .key_times = s.key_times, .slots = s.slots },
         SetPolicyBody(np) => LogState {
             .quorum = s.quorum, .policy = np, .recovery_digests = s.recovery_digests,
             .proposed = s.proposed, .removed = s.removed, .pending = s.pending,
             .vetoes = s.vetoes, .prev_digest = s.prev_digest, .next_seq = s.next_seq,
-            .last_time = s.last_time, .last_cosigs = s.last_cosigs, .rotated_to = s.rotated_to },
+            .last_time = s.last_time, .last_cosigs = s.last_cosigs, .rotated_to = s.rotated_to,
+            .key_times = s.key_times, .slots = s.slots },
         RotateRecoveryBody => LogState {
             .quorum = s.quorum, .policy = s.policy, .recovery_digests = next_digests,
             .proposed = s.proposed, .removed = s.removed, .pending = s.pending,
             .vetoes = s.vetoes, .prev_digest = s.prev_digest, .next_seq = s.next_seq,
-            .last_time = s.last_time, .last_cosigs = s.last_cosigs, .rotated_to = next_digests },
+            .last_time = s.last_time, .last_cosigs = s.last_cosigs, .rotated_to = next_digests,
+            .key_times = s.key_times, .slots = s.slots },
         RecoverBody(r) => LogState {
             .quorum = Quorum {
                 .parties = r.new_parties, .t = s.quorum.t, .root_pubkey = s.quorum.root_pubkey,
@@ -664,7 +695,8 @@ LogState apply_effect(LogState s, EventBody body, List(Int) event_digest, List(L
             .policy = s.policy, .recovery_digests = next_digests,
             .proposed = [], .removed = [], .pending = s.pending,
             .vetoes = 0, .prev_digest = s.prev_digest, .next_seq = s.next_seq,
-            .last_time = s.last_time, .last_cosigs = s.last_cosigs, .rotated_to = [] },
+            .last_time = s.last_time, .last_cosigs = s.last_cosigs, .rotated_to = [],
+            .key_times = s.key_times, .slots = s.slots },
         PartyKeyBody(id, k) => LogState {
             .quorum = Quorum {
                 .parties = with_hpke(s.quorum.parties, id, k, 0, ListBuf()), .t = s.quorum.t, .root_pubkey = s.quorum.root_pubkey,
@@ -672,7 +704,8 @@ LogState apply_effect(LogState s, EventBody body, List(Int) event_digest, List(L
             .policy = s.policy, .recovery_digests = s.recovery_digests,
             .proposed = s.proposed, .removed = s.removed, .pending = s.pending,
             .vetoes = s.vetoes, .prev_digest = s.prev_digest, .next_seq = s.next_seq,
-            .last_time = s.last_time, .last_cosigs = s.last_cosigs, .rotated_to = s.rotated_to },
+            .last_time = s.last_time, .last_cosigs = s.last_cosigs, .rotated_to = s.rotated_to,
+            .key_times = s.key_times, .slots = s.slots },
         _ => s
     };
 }
@@ -682,7 +715,8 @@ LogState with_pending(LogState s, List(Pending) pending) {
         .quorum = s.quorum, .policy = s.policy, .recovery_digests = s.recovery_digests,
         .proposed = s.proposed, .removed = s.removed, .pending = pending,
         .vetoes = s.vetoes, .prev_digest = s.prev_digest, .next_seq = s.next_seq,
-        .last_time = s.last_time, .last_cosigs = s.last_cosigs, .rotated_to = s.rotated_to };
+        .last_time = s.last_time, .last_cosigs = s.last_cosigs, .rotated_to = s.rotated_to,
+            .key_times = s.key_times, .slots = s.slots };
 }
 
 LogState with_vetoes(LogState s, Int vetoes) {
@@ -690,7 +724,8 @@ LogState with_vetoes(LogState s, Int vetoes) {
         .quorum = s.quorum, .policy = s.policy, .recovery_digests = s.recovery_digests,
         .proposed = s.proposed, .removed = s.removed, .pending = s.pending,
         .vetoes = vetoes, .prev_digest = s.prev_digest, .next_seq = s.next_seq,
-        .last_time = s.last_time, .last_cosigs = s.last_cosigs, .rotated_to = s.rotated_to };
+        .last_time = s.last_time, .last_cosigs = s.last_cosigs, .rotated_to = s.rotated_to,
+            .key_times = s.key_times, .slots = s.slots };
 }
 
 LogState with_time(LogState s, Int time) {
@@ -698,7 +733,8 @@ LogState with_time(LogState s, Int time) {
         .quorum = s.quorum, .policy = s.policy, .recovery_digests = s.recovery_digests,
         .proposed = s.proposed, .removed = s.removed, .pending = s.pending,
         .vetoes = s.vetoes, .prev_digest = s.prev_digest, .next_seq = s.next_seq,
-        .last_time = time, .last_cosigs = s.last_cosigs, .rotated_to = s.rotated_to };
+        .last_time = time, .last_cosigs = s.last_cosigs, .rotated_to = s.rotated_to,
+            .key_times = s.key_times, .slots = s.slots };
 }
 
 LogState advance(LogState s, List(Int) digest, Int time, List(WitnessCosignature) cosigs) {
@@ -706,7 +742,35 @@ LogState advance(LogState s, List(Int) digest, Int time, List(WitnessCosignature
         .quorum = s.quorum, .policy = s.policy, .recovery_digests = s.recovery_digests,
         .proposed = s.proposed, .removed = s.removed, .pending = s.pending,
         .vetoes = s.vetoes, .prev_digest = digest, .next_seq = s.next_seq + 1,
-        .last_time = time, .last_cosigs = cosigs, .rotated_to = s.rotated_to };
+        .last_time = time, .last_cosigs = cosigs, .rotated_to = s.rotated_to,
+            .key_times = s.key_times, .slots = s.slots };
+}
+
+LogState with_key_time(LogState s, List(Int) id, Int time) {
+    List(PartyTime) kept = key_times_of(s.key_times, s.quorum.parties, id, 0, ListBuf());
+    return LogState {
+        .quorum = s.quorum, .policy = s.policy, .recovery_digests = s.recovery_digests,
+        .proposed = s.proposed, .removed = s.removed, .pending = s.pending,
+        .vetoes = s.vetoes, .prev_digest = s.prev_digest, .next_seq = s.next_seq,
+        .last_time = s.last_time, .last_cosigs = s.last_cosigs, .rotated_to = s.rotated_to,
+        .key_times = kept.concat([PartyTime {.id = id, .time = time}]), .slots = s.slots };
+}
+
+LogState with_slots(LogState s, List(Slot) slots) {
+    return LogState {
+        .quorum = s.quorum, .policy = s.policy, .recovery_digests = s.recovery_digests,
+        .proposed = s.proposed, .removed = s.removed, .pending = s.pending,
+        .vetoes = s.vetoes, .prev_digest = s.prev_digest, .next_seq = s.next_seq,
+        .last_time = s.last_time, .last_cosigs = s.last_cosigs, .rotated_to = s.rotated_to,
+        .key_times = s.key_times, .slots = slots };
+}
+
+// The entries of `ts` for parties of `ps` other than `id`: what a party
+// that left the quorum did no longer needs keeping.
+List(PartyTime) key_times_of(List(PartyTime) ts, List(Party) ps, List(Int) id, Int i, ListBuf(PartyTime) acc) {
+    if (i >= ts.len()) { return acc.finish(); }
+    Bool keep = !bytes_eq(ts[i].id, id) && known_party(party_by_id(ps, ts[i].id, 0));
+    return key_times_of(ts, ps, id, i + 1, if (keep) { acc.push(ts[i]) } else { acc });
 }
 
 // Applies every pending event whose delay has run by `now`, oldest first.
@@ -822,11 +886,52 @@ Result(LogState, SymbolonError) authority(LogState s, SignedEvent e, List(Int) d
     if (immediate) {
         return Ok(apply_effect(s, ep.body, dig, ep.next_recovery_key_digests));
     }
+    List(List(Int)) signers = valid_signers(e.sigs, live, true, e.encoded, 0, []);
+    if (over_delayed_cap(s, ep.body, signers, 0)) {
+        return refuse(f"a device of this event has {delayed_cap()} delayed events open (pending, or vetoed before their delay ran): one must take effect, be confirmed or run out its delay first (SPEC 8.2)");
+    }
     Pending p = Pending {
         .seq = ep.sequence, .ready_at = s.last_time + (Int)s.policy.recovery_delay_sec,
         .body = ep.body, .event_digest = dig, .next_digests = ep.next_recovery_key_digests, .kit = false,
-        .signers = valid_signers(e.sigs, live, true, e.encoded, 0, []), .forced = force_delay };
+        .signers = signers, .forced = force_delay };
     return Ok(with_pending(s, s.pending.concat([p])));
+}
+
+Bool is_remove_body(EventBody b) {
+    return match b { RemovePartyBody(_) => true, _ => false };
+}
+
+// The per-device cap on delayed events (SPEC 8.2, R3P-2): whether a signer
+// of `signers` already has delayed_cap() delayed events open at the
+// event's witness time (s.last_time): pending ones it signed, and vetoed
+// ones it signed whose delay has not run yet (slots), so that filing and
+// vetoing in turn does not get around it. A remove-party is never refused
+// nor counted, so a device can always be revoked; vetoes, re-shares and
+// recovers are not authority events and are never counted. Without the
+// cap, one stolen device could append delayed events without end, as fast
+// as each one is witnessed.
+Bool over_delayed_cap(LogState s, EventBody body, List(List(Int)) signers, Int i) {
+    if (s.last_time < rate_caps_from() || is_remove_body(body) || i >= signers.len()) { return false; }
+    Int open = open_pending(s.pending, signers[i], 0, 0) + open_slots(s.slots, signers[i], s.last_time, 0, 0);
+    return open >= delayed_cap() || over_delayed_cap(s, body, signers, i + 1);
+}
+
+Int open_pending(List(Pending) ps, List(Int) id, Int i, Int acc) {
+    if (i >= ps.len()) { return acc; }
+    Bool counts = !is_remove_body(ps[i].body) && has_bytes(ps[i].signers, id, 0);
+    return open_pending(ps, id, i + 1, acc + (if (counts) { 1 } else { 0 }));
+}
+
+Int open_slots(List(Slot) ss, List(Int) id, Int now, Int i, Int acc) {
+    if (i >= ss.len()) { return acc; }
+    Bool counts = ss[i].until > now && has_bytes(ss[i].signers, id, 0);
+    return open_slots(ss, id, now, i + 1, acc + (if (counts) { 1 } else { 0 }));
+}
+
+// The slots whose delay has not run by `now`.
+List(Slot) live_slots(List(Slot) ss, Int now, Int i, ListBuf(Slot) acc) {
+    if (i >= ss.len()) { return acc.finish(); }
+    return live_slots(ss, now, i + 1, if (ss[i].until > now) { acc.push(ss[i]) } else { acc });
 }
 
 Result(LogState, SymbolonError) do_propose(LogState s, SignedEvent e, List(Int) dig, Int dev_sigs, Party party) {
@@ -943,7 +1048,22 @@ Result(LogState, SymbolonError) do_party_key(LogState s, SignedEvent e, List(Int
     if (!key_ok(k)) { return refuse("party-key with a bad key"); }
     if (bytes_eq(k, p.hpke_key)) { return refuse("party-key that changes nothing"); }
     if (!signed_by_key(e.sigs, p.auth_key, e.encoded, 0)) { return refuse("party-key not signed by that device"); }
-    return Ok(apply_effect(s, e.payload.body, [], e.payload.next_recovery_key_digests));
+    // At most one per party_key_secs() of witness time (R3P-2): it takes
+    // effect at once, so without a limit one stolen device could append
+    // party-keys as fast as each is witnessed.
+    Int last = key_time_of(s.key_times, id, 0);
+    if (s.last_time >= rate_caps_from() && last >= 0 && s.last_time - last < party_key_secs()) {
+        return refuse("party-key within 24 hours of witness time of that device's last one (SPEC 8.2)");
+    }
+    LogState applied = apply_effect(s, e.payload.body, [], e.payload.next_recovery_key_digests);
+    return Ok(with_key_time(applied, id, s.last_time));
+}
+
+// The witness time of party `id`'s last party-key, or -1.
+Int key_time_of(List(PartyTime) ts, List(Int) id, Int i) {
+    if (i >= ts.len()) { return -1; }
+    if (bytes_eq(ts[i].id, id)) { return ts[i].time; }
+    return key_time_of(ts, id, i + 1);
 }
 
 List(Party) with_hpke(List(Party) ps, List(Int) id, List(Int) k, Int i, ListBuf(Party) acc) {
@@ -1040,7 +1160,12 @@ Result(LogState, SymbolonError) do_veto_found(LogState s, Int dev_sigs, UInt(64)
     Int need = if (kitev && s.vetoes >= 2) { 2 } else { 1 };
     if (dev_sigs < need) { return refuse("veto without enough device signatures"); }
     LogState removed_p = with_pending(s, pending_without(s.pending, target, 0, ListBuf()));
-    return Ok(if (kitev) { with_vetoes(removed_p, s.vetoes + 1) } else { removed_p });
+    // A vetoed authority event keeps its signers' place against the cap
+    // until its delay would have run (over_delayed_cap).
+    Bool held = !kitev && !is_remove_body(p.body) && p.signers.len() > 0;
+    List(Slot) slots = live_slots(s.slots, s.last_time, 0, ListBuf());
+    LogState kept = with_slots(removed_p, if (held) { slots.concat([Slot {.signers = p.signers, .until = p.ready_at}]) } else { slots });
+    return Ok(if (kitev) { with_vetoes(kept, s.vetoes + 1) } else { kept });
 }
 
 Result(LogState, SymbolonError) do_veto(LogState s, Int dev_sigs, UInt(64) target) {
@@ -1211,7 +1336,8 @@ Result(LogState, SymbolonError) start_inception(SignedEvent e0, List(Int) l, Lis
     return Ok(LogState {
         .quorum = q, .policy = pol, .recovery_digests = ep.next_recovery_key_digests,
         .proposed = [], .removed = [], .pending = [], .vetoes = 0,
-        .prev_digest = dig, .next_seq = 1, .last_time = t, .last_cosigs = e0.cosigs, .rotated_to = [] });
+        .prev_digest = dig, .next_seq = 1, .last_time = t, .last_cosigs = e0.cosigs, .rotated_to = [],
+        .key_times = [], .slots = [] });
 }
 
 Result(LogState, SymbolonError) run(LogState s, List(SignedEvent) events, List(Int) l, Bool closure(EventPayload) approvals_ok, Int i) {
