@@ -747,17 +747,22 @@ Int finish_enroll(Str dir, DeviceConfig c, Unlocked u, VerifiedHead vh, CgConfig
     List(Int) kb = random_bytes(32);
     List(Int) ka = kit_key(kk, kb);
     Wrapped wa = offline_wrap(kit.hpke_key, c.log_id, nq.epoch, kit.id, half_bytes(res.offline[0].share, ka), random_bytes(32)) else { Wrapped {.enc = [], .ct = []} };
+    // The log is at the new epoch already: this device's new shares are
+    // kept first, so a blob write that fails (R5-4: one taken first) does
+    // not cost the device its share.
+    Bool kept = store_share(dir, u.real.dek, ncfg) && store_dshare(dir, u.real, ncfg)
+        && (!kd.on || kv_store(dir, u.real.dek, KvKept {.epoch = (Int)nq.epoch, .id = kd.me, .share = kd.out.share}));
+    if (!kept) { return dfail("cannot store this device's new share"); }
     Bool ok = wa.ct.len() > 0
-        && blob_put(relay, kit_a_blob(c.log_id, (Int)nq.epoch), cbor_of_blob(WrappedBlob {.enc = wa.enc, .ct = wa.ct}))
-        && blob_put(relay, kit_secrets_blob(c.log_id, (Int)nq.epoch), kit_secrets_seal(secret_bytes(kk), c.log_id, nq.epoch, u.real.cc, u.real.vault_key))
         && send_to(relay, me, Remote {.party = cos.id, .cg = 0, .hpke_pub = cos.hpke_key}, WKitKey(kb))
         && send_secrets(relay, me, rem, cos.id, u, 0)
-        && store_share(dir, u.real.dek, ncfg) && store_dshare(dir, u.real, ncfg)
-        // k_v: this device's new share, and its part for the kit (a_v)
-        && (!kd.on || (kv_store(dir, u.real.dek, KvKept {.epoch = (Int)nq.epoch, .id = kd.me, .share = kd.out.share})
-                       && kv_put_kit_half(relay, kit, c.log_id, nq.epoch, kd.mine, kd.kit)))
         && save_config(dir, with_log(c, c.witnesses, c.log_id, mailbox_end(relay, c.party, c.mbox_next), c.peers));
     if (!ok) { return dfail("cannot finish the enrollment"); }
+    // The kit's blobs: a, k_a, the secrets under k_K, and a_v.
+    Bool kit_ok = blob_put(relay, kit_a_blob(c.log_id, (Int)nq.epoch), cbor_of_blob(WrappedBlob {.enc = wa.enc, .ct = wa.ct}))
+        && blob_put(relay, kit_secrets_blob(c.log_id, (Int)nq.epoch), kit_secrets_seal(secret_bytes(kk), c.log_id, nq.epoch, u.real.cc, u.real.vault_key))
+        && (!kd.on || kv_put_kit_half(relay, kit, c.log_id, nq.epoch, kd.mine, kd.kit));
+    if (!kit_ok) { return dfail(f"enrolled at epoch {nq.epoch}, but the relay refused the recovery kit's material for it: the kit cannot recover until the next re-share"); }
     println(f"enrolled: epoch {nq.epoch}, {nq.parties.len()} parties");
     return 0;
 }

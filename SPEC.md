@@ -4398,14 +4398,20 @@ written once, never replaced, at most 64 KiB). A person's own objects
 The recovery kit's sealed blobs are named by the epoch they were made
 for (`kit-<log>-a-<epoch>`, `kit-<log>-secrets-<epoch>`,
 `kitv-<log>-a-<epoch>`) and written once, never replaced or removed,
-only by a device of the log's quorum (verified offline at the log's last
-witness time) and only for that quorum's epoch: the device that finishes
-an inception or a re-share writes the new epoch's. A stolen device can
-no longer overwrite the kit's half and so break kit recovery, nor write
-an epoch the log has not reached. Kit recovery reads the blobs of the
-epoch before the `recover` event, and falls back to the names without an
-epoch, from before, which the relay still serves but no longer takes
-(each is sealed to its epoch, so a stale one only fails to open). A household
+only for the quorum's epoch (the log verified offline at its last
+witness time) and only by the device that made that epoch: the first
+signer of the inception or re-share that set it, while it is a device of
+the quorum and not removed (R5-4). Another device of the quorum, perhaps
+a stolen one, cannot take the epoch's names first; a removed one writes
+nothing; no one writes an epoch the log has not reached. The device
+finishing a re-share keeps its new share before it writes the blobs, so
+a refused write does not cost it its share. Kit recovery reads the blobs
+of the epoch before the `recover` event and the names without an epoch,
+from before, which the relay still serves but no longer takes, and uses
+the first that opens and verifies (the a-blob's key opens the secrets,
+a_v fits the quorum's commitments): an epoch-named blob that is there
+but does not open, as one a stolen device wrote on a log from before
+epoch names, does not hide the old one. A household
 folder (19): its first roster makes its writer the owner, and only the
 owner's devices write it after; its `coll-` and `wrap-` objects are
 written by the owner's and the members' devices; `leave-<id>-<log>` by

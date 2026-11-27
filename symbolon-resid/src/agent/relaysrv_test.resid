@@ -1169,6 +1169,45 @@ test "a kit's blobs are written once per epoch by a device of the quorum" {
     expect(relay_serve_handle(g, treq("GET", "/blob/kit-" + lh + "-a-0", "", [])).status).toEqual(200);
 }
 
+// Devices 2 and 3 remove device `who` at 1, co-signed by witnesses 7 and
+// 8 at 1001, stored.
+@requires(filesystem, network, clock(readonly), declassify)
+List(Int) put_removal(Store s, List(Int) l, StoredEvent e0, Int who) {
+    EventPayload p = EventPayload {.log_id = Some(l), .sequence = 1, .predecessor_digest = Some(sha256_bytes(e0.encoded)), .suite = 1, .body = RemovePartyBody(lid(who)),
+                                   .next_recovery_key_digests = [sha256_bytes(lpub(20))], .advisory_time = 0};
+    List(Int) enc = payload_cbor(p) else { [] };
+    List(Int) d = sha256_bytes(enc);
+    List(WitnessCosignature) cs = [WitnessCosignature {.log_id = l, .sequence = 1, .digest = d, .witness_key = lpub(7), .signature = lsign(7, witness_message(l, 1, d)), .witness_time = 1001},
+                                   WitnessCosignature {.log_id = l, .sequence = 1, .digest = d, .witness_key = lpub(8), .signature = lsign(8, witness_message(l, 1, d)), .witness_time = 1001}];
+    _ = st_put(s, "log/" + hex_encode(l) + "/1", cbor_of_event(StoredEvent {.encoded = enc, .sigs = [EventSig {.signer = lid(2), .sig = lsign(2, enc)}, EventSig {.signer = lid(3), .sig = lsign(3, enc)}], .cosigs = cs}));
+    return d;
+}
+
+@requires(filesystem, network, clock(readonly), declassify)
+test "a kit's blobs are written only by the device that made the epoch, and not once it is removed (R5-4)" {
+    Store s = tmp_store();
+    RelayCfg g = cfg_of(s, "");
+    StoredEvent e0 = log_e0("w1");
+    List(Int) l = put_e0(s, e0);
+    Str lh = hex_encode(l);
+    // E0's first signer, device 2, made epoch 0; device 3 is of the quorum too.
+    TDev d2 = TDev {.log = l, .party = lid(2), .priv = lpriv(2), .pub = lpub(2)};
+    TDev d3 = TDev {.log = l, .party = lid(3), .priv = lpriv(3), .pub = lpub(3)};
+    // Device 3 (perhaps stolen) cannot take the epoch's names first.
+    expect(relay_serve_handle(g, treq("PUT", "/blob/kit-" + lh + "-a-0", tsession(s, d3, 1), [6])).status).toEqual(403);
+    expect(relay_serve_handle(g, treq("PUT", "/blob/kit-" + lh + "-secrets-0", tsession(s, d3, 1), [6])).status).toEqual(403);
+    expect(relay_serve_handle(g, treq("PUT", "/blob/kitv-" + lh + "-a-0", tsession(s, d3, 1), [6])).status).toEqual(403);
+    expect(relay_serve_handle(g, treq("PUT", "/blob/kit-" + lh + "-a-0", tsession(s, d2, 1), [1])).status).toEqual(200);
+    // Once device 2 is removed (not yet re-shared out), it writes nothing.
+    Store s2 = tmp_store();
+    RelayCfg g2 = cfg_of(s2, "");
+    List(Int) l2 = put_e0(s2, e0);
+    _ = put_removal(s2, l2, e0, 2);
+    TDev r2 = TDev {.log = l2, .party = lid(2), .priv = lpriv(2), .pub = lpub(2)};
+    expect(relay_serve_handle(g2, treq("PUT", "/blob/kit-" + hex_encode(l2) + "-secrets-0", tsession(s2, r2, 2), [1])).status).toEqual(403);
+    expect(absent(s2, "blob/kit-" + hex_encode(l2) + "-secrets-0")).toBeTrue();
+}
+
 // The new device's (key `k`) rotate-recovery at 2 after the recover at 1
 // (digest `rd`): valid once the recovery has taken effect.
 List(Int) rotate_at(List(Int) l, List(Int) rd, Int k) {

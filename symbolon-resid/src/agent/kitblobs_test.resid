@@ -1,0 +1,87 @@
+// The kit's blobs at the relay as kit recovery reads them
+// (src/agent/kvagent.resid kit_open_blobs, kv_kit_share_from): an
+// epoch-named blob that is there but does not open or verify must not hide
+// the one from before epoch names (R5-4). On a log made before the update
+// the epoch name is free, and a stolen device of the quorum could write
+// garbage, or a well-formed wrap of junk to the kit's public key, there.
+
+import "../types.resid";
+import "../threshold/threshold.resid";
+import "../recovery/recovery.resid";
+import "../vault/kvshare.resid";
+import "kvagent.resid";
+import "common.resid";
+import "hpke.resid";
+import "crypto.resid";
+import "word.resid";
+
+Str hx(List(Int) b) { return hex_encode(b); }
+List(Int) rep(Int b, Int n) { return if (n == 0) { [] } else { [b].concat(rep(b, n - 1)) }; }
+
+Half none_half() { return Half {.share = [], .key = []}; }
+
+List(Int) ints(List(UInt(8)) bs, Int i, List(Int) acc) {
+    if (i >= bs.len()) { return acc; }
+    return ints(bs, i + 1, acc.concat([(Int)bs[i]]));
+}
+
+@requires(declassify)
+Str cc_of(Option(KitOpened) o) {
+    return match o { None => "refused", Some(k) => hx(ints(declassify(secret_join(k.s.cc), "test output"), 0, [])) };
+}
+
+// a, k_a (or `pt`) wrapped to the kit for log 9.., epoch 4, as a blob.
+List(Int) a_blob(KitKeys kit, List(Int) pt, Int seed) {
+    Wrapped w = offline_wrap(kit.hpke_pub, rep(9, 32), 4, rep(8, 32), pt, rep(seed, 32)) else { Wrapped {.enc = [], .ct = []} };
+    return cbor_of_blob(WrappedBlob {.enc = w.enc, .ct = w.ct});
+}
+
+@requires(declassify)
+test "kit recovery passes over an epoch blob that does not open and uses the one from before (R5-4)" {
+    List(Int) log_id = rep(9, 32);
+    KitKeys kit = kit_keys(rep(1, 32)) else { KitKeys {.sign_priv = [], .sign_pub = [], .hpke_priv = [], .hpke_pub = []} };
+    List(UInt(64)) xk = sc_of_bytes(rep(77, 32));
+    List(Int) kk = rep(5, 32);
+    KitHalves h = kit_split(xk, kk, rep(19, 32), rep(200, 32));
+    List(Int) sealed = kit_secrets_seal(secret_bytes(kk), log_id, 4, secret_bytes(rep(11, 32)), secret_bytes(rep(12, 32)));
+    List(Int) real_a = a_blob(kit, half_bytes(h.a, h.ka), 21);
+    Half theirs = half_of(half_bytes(h.b, h.kb)) else { none_half() };
+    // What a stolen device can write under the free epoch name: garbage,
+    // a junk half wrapped to the kit's public key, secrets under its own key.
+    List(Int) garbage = [1, 2, 3];
+    List(Int) forged_a = a_blob(kit, rep(33, 64), 23);
+    List(Int) forged_s = kit_secrets_seal(secret_bytes(rep(44, 32)), log_id, 4, secret_bytes(rep(1, 32)), secret_bytes(rep(1, 32)));
+    Str want = hx(rep(11, 32));
+    // The normal cases: only the epoch's blobs, or only the old ones.
+    expect(cc_of(kit_open_blobs(kit.hpke_priv, log_id, 4, rep(8, 32), theirs, kit_candidates(Some(real_a), None), kit_candidates(Some(sealed), None), 0))).toEqual(want);
+    expect(cc_of(kit_open_blobs(kit.hpke_priv, log_id, 4, rep(8, 32), theirs, kit_candidates(None, Some(real_a)), kit_candidates(None, Some(sealed)), 0))).toEqual(want);
+    // Planted epoch blobs in front of the old ones: the old ones still recover.
+    expect(cc_of(kit_open_blobs(kit.hpke_priv, log_id, 4, rep(8, 32), theirs, kit_candidates(Some(garbage), Some(real_a)), kit_candidates(None, Some(sealed)), 0))).toEqual(want);
+    expect(cc_of(kit_open_blobs(kit.hpke_priv, log_id, 4, rep(8, 32), theirs, kit_candidates(Some(forged_a), Some(real_a)), kit_candidates(Some(garbage), Some(sealed)), 0))).toEqual(want);
+    expect(cc_of(kit_open_blobs(kit.hpke_priv, log_id, 4, rep(8, 32), theirs, kit_candidates(Some(real_a), None), kit_candidates(Some(forged_s), Some(sealed)), 0))).toEqual(want);
+    // Nothing genuine: nothing opens.
+    expect(cc_of(kit_open_blobs(kit.hpke_priv, log_id, 4, rep(8, 32), theirs, kit_candidates(Some(forged_a), None), kit_candidates(Some(sealed), None), 0))).toEqual("refused");
+    expect(cc_of(kit_open_blobs(kit.hpke_priv, log_id, 4, rep(8, 32), theirs, kit_candidates(Some(real_a), None), kit_candidates(Some(forged_s), None), 0))).toEqual("refused");
+}
+
+@requires(declassify)
+test "the kit's a_v is the first candidate that fits the quorum's commitments (R5-4)" {
+    List(Int) log_id = rep(9, 32);
+    KitKeys kit = kit_keys(rep(1, 32)) else { KitKeys {.sign_priv = [], .sign_pub = [], .hpke_priv = [], .hpke_pub = []} };
+    // Two dealers' parts for the kit at index 2: a_v (to the kit) and b_v.
+    KvDealing d1 = kv_generate(2, [1, 2, 3]);
+    KvDealing d2 = kv_generate(2, [1, 2, 3]);
+    List(List(Int)) commits = kv_to_sec1(kv_sum_commits([d1.commits, d2.commits]));
+    List(Int) real_a = a_blob(kit, part_bytes(d1, 2), 21);
+    List(Int) b = part_bytes(d2, 2);
+    List(Int) forged = a_blob(kit, rep(7, 32), 23);
+    Str ok = "fits";
+    Str r1 = match kv_kit_share_from(kit_candidates(Some(real_a), None), kit.hpke_priv, log_id, 4, rep(8, 32), b, commits, 2, 0, "none") { Ok(_) => ok, Err(m) => m };
+    Str r2 = match kv_kit_share_from(kit_candidates(Some(forged), Some(real_a)), kit.hpke_priv, log_id, 4, rep(8, 32), b, commits, 2, 0, "none") { Ok(_) => ok, Err(m) => m };
+    Str r3 = match kv_kit_share_from(kit_candidates(Some([1, 2]), Some(real_a)), kit.hpke_priv, log_id, 4, rep(8, 32), b, commits, 2, 0, "none") { Ok(_) => ok, Err(m) => m };
+    Str r4 = match kv_kit_share_from(kit_candidates(Some(forged), None), kit.hpke_priv, log_id, 4, rep(8, 32), b, commits, 2, 0, "none") { Ok(_) => ok, Err(m) => m };
+    expect(r1).toEqual(ok);
+    expect(r2).toEqual(ok);
+    expect(r3).toEqual(ok);
+    expect(r4).toEqual("the kit's halves of the vault OPRF key do not fit the quorum's commitments");
+}

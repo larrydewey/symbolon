@@ -22,6 +22,7 @@ import "../types.resid";
 import "../vault/kvshare.resid";
 import "../vault/toprf.resid";
 import "../threshold/threshold.resid";
+import "../recovery/recovery.resid";
 import "../net/proto.resid";
 import "../net/services.resid";
 import "state.resid";
@@ -165,12 +166,15 @@ Result(KvOut, Str) combine_at(Int me, List(KvGot) deals, List(List(Int)) old_com
 
 // The kit's sealed blobs at the relay are named by the epoch they were
 // made for ("kit-<log>-a-<epoch>", "kit-<log>-secrets-<epoch>",
-// "kitv-<log>-a-<epoch>") and written once, only by a device of the
-// log's quorum at that epoch (relaysrv.resid kit_write): a stolen device
-// can no longer overwrite the kit's half and break kit recovery. The
-// names without an epoch, from before, are still read when the epoch's
-// is not there (each blob is sealed to its epoch, so an older one only
-// fails to open), never written.
+// "kitv-<log>-a-<epoch>") and written once, only by the device that
+// finished the re-share (or inception) that made that epoch, while it is
+// still a party of the log (relaysrv.resid kit_write). The names without
+// an epoch, from before, are never written again but are still read. A
+// log made before the update has no epoch-named blobs, so a stolen device
+// could write garbage under the free epoch name (R5-4): the reader
+// therefore tries every candidate, the epoch's first, then the one from
+// before, and keeps the first that opens and verifies (each is sealed to
+// its epoch, so a stale one only fails to open).
 pub Str kit_a_blob(List(Int) log_id, Int epoch) { return "kit-" + hex_encode(log_id) + f"-a-{epoch}"; }
 pub Str kit_secrets_blob(List(Int) log_id, Int epoch) { return "kit-" + hex_encode(log_id) + f"-secrets-{epoch}"; }
 pub Str kitv_blob(List(Int) log_id, Int epoch) { return "kitv-" + hex_encode(log_id) + f"-a-{epoch}"; }
@@ -178,15 +182,49 @@ pub Str kit_a_legacy(List(Int) log_id) { return "kit-" + hex_encode(log_id) + "-
 pub Str kit_secrets_legacy(List(Int) log_id) { return "kit-" + hex_encode(log_id) + "-secrets"; }
 pub Str kitv_legacy(List(Int) log_id) { return "kitv-" + hex_encode(log_id) + "-a"; }
 
-// The blob `name`, or the one named `legacy` (from before epoch names)
-// when it is not there.
+// The blobs to try, in order: the one named `name`, then the one named
+// `legacy` (from before epoch names), each when it is there.
 @requires(network, clock(readonly), declassify)
-pub Option(List(Int)) kit_blob_get(Endpoint relay, Str name, Str legacy) {
-    Option(List(Int)) b = blob_get(relay, name);
-    Bool there = match b { Some(_) => true, None => false };
-    if (there) { return b; }
-    Option(List(Int)) old = blob_get(relay, legacy);
-    return old;
+pub List(List(Int)) kit_blobs_get(Endpoint relay, Str name, Str legacy) {
+    List(List(Int)) c = kit_candidates(blob_get(relay, name), blob_get(relay, legacy));
+    return c;
+}
+
+// Both, when there: an epoch blob that is there but does not open must
+// not hide the one from before (R5-4).
+pub List(List(Int)) kit_candidates(Option(List(Int)) cur, Option(List(Int)) old) {
+    List(List(Int)) a = match cur { Some(b) => [b], None => [] };
+    List(List(Int)) b = match old { Some(x) => [x], None => [] };
+    return a.concat(b);
+}
+
+// The kit's assembled half and its secrets from the candidate blobs: each
+// a-blob (a, k_a wrapped to the kit) with the cosigner's half `theirs`,
+// until the key they make opens one of the secrets blobs. A forged a-blob
+// (anyone can wrap to the kit's public key) gives a key that opens
+// nothing, so it is passed over.
+pub type KitOpened = { Half full; KitSecrets s; };
+
+@requires(declassify)
+pub Option(KitOpened) kit_open_blobs(List(Int) kit_hpke_priv, List(Int) log_id, UInt(32) epoch, List(Int) kit_party, Half theirs,
+                                     List(List(Int)) acands, List(List(Int)) scands, Int i) {
+    if (i >= acands.len()) { return None; }
+    Option(WrappedBlob) oa = blob_of_cbor(acands[i]);
+    List(Int) mine = match oa { Some(b) => offline_unwrap(kit_hpke_priv, log_id, epoch, kit_party, Wrapped {.enc = b.enc, .ct = b.ct}) else { [] }, None => [] };
+    Option(Half) oha = half_of(mine);
+    Option(Half) full = match oha { None => None, Some(ha) => kit_assemble(ha, theirs) };
+    Option(KitOpened) got = match full { None => None, Some(f) => kit_secrets_try(f, log_id, epoch, scands, 0) };
+    if (match got { Some(_) => true, None => false }) { return got; }
+    Option(KitOpened) next = kit_open_blobs(kit_hpke_priv, log_id, epoch, kit_party, theirs, acands, scands, i + 1);
+    return next;
+}
+
+@requires(declassify)
+Option(KitOpened) kit_secrets_try(Half full, List(Int) log_id, UInt(32) epoch, List(List(Int)) scands, Int j) {
+    if (j >= scands.len() || full.key.len() != 32) { return None; }
+    Result(KitSecrets, SymbolonError) ks = kit_secrets_open(secret_bytes(full.key), log_id, epoch, scands[j]);
+    Option(KitOpened) r = match ks { Ok(s) => Some(KitOpened {.full = full, .s = s}), Err(_) => kit_secrets_try(full, log_id, epoch, scands, j + 1) };
+    return r;
 }
 
 // a_v wrapped to the kit's HPKE key for epoch `epoch`.
@@ -219,12 +257,30 @@ Option(WrappedBlob) half_in(List(Got) gs, Int i) {
 @requires(network, declassify, clock)
 pub Result(KvScalar, Str) kv_kit_share(Endpoint relay, List(Int) log_id, List(Int) kit_hpke_priv, UInt(32) kit_epoch, List(Int) kit_party,
                                        List(Int) my_hpke_priv, UInt(32) my_epoch, List(Int) me, Option(WrappedBlob) bw, List(List(Int)) commits, Int kit) {
-    Option(WrappedBlob) aw = blob_of_cbor(kit_blob_get(relay, kitv_blob(log_id, (Int)kit_epoch), kitv_legacy(log_id)) else { [] });
-    List(Int) a = match aw { None => [], Some(b) => offline_unwrap(kit_hpke_priv, log_id, kit_epoch, kit_party, Wrapped {.enc = b.enc, .ct = b.ct}) else { [] } };
     List(Int) b = match bw { None => [], Some(x) => offline_unwrap(my_hpke_priv, log_id, my_epoch, me, Wrapped {.enc = x.enc, .ct = x.ct}) else { [] } };
-    if (a.len() != 32) { return Err("the kit's half of the vault OPRF key is not at the relay"); }
+    List(List(Int)) acands = kit_blobs_get(relay, kitv_blob(log_id, (Int)kit_epoch), kitv_legacy(log_id));
+    Result(KvScalar, Str) r = kv_kit_share_from(acands, kit_hpke_priv, log_id, kit_epoch, kit_party, b, commits, kit, 0, "the kit's half of the vault OPRF key is not at the relay");
+    return r;
+}
+
+// The first candidate a_v (the epoch's blob, then the one from before)
+// that with the cosigner's b_v (opened: `b`) fits the quorum's
+// commitments; a forged or stale one is passed over (R5-4).
+@requires(declassify)
+pub Result(KvScalar, Str) kv_kit_share_from(List(List(Int)) acands, List(Int) kit_hpke_priv, List(Int) log_id, UInt(32) kit_epoch, List(Int) kit_party,
+                                            List(Int) b, List(List(Int)) commits, Int kit, Int i, Str why) {
     if (b.len() != 32) { return Err("the cosigner did not release its half of the vault OPRF key"); }
+    if (i >= acands.len()) { return Err(why); }
+    Option(WrappedBlob) aw = blob_of_cbor(acands[i]);
+    List(Int) a = match aw { None => [], Some(x) => offline_unwrap(kit_hpke_priv, log_id, kit_epoch, kit_party, Wrapped {.enc = x.enc, .ct = x.ct}) else { [] } };
+    if (a.len() != 32) {
+        Result(KvScalar, Str) n = kv_kit_share_from(acands, kit_hpke_priv, log_id, kit_epoch, kit_party, b, commits, kit, i + 1, why);
+        return n;
+    }
     Secret(UInt(576)) k = cggmp_secret_scalar_add(kv_share_from(secret_bytes(a)), kv_share_from(secret_bytes(b)));
-    if (!kv_part_ok(kv_from_sec1(commits), kit, k)) { return Err("the kit's halves of the vault OPRF key do not fit the quorum's commitments"); }
+    if (!kv_part_ok(kv_from_sec1(commits), kit, k)) {
+        Result(KvScalar, Str) m = kv_kit_share_from(acands, kit_hpke_priv, log_id, kit_epoch, kit_party, b, commits, kit, i + 1, "the kit's halves of the vault OPRF key do not fit the quorum's commitments");
+        return m;
+    }
     return Ok(kv_scalar(k));
 }

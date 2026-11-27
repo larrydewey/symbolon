@@ -706,25 +706,58 @@ Str kit_epoch_part(Str n) {
 // and no one writes an epoch the log has not reached. The log is
 // verified offline at its own last witness time (as a sign-in starts):
 // the epoch moves only with a witnessed event.
+//
+// Only the device that made the epoch writes its blobs (R5-4): the first
+// signer of the re-share or inception that set it (the requester signs
+// first: enroll.resid after_session, device.resid publish), and only while
+// it has not been removed. Another device of the quorum, perhaps a stolen
+// one, cannot take a free epoch name first, and a removed device writes
+// nothing. An epoch a recover set has no blobs (the recovered device's
+// re-share makes the next).
 @requires(filesystem, network, clock(readonly), declassify)
 pub Str kit_write(Store root, Str name, List(Int) body, Who w) {
     if (kit_log_named(name) != hex_encode(w.log)) { return "only a device of that log writes it"; }
     if (body.len() == 0) { return "a kit's blob is never removed"; }
     List(SignedEvent) evs = log_dir(root, w.log, (UInt(64))0, []);
     if (evs.len() == 0) { return "no log at this relay"; }
-    Result(VerifiedHead, SymbolonError) rv = il_verify(w.log, evs, last_time(evs, policy_of_e0(evs)), lambda(x) { false });
+    Int t = last_time(evs, policy_of_e0(evs));
+    Result(VerifiedHead, SymbolonError) rv = il_verify(w.log, evs, t, lambda(x) { false });
     return match rv {
         Err(_) => "the log does not verify",
-        Ok(vh) => kit_write_at(vh, name, w)
+        Ok(vh) => kit_write_at(vh, evs, il_membership(w.log, evs, t, lambda(x) { false }), name, w)
     };
 }
 
-Str kit_write_at(VerifiedHead vh, Str name, Who w) {
+pub Str kit_write_at(VerifiedHead vh, List(SignedEvent) evs, Option(Membership) om, Str name, Who w) {
     Option(Party) d = device_party(vh.head.quorum.parties, w.party, 0);
     Bool dev = match d { None => false, Some(x) => bytes_eq(x.auth_key, w.key) };
     if (!dev) { return "only a device of the log's quorum writes the kit's blobs"; }
+    Bool removed = match om { None => true, Some(m) => id_in(m.removed, w.party, 0) };
+    if (removed) { return "a device removed from the log does not write the kit's blobs"; }
     if (str_parse_int(kit_epoch_part(name)) != (Int)vh.head.quorum.epoch) { return "a kit's blob is written only for the log's current epoch"; }
+    List(Int) req = epoch_requester(evs, vh.head.quorum.epoch, evs.len() - 1);
+    if (!bytes_eq(req, w.party)) { return "only the device that made the log's epoch writes its kit's blobs"; }
     return "";
+}
+
+Bool id_in(List(List(Int)) ids, List(Int) id, Int i) {
+    if (i >= ids.len()) { return false; }
+    if (bytes_eq(ids[i], id)) { return true; }
+    return id_in(ids, id, i + 1);
+}
+
+// The first signer of the latest re-share or inception whose quorum is at
+// `epoch` ([] when none: a recover set it, or no one signed).
+pub List(Int) epoch_requester(List(SignedEvent) evs, UInt(32) epoch, Int i) {
+    if (i < 0) { return []; }
+    EventBody b = evs[i].payload.body;
+    Bool made = match b { ReshareBody(nq) => nq.epoch == epoch, InceptionBody(q, _) => q.epoch == epoch, _ => false };
+    if (!made) {
+        List(Int) r = epoch_requester(evs, epoch, i - 1);
+        return r;
+    }
+    List(EventSig) ss = evs[i].sigs;
+    return if (ss.len() > 0) { ss[0].signer } else { [] };
 }
 
 pub Int max_alert() { return 65536; }
