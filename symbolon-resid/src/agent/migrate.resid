@@ -244,9 +244,17 @@ Known known_in(Str dir, DeviceConfig c, WitnessedView w, Reports rp, Str fail) {
 //   rotation-rollover ok|avoid
 @requires(filesystem, network, clock(readonly), declassify)
 pub Int device_status_plus(Str dir) {
-    Int r = device_status(dir);
     Option(DeviceConfig) oc = load_config(dir);
-    return match oc { None => r, Some(c) => if (c.log_id.len() == 0) { r } else { status_lines(dir, known_now(dir, c), r) } };
+    return match oc { None => device_status(dir), Some(c) => if (c.log_id.len() == 0) { device_status(dir) } else { status_then(dir, known_now(dir, c)) } };
+}
+
+// What the device knows is worked out first, so that its lines follow
+// the status at once: a reader that stops at the line it wants (`grep
+// -q`) is gone before a late write, which would end this process.
+@requires(filesystem, network, clock(readonly), declassify)
+Int status_then(Str dir, Known k) {
+    Int r = device_status(dir);
+    return status_lines(dir, k, r);
 }
 
 Int status_lines(Str dir, Known k, Int r) {

@@ -92,9 +92,9 @@ grep -q '^security re-share: done already$' "$W/refresh2.log" || fail "the key r
 # A device reported lost: no rollover, each site's own recovery.
 run 60 "$BIN" device security-advice "$W/dev" --report lost > "$W/advice-lost.log" 2>&1 || fail "security-advice --report lost"
 grep -q "Don't use the rollover browser extension" "$W/advice-lost.log" || fail "advice after a lost device: $(cat "$W/advice-lost.log")"
-run 120 "$BIN" device status "$W/dev" | grep -qx 'rotation-rollover avoid' || fail "rollover still advised after a lost device"
+run 120 "$BIN" device status "$W/dev" > "$W/status-lost.log" 2>&1; grep -qx 'rotation-rollover avoid' "$W/status-lost.log" || fail "rollover still advised after a lost device"
 rm "$W/dev/security-reports"; mv "$W/nonce-fix.born" "$W/dev/nonce-fix"
-run 120 "$BIN" device status "$W/dev" | grep -qx 'rotation none' || fail "the household's inception marker no longer counts"
+run 120 "$BIN" device status "$W/dev" > "$W/status-born.log" 2>&1; grep -qx 'rotation none' "$W/status-born.log" || fail "the household's inception marker no longer counts"
 echo "nonce fix: the key refresh ran once (epoch 2), the advice follows the marker and the reports"
 printf '2468\n' | run 300 "$BIN" device register "$W/dev" login.example.com > "$W/reg.log" 2>&1 || fail "register"
 CID=$(awk '/^credential-id/ {print $2}' "$W/reg.log"); PUB=$(awk '/^public-key/ {print $2}' "$W/reg.log")
