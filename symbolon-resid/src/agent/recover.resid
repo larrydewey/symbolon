@@ -245,27 +245,27 @@ Str event_kind(EventBody b) {
 // The labels of the parties of `ps` that `sigs` name.
 Str signer_labels(List(EventSig) sigs, List(Party) ps, Int i, Str acc) {
     if (i >= sigs.len()) { return acc; }
-    Party p = party_named(ps, sigs[i].signer, 0) else { none_party() };
+    Party p = pend_party(ps, sigs[i].signer, 0) else { none_party() };
     Str one = if (p.id.len() == 0) { "?" } else { "\"" + p.label + "\"" };
     return signer_labels(sigs, ps, i + 1, if (str_len(acc) == 0) { one } else { acc + ", " + one });
 }
 
-Option(Party) party_named(List(Party) ps, List(Int) id, Int i) {
+Option(Party) pend_party(List(Party) ps, List(Int) id, Int i) {
     if (i >= ps.len()) { return None; }
     if (bytes_eq(ps[i].id, id)) { return Some(ps[i]); }
-    return party_named(ps, id, i + 1);
+    return pend_party(ps, id, i + 1);
 }
 
-Bool signed_by_party(List(EventSig) sigs, List(Int) id, Int i) {
+Bool pend_signed_by(List(EventSig) sigs, List(Int) id, Int i) {
     if (i >= sigs.len()) { return false; }
-    return bytes_eq(sigs[i].signer, id) || signed_by_party(sigs, id, i + 1);
+    return bytes_eq(sigs[i].signer, id) || pend_signed_by(sigs, id, i + 1);
 }
 
 // The events pending now: those il_pending_events reports and the head
 // still lists (it was verified at the current witness time).
-List(PendingEvent) pending_now(List(PendingEvent) pe, List(UInt(64)) now, Int i, List(PendingEvent) acc) {
+List(PendingEvent) pend_live(List(PendingEvent) pe, List(UInt(64)) now, Int i, List(PendingEvent) acc) {
     if (i >= pe.len()) { return acc; }
-    return pending_now(pe, now, i + 1, if (now.contains(pe[i].seq)) { acc.concat([pe[i]]) } else { acc });
+    return pend_live(pe, now, i + 1, if (now.contains(pe[i].seq)) { acc.concat([pe[i]]) } else { acc });
 }
 
 Str pending_line(List(SignedEvent) es, List(Party) ps, PendingEvent p) {
@@ -298,16 +298,16 @@ pub Int device_pending(Str dir) {
 @requires(network, clock(readonly), declassify)
 Int pending_list(DeviceConfig c, VerifiedHead vh) {
     List(SignedEvent) es = fetch_log(relay_ep(c), c.log_id, 0, []);
-    List(PendingEvent) pe = pending_now(il_pending_events(c.log_id, es, 0, lambda(x) { false }), vh.pending, 0, []);
+    List(PendingEvent) pe = pend_live(il_pending_events(c.log_id, es, 0, lambda(x) { false }), vh.pending, 0, []);
     if (pe.len() == 0) { println("nothing is pending"); return 0; }
-    print_lines(es, vh.head.quorum.parties, pe, 0);
+    pend_print(es, vh.head.quorum.parties, pe, 0);
     return 0;
 }
 
-Int print_lines(List(SignedEvent) es, List(Party) ps, List(PendingEvent) pe, Int i) {
+Int pend_print(List(SignedEvent) es, List(Party) ps, List(PendingEvent) pe, Int i) {
     if (i >= pe.len()) { return 0; }
     println(pending_line(es, ps, pe[i]));
-    return print_lines(es, ps, pe, i + 1);
+    return pend_print(es, ps, pe, i + 1);
 }
 
 // `symbolon device confirm DIR SEQ`: this device confirms the pending
@@ -337,12 +337,12 @@ Int confirm_with(Str dir, DeviceConfig c, UInt(64) seq, Str pin) {
 
 @requires(network, device, declassify, clock(readonly), environment)
 Int confirm_target(DeviceConfig c, Unlocked u, VerifiedHead vh, List(SignedEvent) es, UInt(64) seq) {
-    List(PendingEvent) pe = pending_now(il_pending_events(c.log_id, es, 0, lambda(x) { false }), vh.pending, 0, []);
+    List(PendingEvent) pe = pend_live(il_pending_events(c.log_id, es, 0, lambda(x) { false }), vh.pending, 0, []);
     List(PendingEvent) at = pending_at(pe, seq, 0, []);
     if (at.len() == 0) { return dfail(f"no event is pending at {seq} (`symbolon device pending` lists them)"); }
     PendingEvent p = at[0];
     if (!p.confirmable) { return dfail(f"event {seq} cannot be confirmed (a recover, the kit's set-policy or a set-policy that weakens the policy): veto it or let the delay run"); }
-    if (signed_by_party(es[(Int)seq].sigs, c.party, 0)) { return dfail(f"this device signed event {seq}: another device of the household must confirm it"); }
+    if (pend_signed_by(es[(Int)seq].sigs, c.party, 0)) { return dfail(f"this device signed event {seq}: another device of the household must confirm it"); }
     println("pending " + pending_line(es, vh.head.quorum.parties, p));
     eprintln(f"device: confirm event {seq}, so that it takes effect now? (y/N)");
     Str a = str_to_lower(str_trim(read_pin()));
