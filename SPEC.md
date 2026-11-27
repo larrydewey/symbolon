@@ -2530,6 +2530,29 @@ one; a relay that refuses to claim it, or is gone, keeps the log where it
 is (a stall: the relay is already what stores the log, the kit's
 material and the recovery requests).
 
+**Changing the witnesses.** `symbolon device witnesses DIR --add
+HOST:PORT:KEY ... --remove HOST:PORT ...` makes a `set-policy` from the
+policy in force with the witnesses named by `--add` added and those at the
+addresses named by `--remove` taken out, every other field kept (the
+sequencing relay of field 8 above all; `policy[1]` raised to the floor of
+Section 8.2 when the quorum has grown past it). It is refused, before
+anything is signed, when an address names no witness of the policy, an
+added witness's key is not a P-256 point or is in the policy already,
+two witnesses would share a key, or fewer than three would remain; and
+unless each added witness answers `POST /time` for a fresh nonce with a
+time signed under the key given (reached under the device's TLS trust
+anchor), so that a mistyped address or key cannot leave the log needing a
+witness that never answers. Signed by that one device, it takes effect at
+once only when that is `policy[1]` devices and it does not weaken the
+policy (Section 8.2); otherwise it waits out the recovery delay, during
+which any device of the quorum may veto it, as a recovery. Removing or
+replacing a witness is always delayed. The event itself is co-signed by
+the witnesses of the policy before it; from the event after the one at
+which the change is in force (Section 8.3), every device asks the new
+witnesses: a device co-signs with the witnesses the verified log names,
+not those it was set up with. Running the command again on another device
+reports the change as done or pending instead of making a second one.
+
 A witness co-signs with the witness time at which it checked the event:
 its own clock, but never earlier than the last event's witness time, so a
 witness whose clock runs behind does not co-sign a time that every agent

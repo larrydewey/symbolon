@@ -114,6 +114,10 @@
 //   symbolon device veto DIR                   PIN on stdin; vetoes the latest pending event
 //   symbolon device sequence DIR [HOST:PORT]  PIN on stdin; names the relay (this device's, or HOST:PORT) as the
 //                                              log's sequencer (policy field 8, SPEC 20.3): a set-policy
+//   symbolon device witnesses DIR [--add HOST:PORT:KEY]... [--remove HOST:PORT]...   PIN on stdin; changes the
+//                                              log's witnesses (SPEC 20.3): a set-policy, each added witness's
+//                                              signed time checked first; delayed and vetoable unless signed by
+//                                              policy[1] devices, and always when it removes one (SPEC 8.2)
 //   symbolon device recover-release DIR        PIN on stdin; asks the cosigner for its kit half
 //   symbolon device recover-finish DIR KIT_SEED [PRIMES]  PIN on stdin; after the delay: release, re-share
 //
@@ -547,6 +551,12 @@ Int main_cmd() {
     if (a1 == "device" && a2 == "join" && (n == 5 || n == 6)) { return device_join(args.get(3), args.get(4), if (n == 6) { args.get(5) } else { "" }); }
     if (a1 == "device" && a2 == "recover" && n == 6) { return device_recover(args.get(3), args.get(4), args.get(5)); }
     if (a1 == "device" && a2 == "veto" && n == 4) { return device_veto(args.get(3)); }
+    if (a1 == "device" && a2 == "witnesses" && positional(3) == 4) {
+        List(Str) add = flag_args("--add", 4, ListBuf());
+        List(Str) rm = flag_args("--remove", 4, ListBuf());
+        if ((add.len() + rm.len()) * 2 != n - 4) { return dfail("usage: device witnesses DIR [--add HOST:PORT:KEY]... [--remove HOST:PORT]..."); }
+        return device_witnesses(args.get(3), add, rm);
+    }
     if (a1 == "device" && a2 == "sequence" && (n == 4 || n == 5)) { return device_sequence(args.get(3), if (n == 5) { args.get(4) } else { "" }); }
     if (a1 == "device" && a2 == "recover-release" && n == 4) { return device_recover_release(args.get(3)); }
     if (a1 == "device" && a2 == "recover-finish" && (n == 5 || n == 6)) { return device_recover_finish(args.get(3), args.get(4), if (n == 6) { args.get(5) } else { "" }); }

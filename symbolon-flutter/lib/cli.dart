@@ -304,6 +304,17 @@ class SymbolonCli {
   /// Gives a quorum without one a vault OPRF key (a re-share with the cosigner).
   Future<CliResult> protectionEnable(String dir, String pin) => run(['device', 'protection', 'enable', dir], input: [pin]);
 
+  /// Changes the log's witnesses (SPEC 20.3): [add] as host:port:keyhex,
+  /// [remove] as host:port. Each added witness's signed time is checked
+  /// first. Removing a witness, or a change signed by fewer devices than
+  /// the policy asks for, waits out the recovery delay (any device may
+  /// veto it); the output says whether it is in force or pending. This is
+  /// how a household paired with an older Symbolon Home moves its witness
+  /// majority off the box (the box's reminder gives the addresses).
+  Future<CliResult> witnesses(String dir, String pin, {List<String> add = const [], List<String> remove = const []}) =>
+      run(['device', 'witnesses', dir, for (final a in add) ...['--add', a], for (final r in remove) ...['--remove', r]],
+          input: [pin], timeout: const Duration(minutes: 5));
+
   // ─── Organizations (SPEC 29) ────────────────────────────────────────
 
   /// "org ID NAME-HEX", "version V gov G", "role R", "policy ...",

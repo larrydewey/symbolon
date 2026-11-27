@@ -67,6 +67,14 @@ void main() {
     expect(lines[1], 'device new /e relay.example 443');
   });
 
+  test('a witness change passes each witness as a flag and the PIN on standard input', () async {
+    await cli.witnesses('/d', '2468', add: ['pc.lan:47110:04ab'], remove: ['box.lan:47103', 'box.lan:47104']);
+    final args = (await agent.argsLog.readAsString()).trim();
+    expect(args, 'device witnesses /d --add pc.lan:47110:04ab --remove box.lan:47103 --remove box.lan:47104');
+    expect(args, isNot(contains('2468')));
+    expect(await agent.stdinLog.readAsString(), startsWith('2468\n'));
+  });
+
   test('a missing binary is reported, not thrown', () async {
     final r = await const SymbolonCli('/nonexistent/symbolon').status('/d');
     expect(r.code, 127);

@@ -34,6 +34,7 @@ import "kvagent.resid";
 import "../vault/kvshare.resid";
 import "word.resid";
 import "crypto.resid";
+import "ecdsa.resid";
 import "clock.resid";
 
 pub Party none_party() { return Party {.id = [], .kind = 0, .auth_key = [], .hpke_key = [], .label = "", .attestation = NoAttestation}; }
@@ -83,16 +84,17 @@ pub Result(VerifiedHead, Str) publish_event(DeviceConfig c, EventPayload p, List
     ClaimOut co = claim_post(relay_ep(c), c.log_id, p.sequence, bare);
     if (co.status == 409) { return Err(claimed_by_other(c, before, p.sequence, co)); }
     Option(RelayClaim) cl = if (co.status == 200) { co.claim } else { None };
-    List(CosignOut) outs = cosign_all(c.witnesses, c.ca, c.log_id, p.sequence, d, before.concat([bare]), cl, 0, []);
+    List(WitnessEp) ws = witnesses_for(c, before);
+    List(CosignOut) outs = cosign_all(ws, c.ca, c.log_id, p.sequence, d, before.concat([bare]), cl, 0, []);
     List(WitnessCosignature) cs = cosigs_in(outs, 0, []);
-    if (cs.len() * 2 <= c.witnesses.len() || cs.len() < 2) {
+    if (cs.len() * 2 <= ws.len() || cs.len() < 2) {
         // The relay's two claims at one sequence, when the witnesses hold
         // another event under a claim of the same relay.
         Str eq = equivocation(c, before, p.sequence, d, cl, outs);
         if (str_len(eq) > 0) { return Err(eq); }
         // The freeze alarm (SPEC 20.4): witnesses that co-signed different
         // events at this sequence, so none can get a majority there.
-        Str frozen = freeze_check(c.witnesses, c.ca, c.log_id, p.sequence);
+        Str frozen = freeze_check(ws, c.ca, c.log_id, p.sequence);
         Str none = if (co.status == 200) { "" } else { f" (the relay gave no claim on the event: {co.status})" };
         return Err(if (str_len(frozen) > 0) { frozen } else { "too few witnesses co-signed" + none });
     }
@@ -101,6 +103,17 @@ pub Result(VerifiedHead, Str) publish_event(DeviceConfig c, EventPayload p, List
     // the witnesses itself, agent/relaysrv.resid claim_complete).
     if (!put && !relay_holds(relay_ep(c), c.log_id, p.sequence, d)) { return Err("the relay refused the event"); }
     return match verified_log(relay_ep(c), c.log_id) { Ok(v) => Ok(v), Err(e) => Err("the log does not verify: " + err_text(e)) };
+}
+
+// The witnesses whose co-signatures the event after the log `before`
+// needs: those its policy names as the log stands (il_witnesses), so that
+// every device follows a set-policy that changes them (`device
+// witnesses`), once it is in force, whatever its own configuration
+// recorded at inception or enrollment. The configured ones only when
+// `before` does not verify (the event is then refused anyway).
+pub List(WitnessEp) witnesses_for(DeviceConfig c, List(List(Int)) before) {
+    List(WitnessRef) ws = il_witnesses(c.log_id, events_of_raw(before, 0, []));
+    return if (ws.len() == 0) { c.witnesses } else { eps_of(ws, 0, []) };
 }
 
 // Each witness's answer to a co-sign request with the relay's claim.
@@ -139,10 +152,11 @@ Str claimed_by_other(DeviceConfig c, List(List(Int)) before, UInt(64) n, ClaimOu
     Option(StoredEvent) se = event_of_cbor(co.event);
     List(Int) od = match se { None => [], Some(x) => sha256_bytes(x.encoded) };
     if (od.len() == 0) { return f"the relay claimed sequence {n} of the log for another event it does not show"; }
-    List(CosignOut) outs = cosign_all(c.witnesses, c.ca, c.log_id, n, od, before.concat([co.event]), co.claim, 0, []);
+    List(WitnessEp) ws = witnesses_for(c, before);
+    List(CosignOut) outs = cosign_all(ws, c.ca, c.log_id, n, od, before.concat([co.event]), co.claim, 0, []);
     List(WitnessCosignature) cs = cosigs_in(outs, 0, []);
     StoredEvent x = se else { StoredEvent {.encoded = [], .sigs = [], .cosigs = []} };
-    Bool done = cs.len() * 2 > c.witnesses.len() && cs.len() >= 2
+    Bool done = cs.len() * 2 > ws.len() && cs.len() >= 2
         && (log_put(relay_ep(c), c.log_id, n, cbor_of_event(StoredEvent {.encoded = x.encoded, .sigs = x.sigs, .cosigs = cs})) || relay_holds(relay_ep(c), c.log_id, n, od));
     Str what = f"sequence {n} of the log is claimed at the relay by another event (digest {hex_encode(od)})";
     return what + if (done) { ", now witnessed and stored: check it (device status) and try again" } else { ", not witnessed yet" };
@@ -217,6 +231,162 @@ Int sequence_set(DeviceConfig c, Unlocked u, VerifiedHead vh, WitnessRef sq) {
 Int sequence_done(WitnessRef sq, VerifiedHead vh) {
     Bool now = vh.head.policy.sequencer.len() == 1 && bytes_eq(vh.head.policy.sequencer[0].key, sq.key);
     println("relay " + sq.url + " " + hex_encode(sq.key) + if (now) { " sequences the log now" } else { f" sequences the log once the set-policy's delay has run ({vh.pending.len()} pending)" });
+    return 0;
+}
+
+// ─── `device witnesses DIR [--add HOST:PORT:KEY]... [--remove HOST:PORT]...` (SPEC 20.3) ─
+// Changes the log's witnesses: a set-policy that adds the witnesses named
+// with --add and takes out those at the addresses named with --remove,
+// every other field of the policy kept (the sequencing relay above all).
+// Signed by this device: it takes effect at once only when that is
+// policy[1] devices (a quorum of one) and the change does not weaken the
+// policy; otherwise it waits out the recovery delay, during which any
+// device may veto it (`device veto`), as for a recovery (SPEC 8.2).
+// Removing or replacing a witness always weakens the policy, and so does
+// adding so many that the added ones and a minority of the old ones make a
+// majority. Each witness added is asked its time first, for a fresh nonce,
+// and must sign it under the key given: a typo in an address or key is
+// refused here instead of leaving the log needing a witness that never
+// answers. A household whose box (an old Symbolon Home) runs every
+// witness moves the majority off it this way; every device follows the
+// policy in force (publish_event), so only one of them runs it, and the
+// others may run the same command to see that it is pending or done.
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+pub Int device_witnesses(Str dir, List(Str) add, List(Str) remove) {
+    Option(DeviceConfig) oc = load_config(dir);
+    Result(List(WitnessRef), Str) ra = witness_specs(add, 0, []);
+    return match oc {
+        None => dfail("not set up"),
+        Some(c) => match ra {
+            Err(m) => dfail(m),
+            Ok(ws) => witnesses_with(dir, c, ws, remove, read_pin())
+        }
+    };
+}
+
+// HOST:PORT:KEY (KEY: the witness's P-256 public key, 130 hex digits, as
+// `symbolon witness keygen` prints it), as the policy names a witness.
+pub Result(List(WitnessRef), Str) witness_specs(List(Str) xs, Int i, List(WitnessRef) acc) {
+    if (i >= xs.len()) { return Ok(acc); }
+    List(Str) p = str_split(xs[i], ":");
+    if (p.len() != 3 || str_len(p[0]) == 0) { return Err(xs[i] + ": a witness is HOST:PORT:KEY"); }
+    Int port = if (str_is_int(p[1])) { str_parse_int(p[1]) } else { 0 };
+    if (port < 1 || port > 65535) { return Err(xs[i] + ": the port is not a number from 1 to 65535"); }
+    List(Int) k = cose_hex_decode(p[2]);
+    if (k.len() != 65 || str_len(p[2]) != 130 || !ec_public_ok(P256, k)) { return Err(xs[i] + ": the key is not a P-256 public key (130 hex digits, as `symbolon witness keygen` prints it)"); }
+    return witness_specs(xs, i + 1, acc.concat([WitnessRef {.url = "http://" + str_to_lower(p[0]) + ":" + f"{port}", .key = k}]));
+}
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+Int witnesses_with(Str dir, DeviceConfig c, List(WitnessRef) add, List(Str) remove, Str pin) {
+    Unlocked u = unlock_dir(dir, c, pin);
+    if (u.kind == 2) { return dfail(duress_refusal(dir, c)); }
+    if (u.kind != 1) { return dfail("wrong PIN"); }
+    Result(VerifiedHead, SymbolonError) rv = verified_log(relay_ep(c), c.log_id);
+    return match rv {
+        Err(e) => dfail(err_text(e)),
+        Ok(vh) => witnesses_change(c, u, vh, add, remove)
+    };
+}
+
+@requires(filesystem, network, device, declassify, clock, environment)
+Int witnesses_change(DeviceConfig c, Unlocked u, VerifiedHead vh, List(WitnessRef) add, List(Str) remove) {
+    Policy p0 = vh.head.policy;
+    if (witnesses_done(p0.witnesses, add, remove)) {
+        println("the log's policy names those witnesses already: " + witness_names(p0.witnesses, 0, StrBuf()));
+        return 0;
+    }
+    Result(Policy, Str) rp = policy_with_witnesses(p0, vh.head.quorum, add, remove);
+    Policy np = match rp { Ok(x) => x, Err(_) => p0 };
+    Str why = match rp { Ok(_) => "", Err(m) => m };
+    if (str_len(why) > 0) { return dfail(why); }
+    List(SignedEvent) es = fetch_log(relay_ep(c), c.log_id, 0, []);
+    UInt(64) waiting = pending_witness_change(es, vh.pending, np.witnesses, 0);
+    if ((Int)waiting > 0) {
+        println(f"a set-policy naming those witnesses is pending already (event {waiting}): it takes effect once its delay has run, unless a device vetoes it");
+        return 0;
+    }
+    Str dead = unanswered(add, c.ca, 0);
+    if (str_len(dead) > 0) { return dfail(dead); }
+    EventPayload p = next_event(vh, SetPolicyBody(np), field6_in_force(es, vh.pending, es.len() - 1));
+    List(Int) enc = payload_cbor(p) else { [] };
+    if (enc.len() == 0) { return dfail("the policy does not encode"); }
+    Result(List(Int), Str) s = dk_sign(c, u.real, u.st, enc);
+    return match s {
+        Err(m) => dfail(m),
+        Ok(sig) => match publish_event(c, p, enc, [EventSig {.signer = c.party, .sig = sig}]) {
+            Err(m) => dfail("set-policy: " + m),
+            Ok(vh2) => witnesses_published(p0, np, vh2)
+        }
+    };
+}
+
+// Whether the policy's witnesses `ws` already hold every witness of `add`
+// (the same key at the same address) and none at an address of `remove`.
+Bool witnesses_done(List(WitnessRef) ws, List(WitnessRef) add, List(Str) remove) {
+    return (add.len() > 0 || remove.len() > 0) && adds_present(ws, add, 0) && removes_absent(ws, remove, 0);
+}
+
+Bool adds_present(List(WitnessRef) ws, List(WitnessRef) add, Int i) {
+    if (i >= add.len()) { return true; }
+    return has_witness(ws, add[i], 0) && adds_present(ws, add, i + 1);
+}
+
+Bool has_witness(List(WitnessRef) ws, WitnessRef w, Int i) {
+    if (i >= ws.len()) { return false; }
+    if (bytes_eq(ws[i].key, w.key) && witness_addr(ws[i].url) == witness_addr(w.url)) { return true; }
+    return has_witness(ws, w, i + 1);
+}
+
+Bool removes_absent(List(WitnessRef) ws, List(Str) remove, Int i) {
+    if (i >= remove.len()) { return true; }
+    return !addr_in(ws, witness_addr(remove[i]), 0) && removes_absent(ws, remove, i + 1);
+}
+
+Bool addr_in(List(WitnessRef) ws, Str a, Int i) {
+    if (i >= ws.len()) { return false; }
+    return witness_addr(ws[i].url) == a || addr_in(ws, a, i + 1);
+}
+
+// The sequence of a pending set-policy whose witnesses are `ws`, or 0.
+UInt(64) pending_witness_change(List(SignedEvent) es, List(UInt(64)) pending, List(WitnessRef) ws, Int i) {
+    if (i >= es.len()) { return (UInt(64))0; }
+    EventPayload ep = es[i].payload;
+    EventBody b = ep.body;
+    Bool same = in_seqs(pending, ep.sequence, 0) && match b { SetPolicyBody(np) => same_witness_keys(np.witnesses, ws), _ => false };
+    if (same) { return ep.sequence; }
+    return pending_witness_change(es, pending, ws, i + 1);
+}
+
+// Why a witness of `ws` cannot be used: it does not answer POST /time for
+// a fresh nonce with a time signed under its key (SPEC 20.3); "" when
+// every one does.
+@requires(network, clock(readonly), declassify)
+Str unanswered(List(WitnessRef) ws, Str ca, Int i) {
+    if (i >= ws.len()) { return ""; }
+    Option(Endpoint) oe = endpoint_of_url(witness_addr(ws[i].url), ca);
+    Option(Int) t = match oe { None => None, Some(e) => time_from(e, ws[i].key, random_bytes(32)) };
+    Bool ok = match t { Some(_) => true, None => false };
+    if (!ok) {
+        return "the witness at " + witness_addr(ws[i].url) + " does not answer with a time signed by that key (POST /time): check its address, its key and that it is running; nothing was changed";
+    }
+    return unanswered(ws, ca, i + 1);
+}
+
+Str witness_names(List(WitnessRef) ws, Int i, StrBuf acc) {
+    if (i >= ws.len()) { return acc.finish(); }
+    return witness_names(ws, i + 1, if (i == 0) { acc.push(witness_addr(ws[i].url)) } else { acc.push(", ").push(witness_addr(ws[i].url)) });
+}
+
+Int witnesses_published(Policy p0, Policy np, VerifiedHead vh) {
+    Bool now = same_witness_keys(vh.head.policy.witnesses, np.witnesses);
+    if (now) {
+        println("the log's witnesses are now " + witness_names(np.witnesses, 0, StrBuf()));
+        return 0;
+    }
+    Str weak = if (weakens(p0, np)) { "removing or replacing witnesses (or adding enough to outvote the old ones) always waits out the delay" } else { "the policy asks for more devices' signatures than this one" };
+    println(f"set-policy published; the new witnesses take effect once the recovery delay ({p0.recovery_delay_sec} s of witness time) has run, unless a device vetoes it (device veto): "
+        + weak + f". Pending events: {vh.pending.len()}");
     return 0;
 }
 
@@ -682,7 +852,7 @@ pub Remote cos_remote(VerifiedHead vh) {
 pub List(WitnessEp) eps_of(List(WitnessRef) ws, Int i, List(WitnessEp) acc) {
     if (i >= ws.len()) { return acc; }
     Str u = ws[i].url;
-    Str hp = if (str_len(u) > 7 && str_slice(u, 0, 7) == "http://") { str_slice(u, 7, str_len(u)) } else { u };
+    Str hp = witness_addr(u);
     List(Str) parts = str_split(hp, ":");
     List(WitnessEp) next = if (parts.len() == 2) { acc.concat([WitnessEp {.host = parts[0], .port = str_parse_int(parts[1]), .key = ws[i].key}]) } else { acc };
     return eps_of(ws, i + 1, next);
