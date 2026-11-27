@@ -372,72 +372,95 @@ pub List(Int) open_box_key(Str dir, Str pass_flag) {
 
 List(Int) fail_key(Str m) { eprintln(m); return []; }
 
-// A file of the box sealed under `k` where it lies (an empty or missing
-// file, or one sealed already, stays as it is).
+// The file at `rel` below the sealed root `root`, sealed under `k` where
+// it lies, for its path (boxseal.resid, R4-9): an empty or missing file,
+// or one sealed already, stays as it is; with `again`, a file sealed in
+// format 1 (one constant for every path) is sealed again for its path.
 @requires(filesystem)
-pub Bool seal_in_place(Str path, List(Int) k) {
+pub Bool seal_in_place(Str root, Str rel, List(Int) k, Bool again) {
+    Str path = root + "/" + rel;
     List(Int) b = filesystem.read_bytes(path);
-    if (b.len() == 0 || is_sealed(b)) { return true; }
-    List(Int) s = seal_bytes(k, b);
-    return s.len() > 0 && filesystem.write_secret(path, s);
+    if (b.len() == 0 || (is_sealed(b) && !(again && is_sealed1(b)))) { return true; }
+    Option(List(Int)) s = seal_again(k, rel, b);
+    return match s { None => false, Some(x) => filesystem.write_secret(path, x) };
 }
 
-// A box file's contents: opened under `k` when sealed, else as it is.
+// A box file's contents (`rel` below the box's directory `dir`): opened
+// under `k` when it is sealed for its path; on a sealed box (`k` given)
+// nothing else is read ([]), on a box not sealed the file as it is.
 @requires(filesystem)
-pub List(Int) box_file(Str path, List(Int) k) {
-    List(Int) b = filesystem.read_bytes(path);
-    if (!is_sealed(b)) { return b; }
-    return match unseal_bytes(k, b) { Some(p) => p, None => [] };
+pub List(Int) box_file(Str dir, Str rel, List(Int) k) {
+    List(Int) b = filesystem.read_bytes(dir + "/" + rel);
+    if (k.len() != 32) { return if (is_sealed(b)) { [] } else { b }; }
+    return match unseal_bytes(k, rel, b) { Some(p) => p, None => [] };
 }
 
-// The secret files of a cosigner's directory (cosignerd.resid,
-// epochfiles.resid): its root key, its shares and the kit's halves, the
-// vault OPRF shares, the duress keys, a re-share's pending ones, and its
-// mail session at the relay.
-pub Bool cos_secret_name(Str n) {
-    return n == "root" || n == "duress-keys" || n == "duress-transport" || n == "relay.mtoken"
-        || (str_starts_with(n, "cg-") && str_ends_with(n, ".cfg")) || str_starts_with(n, "kit-b-") || str_starts_with(n, "kit-half")
-        || str_starts_with(n, "kv-") || str_starts_with(n, "kitv-b-") || str_starts_with(n, "kvpend-")
-        || (str_starts_with(n, "pending-") && (str_ends_with(n, ".cfg") || str_ends_with(n, ".kitb") || str_ends_with(n, ".kb") || str_ends_with(n, ".kv")));
-}
+// The secret files of a cosigner's directory (boxseal.resid).
+pub Bool cos_secret_name(Str n) { return seal_secret_name(n); }
 
 @requires(filesystem)
-Bool seal_cos_dir(Str cos, List(Str) names, Int i, List(Int) k) {
+Bool seal_cos_dir(Str cos, List(Str) names, Int i, List(Int) k, Bool again) {
     if (i >= names.len()) { return true; }
-    Bool ok = !cos_secret_name(names[i]) || seal_in_place(cos + "/" + names[i], k);
-    return ok && seal_cos_dir(cos, names, i + 1, k);
+    Bool ok = !cos_secret_name(names[i]) || seal_in_place(cos, names[i], k, again);
+    return ok && seal_cos_dir(cos, names, i + 1, k, again);
 }
 
 @requires(filesystem)
-Bool seal_people(Str dir, List(Str) people, Int i, List(Int) k) {
+Bool seal_people(Str dir, List(Str) people, Int i, List(Int) k, Bool again) {
     if (i >= people.len()) { return true; }
     Str cos = dir + "/people/" + people[i] + "/cos";
-    return seal_cos_dir(cos, filesystem.list_dir(cos), 0, k) && seal_people(dir, people, i + 1, k);
+    Bool ok = !filesystem.is_dir(cos) || (seal_cos_dir(cos, filesystem.list_dir(cos), 0, k, again) && seal_mark(cos));
+    return ok && seal_people(dir, people, i + 1, k, again);
 }
 
-// Every object of the relay's directory store (its claim and challenge
-// keys, sign-in sessions, mailboxes, logs, blobs), sealed where it lies;
-// the claims and temporary files beside them (names starting with ".")
-// hold no data and stay.
+// The directory marked sealed (boxseal.resid seal_mark_name): so it stays
+// sealed when its pointer is taken away.
 @requires(filesystem)
-pub Bool seal_tree(Str d, List(Str) names, Int i, List(Int) k) {
+Bool seal_mark(Str d) { return filesystem.exists(d + "/" + seal_mark_name()) || filesystem.write_all(d + "/" + seal_mark_name(), "sealed"); }
+
+// Every object of the relay's directory store (its claim and challenge
+// keys, sign-in sessions, mailboxes, logs, blobs), sealed where it lies,
+// each for its key below the store's root `root` (`pre` is the path of
+// `d` below it, "" or ending in "/"); the claims and temporary files beside
+// them (names starting with ".") hold no data and stay.
+@requires(filesystem)
+pub Bool seal_tree(Str root, Str pre, List(Str) names, Int i, List(Int) k, Bool again) {
     if (i >= names.len()) { return true; }
     Str n = names[i];
-    Str p = d + "/" + n;
-    Bool ok = str_starts_with(n, ".") || (if (filesystem.is_dir(p)) { seal_tree(p, filesystem.list_dir(p), 0, k) } else { seal_in_place(p, k) });
-    return ok && seal_tree(d, names, i + 1, k);
+    Str rel = pre + n;
+    Str p = root + "/" + rel;
+    Bool ok = str_starts_with(n, ".") || (if (filesystem.is_dir(p)) { seal_tree(root, rel + "/", filesystem.list_dir(p), 0, k, again) } else { seal_in_place(root, rel, k, again) });
+    return ok && seal_tree(root, pre, names, i + 1, k, again);
 }
 
 // Every secret of the box sealed under `k`: the CA's key, the server
 // certificate's, the witnesses', each cosigner's secret files, the relay's
-// store and the alert channels' settings (SMTP and ntfy credentials).
+// store and the alert channels' settings (SMTP and ntfy credentials); and
+// the directories that hold them marked sealed.
 @requires(filesystem)
-pub Bool seal_box_files(Str dir, List(Int) k) {
-    return seal_in_place(dir + "/tls/ca.key", k) && seal_in_place(dir + "/tls/server.key", k)
-        && seal_in_place(dir + "/w1.key", k) && seal_in_place(dir + "/w2.key", k) && seal_in_place(dir + "/w3.key", k)
-        && seal_people(dir, filesystem.list_dir(dir + "/people"), 0, k)
-        && seal_tree(dir + "/relay", filesystem.list_dir(dir + "/relay"), 0, k)
-        && seal_in_place(dir + "/alerts.conf", k);
+pub Bool seal_box_files(Str dir, List(Int) k) { return seal_box_files_at(dir, k, false); }
+
+@requires(filesystem)
+Bool seal_box_files_at(Str dir, List(Int) k, Bool again) {
+    _ = filesystem.create_dir(dir + "/relay");
+    return seal_in_place(dir, "tls/ca.key", k, again) && seal_in_place(dir, "tls/server.key", k, again)
+        && seal_in_place(dir, "w1.key", k, again) && seal_in_place(dir, "w2.key", k, again) && seal_in_place(dir, "w3.key", k, again)
+        && seal_people(dir, filesystem.list_dir(dir + "/people"), 0, k, again)
+        && seal_tree(dir + "/relay", "", filesystem.list_dir(dir + "/relay"), 0, k, again) && seal_mark(dir + "/relay")
+        && seal_in_place(dir, "alerts.conf", k, again) && seal_mark(dir);
+}
+
+// The box's files sealed in format 2 (R4-9): once, at the first `home
+// serve` after the update (while seal/format does not say 2), every file
+// sealed in format 1 is opened and sealed again for its path, and a
+// secret left in the clear is sealed; after that format 1 opens nowhere,
+// so a file sealed under one name cannot be put under another.
+pub Str seal_format_file(Str dir) { return dir + "/seal/format"; }
+
+@requires(filesystem)
+pub Bool seal_migrate(Str dir, List(Int) k) {
+    if (str_trim(filesystem.read_all(seal_format_file(dir))) == "2") { return true; }
+    return seal_box_files_at(dir, k, true) && filesystem.write_all(seal_format_file(dir), "2");
 }
 
 // `symbolon home alerts DIR [set KEY VALUE]`: on a sealed box, with the
@@ -446,7 +469,10 @@ pub Bool seal_box_files(Str dir, List(Int) k) {
 pub Int home_alerts_cmd(Str dir, List(Str) args) {
     if (!home_sealed(dir)) { return home_alerts(dir, args); }
     List(Int) k = open_box_key(dir, "");
-    return if (k.len() == 32) { home_alerts_with(dir, args, k) } else { 1 };
+    // Settings sealed in format 1, before the box's first `home serve`
+    // since the update, are sealed for their path first (seal_migrate).
+    Bool fresh = str_trim(filesystem.read_all(seal_format_file(dir))) == "2" || seal_in_place(dir, "alerts.conf", k, true);
+    return if (k.len() == 32 && fresh) { home_alerts_with(dir, args, k) } else { 1 };
 }
 
 // ─── What the box's devices are told ────────────────────────────
@@ -639,10 +665,10 @@ pub Int home_init(Str dir, List(Str) hosts, Int base, Str bind_flag, List(Str) w
     Bool ok = filesystem.write_secret(box_key_file(dir), sealed)
            && filesystem.write_all(dir + "/tls/ca.pem", ca_pem)
            && filesystem.write_all(dir + "/tls/trust.pem", ca_pem + wca)
-           && filesystem.write_secret(dir + "/tls/ca.key", seal_bytes(k, ca_priv))
+           && filesystem.write_secret(dir + "/tls/ca.key", seal_bytes(k, "tls/ca.key", ca_priv))
            && filesystem.write_all(dir + "/tls/server.pem", x509g_pem("CERTIFICATE", srv_der) + ca_pem)
-           && filesystem.write_secret(dir + "/tls/server.key", seal_bytes(k, str_to_bytes(x509g_pem("EC PRIVATE KEY", x509g_sec1_key(srv_priv, srv_pub)))))
-           && filesystem.write_secret(dir + "/w1.key", seal_bytes(k, w_priv)) && filesystem.write_all(dir + "/w1.pub", hex_encode(ec_public_key(P256, w_priv)))
+           && filesystem.write_secret(dir + "/tls/server.key", seal_bytes(k, "tls/server.key", str_to_bytes(x509g_pem("EC PRIVATE KEY", x509g_sec1_key(srv_priv, srv_pub)))))
+           && filesystem.write_secret(dir + "/w1.key", seal_bytes(k, "w1.key", w_priv)) && filesystem.write_all(dir + "/w1.pub", hex_encode(ec_public_key(P256, w_priv)))
            && filesystem.write_all(dir + "/witnesses.txt", lines(witnesses, 0, StrBuf()))
            && filesystem.write_all(dir + "/bind.txt", bind)
            && filesystem.write_all(dir + "/home.txt", f"{base}\n" + lines(hosts, 0, StrBuf()));
@@ -725,7 +751,7 @@ pub Int home_witness_cert(Str dir, Str host, Str out, Str pass_flag) {
     if (lower_all(c.hosts, 0, ListBuf()).contains(str_to_lower(host)) || str_len(host) == 0) { eprintln("home: " + host + " is this box; the certificate is for the witness's own machine"); return 1; }
     List(Int) k = if (home_sealed(dir)) { open_box_key(dir, pass_flag) } else { [] };
     if (home_sealed(dir) && k.len() != 32) { return 1; }
-    List(Int) ca_priv = box_file(dir + "/tls/ca.key", k);
+    List(Int) ca_priv = box_file(dir, "tls/ca.key", k);
     if (ca_priv.len() != 32) { eprintln("home: cannot read the CA's key"); return 1; }
     Int now = clock_now_seconds();
     List(Int) priv = fresh_key();
@@ -851,16 +877,16 @@ pub type ServeKeys = { Str run; Str server_key; List(Str) witness_keys; };
 @requires(filesystem)
 ServeKeys unsealed_keys(Str dir, Str run, List(Int) k) {
     Bool ok = filesystem.write_secret(run + "/box.key", k)
-           && put_unsealed(dir + "/tls/server.key", run + "/server.key", k)
-           && put_unsealed(dir + "/w1.key", run + "/w1.key", k) && put_unsealed(dir + "/w2.key", run + "/w2.key", k) && put_unsealed(dir + "/w3.key", run + "/w3.key", k);
+           && put_unsealed(dir, "tls/server.key", run + "/server.key", k)
+           && put_unsealed(dir, "w1.key", run + "/w1.key", k) && put_unsealed(dir, "w2.key", run + "/w2.key", k) && put_unsealed(dir, "w3.key", run + "/w3.key", k);
     if (!ok) { return ServeKeys {.run = "", .server_key = "", .witness_keys = []}; }
     return ServeKeys {.run = run, .server_key = run + "/server.key", .witness_keys = [run + "/w1.key", run + "/w2.key", run + "/w3.key"]};
 }
 
 @requires(filesystem)
-Bool put_unsealed(Str from, Str to, List(Int) k) {
-    if (!filesystem.exists(from)) { return true; }
-    List(Int) b = box_file(from, k);
+Bool put_unsealed(Str dir, Str rel, Str to, List(Int) k) {
+    if (!filesystem.exists(dir + "/" + rel)) { return true; }
+    List(Int) b = box_file(dir, rel, k);
     return b.len() > 0 && filesystem.write_secret(to, b);
 }
 
@@ -870,7 +896,8 @@ Bool put_unsealed(Str from, Str to, List(Int) k) {
 Bool point_all(Str dir, Str keyfile) {
     _ = filesystem.create_dir(dir + "/relay");
     return point_people(dir, filesystem.list_dir(dir + "/people"), 0, keyfile)
-        && filesystem.write_all(dir + "/relay/" + seal_ptr_name(), keyfile) && filesystem.write_all(dir + "/" + seal_ptr_name(), keyfile);
+        && filesystem.write_all(dir + "/relay/" + seal_ptr_name(), keyfile) && filesystem.write_all(dir + "/" + seal_ptr_name(), keyfile)
+        && seal_mark(dir + "/relay") && seal_mark(dir);
 }
 
 // Each cosigner directory names the box key in memory (boxseal.resid).
@@ -878,7 +905,7 @@ Bool point_all(Str dir, Str keyfile) {
 Bool point_people(Str dir, List(Str) people, Int i, Str keyfile) {
     if (i >= people.len()) { return true; }
     Str cos = dir + "/people/" + people[i] + "/cos";
-    Bool ok = !filesystem.is_dir(cos) || filesystem.write_all(cos + "/" + seal_ptr_name(), keyfile);
+    Bool ok = !filesystem.is_dir(cos) || (filesystem.write_all(cos + "/" + seal_ptr_name(), keyfile) && seal_mark(cos));
     return ok && point_people(dir, people, i + 1, keyfile);
 }
 
@@ -893,6 +920,7 @@ pub Int home_serve(Str dir, Str self, Str pass_flag, Str run_base) {
     Bool sealed = home_sealed(dir);
     List(Int) k = if (sealed) { open_box_key(dir, pass_flag) } else { [] };
     if (sealed && k.len() != 32) { return 1; }
+    if (sealed && !seal_migrate(dir, k)) { eprintln("home: cannot seal the box's files again for their paths (format 2)"); return 1; }
     Str run = if (sealed) { make_run_dir(dir, run_base) } else { "" };
     if (sealed && str_len(run) == 0) { return 1; }
     ServeKeys sk = if (sealed) { unsealed_keys(dir, run, k) } else {
@@ -1006,7 +1034,7 @@ Int make_cosigners(Str dir, List(Str) names, Int i, HomeCfg c, Str keyfile) {
 Bool make_cosigner(Str dir, Str pd, HomeCfg c, Str keyfile) {
     Str cos = pd + "/cos";
     _ = filesystem.create_dir(cos);
-    if (str_len(keyfile) > 0 && !filesystem.write_all(cos + "/" + seal_ptr_name(), keyfile)) { return false; }
+    if (str_len(keyfile) > 0 && !(filesystem.write_all(cos + "/" + seal_ptr_name(), keyfile) && seal_mark(cos))) { return false; }
     Str keys = cosigner_make(cos, local_of(c.bind), c.base + 1, filesystem.read_all(trust_file(dir)));
     Bool ok = str_len(keys) > 0 && filesystem.write_all(cos + "/local_host", local_witnesses(dir, c))
            && filesystem.write_all(pd + "/witnesses", lines(witness_list(dir, c), 0, StrBuf()))

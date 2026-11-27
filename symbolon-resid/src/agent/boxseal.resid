@@ -15,31 +15,101 @@
 // and returns other files as they are. A copy of the disk, or a backup of
 // the data folder, holds sealed files and the box key sealed, never the
 // box key itself.
+//
+// R4-9. The associated data was one constant, so a sealed file opened
+// under any name: someone who can write the box's disk could swap two
+// sealed files (one share for another, one relay object for another). And
+// with `.box-seal.path` deleted the directory counted as not sealed: what
+// was written next went to the disk in the clear, and a planted plaintext
+// file was read as it was. Now:
+//
+// - a file is sealed in format 2, "SYMBSEA2" || IV || AES-256-GCM(box key,
+//   IV, plaintext, "symbolon v1 home sealed file" || 0x00 || REL), REL its
+//   path below the sealed root (the file's name in a cosigner directory,
+//   the object's key in the relay's store, "tls/ca.key" in the box's
+//   directory), so it opens only under its own name;
+// - a sealed root is one with `.box-seal.path`, or `.box-sealed`, or the
+//   box's sealed key (seal/box.key), or a sealed cosigner root key
+//   ("root") or relay challenge key ("auth/challenge-key"): deleting the
+//   pointer no longer unseals it, it only takes the key away (nothing is
+//   written, nothing opens);
+// - in a sealed root a secret is never read in the clear: a secret file of
+//   a cosigner (seal_secret_name) or any object of the relay's store that
+//   is not sealed in format 2 reads as nothing (an empty one as empty).
+//
+// Files sealed in format 1 (the constant) are sealed again in format 2
+// once, by `home serve` (home.resid seal_migrate) while the box's
+// seal/format file does not say 2; after that format 1 opens nowhere.
 
 import "aesgcm.resid";
 import "crypto.resid";
 
-pub List(Int) seal_magic() { return [83, 89, 77, 66, 83, 69, 65, 76]; }   // "SYMBSEAL"
+pub List(Int) seal_magic() { return [83, 89, 77, 66, 83, 69, 65, 76]; }   // "SYMBSEAL", format 1
+pub List(Int) seal_magic2() { return [83, 89, 77, 66, 83, 69, 65, 50]; }  // "SYMBSEA2", format 2
 // Hidden, so no listing of a directory (the relay store's) shows it.
 pub Str seal_ptr_name() { return ".box-seal.path"; }
+// Hidden too: says the directory is sealed, whether or not the pointer is there.
+pub Str seal_mark_name() { return ".box-sealed"; }
 // "symbolon v1 home sealed file"
 List(Int) seal_aad() { return [115, 121, 109, 98, 111, 108, 111, 110, 32, 118, 49, 32, 104, 111, 109, 101, 32, 115, 101, 97, 108, 101, 100, 32, 102, 105, 108, 101]; }
 
-pub Bool is_sealed(List(Int) b) { return b.len() >= 36 && b[0..8] == seal_magic(); }
+// The associated data of a file at `rel` below its sealed root.
+pub List(Int) seal_aad_at(Str rel) { return seal_aad().concat([0]).concat(str_to_bytes(rel)); }
 
-// `pt` sealed under `key` (32 bytes), or [] for a bad key.
-pub List(Int) seal_bytes(List(Int) key, List(Int) pt) {
+// Sealed, in either format (so nothing is sealed twice).
+pub Bool is_sealed(List(Int) b) { return b.len() >= 36 && (b[0..8] == seal_magic() || b[0..8] == seal_magic2()); }
+
+pub Bool is_sealed1(List(Int) b) { return b.len() >= 36 && b[0..8] == seal_magic(); }
+
+// `pt` sealed under `key` (32 bytes) for the path `rel` below its sealed
+// root, or [] for a bad key.
+pub List(Int) seal_bytes(List(Int) key, Str rel, List(Int) pt) {
     if (key.len() != 32) { return []; }
     List(Int) iv = random_bytes(12);
-    List(Int) ct = aes_gcm_seal(key, iv, pt, seal_aad());
-    return if (ct.len() < 16) { [] } else { seal_magic().concat(iv).concat(ct) };
+    List(Int) ct = aes_gcm_seal(key, iv, pt, seal_aad_at(rel));
+    return if (ct.len() < 16) { [] } else { seal_magic2().concat(iv).concat(ct) };
 }
 
-// The plaintext of a sealed `b`, None when it is not sealed or the key is
-// not the one it was sealed under.
-pub Option(List(Int)) unseal_bytes(List(Int) key, List(Int) b) {
-    if (key.len() != 32 || !is_sealed(b)) { return None; }
+// The plaintext of `b` sealed (format 2) for `rel`, None when it is not
+// sealed so, sealed for another path, or the key is not the one it was
+// sealed under.
+pub Option(List(Int)) unseal_bytes(List(Int) key, Str rel, List(Int) b) {
+    if (key.len() != 32 || b.len() < 36 || b[0..8] != seal_magic2()) { return None; }
+    return aes_gcm_decrypt(key, b[8..20], b[20..b.len()], seal_aad_at(rel));
+}
+
+// A format-1 file opened (the constant associated data): only to seal it
+// again in format 2, once (home.resid seal_migrate).
+pub Option(List(Int)) unseal_bytes1(List(Int) key, List(Int) b) {
+    if (key.len() != 32 || !is_sealed1(b)) { return None; }
     return aes_gcm_decrypt(key, b[8..20], b[20..b.len()], seal_aad());
+}
+
+// `b` (at `rel`) in format 2: a format-1 file opened and sealed again, a
+// plaintext one sealed, a format-2 one as it is; None when a sealed one
+// does not open.
+pub Option(List(Int)) seal_again(List(Int) key, Str rel, List(Int) b) {
+    if (is_sealed(b) && !is_sealed1(b)) { return Some(b); }
+    Option(List(Int)) pt = if (is_sealed1(b)) { unseal_bytes1(key, b) } else { Some(b) };
+    List(Int) x = match pt { None => [], Some(v) => seal_bytes(key, rel, v) };
+    return if (x.len() > 0) { Some(x) } else { None };
+}
+
+// The file name of a path.
+pub Str seal_base_of(Str path) {
+    Int i = seal_last_slash(path, str_len(path) - 1);
+    return if (i < 0) { path } else { str_slice(path, i + 1, str_len(path)) };
+}
+
+// The secret files of a cosigner's directory (cosignerd.resid,
+// epochfiles.resid): its root key, its shares and the kit's halves, the
+// vault OPRF shares, the duress keys, a re-share's pending ones, its mail
+// session at the relay; and the box's alert settings.
+pub Bool seal_secret_name(Str n) {
+    return n == "root" || n == "duress-keys" || n == "duress-transport" || n == "relay.mtoken" || n == "alerts.conf"
+        || (str_starts_with(n, "cg-") && str_ends_with(n, ".cfg")) || str_starts_with(n, "kit-b-") || str_starts_with(n, "kit-half")
+        || str_starts_with(n, "kv-") || str_starts_with(n, "kitv-b-") || str_starts_with(n, "kvpend-")
+        || (str_starts_with(n, "pending-") && (str_ends_with(n, ".cfg") || str_ends_with(n, ".kitb") || str_ends_with(n, ".kb") || str_ends_with(n, ".kv")));
 }
 
 // The directory part of a path ("" for none).
@@ -53,18 +123,26 @@ Int seal_last_slash(Str s, Int i) {
     return if (str_slice(s, i, i + 1) == "/") { i } else { seal_last_slash(s, i - 1) };
 }
 
-// Whether `dir` is sealed (its .box-seal.path is there), and the box key
-// when the file it names holds one ([] when it does not: the box is not
-// serving, so nothing is written and nothing sealed opens).
+// Whether `dir` is sealed, and the box key when its .box-seal.path names a
+// file that holds one ([] when it does not: the box is not serving, or the
+// pointer was taken away, so nothing is written and nothing sealed opens).
 pub type SealAt = { Bool on; List(Int) key; };
 
 @requires(filesystem)
 pub SealAt seal_at(Str dir) {
     Str ptr = dir + "/" + seal_ptr_name();
-    if (!filesystem.exists(ptr)) { return SealAt {.on = false, .key = []}; }
+    if (!filesystem.exists(ptr)) { return SealAt {.on = sealed_root(dir), .key = []}; }
     Str kf = str_trim(filesystem.read_all(ptr));
     List(Int) k = if (str_len(kf) == 0) { [] } else { filesystem.read_bytes(kf) };
     return SealAt {.on = true, .key = if (k.len() == 32) { k } else { [] }};
+}
+
+// A directory sealed although its pointer is not there: its mark, the
+// box's sealed key, or a sealed cosigner root key or relay challenge key.
+@requires(filesystem)
+pub Bool sealed_root(Str dir) {
+    return filesystem.exists(dir + "/" + seal_mark_name()) || filesystem.exists(dir + "/seal/box.key")
+        || is_sealed(filesystem.read_bytes(dir + "/root")) || is_sealed(filesystem.read_bytes(dir + "/auth/challenge-key"));
 }
 
 // A secret file: sealed when its directory is, mode 0600 either way.
@@ -72,43 +150,49 @@ pub SealAt seal_at(Str dir) {
 pub Bool seal_put(Str path, List(Int) b) {
     SealAt s = seal_at(seal_dir_of(path));
     if (!s.on) { return filesystem.write_secret(path, b); }
-    List(Int) sealed = seal_bytes(s.key, b);
+    List(Int) sealed = seal_bytes(s.key, seal_base_of(path), b);
     return sealed.len() > 0 && filesystem.write_secret(path, sealed);
 }
 
-// A file's contents, opened when it is sealed ([] when it cannot be).
+// A file's contents, opened when it is sealed ([] when it cannot be). In a
+// sealed directory a secret file (seal_secret_name) that is not sealed for
+// its own name reads as nothing; other files (public ones) as they are.
 @requires(filesystem)
 pub List(Int) seal_get(Str path) {
     List(Int) b = filesystem.read_bytes(path);
-    if (!is_sealed(b)) { return b; }
+    Bool secret = seal_secret_name(seal_base_of(path));
+    if (!is_sealed(b) && !secret) { return b; }
     SealAt s = seal_at(seal_dir_of(path));
     // Outside a sealed directory every file is read as it is (a device's
     // files, whatever their first bytes).
     if (!s.on) { return b; }
-    return match unseal_bytes(s.key, b) { Some(p) => p, None => [] };
+    if (b.len() == 0) { return b; }
+    return match unseal_bytes(s.key, seal_base_of(path), b) { Some(p) => p, None => [] };
 }
 
 // ─── A tree sealed at its root (the relay's directory store) ────
 
-// What to write under `root` for the bytes `b`: sealed when the root names
-// the box key (its .box-seal.path), else `b`; None when it is sealed and the
+// What to write at `rel` under `root` for the bytes `b`: sealed (for
+// `rel`) when the root is sealed, else `b`; None when it is sealed and the
 // key is not in memory (nothing is written then).
 @requires(filesystem)
-pub Option(List(Int)) seal_wrap(Str root, List(Int) b) {
+pub Option(List(Int)) seal_wrap(Str root, Str rel, List(Int) b) {
     SealAt s = seal_at(root);
     if (!s.on) { return Some(b); }
-    List(Int) x = seal_bytes(s.key, b);
+    List(Int) x = seal_bytes(s.key, rel, b);
     return if (x.len() > 0) { Some(x) } else { None };
 }
 
-// The bytes read under `root`, opened: sealed ones under the box key the
-// root names (None when they do not open), others as they are.
+// The bytes read at `rel` under `root`, opened: in a sealed root only what
+// is sealed for `rel` under the box key (None otherwise: a planted
+// plaintext object, one sealed for another path, or the key not in
+// memory; an empty object stays empty); in another root as they are.
 @requires(filesystem)
-pub Option(List(Int)) seal_unwrap(Str root, List(Int) b) {
-    if (!is_sealed(b)) { return Some(b); }
+pub Option(List(Int)) seal_unwrap(Str root, Str rel, List(Int) b) {
     SealAt s = seal_at(root);
     if (!s.on) { return Some(b); }
-    return unseal_bytes(s.key, b);
+    if (b.len() == 0) { return Some(b); }
+    return unseal_bytes(s.key, rel, b);
 }
 
 // The text of a small file's bytes (a token, a settings file; ASCII).

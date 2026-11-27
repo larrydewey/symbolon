@@ -13,6 +13,7 @@ import "../net/store.resid";
 import "httpserv.resid";
 import "ecdsa.resid";
 import "crypto.resid";
+import "aesgcm.resid";
 
 @requires(filesystem, declassify)
 Str tmp_dir() {
@@ -37,15 +38,17 @@ Str wkey(Int n) { return hex_encode(ec_public_key(P256, key32(n))); }
 test "a sealed file opens only under its key, and holds no byte run of what it seals" {
     List(Int) k = key32(1);
     List(Int) secret = key32(2);
-    List(Int) s = seal_bytes(k, secret);
+    List(Int) s = seal_bytes(k, "root", secret);
     expect(is_sealed(s)).toBeTrue();
     expect(contains_bytes(s, secret[0..8], 0)).toBeFalse();
-    expect(unseal_bytes(k, s)).toEqual(Some(secret));
-    expect(unseal_bytes(key32(3), s)).toEqual(None);
+    expect(unseal_bytes(k, "root", s)).toEqual(Some(secret));
+    expect(unseal_bytes(key32(3), "root", s)).toEqual(None);
     // A changed byte, or the box key on the wrong file, is refused.
     List(Int) t = s[0..30].concat([s[30] ^ 1]).concat(s[31..s.len()]);
-    expect(unseal_bytes(k, t)).toEqual(None);
-    expect(seal_bytes([1, 2, 3], secret)).toEqual([]);
+    expect(unseal_bytes(k, "root", t)).toEqual(None);
+    expect(seal_bytes([1, 2, 3], "root", secret)).toEqual([]);
+    // Sealed for one path, it opens under no other (R4-9).
+    expect(unseal_bytes(k, "cg-1.cfg", s)).toEqual(None);
 }
 
 @requires(declassify)
@@ -117,7 +120,8 @@ test "home secure seals every key file of an existing box in place, and leaves t
     expect(is_sealed(filesystem.read_bytes(cos + "/pending-3-ab.kb"))).toBeTrue();
     expect(filesystem.read_bytes(cos + "/cosigner.cbor")).toEqual([9, 9]);
     expect(filesystem.read_all(cos + "/pending.tag")).toEqual("3-ab");
-    expect(box_file(d + "/w1.key", k)).toEqual(key32(21));
+    expect(box_file(d, "w1.key", k)).toEqual(key32(21));
+    expect(box_file(d, "w2.key", k)).toEqual(key32(22));
     // Running it again changes nothing (no file sealed twice).
     List(Int) once = filesystem.read_bytes(cos + "/root");
     expect(seal_box_files(d, k)).toBeTrue();
@@ -159,7 +163,7 @@ test "home secure seals the relay's store, the alert settings and the cosigner's
     List(Int) mt = filesystem.read_bytes(cos + "/relay.mtoken");
     expect(is_sealed(mt)).toBeTrue();
     expect(contains_bytes(mt, str_to_bytes("0123456789abcdef"), 0)).toBeFalse();
-    expect(box_file(d + "/relay/auth/claim-key", k)).toEqual(claim);
+    expect(box_file(d + "/relay", "auth/claim-key", k)).toEqual(claim);
 }
 
 @requires(filesystem, declassify, network, clock(readonly))
@@ -172,7 +176,8 @@ test "the relay's directory store on a sealed box writes every object sealed, an
     // Not sealed: objects as they are.
     expect(st_put(st, "blob/x", [5, 6])).toBeTrue();
     expect(filesystem.read_bytes(d + "/blob/x")).toEqual([5, 6]);
-    // Sealed: written sealed, read opened; an object from before is read as it is.
+    // Sealed: written sealed, read opened; an object left in the clear
+    // reads as none (home secure and home serve seal those in place).
     _ = filesystem.write_secret(run + "/box.key", k);
     _ = filesystem.write_all(d + "/" + seal_ptr_name(), run + "/box.key");
     expect(st_put_new(st, "auth/claim-key", claim)).toEqual(1);
@@ -183,7 +188,7 @@ test "the relay's directory store on a sealed box writes every object sealed, an
     expect(st_put(st, "auth/challenge-key", key32(72))).toBeTrue();
     expect(contains_bytes(filesystem.read_bytes(d + "/auth/challenge-key"), key32(72)[0..8], 0)).toBeFalse();
     expect(st_bytes(st, "auth/challenge-key")).toEqual(key32(72));
-    expect(st_bytes(st, "blob/x")).toEqual([5, 6]);
+    expect(st_get(st, "blob/x")).toEqual(None);
     // The listing does not show the pointer.
     expect(st_list(st, "", "", 100).contains(seal_ptr_name())).toBeFalse();
     // The box key gone from memory: nothing opens, nothing is written.
@@ -213,6 +218,95 @@ test "the alert settings on a sealed box are written sealed and read by the cosi
     BoxAlerts b = box_alerts(d);
     expect(setting(b, "smtp_pass")).toEqual("hunter2-secret");
     expect(setting(b, "ntfy_token")).toEqual("tk_abcdef");
+}
+
+// "SYMBSEAL" || IV || AES-256-GCM under the one constant: a file sealed
+// before R4-9 (format 1).
+List(Int) seal1(List(Int) k, List(Int) pt) {
+    List(Int) iv = key32(250)[0..12];
+    return seal_magic().concat(iv).concat(aes_gcm_seal(k, iv, pt, str_to_bytes("symbolon v1 home sealed file")));
+}
+
+// R4-9: one constant as associated data let someone who writes the box's
+// disk swap two sealed files; with the pointer deleted the directory was
+// "not sealed", and planted plaintext was read and new secrets written
+// in the clear.
+@requires(filesystem, declassify, network, clock(readonly))
+test "a sealed file opens only at its own path, and a sealed directory stays sealed without its pointer" {
+    Str d = tmp_dir();
+    Str run = tmp_dir();
+    List(Int) k = key32(90);
+    _ = filesystem.write_secret(run + "/box.key", k);
+    _ = filesystem.write_all(d + "/" + seal_ptr_name(), run + "/box.key");
+    expect(put_secret_file(d + "/root", key32(91))).toBeTrue();
+    expect(put_secret_file(d + "/cg-1.cfg", key32(92))).toBeTrue();
+    expect(put_secret_file(d + "/cg-2.cfg", key32(93))).toBeTrue();
+    expect(get_file(d + "/cg-1.cfg")).toEqual(key32(92));
+    // the epoch-1 share put where epoch 2's is: it does not open there
+    _ = filesystem.write_secret(d + "/cg-2.cfg", filesystem.read_bytes(d + "/cg-1.cfg"));
+    expect(get_file(d + "/cg-2.cfg")).toEqual([]);
+    // a secret planted in the clear is not read, the pointer there or not
+    _ = filesystem.write_secret(d + "/kv-1", key32(94));
+    expect(get_file(d + "/kv-1")).toEqual([]);
+    _ = filesystem.remove(d + "/" + seal_ptr_name());
+    expect(filesystem.exists(d + "/" + seal_ptr_name())).toBeFalse();
+    expect(get_file(d + "/kv-1")).toEqual([]);
+    // without the pointer: nothing written in the clear, nothing opens
+    expect(put_secret_file(d + "/kv-2", key32(95))).toBeFalse();
+    expect(filesystem.exists(d + "/kv-2")).toBeFalse();
+    expect(get_file(d + "/root")).toEqual([]);
+    // the relay's store: an object opens only under its own key
+    Str r = tmp_dir();
+    Store st = FsStore(r);
+    _ = filesystem.write_all(r + "/" + seal_ptr_name(), run + "/box.key");
+    expect(st_put(st, "auth/challenge-key", key32(96))).toBeTrue();
+    expect(st_put(st, "blob/a", [1, 1])).toBeTrue();
+    expect(st_put(st, "blob/b", [2, 2])).toBeTrue();
+    _ = filesystem.write_bytes(r + "/blob/b", filesystem.read_bytes(r + "/blob/a"));
+    expect(st_get(st, "blob/b")).toEqual(None);
+    expect(st_get(st, "blob/a")).toEqual(Some([1, 1]));
+    // its pointer gone, the store stays sealed: no object in the clear
+    _ = filesystem.remove(r + "/" + seal_ptr_name());
+    expect(st_put(st, "blob/c", [3])).toBeFalse();
+    _ = filesystem.write_bytes(r + "/blob/d", [4]);
+    expect(st_get(st, "blob/d")).toEqual(None);
+}
+
+// Files sealed before (format 1) are sealed again for their paths once,
+// by home serve; after that format 1 opens nowhere.
+@requires(filesystem, declassify, network, clock(readonly))
+test "home serve seals files of the old format again for their paths, once" {
+    Str d = tmp_dir();
+    Str run = tmp_dir();
+    Str cos = d + "/people/alice/cos";
+    _ = filesystem.create_dir(d + "/tls");
+    _ = filesystem.create_dir(d + "/seal");
+    _ = filesystem.create_dir(d + "/people");
+    _ = filesystem.create_dir(d + "/people/alice");
+    _ = filesystem.create_dir(cos);
+    _ = filesystem.create_dir(d + "/relay");
+    _ = filesystem.create_dir(d + "/relay/blob");
+    List(Int) k = key32(100);
+    _ = filesystem.write_secret(d + "/w1.key", seal1(k, key32(101)));
+    _ = filesystem.write_secret(cos + "/root", seal1(k, key32(102)));
+    _ = filesystem.write_secret(cos + "/cg-1.cfg", seal1(k, key32(103)));
+    _ = filesystem.write_bytes(d + "/relay/blob/x", seal1(k, [7, 7]));
+    _ = filesystem.write_secret(run + "/box.key", k);
+    _ = filesystem.write_all(cos + "/" + seal_ptr_name(), run + "/box.key");
+    _ = filesystem.write_all(d + "/relay/" + seal_ptr_name(), run + "/box.key");
+    // format 1 does not open as it is
+    expect(get_file(cos + "/cg-1.cfg")).toEqual([]);
+    expect(box_file(d, "w1.key", k)).toEqual([]);
+    expect(seal_migrate(d, k)).toBeTrue();
+    expect(str_trim(filesystem.read_all(seal_format_file(d)))).toEqual("2");
+    expect(box_file(d, "w1.key", k)).toEqual(key32(101));
+    expect(get_file(cos + "/root")).toEqual(key32(102));
+    expect(get_file(cos + "/cg-1.cfg")).toEqual(key32(103));
+    expect(st_get(FsStore(d + "/relay"), "blob/x")).toEqual(Some([7, 7]));
+    // once: a format-1 file put back later is not taken
+    _ = filesystem.write_secret(cos + "/cg-1.cfg", seal1(k, key32(104)));
+    expect(seal_migrate(d, k)).toBeTrue();
+    expect(get_file(cos + "/cg-1.cfg")).toEqual([]);
 }
 
 test "the unsealed keys go only to a directory in memory" {

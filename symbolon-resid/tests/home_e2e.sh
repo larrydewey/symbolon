@@ -28,7 +28,7 @@ trap "exit 1" INT TERM HUP
 run() { ( ulimit -v 40000000; ulimit -s unlimited; timeout "$1" "${@:2}" ); }
 fail() { echo "FAIL: $*"; for f in "$W"/*.log; do echo "== $f"; tail -5 "$f"; done; KEEP=1; exit 1; }
 wait_port() { for _ in $(seq 150); do (exec 3<>"/dev/tcp/${2:-127.0.0.1}/$1") 2>/dev/null && return 0; sleep 0.2; done; return 1; }
-sealed() { [ "$(head -c 8 "$1")" = "SYMBSEAL" ]; }
+sealed() { [ "$(head -c 8 "$1")" = "SYMBSEA2" ]; }
 BASE=$(python3 -c 'import random; print(random.randrange(20000, 60000, 10))')
 
 python3 - "$W" <<'EOF'
@@ -151,7 +151,7 @@ echo "at rest: the cosigner's root key, share and kit half are sealed; home stat
 # challenge keys, sessions, logs), the cosigner's mail token, and the
 # alert channels' settings, written by `home alerts` with the passphrase.
 [ -e "$W/box/relay/auth/claim-key" ] || fail "the relay has no claim key"
-PLAIN=$(find "$W/box/relay" -type f ! -name '.*' -exec sh -c '[ "$(head -c 8 "$1")" = SYMBSEAL ] || echo "$1"' _ {} \;)
+PLAIN=$(find "$W/box/relay" -type f ! -name '.*' -exec sh -c '[ "$(head -c 8 "$1")" = SYMBSEA2 ] || echo "$1"' _ {} \;)
 [ -z "$PLAIN" ] || fail "relay objects not sealed: $PLAIN"
 [ -e "$W/box/people/alice/cos/relay.mtoken" ] && { sealed "$W/box/people/alice/cos/relay.mtoken" || fail "the cosigner's mail token is not sealed"; }
 SYMBOLON_HOME_PASSPHRASE_FILE="$W/pass" run 120 "$BIN" home alerts "$W/box" set smtp_pass hunter2-secret > "$W/alerts.log" 2>&1 || fail "home alerts: $(cat "$W/alerts.log")"

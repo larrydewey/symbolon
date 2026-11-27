@@ -180,7 +180,7 @@ grep -q "local copy: .*signature does not verify" "$W/tamper.log" || fail "tampe
 cp "$W/roster.v2" "$BLOB/roster-$ID"
 cp "$BLOB/coll-$ID" "$W/coll.saved"
 printf '2468\nsecret %s\n' "$(hx x)" | run 300 "$BIN" device vault set "$A" own secret > "$W/ownset.log" 2>&1 || fail "alice's own item: $(cat "$W/ownset.log")"
-cp "$BLOB/vault-$ALOG" "$BLOB/coll-$ID" || fail "alice has no vault blob"
+rs copy "$BLOB/vault-$ALOG" "$BLOB/coll-$ID" || fail "alice has no vault blob"
 pin device vault list "$B" --share "$ID" > "$W/swap.log" 2>&1 || fail "bob's copy: $(cat "$W/swap.log")"
 grep -q "local copy: .*another vault" "$W/swap.log" || fail "swapped items: $(cat "$W/swap.log")"
 cp "$W/coll.saved" "$BLOB/coll-$ID"
