@@ -97,15 +97,22 @@ pub Result(RsStep, CgFail) rs_start(RsCtx c) {
     List(List(UInt(64))) pq = if (c.primes.len() == 2) { c.primes } else { kg_primes(KgCtx {.self = c.self, .ids = c.receivers, .threshold = c.degree, .prev = [], .session_id = c.session_id, .seed = c.seed, .primes = []}) };
     if (pq.len() != 2) { return Err(cg_fail("no Paillier primes", [])); }
     Option(PaillierSec) os = paillier_sec(pq[0], pq[1]);
-    Option(PedersenKey) opk = pedersen_generate(pq[0], pq[1], cg_rng(c.seed, "rs/ped", 2048));
+    Option(PedersenKey) opk = pedersen_generate(pq[0], pq[1], cg_rng(c.seed, "rs/ped", rs_ped_bytes(pq)));
     return match os {
         None => Err(cg_fail("bad Paillier primes", [])),
         Some(sec) => match opk {
-            None => Err(cg_fail("randomness exhausted", [])),
+            None => Err(cg_exhausted("Pedersen parameters")),
             Some(pk) => announce(c, RsMine {.p = pq[0], .q = pq[1], .psec = sec, .ppub = paillier_pub(bn_mul(pq[0], pq[1])), .ped = pk, .elg = cg_scalar(c.seed, "rs/elg")})
         }
     };
 }
+
+// The stream for pedersen_generate: it rejection-samples two values (lam
+// below phi, then a unit mod N), each from 256-byte chunks accepted with
+// probability above 1/2, so cg_draw_bytes(bits of N, 2) = 256 chunks run
+// out with probability below 2^-247. It was 2048 bytes (8 chunks) before
+// 2026-11-27: a re-share failed to start in about 1 of 846 (worst 1.5%).
+pub Int rs_ped_bytes(List(List(UInt(64))) pq) { return cg_draw_bytes(bn_bit_len(bn_mul(pq[0], pq[1])), 2); }
 
 Result(RsStep, CgFail) announce(RsCtx c, RsMine m) {
     Transcript tr = rs_tr(c, c.self);

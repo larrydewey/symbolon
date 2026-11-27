@@ -319,3 +319,14 @@ test "a received re-share part with the nonce 1 is refused, no one blamed" {
     };
     expect(why).toEqual(nonce_one_refused());
 }
+
+// ─── The re-share's Pedersen stream (reshare.resid rs_ped_bytes) ──
+
+test "a re-share's Pedersen parameters are drawn from a stream sized by cg_draw_bytes" {
+    List(List(UInt(64))) pq = [config(1).p, config(1).q];
+    // Seed 90 (found by a search): 2048 bytes, 8 chunks, hold fewer than
+    // the 2 accepted draws pedersen_generate needs; the old size failed.
+    expect(match pedersen_generate(pq[0], pq[1], cg_rng(seed_n(90), "rs/ped", 2048)) { Some(_) => "drawn", None => "exhausted" }).toEqual("exhausted");
+    expect(match pedersen_generate(pq[0], pq[1], cg_rng(seed_n(90), "rs/ped", rs_ped_bytes(pq))) { Some(_) => "drawn", None => "exhausted" }).toEqual("drawn");
+    expect(rs_ped_bytes(pq)).toEqual(65536);
+}
