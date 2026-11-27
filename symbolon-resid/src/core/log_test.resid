@@ -657,3 +657,95 @@ test "a recover whose new party id is not SHA-256 of its key is refused" {
     expect(ok(il_verify(l, [e0_kit([2, 3]), next(1, 1, enc(0), RecoverBody(r), [20], 2000)], 2000, lambda(x) { false }))).toBeFalse();
     expect(ok(il_verify(l, [e0_kit([2, 3]), recover_ev(1, 1, enc(0), 20, 2000)], 2000, lambda(x) { false }))).toBeTrue();
 }
+
+// ─── A witness change (`device witnesses`, SPEC 8.2, 20.3) ──────
+
+WitnessRef wref(Str url, Int k) { return WitnessRef {.url = url, .key = pubk(k)}; }
+
+Policy changed(Result(Policy, Str) r) { return match r { Ok(p) => p, Err(_) => policy(1) }; }
+
+Str change_err(Result(Policy, Str) r) { return match r { Ok(_) => "", Err(m) => m }; }
+
+Int witnesses_of(Result(VerifiedHead, SymbolonError) r) { return match r { Ok(v) => v.head.policy.witnesses.len(), Err(_) => -1 }; }
+
+test "a witness change keeps every other field, the sequencing relay above all" {
+    List(WitnessRef) one = [WitnessRef {.url = "relay:1", .key = pubk(30)}];
+    Result(Policy, Str) r = policy_with_witnesses(policy_seq(one), quorum2(), [wref("http://w4:1", 12)], []);
+    expect(change_err(r)).toEqual("");
+    Policy p = changed(r);
+    expect(p.witnesses.len()).toEqual(4);
+    expect(p.sequencer.len()).toEqual(1);
+    expect(hex_encode(p.sequencer[0].key)).toEqual(hex_encode(pubk(30)));
+    expect((Int)p.recovery_delay_sec).toEqual(86400);
+    expect((Int)p.device_sigs_for_authority).toEqual(2);
+    // Removal by address, with or without the scheme, in any case.
+    Policy q = changed(policy_with_witnesses(p, quorum2(), [], ["HTTP://W4:1"]));
+    expect(q.witnesses.len()).toEqual(3);
+    expect(q.sequencer.len()).toEqual(1);
+}
+
+test "a witness change is refused with a bad key, too few witnesses, or an address it does not hold" {
+    Policy p = policy(86400);
+    // A key that is not a P-256 point.
+    expect(str_len(change_err(policy_with_witnesses(p, quorum2(), [WitnessRef {.url = "http://w4:1", .key = [4, 1, 2]}], []))) > 0).toBeTrue();
+    // A key the policy holds already (under another address), or an address it holds.
+    expect(str_len(change_err(policy_with_witnesses(p, quorum2(), [wref("http://w9:1", 7)], []))) > 0).toBeTrue();
+    expect(str_len(change_err(policy_with_witnesses(p, quorum2(), [wref("w1", 12)], []))) > 0).toBeTrue();
+    // The same new key twice.
+    expect(str_len(change_err(policy_with_witnesses(p, quorum2(), [wref("http://w4:1", 12), wref("http://w5:1", 12)], []))) > 0).toBeTrue();
+    // Fewer than three witnesses left.
+    expect(str_len(change_err(policy_with_witnesses(p, quorum2(), [], ["w1"]))) > 0).toBeTrue();
+    // An address that names no witness of the policy.
+    expect(str_len(change_err(policy_with_witnesses(p, quorum2(), [wref("http://w4:1", 12)], ["w7"]))) > 0).toBeTrue();
+    // Nothing named.
+    expect(str_len(change_err(policy_with_witnesses(p, quorum2(), [], []))) > 0).toBeTrue();
+    // Negative control: a replacement that leaves three is accepted.
+    expect(change_err(policy_with_witnesses(p, quorum2(), [wref("http://w4:1", 12)], ["w1"]))).toEqual("");
+}
+
+test "removing or replacing a witness weakens the policy, and so does outvoting the old ones" {
+    List(WitnessRef) old = policy(86400).witnesses;
+    List(WitnessRef) four = old.concat([wref("w4", 12)]);
+    // One added to three: every majority of four holds two of the three.
+    expect(witnesses_weaken(old, four)).toBeFalse();
+    expect(witnesses_weaken(old, old)).toBeFalse();
+    // Two added to three: two new and one old make a majority of five.
+    expect(witnesses_weaken(old, four.concat([wref("w5", 13)]))).toBeTrue();
+    // A removal (four to three), or a replacement (same count, a key gone).
+    expect(witnesses_weaken(four, old)).toBeTrue();
+    expect(witnesses_weaken(old, [old[0], old[1], wref("w4", 12)])).toBeTrue();
+    expect(weakens(policy(86400), Policy {.device_sigs_for_authority = 2, .recovery_delay_sec = 86400, .guardians = [], .guardian_threshold = 0,
+                                          .witnesses = [old[0], old[1], wref("w4", 12)], .duress_window_sec = 3600, .sequencer = [], .cosigner_policy = NoCosignerPolicy})).toBeTrue();
+}
+
+test "adding a witness with one device's signature is delayed and vetoable; with policy[1] devices it is immediate" {
+    List(Int) l = log_id();
+    Policy np = changed(policy_with_witnesses(policy(86400), quorum2(), [wref("http://w4:1", 12)], []));
+    SignedEvent one = next(1, 1, enc(0), SetPolicyBody(np), [2], 2000);
+    Result(VerifiedHead, SymbolonError) early = il_verify(l, [e0([2, 3]), one], 2000 + 86399, lambda(x) { false });
+    expect(pending_n(early)).toEqual(1);
+    expect(witnesses_of(early)).toEqual(3);
+    expect(witnesses_of(il_verify(l, [e0([2, 3]), one], 2000 + 86400, lambda(x) { false }))).toEqual(4);
+    // The other device vetoes it within the delay: never in force.
+    SignedEvent veto = next(2, 2, enc(1), VetoBody(1), [3], 3000);
+    Result(VerifiedHead, SymbolonError) vetoed = il_verify(l, [e0([2, 3]), one, veto], 2000 + 90000, lambda(x) { false });
+    expect(pending_n(vetoed)).toEqual(0);
+    expect(witnesses_of(vetoed)).toEqual(3);
+    // Both devices: in force at once.
+    SignedEvent both = next(1, 1, enc(0), SetPolicyBody(np), [2, 3], 2000);
+    Result(VerifiedHead, SymbolonError) r = il_verify(l, [e0([2, 3]), both], 2000, lambda(x) { false });
+    expect(pending_n(r)).toEqual(0);
+    expect(witnesses_of(r)).toEqual(4);
+}
+
+test "replacing a witness is delayed even with every device's signature" {
+    List(Int) l = log_id();
+    Policy np = changed(policy_with_witnesses(policy(86400), quorum2(), [wref("http://w4:1", 12)], ["w3"]));
+    SignedEvent both = next(1, 1, enc(0), SetPolicyBody(np), [2, 3], 2000);
+    Result(VerifiedHead, SymbolonError) r = il_verify(l, [e0([2, 3]), both], 2000, lambda(x) { false });
+    expect(pending_n(r)).toEqual(1);
+    expect(witnesses_of(r)).toEqual(3);
+    // Vetoable like any delayed event.
+    SignedEvent veto = next(2, 2, enc(1), VetoBody(1), [3], 3000);
+    expect(pending_n(il_verify(l, [e0([2, 3]), both, veto], 2000 + 90000, lambda(x) { false }))).toEqual(0);
+}

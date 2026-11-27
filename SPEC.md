@@ -474,7 +474,14 @@ recover-body = [
   notified and may veto, exactly as for `recover` (A-04).
 - A `set-policy` that weakens recovery protection (shorter delay, fewer
   guardians, lower guardian threshold, fewer witnesses, or no sequencing
-  relay where there was one) is always delayed.
+  relay where there was one) is always delayed. A change of witnesses
+  weakens it unless it only adds witnesses, and few enough that every
+  majority of the new set holds a majority of the old one (with `n` old
+  and `a` added, `floor((n+a)/2) + 1 - a >= floor(n/2) + 1`: one added to
+  three does not weaken, two do): removing or replacing a witness (any key
+  of the old set missing from the new one) always weakens it, and so does
+  adding enough witnesses that the added ones and a minority of the old
+  ones could co-sign without the rest.
 - `reshare`: signatures from every party that took part in the re-share
   (Section 11.3), at least `t` of the old quorum.
 - `recover`: Section 13. `veto`: Section 13.4.

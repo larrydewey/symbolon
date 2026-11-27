@@ -184,13 +184,122 @@ Bool policy_ok(Policy p, Quorum q) {
 // SPEC 8.2: a policy that shortens the delay or thins guardians or
 // witnesses, or drops the sequencing relay (SPEC 20.3: without one, any
 // single key holder can freeze the log again).
-Bool weakens(Policy old, Policy new) {
+pub Bool weakens(Policy old, Policy new) {
     if (old.sequencer.len() > 0 && new.sequencer.len() == 0) { return true; }
     if (new.recovery_delay_sec < old.recovery_delay_sec) { return true; }
     if (new.guardians.len() < old.guardians.len()) { return true; }
     if (new.guardian_threshold < old.guardian_threshold) { return true; }
     if (new.witnesses.len() < old.witnesses.len()) { return true; }
-    return false;
+    return witnesses_weaken(old.witnesses, new.witnesses);
+}
+
+// SPEC 8.2, 20.3: a witness change weakens the policy unless it only adds
+// witnesses, and few enough that every majority of the new set still holds
+// a majority of the old one. Removing or replacing a witness (any key of
+// the old set missing from the new one) weakens it: the keys a log's
+// holders chose to vouch against forks are gone. So does adding as many
+// witnesses as could, with a minority of the old ones, make up a majority
+// on their own (three added to three: three of the six new, with one old,
+// co-sign), which would let whoever runs the added ones fork the log with
+// fewer of the old witnesses than before.
+pub Bool witnesses_weaken(List(WitnessRef) old, List(WitnessRef) new) {
+    List(List(Int)) nk = witness_key_list(new, 0, ListBuf());
+    if (!keys_all_in(witness_key_list(old, 0, ListBuf()), nk, 0)) { return true; }
+    Int added = keys_not_in(nk, witness_key_list(old, 0, ListBuf()), 0, []);
+    return witnesses_need(new) - added < witnesses_need(old);
+}
+
+Int witnesses_need(List(WitnessRef) ws) { return ws.len() / 2 + 1; }
+
+Bool keys_all_in(List(List(Int)) xs, List(List(Int)) ys, Int i) {
+    if (i >= xs.len()) { return true; }
+    return has_bytes(ys, xs[i], 0) && keys_all_in(xs, ys, i + 1);
+}
+
+// How many distinct keys of `xs` are not in `ys`.
+Int keys_not_in(List(List(Int)) xs, List(List(Int)) ys, Int i, List(List(Int)) seen) {
+    if (i >= xs.len()) { return seen.len(); }
+    Bool count = !has_bytes(ys, xs[i], 0) && !has_bytes(seen, xs[i], 0);
+    return keys_not_in(xs, ys, i + 1, if (count) { seen.concat([xs[i]]) } else { seen });
+}
+
+// ============================================================================
+// A witness change (`symbolon device witnesses`, SPEC 20.3)
+// ============================================================================
+
+// A witness's address as HOST:PORT, lower case, without http:// or https://.
+pub Str witness_addr(Str url) {
+    Str u = str_to_lower(str_trim(url));
+    Str a = if (str_starts_with(u, "https://")) { str_slice(u, 8, str_len(u)) } else {
+        if (str_starts_with(u, "http://")) { str_slice(u, 7, str_len(u)) } else { u } };
+    return a;
+}
+
+Int at_addr(List(WitnessRef) ws, Str a, Int i, Int n) {
+    if (i >= ws.len()) { return n; }
+    return at_addr(ws, a, i + 1, if (witness_addr(ws[i].url) == a) { n + 1 } else { n });
+}
+
+List(WitnessRef) not_at(List(WitnessRef) ws, List(Str) addrs, Int i, ListBuf(WitnessRef) acc) {
+    if (i >= ws.len()) { return acc.finish(); }
+    return not_at(ws, addrs, i + 1, if (addrs.contains(witness_addr(ws[i].url))) { acc } else { acc.push(ws[i]) });
+}
+
+List(Str) addrs_of(List(Str) xs, Int i, ListBuf(Str) acc) {
+    if (i >= xs.len()) { return acc.finish(); }
+    return addrs_of(xs, i + 1, acc.push(witness_addr(xs[i])));
+}
+
+// The first address of `remove` that names no witness of `ws`, or "".
+Str unknown_addr(List(WitnessRef) ws, List(Str) remove, Int i) {
+    if (i >= remove.len()) { return ""; }
+    if (at_addr(ws, remove[i], 0, 0) == 0) { return remove[i]; }
+    return unknown_addr(ws, remove, i + 1);
+}
+
+// Why witness `add[i]` cannot join `have` (the witnesses kept, then the
+// ones added before it), or "" when every one can.
+Str add_problem(List(WitnessRef) have, List(WitnessRef) add, Int i) {
+    if (i >= add.len()) { return ""; }
+    WitnessRef w = add[i];
+    if (!key_ok(w.key)) { return w.url + ": the key is not a P-256 public key"; }
+    if (has_bytes(witness_key_list(have, 0, ListBuf()), w.key, 0)) { return w.url + ": a witness with that key is in the policy already"; }
+    if (at_addr(have, witness_addr(w.url), 0, 0) > 0) { return w.url + ": a witness at that address is in the policy already"; }
+    return add_problem(have.concat([w]), add, i + 1);
+}
+
+// Policy `p0` with the witnesses at the addresses `remove` (HOST:PORT)
+// taken out and `add` put in, every other field kept: the sequencing
+// relay (field 8) above all. policy[1] is raised to the floor when the
+// quorum `q` has grown past it (as `device sequence` does), or the policy
+// would not be valid. Err(why) when an address names no witness, an added
+// witness has a bad key or one the policy holds, nothing changes, or the
+// result is no valid policy (at least three witnesses, distinct keys).
+pub Result(Policy, Str) policy_with_witnesses(Policy p0, Quorum q, List(WitnessRef) add, List(Str) remove) {
+    List(Str) rm = addrs_of(remove, 0, ListBuf());
+    if (add.len() == 0 && rm.len() == 0) { return Err("name a witness to add or remove"); }
+    Str unknown = unknown_addr(p0.witnesses, rm, 0);
+    if (str_len(unknown) > 0) { return Err(unknown + ": no witness of the policy is at that address"); }
+    List(WitnessRef) kept = not_at(p0.witnesses, rm, 0, ListBuf());
+    Str bad = add_problem(kept, add, 0);
+    if (str_len(bad) > 0) { return Err(bad); }
+    List(WitnessRef) ws = kept.concat(add);
+    if (witness_keys_distinct(ws, 0) != ws.len()) { return Err("two witnesses would have the same key"); }
+    if (ws.len() < 3) { return Err(f"a policy names at least three witnesses (SPEC 20.3); this would leave {ws.len()}"); }
+    Int floor = if (device_count(q.parties, 0, 0) >= 2) { 2 } else { 1 };
+    UInt(8) dsigs = if ((Int)p0.device_sigs_for_authority < floor) { (UInt(8))floor } else { p0.device_sigs_for_authority };
+    Policy np = Policy {.device_sigs_for_authority = dsigs, .recovery_delay_sec = p0.recovery_delay_sec, .guardians = p0.guardians,
+                        .guardian_threshold = p0.guardian_threshold, .witnesses = ws, .duress_window_sec = p0.duress_window_sec,
+                        .sequencer = p0.sequencer, .cosigner_policy = p0.cosigner_policy};
+    if (!policy_ok(np, q)) { return Err("the new policy is not valid (SPEC 8.2, 20.3)"); }
+    return Ok(np);
+}
+
+// Whether `a` and `b` name the same witness keys (in any order).
+pub Bool same_witness_keys(List(WitnessRef) a, List(WitnessRef) b) {
+    List(List(Int)) ka = witness_key_list(a, 0, ListBuf());
+    List(List(Int)) kb = witness_key_list(b, 0, ListBuf());
+    return keys_all_in(ka, kb, 0) && keys_all_in(kb, ka, 0);
 }
 
 // ============================================================================
