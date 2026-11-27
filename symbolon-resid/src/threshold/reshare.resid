@@ -220,6 +220,17 @@ Result(RsStep, CgFail) rs_round2(RsCtx c, List(RsMine) mine, List(ThMsg) in) {
     List(RsAnnMsg) as = check_anns(c, anns_of(in, 0, []), mine, 0, [])?;
     List(ThMsg) fac_out = if (c.self != 0) { facs(c, mine[0], as, 0, []) } else { [] };
     if (c.old_self == 0 || c.old.len() == 0) { return Ok(RsStep {.state = RS2(c, mine, as, [], []), .out = fac_out}); }
+    return deal_try(c, mine, as, fac_out, 0);
+}
+
+// The deal is broadcast, so every party sees each part Enc_j(f_i(j)); a
+// part with the nonce 1 shows f_i(j), and with two dealers the other
+// dealer adds its own and has j's new share (SPEC 6.2.1). On such a part
+// the deal is made again from a fresh seed (a new masking polynomial and
+// new nonces); nothing of the dropped one was sent.
+pub Result(RsStep, CgFail) deal_try(RsCtx c0, List(RsMine) mine, List(RsAnnMsg) as, List(ThMsg) fac_out, Int k) {
+    if (k >= nonce_one_redraws()) { return Err(cg_fail(nonce_one_exhausted(), [])); }
+    RsCtx c = if (k == 0) { c0 } else { rs_reseeded(c0, nonce_one_seed(c0.seed, k)) };
     // None only when this party is not among the dealers or the masking
     // polynomial is malformed (rs_ctx_problem rules out the degree).
     Option(List(List(UInt(64)))) opoly = rsh_dealer_poly(c.old[0].ecdsa, c.dealers, c.old_self, zero_poly(c, 0, []));
@@ -228,9 +239,28 @@ Result(RsStep, CgFail) rs_round2(RsCtx c, List(RsMine) mine, List(ThMsg) in) {
         None => Err(cg_fail("this party cannot deal: not a dealer, or a bad polynomial", [])),
         Some(poly) => match od {
             None => Err(cg_fail("this party cannot deal: not a dealer, or a bad polynomial", [])),
-            Some(d) => dealt(c, mine, as, poly, d, fac_out)
+            Some(d) => if (parts_nonce_one(parts_msg(d.parts, 0, []), as, 0)) { deal_try(c0, mine, as, fac_out, k + 1) } else { dealt(c, mine, as, poly, d, fac_out) }
         }
     };
+}
+
+RsCtx rs_reseeded(RsCtx c, List(Int) seed) {
+    return RsCtx {.self = c.self, .old_self = c.old_self, .dealers = c.dealers, .receivers = c.receivers, .offline = c.offline, .degree = c.degree,
+                  .old = c.old, .root = c.root, .session_id = c.session_id, .seed = seed, .primes = c.primes};
+}
+
+// Whether a part is encrypted with the nonce 1 under its addressee's
+// announced modulus (a part to no announced party is left to round 3).
+pub Bool parts_nonce_one(List(RsPartMsg) ps, List(RsAnnMsg) as, Int i) {
+    if (i >= ps.len()) { return false; }
+    Option(RsAnnMsg) oa = ann_for(as, ps[i].to, 0);
+    Bool hit = match oa { None => false, Some(a) => pa_nonce_one(a.n, ps[i].ct) };
+    return hit || parts_nonce_one(ps, as, i + 1);
+}
+
+Bool deals_nonce_one(List(RsDealMsg) ds, List(RsAnnMsg) as, Int i) {
+    if (i >= ds.len()) { return false; }
+    return parts_nonce_one(ds[i].parts, as, 0) || deals_nonce_one(ds, as, i + 1);
 }
 
 Result(RsStep, CgFail) dealt(RsCtx c, List(RsMine) mine, List(RsAnnMsg) as, List(List(UInt(64))) poly, RshD1 d, List(ThMsg) fac_out) {
@@ -379,6 +409,8 @@ List(CgPublicCfg) publics(List(RsAnnMsg) as, List(RsDealMsg) ds, Int i, List(CgP
 }
 
 Result(RsStep, CgFail) rs_round3(RsCtx c, List(RsMine) mine, List(RsAnnMsg) as, List(RsOffline) off, List(ThMsg) in, List(RsDealMsg) own_deal) {
+    // A part with the nonce 1 is refused before anything is built on it.
+    if (deals_nonce_one(deals_of(in, 0, []), as, 0)) { return Err(cg_fail(nonce_one_refused(), [])); }
     List(RsDealMsg) ds = ordered_deals(c, deals_of(in, 0, []).concat(own_deal), 0, [])?;
     _ = check_constants(c, ds)?;
     // The deals must keep X: the constant terms add up to the root key.

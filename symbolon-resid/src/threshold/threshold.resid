@@ -190,7 +190,8 @@ pub type ThState =
   | ThVerdictAbort(PsAb2, BlR2)         // the designated party, "abort" sent; its round-7 inbox holds nothing for it
   | ThAwaitAbort(PsAb2, BlR2)           // the designated party, waiting for abort-2 openings
   | ThSigned(CgSig)
-  | ThClosed;
+  | ThClosed
+  | ThNoNonce;                          // no redraw gave round 1 a nonce other than 1; nothing was sent
 
 pub type ThStep = { ThState state; List(ThMsg) out; };
 
@@ -245,9 +246,19 @@ Option(BlVerdict) verdict_for(List(ThMsg) ms, Int me, Int i) {
     };
 }
 
-pub ThStep th_start(CgCtx c, BlRole role) {
-    Ps1 s = ps_start(c);
-    return ThStep {.state = ThR1(s, role), .out = wrap_cg(s.out, 0, ListBuf())};
+// Round 1: K = Enc(k) and G = Enc(gamma). When one has the nonce 1 (see
+// "Paillier nonce 1" below) the round is drawn again from a fresh seed,
+// so k and gamma are new as well: the k that would have shown is dropped
+// before anything left this party.
+pub ThStep th_start(CgCtx c, BlRole role) { return th_start_try(c, role, 0); }
+
+ThStep th_start_try(CgCtx c, BlRole role, Int k) {
+    if (k >= nonce_one_redraws()) { return ThStep {.state = ThNoNonce, .out = []}; }
+    CgCtx ck = if (k == 0) { c } else { ctx_reseeded(c, nonce_one_seed(c.seed, k)) };
+    Ps1 s = ps_start(ck);
+    List(ThMsg) out = wrap_cg(s.out, 0, ListBuf());
+    if (th_nonce_one(ck, out, 0)) { return th_start_try(c, role, k + 1); }
+    return ThStep {.state = ThR1(s, role), .out = out};
 }
 
 CgCtx ctx_of6(Ps6 s) { return s.prev.prev.prev.prev.prev.ctx; }
@@ -273,17 +284,39 @@ pub Result(ThStep, CgFail) th_step(ThState st, List(ThMsg) in) {
         ThVerdictAbort(a, b) => Ok(quiet(ThAwaitAbort(a, b))),
         ThAwaitAbort(a, b) => Err(bl_abort2_blame(a, cin, b)),
         ThSigned(sig) => Ok(quiet(ThSigned(sig))),
-        ThClosed => Err(cg_fail("session closed", []))
+        ThClosed => Err(cg_fail("session closed", [])),
+        ThNoNonce => Err(cg_fail(nonce_one_exhausted(), []))
     };
 }
 
+// Round 2: the Delta and Chi MtAs (F = Enc_self(y) to each peer) and, at
+// the designated party, the tweak MtA (T = Enc_self(tau), F). A peer's K or
+// G with the nonce 1 is refused first. When one of ours has the nonce 1
+// the round is computed again with a fresh seed for this round's draws:
+// k and gamma stay (K and G went out in round 1 and are what the peers
+// hold), the masks y, the nonces and the proofs are new, and the round
+// that would have shown y (and through D the secret it masks) is never
+// sent.
 Result(ThStep, CgFail) th_r2(Ps1 s, BlRole role, List(CgMsg) in) {
-    Ps2 s2 = ps_r2(s, in)?;
-    BlR2 b = bl_r2(s2, role);
-    return Ok(ThStep {.state = ThR2(b), .out = wrap_cg(s2.out, 0, ListBuf()).concat(wrap_tw(b.out, 0, ListBuf()))});
+    if (th_nonce_one(s.ctx, wrap_cg(in, 0, ListBuf()), 0)) { return Err(cg_fail(nonce_one_refused(), [])); }
+    return th_r2_try(s, role, in, 0);
 }
 
+Result(ThStep, CgFail) th_r2_try(Ps1 s0, BlRole role, List(CgMsg) in, Int k) {
+    if (k >= nonce_one_redraws()) { return Err(cg_fail(nonce_one_exhausted(), [])); }
+    Ps1 s = if (k == 0) { s0 } else { ps1_reseeded(s0, nonce_one_seed(s0.ctx.seed, k)) };
+    Ps2 s2 = ps_r2(s, in)?;
+    BlR2 b = bl_r2(s2, role);
+    List(ThMsg) out = wrap_cg(s2.out, 0, ListBuf()).concat(wrap_tw(b.out, 0, ListBuf()));
+    if (th_nonce_one(s.ctx, out, 0)) { return th_r2_try(s0, role, in, k + 1); }
+    return Ok(ThStep {.state = ThR2(b), .out = out});
+}
+
+// Round 3 reads the peers' F ciphertexts and the designated party's tweak
+// T and F; one with the nonce 1 is refused before anything is built on it.
 Result(ThStep, CgFail) th_r3(BlR2 b, List(CgMsg) in, List(BlTwMsg) tw) {
+    CgCtx c = b.s.prev.ctx;
+    if (th_nonce_one(c, wrap_cg(in, 0, ListBuf()).concat(wrap_tw(tw, 0, ListBuf())), 0)) { return Err(cg_fail(nonce_one_refused(), [])); }
     Ps3 s = bl_r3(b, in, tw)?;
     return Ok(ThStep {.state = ThR3(s, b), .out = wrap_cg(s.out, 0, ListBuf())});
 }
@@ -354,6 +387,10 @@ Result(ThStep, CgFail) th_finish(Ps6 s, CgPresig pre, BlR2 b, List(CgMsg) in) {
     };
 }
 
+// Whether a session could not start: every redraw of round 1 hit the
+// nonce 1 (th_start). The caller ends the session without sending.
+pub Bool th_no_nonce(ThState st) { return match st { ThNoNonce => true, _ => false }; }
+
 // Whether a peer's session ended in its answer to an "abort" verdict: the
 // designated party found that the S points do not add up.
 pub Bool th_peer_aborted(ThState st) {
@@ -362,6 +399,90 @@ pub Bool th_peer_aborted(ThState st) {
 
 // The ECDSA signature r || s (64 bytes) of a finished session.
 pub List(Int) th_sig_raw(CgSig sig) { return cg_sig_raw(sig.r, sig.s); }
+
+// ============================================================================
+// Paillier nonce 1 (SPEC 6.2.1)
+// ============================================================================
+//
+// Resid's cg_unit (lib/cggmp.resid:46-52 up to master 1458799c) draws a
+// Paillier nonce from an 8-chunk stream and falls back to the nonce 1 when
+// every chunk is rejected: for a 2048-bit N that is up to 1 call in 745
+// (1 in 13,200 on average). Enc(m; 1) = 1 + mN mod N^2, so anyone holding
+// the ciphertext and N reads m = (c - 1) / N, and pa_ct_ok accepts it. The
+// values so encrypted are k and gamma (K, G), the MtA masks y (F, which give
+// gamma or the sender's key share through D), tau (T and the tweak F) and a
+// re-share dealer's parts: with two signers several of them give the other
+// party the root key. Symbolon does not change Resid; it guards both sides:
+//
+// - A sender tests every Paillier ciphertext it made before the round goes
+//   out (th_start, th_r2 here; reshare.resid's deal) and on a hit computes
+//   the round again from nonce_one_seed. Nothing derived from the dropped
+//   draw was sent, so nothing is reused and no one is blamed.
+// - A receiver refuses a ciphertext c with c = 1 (mod N_sender): the session
+//   ends without blame (record_run leaves the abort book alone), so an
+//   honest party never builds on a value the sender's build showed.
+//
+// For a valid ciphertext c = (1 + mN) r^N, c mod N = r^N mod N, and x -> x^N
+// is a bijection on the units mod N (gcd(N, phi(N)) = 1), so c = 1 (mod N)
+// exactly when r = 1 (mod N).
+
+// Whether c = 1 (mod N): a ciphertext under N whose nonce is 1.
+pub Bool pa_nonce_one(List(UInt(64)) n, List(UInt(64)) c) {
+    if (bn_cmp(n, [2]) < 0 || c.len() == 0) { return false; }
+    return bn_cmp(bn_mod(c, n), [1]) == 0;
+}
+
+// How many fresh seeds a round tries before it gives up (each hit has
+// probability below 2^-9.5, so 8 in a row below 2^-76).
+pub Int nonce_one_redraws() { return 8; }
+
+// The seed of redraw k: a function of the secret session seed, so as
+// unpredictable as it.
+pub List(Int) nonce_one_seed(List(Int) seed, Int k) {
+    return sha256_bytes(seed.concat(bytes_of(f"symbolon v1 nonce-one redraw {k}")));
+}
+
+pub Str nonce_one_prefix() { return "Paillier nonce 1: "; }
+pub Str nonce_one_refused() { return nonce_one_prefix() + "a peer sent a ciphertext that shows its plaintext (its build lacks the nonce fix); refused, no one blamed"; }
+pub Str nonce_one_exhausted() { return nonce_one_prefix() + "every redraw made a ciphertext that would show its plaintext; nothing sent"; }
+
+pub CgCtx ctx_reseeded(CgCtx c, List(Int) seed) {
+    return CgCtx {.self = c.self, .ids = c.ids, .pubs = c.pubs, .x = c.x, .elg = c.elg, .psec = c.psec, .pubkey = c.pubkey, .base = c.base, .seed = seed, .digest = c.digest};
+}
+
+Ps1 ps1_reseeded(Ps1 s, List(Int) seed) {
+    return Ps1 {.ctx = ctx_reseeded(s.ctx, seed), .gamma = s.gamma, .kshare = s.kshare, .g_nonce = s.g_nonce, .k_nonce = s.k_nonce, .elg_nonce = s.elg_nonce,
+                .pre_id = s.pre_id, .decommit = s.decommit, .k_ct = s.k_ct, .g_ct = s.g_ct, .zl = s.zl, .zm = s.zm, .commit = s.commit, .out = s.out};
+}
+
+// The ciphertexts of m that its sender encrypted under its own key: K and
+// G (PsB2), both MtAs' F (PsM3), the tweak MtA's T and F. (D is under the
+// receiver's key, which reads it anyway.)
+Bool cg_msg_nonce_one(CgCtx c, CgMsg m) {
+    if (cg_index(c.ids, m.from, 0) < 0) { return false; }
+    List(UInt(64)) n = cg_pub_of(c, m.from).pail.n;
+    CgBody b = m.body;
+    return match b {
+        PsB2(x) => pa_nonce_one(n, x.k) || pa_nonce_one(n, x.g),
+        PsM3(x) => pa_nonce_one(n, x.delta_f) || pa_nonce_one(n, x.chi_f),
+        _ => false
+    };
+}
+
+Bool tw_msg_nonce_one(CgCtx c, BlTwMsg t) {
+    if (cg_index(c.ids, t.from, 0) < 0) { return false; }
+    List(UInt(64)) n = cg_pub_of(c, t.from).pail.n;
+    return pa_nonce_one(n, t.t) || pa_nonce_one(n, t.f);
+}
+
+// Whether any message of `ms` carries a ciphertext with the nonce 1 under
+// its sender's key.
+pub Bool th_nonce_one(CgCtx c, List(ThMsg) ms, Int i) {
+    if (i >= ms.len()) { return false; }
+    ThMsg m = ms[i];
+    Bool hit = match m { ThCg(x) => cg_msg_nonce_one(c, x), ThTw(t) => tw_msg_nonce_one(c, t), _ => false };
+    return hit || th_nonce_one(c, ms, i + 1);
+}
 
 // ============================================================================
 // Aborts (SPEC 6.2)
@@ -431,9 +552,13 @@ pub AbortBook after_reshare(AbortBook book, Quorum q) {
 // unidentified aborts; a session that failed a protocol check is an abort
 // (identified when it names a party); a session that only timed out or was
 // refused is no abort, since no check failed.
+// A party refused for an old build (a ciphertext with the nonce 1, SPEC
+// 6.2.1) is no abort either: no protocol check failed against an honest
+// party of the current build.
 pub AbortBook record_run(AbortBook book, Quorum q, Str fail, List(Int) culprits) {
     if (str_len(fail) == 0) { return record_success(book); }
     if (fail == "timed out waiting for a round" || fail == "the cosigner is unreachable") { return book; }
+    if (str_starts_with(fail, nonce_one_prefix())) { return book; }
     return record_abort(book, q, cg_fail(fail, culprits));
 }
 

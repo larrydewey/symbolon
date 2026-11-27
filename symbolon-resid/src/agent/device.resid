@@ -982,6 +982,7 @@ Result(List(Int), Str) run_sign_core(Str dir, DeviceConfig c, List(Secret(UInt(8
 @requires(filesystem, network, declassify, clock)
 Result(List(Int), Str) run_sign_ctx(Str dir, DeviceConfig c, Quorum q, List(UInt(64)) tau, List(Int) m, Endpoint relay, List(Int) sid, Local dev, Remote cr, Int start, CgCtx ctx) {
     ThStep st = th_start(ctx, th_role(ctx, q, c.party, tau));
+    if (th_no_nonce(st.state)) { return Err("signing: " + nonce_one_exhausted()); }
     return finish_sign(dir, c, q, tau, m, run_session(relay, sid, [Seat {.me = dev, .st = st.state, .round = 1, .out = st.out, .done = false}],
         [cr], [Cursor {.party = c.party, .next = start}], [], lambda(t, msgs) { sign_adapt(t, msgs) }, 120));
 }

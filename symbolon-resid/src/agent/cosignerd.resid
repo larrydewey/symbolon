@@ -755,6 +755,7 @@ Cosigner cosign(Cosigner c, SignInvite inv, VerifiedHead vh, CosignerState s, Li
 @requires(network, filesystem, declassify, clock)
 Cosigner run_cosign(Cosigner c, SignInvite inv, Quorum q, CgCtx ctx, List(Got) early, List(Int) via) {
     ThStep st = th_start(ctx, th_role(ctx, q, inv.requester, []));
+    if (th_no_nonce(st.state)) { return cos_fail(c, "session: " + nonce_one_exhausted()); }
     // The requester by the key its request came under (its duress
     // profile's transport key under duress, SPEC 14.2).
     List(Remote) rs = keyed(quorum_remotes(q, inv.signers, c.cfg.party, 0, []), inv.requester, via, 0, []);

@@ -375,6 +375,36 @@ deployed threshold ECDSA libraries came from omitted or weakened proofs and
 parameter checks; the implementation requirements in Section 23 exist
 because of them.
 
+#### 6.2.1 Paillier nonces
+
+A Paillier ciphertext `c = (1 + N)^m * r^N mod N^2` with the nonce `r = 1`
+is `1 + mN` and shows `m` to anyone who holds `c` and `N`. Resid's
+`cg_unit` up to master 1458799c fell back to the nonce 1 when its 8-chunk
+stream ran out (up to 1 draw in 745 for a 2048-bit `N`, 1 in 13,200 on
+average), and `pa_ct_ok` accepts such a ciphertext. The values so encrypted
+are `k` and `gamma` (K, G), the MtA masks (F, which with D give `gamma` or
+the sender's Lagrange-weighted key share), `tau` (T and the tweak MtA's F)
+and a re-share dealer's parts (broadcast in the deal); with two signers
+several give the other party the root key. For a valid ciphertext,
+`c mod N = r^N mod N`, and `x -> x^N` is a bijection on the units mod `N`,
+so `c = 1 (mod N)` exactly when `r = 1`. Therefore:
+
+- **Sender.** Before a round's messages go out, a party MUST test every
+  Paillier ciphertext it encrypted (under its own `N` in signing; under the
+  addressee's `N_j` for re-share parts) and MUST NOT send one with
+  `c = 1 (mod N)`. On a hit it computes the round again from a fresh seed
+  (SHA-256 of the session seed and a redraw counter): round 1 with new `k`
+  and `gamma`; round 2 with the same `k` and `gamma` (K and G were already
+  sent) and new masks, nonces and proofs; a re-share deal with a new
+  masking polynomial. Nothing derived from the dropped draw was sent, so
+  no value is reused and no one is blamed. After 8 hits in a row (below
+  2^-76) the session ends without sending.
+- **Receiver.** A party MUST refuse a received K, G, F, T or re-share part
+  with `c = 1 (mod N_sender)` (for parts, `N` of the addressee) before
+  building on it. The session ends naming no one; it is not an abort for
+  Section 6.2's rule (the sender's build is at fault, not a protocol check
+  against an honest party).
+
 ---
 
 ## 7. Data model
