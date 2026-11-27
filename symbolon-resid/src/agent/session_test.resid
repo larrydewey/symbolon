@@ -4,6 +4,8 @@
 import "../threshold/threshold.resid";
 import "cggmp_blind.resid";
 import "session.resid";
+import "../types.resid";
+import "../net/envelope.resid";
 
 List(Int) pid(Int n) { return [n, n, n, n]; }
 
@@ -37,4 +39,62 @@ test "a party's batch brings only messages from that party's id" {
     Bool missing = match none { None => true, Some(_) => false };
     expect(missing).toBeTrue();
     expect(from_only([verdict(1, 3, true), verdict(2, 3, true), verdict(1, 2, false)], 1, 0, ListBuf()).len()).toEqual(2);
+}
+
+// ─── The session protocol version (SPEC 6.2.1) ──────────────────
+
+Int find_at(List(Int) b, List(Int) pat, Int i) {
+    if (i + pat.len() > b.len()) { return -1; }
+    if (bytes_eq(b[i..i + pat.len()], pat)) { return i; }
+    return find_at(b, pat, i + 1);
+}
+
+// The CBOR a build from before the version sent: the same bytes without
+// the "proto" entry (its value is one byte), and the struct's map header
+// (just before its first key, "session_id") one entry shorter.
+List(Int) without_proto(List(Int) b) {
+    Int k = find_at(b, [101, 112, 114, 111, 116, 111], 0);
+    Int h = find_at(b, [106, 115, 101, 115, 115, 105, 111, 110, 95, 105, 100], 0) - 1;
+    if (k < 0 || h < 0 || h > k) { return []; }
+    List(Int) cut = b[0..k].concat(b[k + 7..b.len()]);
+    return cut[0..h].concat([cut[h] - 1]).concat(cut[h + 1..cut.len()]);
+}
+
+Int proto_in(Option(Packet) op) {
+    return match op {
+        None => -1,
+        Some(w) => match w { WSession(m) => m.proto, WSign(x) => x.proto, WReshare(r) => r.proto, _ => -2 }
+    };
+}
+
+Got got_of(Packet w) { return Got {.from = pid(7), .to = pid(3), .w = w, .key = []}; }
+
+Bool old_from_7(Option(Got) og) { return match og { Some(g) => bytes_eq(g.from, pid(7)), None => false }; }
+
+Bool is_some(Option(Got) og) { return match og { Some(_) => true, None => false }; }
+
+test "a batch or invitation from a build before the nonce fix reads as version 0 and is refused, without blame" {
+    List(Int) sid = [9, 9, 9, 9];
+    Packet now = WSession(SessionMsg {.session_id = sid, .round = 1, .msgs = [], .proto = session_proto()});
+    expect(proto_in(wire_decode(wire_encode(now)))).toEqual(2);
+    List(Int) old = without_proto(wire_encode(now));
+    expect(old.len() + 7).toEqual(wire_encode(now).len());
+    Option(Packet) oldp = wire_decode(old);
+    expect(proto_in(oldp)).toEqual(0);
+    Packet oldw = oldp else { now };
+    // The old batch ends the session; the current one, and an old batch of another session, do not.
+    expect(old_from_7(old_batch([got_of(now), got_of(oldw)], sid, 0))).toBeTrue();
+    expect(is_some(old_batch([got_of(now)], sid, 0))).toBeFalse();
+    expect(is_some(old_batch([got_of(oldw)], [1, 1, 1, 1], 0))).toBeFalse();
+    // An old device's sign request reads as version 0 too, which the cosigner refuses.
+    Packet inv = WSign(SignInvite {.session_id = sid, .message = [], .epoch = 1, .requester = pid(7), .kind = 1, .sig = [], .signers = [], .proto = session_proto()});
+    expect(proto_in(wire_decode(without_proto(wire_encode(inv))))).toEqual(0);
+    expect(session_proto_min() > 0).toBeTrue();
+    expect(session_proto() >= session_proto_min()).toBeTrue();
+    // The refusal says what to upgrade and is no abort.
+    Str why = old_build_refusal("party 0707", 0);
+    expect(str_starts_with(why, "old build: party 0707 runs a Symbolon build from before the Paillier nonce fix")).toBeTrue();
+    Quorum q = Quorum {.parties = [], .t = 2, .root_pubkey = [], .epoch = 1, .transcript_digest = [], .kv_commits = []};
+    AbortBook b = record_run(abort_book(), q, why, []);
+    expect(b.unidentified).toEqual(0);
 }

@@ -576,11 +576,11 @@ Int reshare_as_kit(Str dir, DeviceConfig c, Unlocked u0, KitSecrets s, List(UInt
     Int kit_old = pos1(pre.parties, oldkit.id, 0);
     List(Int) sid = random_bytes(32);
     ReshareInvite inv0 = ReshareInvite {.session_id = sid, .log_id = c.log_id, .new_parties = np, .dealers = [kit_old, pos1(pre.parties, cos.id, 0)],
-        .receivers = receivers_of(np, 0, []), .offline = offline_of(np, 0, []), .degree = (Int)q.t - 1, .epoch = (Int)q.epoch + 1, .requester = c.party, .sig = []};
+        .receivers = receivers_of(np, 0, []), .offline = offline_of(np, 0, []), .degree = (Int)q.t - 1, .epoch = (Int)q.epoch + 1, .requester = c.party, .sig = [], .proto = session_proto()};
     Result(List(Int), Str) rs = dk_sign(c, u.real, u.st, request_tbs(sid, reshare_message(inv0), q.epoch, c.party, request_reshare()));
     List(Int) rsig = match rs { Ok(x) => x, Err(_) => [] };
     ReshareInvite inv = ReshareInvite {.session_id = sid, .log_id = c.log_id, .new_parties = np, .dealers = inv0.dealers, .receivers = inv0.receivers,
-        .offline = inv0.offline, .degree = inv0.degree, .epoch = inv0.epoch, .requester = c.party, .sig = rsig};
+        .offline = inv0.offline, .degree = inv0.degree, .epoch = inv0.epoch, .requester = c.party, .sig = rsig, .proto = session_proto()};
     Endpoint relay = mail_ep(dir, c, u);
     Int me_new = pos1(np, c.party, 0);
     Local me = Local {.party = c.party, .cg = me_new, .hpke_sk = device_transport(c, u.real.dek).sk};

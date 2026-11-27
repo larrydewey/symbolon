@@ -696,6 +696,9 @@ Cosigner decide(Cosigner c, Remote back, SignInvite inv, VerifiedHead vh, List(G
     // A signing session is a sign request: any other kind would be billed
     // to another budget (an evaluation's) or pass as an authority request.
     if (!bytes_eq(from, inv.requester) || inv.epoch < 0 || inv.kind != (Int)request_sign()) { return refuse_to(c, back, inv.session_id); }
+    // A device of a build before the Paillier nonce fix is refused before
+    // its request is counted (SPEC 6.2.1); it sees the refusal.
+    if (inv.proto < session_proto_min()) { eprintln("cosigner: " + old_build_refusal("the requesting device", inv.proto)); return refuse_to(c, back, inv.session_id); }
     _ = prune_old_epochs(c.dir, (Int)vh.head.quorum.epoch);
     // No session with a party an abort identified, nor after repeated
     // aborts that identified no one, until a re-share (SPEC 6.2).
@@ -864,6 +867,7 @@ Cosigner reshare_decide(Cosigner c, List(Int) from, ReshareInvite inv, VerifiedH
     CosignerState st = load_state(c, vh);
     Quorum q = vh.head.quorum;
     if (!bytes_eq(from, inv.requester) || inv.epoch != (Int)q.epoch + 1) { return refuse(c, from, inv.session_id); }
+    if (inv.proto < session_proto_min()) { eprintln("cosigner: re-share refused: " + old_build_refusal("the requesting device", inv.proto)); return refuse(c, from, inv.session_id); }
     // An earlier re-share's outcome becomes an epoch's only when these
     // verified events hold its reshare event; one the log passed is wiped.
     _ = promote_reshares(c.dir, es, (Int)q.epoch, c.cfg.party);

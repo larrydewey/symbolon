@@ -14,6 +14,7 @@ import "../net/envelope.resid";
 import "../net/services.resid";
 import "../core/log.resid";
 import "clock.resid";
+import "crypto.resid";
 
 // A party this process speaks for: its id, CGGMP id and HPKE secret key.
 pub type Local = { List(Int) party; Int cg; List(Secret(UInt(8))) hpke_sk; };
@@ -225,6 +226,8 @@ Bool all_done(List(Seat(T)) ss, Int i) {
 pub Run(T) run_session(Endpoint relay, List(Int) sid, List(Seat(T)) seats, List(Remote) remotes, List(Cursor) cursors, List(Got) early,
                        Result(Stepped(T), CgFail) closure(T, List(ThMsg)) step, Int wait_s) {
     List(Local) ls = locals_of(seats, 0, []);
+    Option(Got) old = old_batch(early, sid, 0);
+    if (match old { Some(_) => true, None => false }) { return refuse_old(relay, sid, seats, ls, remotes, old, cursors); }
     Outs o = outs_all(sid, seats, remotes, ls, 0, no_outs());
     return rs_loop(relay, sid, seats, remotes, ls, cursors, batches_of(early, sid, 0, []).concat(o.local), o.posts, step, wait_s, clock_now_seconds());
 }
@@ -247,7 +250,7 @@ Outs outs_round(List(Int) sid, Local from, Int round, List(ThMsg) out, List(Remo
     if (i < remotes.len()) {
         Remote r = remotes[i];
         List(Secret(UInt(8))) fresh = [];
-        Option(Envelope) oe = seal(from.party, from.hpke_sk, r.party, r.hpke_pub, WSession(SessionMsg {.session_id = sid, .round = round, .msgs = for_party(out, r.cg, 0, ListBuf())}), fresh);
+        Option(Envelope) oe = seal(from.party, from.hpke_sk, r.party, r.hpke_pub, WSession(SessionMsg {.session_id = sid, .round = round, .msgs = for_party(out, r.cg, 0, ListBuf()), .proto = session_proto()}), fresh);
         Outs next = match oe { None => acc, Some(e) => Outs {.posts = acc.posts.concat([Post {.to = r.party, .envelope = envelope_encode(e)}]), .local = acc.local} };
         return outs_round(sid, from, round, out, remotes, locals, i + 1, next);
     }
@@ -309,8 +312,50 @@ Run(T) rs_loop(Endpoint relay, List(Int) sid, List(Seat(T)) seats, List(Remote) 
     // A party that refuses the session (the cosigner's policy; during
     // duress, SPEC 14.3) ends it, with the face of an outage.
     if (refused_in(gs, sid, 0)) { return Run {.seats = seats, .fail = "the cosigner is unreachable", .culprits = [], .cursors = cs2}; }
+    // A batch from a build before the Paillier nonce fix ends the session
+    // before anything is built on it (SPEC 6.2.1).
+    Option(Got) old = old_batch(gs, sid, 0);
+    if (match old { Some(_) => true, None => false }) { return rs_end(relay, posts, refuse_old(relay, sid, seats, ls, remotes, old, cs2)); }
     List(Post) none = [];
     return rs_loop(relay, sid, seats, remotes, ls, cs2, buf.concat(batches_of(gs, sid, 0, [])), none, step, wait_s, since);
+}
+
+// The first batch of session `sid` in `gs` whose sender's build is below
+// session_proto_min (a build from before the field reads as 0), if any.
+pub Option(Got) old_batch(List(Got) gs, List(Int) sid, Int i) {
+    if (i >= gs.len()) { return None; }
+    Packet w = gs[i].w;
+    Bool old = match w { WSession(m) => bytes_eq(m.session_id, sid) && m.proto < session_proto_min(), _ => false };
+    return if (old) { Some(gs[i]) } else { old_batch(gs, sid, i + 1) };
+}
+
+Int proto_of(Packet w) { return match w { WSession(m) => m.proto, _ => 0 }; }
+
+// Ends the session on an old peer's batch: the peer is told (WRefused,
+// which an old build reads as a refusal and stops on) and the failure says
+// which party to upgrade. No one is blamed (record_run).
+@requires(network, declassify, clock(readonly))
+Run(T) refuse_old(Endpoint relay, List(Int) sid, List(Seat(T)) seats, List(Local) ls, List(Remote) remotes, Option(Got) og, List(Cursor) cs) {
+    return match og {
+        None => Run {.seats = seats, .fail = "", .culprits = [], .cursors = cs},
+        Some(g) => refused_old(relay, sid, seats, ls, remotes, g, cs)
+    };
+}
+
+@requires(network, declassify, clock(readonly))
+Run(T) refused_old(Endpoint relay, List(Int) sid, List(Seat(T)) seats, List(Local) ls, List(Remote) remotes, Got g, List(Cursor) cs) {
+    Option(Local) me = local_by_party(ls, g.to, 0);
+    Option(Remote) peer = remote_by_party(remotes, g.from, 0);
+    Bool told = match me { None => false, Some(l) => match peer { None => false, Some(r) => send_to(relay, l, r, WRefused(sid)) } };
+    eprintln(old_build_refusal("party " + hex_encode(g.from), proto_of(g.w)) + (if (told) { " (told it so)" } else { "" }));
+    Str who = "party " + hex_encode(if (g.from.len() > 8) { g.from[0..8] } else { g.from });
+    return Run {.seats = seats, .fail = old_build_refusal(who, proto_of(g.w)), .culprits = [], .cursors = cs};
+}
+
+Option(Local) local_by_party(List(Local) ls, List(Int) p, Int i) {
+    if (i >= ls.len()) { return None; }
+    if (bytes_eq(ls[i].party, p)) { return Some(ls[i]); }
+    return local_by_party(ls, p, i + 1);
 }
 
 // A session's end: what the seats said last still goes out.

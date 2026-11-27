@@ -970,7 +970,7 @@ Result(List(Int), Str) run_sign_core(Str dir, DeviceConfig c, List(Secret(UInt(8
     Local dev = Local {.party = c.party, .cg = cg_id_of(q, c.party, 0), .hpke_sk = hpke_sk};
     Remote cr = Remote {.party = cos.id, .cg = cg_id_of(q, cos.id, 0), .hpke_pub = cos.hpke_key};
     Int start = mailbox_end(relay, c.party, c.mbox_next);
-    SignInvite inv = SignInvite {.session_id = sid, .message = m, .epoch = (Int)q.epoch, .requester = c.party, .kind = (Int)request_sign(), .sig = rsig, .signers = signers};
+    SignInvite inv = SignInvite {.session_id = sid, .message = m, .epoch = (Int)q.epoch, .requester = c.party, .kind = (Int)request_sign(), .sig = rsig, .signers = signers, .proto = session_proto()};
     if (!send_to(relay, dev, cr, WSign(inv))) { return Err("cannot reach the relay"); }
     Option(CgCtx) octx = th_ctx(x, q, signers, c.party, tau, sid, m, random_bytes(32));
     return match octx {

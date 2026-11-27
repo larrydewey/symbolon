@@ -375,7 +375,7 @@ deployed threshold ECDSA libraries came from omitted or weakened proofs and
 parameter checks; the implementation requirements in Section 23 exist
 because of them.
 
-#### 6.2.1 Paillier nonces
+#### 6.2.1 Paillier nonces and the session protocol version
 
 A Paillier ciphertext `c = (1 + N)^m * r^N mod N^2` with the nonce `r = 1`
 is `1 + mN` and shows `m` to anyone who holds `c` and `N`. Resid's
@@ -404,6 +404,19 @@ so `c = 1 (mod N)` exactly when `r = 1`. Therefore:
   building on it. The session ends naming no one; it is not an abort for
   Section 6.2's rule (the sender's build is at fault, not a protocol check
   against an honest party).
+- **Version.** Every sign invitation, re-share invitation and session
+  round batch carries the sender's session protocol version (field
+  `proto`; absent reads as 0). Version 2 is the first with these checks.
+  A party MUST refuse an invitation or batch below version 2: the cosigner
+  answers an old device's request with a refusal before the request counts
+  against its policy, and logs that the device must upgrade; a device or
+  cosigner that receives an old peer's batch ends the session, tells the
+  peer (a refusal, which an old build reads as "the cosigner is
+  unreachable"), and reports `old build: party ... runs a Symbolon build
+  from before the Paillier nonce fix (session protocol 0, 2 needed):
+  upgrade it`. Neither is an abort. Upgrade the cosigner first, then the
+  devices: until a device is upgraded it cannot sign with an upgraded
+  cosigner.
 
 ---
 

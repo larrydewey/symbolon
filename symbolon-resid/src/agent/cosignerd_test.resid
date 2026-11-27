@@ -78,7 +78,7 @@ List(Party) three() { return [pt(4, party_kind_device()), pt(1, party_kind_cosig
 
 ReshareInvite invite_to(Int epoch, Int sid) {
     return ReshareInvite {.session_id = rep(sid, 32), .log_id = rep(7, 32), .new_parties = three(), .dealers = [1, 2], .receivers = [1, 2], .offline = [3], .degree = 1,
-                          .epoch = epoch, .requester = rep(4, 32), .sig = []};
+                          .epoch = epoch, .requester = rep(4, 32), .sig = [], .proto = session_proto()};
 }
 
 CgConfig cfg_of(Int id) {

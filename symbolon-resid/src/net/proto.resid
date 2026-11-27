@@ -19,20 +19,28 @@ pub type KeygenInvite = { List(Int) session_id; List(PartyKeys) parties; Int thr
 pub type PartyKeys = { List(Int) party; List(Int) auth_key; List(Int) hpke_key; };
 
 // A request to co-sign (SPEC 10.4 step 3): the signed request and the
-// signer set, then protocol messages under its session id.
+// signer set, then protocol messages under its session id. `proto` is the
+// sender's session protocol version (threshold.resid session_proto, SPEC
+// 6.2.1); a build from before it sends none, read as 0.
 //@ serial
 pub type SignInvite = {
     List(Int) session_id; List(Int) message; Int epoch; List(Int) requester; Int kind; List(Int) sig;
     List(List(Int)) signers;
+    Int proto;                          //@ default
 };
 
 // One round's protocol messages from one sender: a receiver runs round
 // `round` once it holds that round's batch from every other party. In a
 // signing session the designated signer's round-7 batch carries its
 // verdict on the S points (ThVerdict), and each peer's round-8 batch its
-// answer: its signature share, or its abort-2 openings.
+// answer: its signature share, or its abort-2 openings. `proto` as in
+// SignInvite: every batch carries it, and a batch below
+// session_proto_min ends the session (agent/session.resid).
 //@ serial
-pub type SessionMsg = { List(Int) session_id; Int round; List(ThMsg) msgs; };
+pub type SessionMsg = {
+    List(Int) session_id; Int round; List(ThMsg) msgs;
+    Int proto;                          //@ default
+};
 
 // The cosigner's half of the kit's material for a recovered device, and
 // any other offline wrapping: HPKE base mode enc and ciphertext.
@@ -43,12 +51,14 @@ pub type WrappedBlob = { List(Int) enc; List(Int) ct; };
 // CGGMP id order (id i + 1 is new_parties[i]), who deals (old ids), who
 // receives (new ids), who is offline (new ids), the new polynomial degree
 // and epoch, and the requester's DK signature over request_tbs(session id,
-// reshare_message(...), old epoch, requester, request_reshare).
+// reshare_message(...), old epoch, requester, request_reshare). `proto`
+// as in SignInvite (not signed: it only says which build sent it).
 //@ serial
 pub type ReshareInvite = {
     List(Int) session_id; List(Int) log_id; List(Party) new_parties;
     List(Int) dealers; List(Int) receivers; List(Int) offline; Int degree; Int epoch;
     List(Int) requester; List(Int) sig;
+    Int proto;                          //@ default
 };
 
 // What an enrolled device receives from the device that enrolled it (SPEC

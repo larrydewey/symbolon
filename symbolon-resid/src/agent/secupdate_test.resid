@@ -96,7 +96,7 @@ Envelope env_to(List(Int) party, List(Int) pk, HpkeKeyPairG(Secret(UInt(8))) fro
 
 Packet reshare_packet() {
     return WReshare(ReshareInvite {.session_id = rep(1, 32), .log_id = rep(2, 32), .new_parties = [], .dealers = [1], .receivers = [1], .offline = [],
-                                   .degree = 1, .epoch = 2, .requester = rep(3, 32), .sig = []});
+                                   .degree = 1, .epoch = 2, .requester = rep(3, 32), .sig = [], .proto = session_proto()});
 }
 
 @requires(filesystem, device, declassify, provision, network, environment, clock)
@@ -373,13 +373,13 @@ test "the cosigner knows a duress profile by its own transport key, only for wha
     Local me = Local {.party = c.cfg.party, .cg = 0, .hpke_sk = cos.sk};
     List(Secret(UInt(8))) fresh = [];
     List(Int) by_dev = envelope_encode(seal(dev, dk.sk, c.cfg.party, cos.pk, WBeacon(Beacon {.session_id = [], .log_id = [], .epoch = 0, .time = 0, .location = [], .requester = dev, .sig = []}), fresh) else { Envelope {.from = [], .to = [], .enc = [], .ct = []} });
-    List(Int) by_dur = envelope_encode(seal(dev, tk.sk, c.cfg.party, cos.pk, WSign(SignInvite {.session_id = [], .message = [], .epoch = 0, .requester = dev, .kind = 1, .sig = [], .signers = []}), fresh) else { Envelope {.from = [], .to = [], .enc = [], .ct = []} });
+    List(Int) by_dur = envelope_encode(seal(dev, tk.sk, c.cfg.party, cos.pk, WSign(SignInvite {.session_id = [], .message = [], .epoch = 0, .requester = dev, .kind = 1, .sig = [], .signers = [], .proto = session_proto()}), fresh) else { Envelope {.from = [], .to = [], .enc = [], .ct = []} });
     List(Int) by_other = envelope_encode(seal(dev, hpkeg_derive_keypair(16, random_secret(32)).sk, c.cfg.party, cos.pk, WKitRelease([]), fresh) else { Envelope {.from = [], .to = [], .enc = [], .ct = []} });
     expect(hex_encode(got_key(open_env(me, known_of(c), by_dev)))).toEqual(hex_encode(dk.pk));
     expect(hex_encode(got_key(open_env(me, known_of(c), by_dur)))).toEqual(hex_encode(tk.pk));
     expect(got_key(open_env(me, known_of(c), by_other)).len()).toEqual(0);
     // Under the duress transport key only what a duress profile sends.
-    expect(duress_packet(WSign(SignInvite {.session_id = [], .message = [], .epoch = 0, .requester = dev, .kind = 1, .sig = [], .signers = []}))).toBeTrue();
+    expect(duress_packet(WSign(SignInvite {.session_id = [], .message = [], .epoch = 0, .requester = dev, .kind = 1, .sig = [], .signers = [], .proto = session_proto()}))).toBeTrue();
     expect(duress_packet(WDuressKey(sub))).toBeFalse();
     expect(duress_packet(WKitRelease([]))).toBeFalse();
     expect(duress_packet(WSignEvent([]))).toBeFalse();

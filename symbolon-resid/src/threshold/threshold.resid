@@ -426,6 +426,20 @@ pub List(Int) th_sig_raw(CgSig sig) { return cg_sig_raw(sig.r, sig.s); }
 // is a bijection on the units mod N (gcd(N, phi(N)) = 1), so c = 1 (mod N)
 // exactly when r = 1 (mod N).
 
+// The session protocol version every invitation and round batch carries
+// (proto.resid: SignInvite, ReshareInvite, SessionMsg; absent reads as 0).
+// 2 is the first with this guard. A party refuses an invitation or a batch
+// below session_proto_min: a build without the guard can send a ciphertext
+// that shows its secret, and an old peer that receives ours keeps the
+// unguarded build in use. The refusal blames no one and tells the user
+// which side to upgrade (the cosigner first, then the devices).
+pub Int session_proto() { return 2; }
+pub Int session_proto_min() { return 2; }
+pub Str old_build_prefix() { return "old build: "; }
+pub Str old_build_refusal(Str who, Int v) {
+    return old_build_prefix() + f"{who} runs a Symbolon build from before the Paillier nonce fix (session protocol {v}, {session_proto_min()} needed): upgrade it";
+}
+
 // Whether c = 1 (mod N): a ciphertext under N whose nonce is 1.
 pub Bool pa_nonce_one(List(UInt(64)) n, List(UInt(64)) c) {
     if (bn_cmp(n, [2]) < 0 || c.len() == 0) { return false; }
@@ -552,13 +566,13 @@ pub AbortBook after_reshare(AbortBook book, Quorum q) {
 // unidentified aborts; a session that failed a protocol check is an abort
 // (identified when it names a party); a session that only timed out or was
 // refused is no abort, since no check failed.
-// A party refused for an old build (a ciphertext with the nonce 1, SPEC
-// 6.2.1) is no abort either: no protocol check failed against an honest
-// party of the current build.
+// A party refused for an old build (a ciphertext with the nonce 1, or a
+// protocol version below session_proto_min, SPEC 6.2.1) is no abort either:
+// no protocol check failed against an honest party of the current build.
 pub AbortBook record_run(AbortBook book, Quorum q, Str fail, List(Int) culprits) {
     if (str_len(fail) == 0) { return record_success(book); }
     if (fail == "timed out waiting for a round" || fail == "the cosigner is unreachable") { return book; }
-    if (str_starts_with(fail, nonce_one_prefix())) { return book; }
+    if (str_starts_with(fail, nonce_one_prefix()) || str_starts_with(fail, old_build_prefix())) { return book; }
     return record_abort(book, q, cg_fail(fail, culprits));
 }
 
