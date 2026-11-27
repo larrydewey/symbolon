@@ -200,3 +200,14 @@ test "a party removed in force is left out of the refresh" {
     // The removed device is not dropped by an invitation that keeps it.
     expect(refresh_problem(invite(q5.parties, [1, 3], 1, 5, 1, session_proto()), logid(), pid(2), q5, [pid(3)])).toEqual("the invitation changes who is in the household: it is not a refresh, refused");
 }
+
+// R-6 (a thief leading the refresh swaps the chain code or vault key of
+// the devices that join).
+test "red team: a party already in the quorum keeps its own chain code and vault key when it joins" {
+    List(Int) a = [1, 1, 1];
+    List(Int) b = [2, 2, 2];
+    expect(keeps_secrets(true, a, b, a, b)).toEqual(true);
+    expect(keeps_secrets(true, b, b, a, b)).toEqual(false);
+    expect(keeps_secrets(true, a, a, a, b)).toEqual(false);
+    expect(keeps_secrets(false, b, a, a, b)).toEqual(true);
+}

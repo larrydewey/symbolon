@@ -927,6 +927,13 @@ Bool reshare_matches(EventPayload p, RsResult res, ReshareInvite inv) {
 @requires(filesystem, network, device, declassify, clock, provision, environment)
 Int joined(Str dir, DeviceConfig c, Unlocked u, Str pin, CgConfig ncfg, EnrollSecrets es, VerifiedHead vh, Cursor cur, Option(KvOut) kvo, ReshareInvite inv) {
     if (es.cc.len() != 32 || es.vault_key.len() != 32) { return dfail("malformed secrets"); }
+    // A party of the quorum already holds the household's chain code and
+    // vault key: one that leads a re-share it joins must not swap them
+    // (every credential's key would change, the vault would be sealed to
+    // a key the leader chose). Refused before anything is stored.
+    if (!keeps_secrets(pos1(vh.head.quorum.parties, c.party, 0) != 0, es.cc, es.vault_key, reveal(u.real.cc), reveal(u.real.vault_key))) {
+        return dfail("the device that led the re-share sent another chain code or vault key than this device holds: refused, nothing changed");
+    }
     RealProfile real = RealProfile {.share = u.real.share, .cc = secret_bytes(es.cc), .vault_key = secret_bytes(es.vault_key), .dek = u.real.dek, .duress_hpke_pub = u.real.duress_hpke_pub};
     List(Secret(UInt(8))) k = u.ukey;
     List(Secret(UInt(8))) rp = encode_real(real) else { [] };
@@ -968,6 +975,13 @@ pub List(WitnessEp) eps_of(List(WitnessRef) ws, Int i, List(WitnessEp) acc) {
 Bool ep_key_in(List(WitnessEp) eps, List(Int) k, Int i) {
     if (i >= eps.len()) { return false; }
     return bytes_eq(eps[i].key, k) || ep_key_in(eps, k, i + 1);
+}
+
+// Whether the chain code and vault key a re-share's leader sent may be
+// taken: by a new party, any; by a party already in the quorum, only its
+// own (joined).
+pub Bool keeps_secrets(Bool member, List(Int) cc, List(Int) vk, List(Int) my_cc, List(Int) my_vk) {
+    return !member || (bytes_eq(cc, my_cc) && bytes_eq(vk, my_vk));
 }
 
 // The last re-share's failure, for `device status` (migrate.resid: an old
