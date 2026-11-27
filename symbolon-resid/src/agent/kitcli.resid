@@ -160,7 +160,7 @@ Int renew_at(Str dir, DeviceConfig c, Unlocked u, CgConfig x, LogView v, Str pin
     Str st = if (nk.sign_pub.len() == 0) { "none" } else { rotation_state(v.events, v.vh.pending, q, recovery_key_digest(nk.sign_pub)) };
     if (st == "done") { return replaced(dir, nk); }
     if (st == "pending") {
-        println(f"kit replacement pending: it takes effect after {v.vh.head.policy.recovery_delay_sec} s of witness time from its event, unless a device vetoes it; until then the old kit still works.");
+        println(f"kit replacement pending: it takes effect after {v.vh.head.policy.recovery_delay_sec} s of witness time from its event, unless a device vetoes it, or at once when another device confirms it (`symbolon device pending`, then `device confirm`); until then the old kit still works.");
         println("Then run `symbolon device kit renew " + dir + "` again to finish it.");
         return 0;
     }

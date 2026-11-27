@@ -218,6 +218,158 @@ Int kit_escaped(VerifiedHead vh) {
     return 0;
 }
 
+
+// ─── `device pending DIR` and `device confirm DIR SEQ` (SPEC 8.2) ───
+// In a household of two devices or more, an authority event one device
+// signs alone (a proposal, a removal, a set-policy, a kit renewal) waits
+// out the recovery delay, during which any other device may veto it. Or
+// another device confirms it: a confirm event, signed by that device,
+// naming the pending event's sequence and digest, with which the event
+// takes effect at once once its signers and the confirm's reach policy[1]
+// (core/log.resid do_confirm). Never for a recover, the kit's set-policy
+// or a set-policy that weakens the policy.
+
+// What a pending event is, in a word or two.
+Str event_kind(EventBody b) {
+    return match b {
+        ProposePartyBody(p, _) => "propose-party (\"" + p.label + "\")",
+        RemovePartyBody(_) => "remove-party",
+        SetPolicyBody(_) => "set-policy",
+        RotateRecoveryBody => "rotate-recovery (a new kit)",
+        RecoverBody(_) => "recover",
+        MigrateBody(_) => "migrate",
+        _ => "other"
+    };
+}
+
+// The labels of the parties of `ps` that `sigs` name.
+Str signer_labels(List(EventSig) sigs, List(Party) ps, Int i, Str acc) {
+    if (i >= sigs.len()) { return acc; }
+    Party p = party_named(ps, sigs[i].signer, 0) else { none_party() };
+    Str one = if (p.id.len() == 0) { "?" } else { "\"" + p.label + "\"" };
+    return signer_labels(sigs, ps, i + 1, if (str_len(acc) == 0) { one } else { acc + ", " + one });
+}
+
+Option(Party) party_named(List(Party) ps, List(Int) id, Int i) {
+    if (i >= ps.len()) { return None; }
+    if (bytes_eq(ps[i].id, id)) { return Some(ps[i]); }
+    return party_named(ps, id, i + 1);
+}
+
+Bool signed_by_party(List(EventSig) sigs, List(Int) id, Int i) {
+    if (i >= sigs.len()) { return false; }
+    return bytes_eq(sigs[i].signer, id) || signed_by_party(sigs, id, i + 1);
+}
+
+// The events pending now: those il_pending_events reports and the head
+// still lists (it was verified at the current witness time).
+List(PendingEvent) pending_now(List(PendingEvent) pe, List(UInt(64)) now, Int i, List(PendingEvent) acc) {
+    if (i >= pe.len()) { return acc; }
+    return pending_now(pe, now, i + 1, if (now.contains(pe[i].seq)) { acc.concat([pe[i]]) } else { acc });
+}
+
+Str pending_line(List(SignedEvent) es, List(Party) ps, PendingEvent p) {
+    Int s = (Int)p.seq;
+    SignedEvent e = es[s];
+    EventBody b = e.payload.body;
+    Str d = str_slice(hex_encode(p.digest), 0, 16);
+    Str how = if (p.confirmable) { "confirmable" } else { "not-confirmable" };
+    return f"{s} " + d + f" {p.ready_at} " + how + " " + event_kind(b) + "; signed by " + signer_labels(e.sigs, ps, 0, "");
+}
+
+// `symbolon device pending DIR`: the log's pending events, one per line:
+// "SEQ DIGEST READY confirmable|not-confirmable KIND; signed by LABELS":
+// DIGEST the first 16 hex digits of the event's digest, READY the witness
+// time it takes effect at unless vetoed, and whether devices may confirm
+// it (a recover, the kit's set-policy or a weakening set-policy may only
+// be vetoed or left to run).
+@requires(filesystem, network, clock(readonly), declassify)
+pub Int device_pending(Str dir) {
+    Option(DeviceConfig) oc = load_config(dir);
+    return match oc {
+        None => dfail("not set up"),
+        Some(c) => match verified_log(relay_ep(c), c.log_id) {
+            Err(e) => dfail(err_text(e)),
+            Ok(vh) => pending_list(c, vh)
+        }
+    };
+}
+
+@requires(network, clock(readonly), declassify)
+Int pending_list(DeviceConfig c, VerifiedHead vh) {
+    List(SignedEvent) es = fetch_log(relay_ep(c), c.log_id, 0, []);
+    List(PendingEvent) pe = pending_now(il_pending_events(c.log_id, es, 0, lambda(x) { false }), vh.pending, 0, []);
+    if (pe.len() == 0) { println("nothing is pending"); return 0; }
+    print_lines(es, vh.head.quorum.parties, pe, 0);
+    return 0;
+}
+
+Int print_lines(List(SignedEvent) es, List(Party) ps, List(PendingEvent) pe, Int i) {
+    if (i >= pe.len()) { return 0; }
+    println(pending_line(es, ps, pe[i]));
+    return print_lines(es, ps, pe, i + 1);
+}
+
+// `symbolon device confirm DIR SEQ`: this device confirms the pending
+// event at SEQ, so that it takes effect at once. Standard input: the PIN,
+// then "y" once the event shown is the one meant.
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+pub Int device_confirm(Str dir, Str seq) {
+    Option(DeviceConfig) oc = load_config(dir);
+    if (!str_is_int(seq) || str_parse_int(seq) < 1) { return dfail("give the pending event's sequence number (`symbolon device pending DIR` lists them)"); }
+    return match oc {
+        None => dfail("not set up"),
+        Some(c) => confirm_with(dir, c, (UInt(64))str_parse_int(seq), read_pin())
+    };
+}
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+Int confirm_with(Str dir, DeviceConfig c, UInt(64) seq, Str pin) {
+    Unlocked u = unlock_dir(dir, c, pin);
+    if (u.kind == 2) { return dfail(duress_refusal(dir, c)); }
+    if (u.kind != 1) { return dfail("wrong PIN"); }
+    Result(VerifiedHead, SymbolonError) rv = verified_log(relay_ep(c), c.log_id);
+    return match rv {
+        Err(e) => dfail(err_text(e)),
+        Ok(vh) => confirm_target(c, u, vh, fetch_log(relay_ep(c), c.log_id, 0, []), seq)
+    };
+}
+
+@requires(network, device, declassify, clock(readonly), environment)
+Int confirm_target(DeviceConfig c, Unlocked u, VerifiedHead vh, List(SignedEvent) es, UInt(64) seq) {
+    List(PendingEvent) pe = pending_now(il_pending_events(c.log_id, es, 0, lambda(x) { false }), vh.pending, 0, []);
+    List(PendingEvent) at = pending_at(pe, seq, 0, []);
+    if (at.len() == 0) { return dfail(f"no event is pending at {seq} (`symbolon device pending` lists them)"); }
+    PendingEvent p = at[0];
+    if (!p.confirmable) { return dfail(f"event {seq} cannot be confirmed (a recover, the kit's set-policy or a set-policy that weakens the policy): veto it or let the delay run"); }
+    if (signed_by_party(es[(Int)seq].sigs, c.party, 0)) { return dfail(f"this device signed event {seq}: another device of the household must confirm it"); }
+    println("pending " + pending_line(es, vh.head.quorum.parties, p));
+    eprintln(f"device: confirm event {seq}, so that it takes effect now? (y/N)");
+    Str a = str_to_lower(str_trim(read_pin()));
+    if (a != "y" && a != "yes") { return dfail("not confirmed"); }
+    EventPayload np = next_event(vh, ConfirmBody(seq, p.digest), field6_in_force(es, vh.pending, es.len() - 1));
+    List(Int) enc = payload_cbor(np) else { [] };
+    if (enc.len() == 0) { return dfail("the confirm does not encode"); }
+    Result(List(Int), Str) s = dk_sign(c, u.real, u.st, enc);
+    return match s {
+        Err(m) => dfail(m),
+        Ok(sig) => match publish_event(c, np, enc, [EventSig {.signer = c.party, .sig = sig}]) {
+            Err(m) => dfail("confirm: " + m),
+            Ok(vh2) => confirm_done(seq, vh2)
+        }
+    };
+}
+
+List(PendingEvent) pending_at(List(PendingEvent) pe, UInt(64) seq, Int i, List(PendingEvent) acc) {
+    if (i >= pe.len()) { return acc; }
+    return pending_at(pe, seq, i + 1, if (pe[i].seq == seq) { acc.concat([pe[i]]) } else { acc });
+}
+
+Int confirm_done(UInt(64) seq, VerifiedHead vh) {
+    println(f"confirmed event {seq}: in force now; pending now {vh.pending.len()}");
+    return 0;
+}
+
 Int veto_done(UInt(64) target, VerifiedHead vh) {
     println(f"vetoed event {target}; pending now {vh.pending.len()}");
     return 0;

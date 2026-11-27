@@ -389,8 +389,10 @@ run 60 "$BIN" device kit status "$W/dev" > "$W/kstat.log" 2>&1 || fail "kit stat
 # signed by this device alone. With two devices it is delayed and
 # vetoable (SPEC 8.2: the floor of policy[1] holds for the quorum in
 # force, though the stored policy[1] is still the inception's 1), so a
-# device holding one device cannot kill the owner's kit at once. Past the
-# delay (witnesses restarted with clocks moved forward), `kit renew` again
+# device holding one device cannot kill the owner's kit at once. The
+# second device lists it (`device pending`) and confirms it (`device
+# confirm`, a confirm event): in force at once, without the delay. The
+# device that signed it cannot confirm it itself. `kit renew` again then
 # re-shares with the cosigner to the new kit; the second device takes
 # part, as it did in the enrollment.
 # The floor holds for events witnessed from the release cutover
@@ -413,15 +415,21 @@ KIT=$(sed -n 's/^NEW RECOVERY KIT (write it down; it is shown once): //p' "$W/re
 [ "${#KIT}" = 136 ] && [ "${KIT:0:2}" = 01 ] || fail "the new kit is not a protected sheet: $KIT"
 grep -q '^kit replacement pending' "$W/renew.log" || fail "one device of two replaced the kit at once: $(cat "$W/renew.log")"
 run 120 "$BIN" device status "$W/dev2" | grep -q 'epoch 2 parties 4 threshold 2 pending 1' || fail "status with the replacement pending"
-for i in 1 2 3; do
-  pkill -f -- "witness (serve|child) $W/w$i " 2>/dev/null
-  for _ in $(seq 50); do (exec 3<>"/dev/tcp/127.0.0.1/${WPORT[$i]}") 2>/dev/null || break; sleep 0.1; done
-  runs 3600 "$BIN" witness serve "$W/w$i" "${WPORT[$i]}" "$W/w$i.key" $((SHIFT + 263400)) "${SERVE_TLS[@]}" > "$W/w$i-renew.log" 2>&1 & PIDS+=($!)
-  wait_port "${WPORT[$i]}" || fail "witness $i did not restart"
-done
+run 120 "$BIN" device pending "$W/dev2" > "$W/pending.log" 2>&1 || fail "device pending: $(cat "$W/pending.log")"
+grep -Eq '^[0-9]+ [0-9a-f]{16} [0-9]+ confirmable rotate-recovery' "$W/pending.log" || fail "device pending: $(cat "$W/pending.log")"
+RSEQ=$(awk 'NR == 1 {print $1}' "$W/pending.log")
+printf '2468\ny\n' | run 600 "$BIN" device confirm "$W/dev" "$RSEQ" > "$W/confirm-self.log" 2>&1 && fail "the device that signed the kit replacement confirmed it itself"
+grep -q 'another device of the household must confirm it' "$W/confirm-self.log" || fail "self-confirm: $(cat "$W/confirm-self.log")"
+printf '1111\nn\n' | run 600 "$BIN" device confirm "$W/dev2" "$RSEQ" > "$W/confirm-no.log" 2>&1 && fail "confirmed without a yes"
+run 120 "$BIN" device status "$W/dev2" | grep -q 'pending 1' || fail "a confirm without a yes changed the log"
+printf '1111\ny\n' | run 600 "$BIN" device confirm "$W/dev2" "$RSEQ" > "$W/confirm.log" 2>&1 || fail "device confirm: $(cat "$W/confirm.log")"
+grep -q "confirmed event $RSEQ: in force now; pending now 0" "$W/confirm.log" || fail "device confirm: $(cat "$W/confirm.log")"
+run 120 "$BIN" device status "$W/dev" | grep -q 'epoch 2 parties 4 threshold 2 pending 0' || fail "status after the confirm"
+[ "$(run 120 "$BIN" device pending "$W/dev")" = "nothing is pending" ] || fail "device pending after the confirm"
+echo "kit replacement: pending, confirmed by the second device, in force at once (no delay)"
 printf '1111\n' | run 1800 "$BIN" device join "$W/dev2" "$DEV" "$W/dev2.primes" > "$W/kjoin.log" 2>&1 & KJ=$!
-echo "kit replacement past the delay (re-share with both devices; a minute or two)..."
-printf '2468\n' | run 1800 "$BIN" device kit renew "$W/dev" "$W/devrs.primes" > "$W/renew2.log" 2>&1 || fail "kit renew (after the delay): $(tail -3 "$W/renew2.log")"
+echo "kit replacement re-share (both devices; a minute or two)..."
+printf '2468\n' | run 1800 "$BIN" device kit renew "$W/dev" "$W/devrs.primes" > "$W/renew2.log" 2>&1 || fail "kit renew (after the confirm): $(tail -3 "$W/renew2.log")"
 wait $KJ || fail "the second device in the kit's re-share: $(tail -3 "$W/kjoin.log")"
 grep -q '^kit replaced' "$W/renew2.log" || fail "kit renew: $(cat "$W/renew2.log")"
 [ "$(run 60 "$BIN" device kit status "$W/dev" | head -1)" = "kit: protected by a passphrase" ] || fail "kit status (protected)"

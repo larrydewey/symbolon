@@ -410,7 +410,8 @@ Int witnesses_published(Policy p0, Policy np, VerifiedHead vh) {
         return 0;
     }
     Str weak = if (weakens(p0, np)) { "removing or replacing witnesses (or adding enough to outvote the old ones) always waits out the delay" } else { "the policy asks for more devices' signatures than this one" };
-    println(f"set-policy published; the new witnesses take effect once the recovery delay ({p0.recovery_delay_sec} s of witness time) has run, unless a device vetoes it (device veto): "
+    Str conf = if (weakens(p0, np)) { "" } else { " or at once when another device confirms it (device confirm)" };
+    println(f"set-policy published; the new witnesses take effect once the recovery delay ({p0.recovery_delay_sec} s of witness time) has run, unless a device vetoes it (device veto)" + conf + ": "
         + weak + f". Pending events: {vh.pending.len()}");
     return 0;
 }
@@ -565,7 +566,7 @@ Bool proposal_pending(List(UInt(64)) ps, UInt(64) seq, Int i) {
 // SPEC 8.2: with two devices or more one device's propose-party is delayed
 // (whatever policy[1] says), so the re-share waits for its delay.
 Int proposal_delayed(Str dir, VerifiedHead vh) {
-    println(f"device: the proposal is pending: it takes effect after {vh.head.policy.recovery_delay_sec} s of witness time, unless a device vetoes it (SPEC 8.2: one device of several cannot add a party at once).");
+    println(f"device: the proposal is pending: it takes effect after {vh.head.policy.recovery_delay_sec} s of witness time, unless a device vetoes it, or at once when another device confirms it (`device confirm`; SPEC 8.2: one device of several cannot add a party at once).");
     println("Then run `symbolon device enroll " + dir + " ...` again, and `symbolon device join` on the new device, to re-share it in.");
     return 0;
 }

@@ -116,6 +116,11 @@
 //   symbolon device recover DIR KIT LOG_ID    a new device starts a kit recovery (SPEC 13.2); stdin: the
 //                                              kit's passphrase if it has one, then the new kit's twice
 //   symbolon device veto DIR                   PIN on stdin; vetoes the latest pending event
+//   symbolon device pending DIR                the log's pending events: SEQ KIND DIGEST, when each takes
+//                                              effect, who signed it, whether it may be confirmed
+//   symbolon device confirm DIR SEQ            stdin: the PIN, then y; this device confirms the pending
+//                                              authority event SEQ another device signed: in force at once
+//                                              (a confirm event, SPEC 8.2; never a recover or a weakening)
 //   symbolon device kit-escape DIR KIT_SEED    the kit drops the log's sequencing relay (one that is gone or
 //                                              refuses every claim): delayed by the recovery delay, vetoable (SPEC 20.3)
 //   symbolon device sequence DIR [HOST:PORT]  PIN on stdin; names the relay (this device's, or HOST:PORT) as the
@@ -568,6 +573,8 @@ Int main_cmd() {
     if (a1 == "device" && a2 == "join" && (n == 5 || n == 6)) { return device_join(args.get(3), args.get(4), if (n == 6) { args.get(5) } else { "" }); }
     if (a1 == "device" && a2 == "recover" && n == 6) { return device_recover(args.get(3), args.get(4), args.get(5)); }
     if (a1 == "device" && a2 == "veto" && n == 4) { return device_veto(args.get(3)); }
+    if (a1 == "device" && a2 == "pending" && n == 4) { return device_pending(args.get(3)); }
+    if (a1 == "device" && a2 == "confirm" && n == 5) { return device_confirm(args.get(3), args.get(4)); }
     if (a1 == "device" && a2 == "witnesses" && positional(3) == 4) {
         List(Str) add = flag_args("--add", 4, ListBuf());
         List(Str) rm = flag_args("--remove", 4, ListBuf());

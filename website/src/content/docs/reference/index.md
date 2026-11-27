@@ -20,6 +20,8 @@ from the command line; values that may hold any text are printed as hex.
 | `device enroll DIR NEW-KEYS` / `device join DIR ENROLLER-KEYS` | adds a device with keys copied by hand (on the old one / the new one) |
 | `device recover DIR KIT LOG-ID` | starts a recovery with the kit |
 | `device veto DIR` | stops a pending event, such as a recovery |
+| `device pending DIR` | the pending events: sequence, kind, digest, when each takes effect, who signed it |
+| `device confirm DIR SEQ` | another device's pending change (a new kit, a removal, a policy) takes effect now (PIN, then `y`, on stdin); never a recovery |
 
 ## Passkeys
 
