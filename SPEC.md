@@ -2735,7 +2735,9 @@ serves.
 Witnesses co-sign `(log-id, seq, digest)` and refuse a second digest for
 the same `(log-id, seq)`. A witness co-signs only an event that is valid
 as the next event of the log it is shown with the request (the whole log
-before it, with its co-signatures): the log verifies (Section 8.3), and
+before it, with its co-signatures, or the events after the state the
+witness keeps for the log: incremental requests below): the log
+verifies (Section 8.3), and
 the event passes every check of the next step at the witness's own time
 but its co-signatures, which do not exist yet; at sequence 0, an inception
 whose digest is the log id, signed by every party of its quorum. So only
@@ -2933,6 +2935,45 @@ would refuse ("witness time went backwards") while it holds the sequence.
 It records what it co-signed whole or not at all (a temporary file renamed
 into place). A co-sign request is bounded (2 MiB, 2048 events); with the
 signature limits of Section 8.3 its cost grows only with its size.
+
+**Incremental requests (R3P-2).** A request that had to carry the whole
+log would stop fitting once the log grew past those bounds (years of
+events, or a stolen device padding it before its `remove-party` lands,
+Section 8.2), and from then on no event could be witnessed. So a witness
+keeps, per log, the verifier's state (Section 8.3) after the longest
+stretch of the log from `E0` it has verified with its co-signatures, and
+a request may carry only the events after it:
+
+- `POST /cosign` with `CBOR [log, k, Ek, ..., En, ? claim]` (`k` an
+  unsigned integer where the whole-log form has `E0`): the events from
+  sequence `k` on, `Ek` to `En-1` with their co-signatures. The witness
+  verifies them on top of the state it keeps, skipping those the state
+  already holds (the last of these must be the state's last event, or
+  409), then checks `En` as above. When the state it keeps does not
+  reach sequence `k - 1`, or it keeps none, or it keeps the log past
+  `En`, it answers 412 with `CBOR [next]`, the sequence after the last
+  event it keeps (0 for none, and 0 when past `En`: send the whole log).
+- `POST /catchup` with `CBOR [log, k, Ek, ..., Em]`: co-signed events
+  only, verified the same way (from `E0` when `k` is 0) and kept, nothing
+  co-signed; it answers `CBOR [next]` (or 412, 409, 403 as above). Each
+  request stays within the bounds above, so a long log reaches a witness
+  without state in parts.
+- The whole-log form is still accepted, by every witness, and the
+  witness keeps the state it reaches from it.
+
+The kept state comes only from what the witness verified itself, from
+`E0` or on top of a state it kept: a request says from which sequence its
+events run, never what the state before them is, and the events are
+checked against what the witness co-signed (409) as before. The state
+only moves forward and is written whole (a temporary file renamed into
+place, `state/<log>`); a state that does not read back is none, and the
+witness asks for the log again. A client (device, relay, cosigner) first
+sends the last two events from `n-1` (a witness that co-signed event
+`n-1` verified and kept the log before it), and on 412 sends from where
+the witness keeps the log: in one request when it fits (the whole-log
+form from `E0`), else `/catchup` parts first; on 400 (a witness that does
+not know these forms) the whole log. The answers only steer what is sent.
+The usual request is then two events, whatever the log's length.
 
 A witness answers, for a 32-byte nonce and a log id (`POST /head`, body
 `nonce || log`), CBOR `[seq, digest, time, sig]`: the highest sequence of

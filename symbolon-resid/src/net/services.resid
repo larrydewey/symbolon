@@ -28,7 +28,16 @@
 //                              [time, r || s], is the log's relay's claim on (log, n, H(En))
 //                              (agent/relaysrv.resid POST /claim), needed when the log's
 //                              policy names a sequencing relay (field 8, SPEC 20.3); a 409
-//                              answers CBOR [digest, claim or an empty bstr] held there
+//                              answers CBOR [digest, claim or an empty bstr] held there.
+//                              Or CBOR [log, k, Ek, ..., En, ? claim]: only the events
+//                              from k on, on top of the state the witness keeps for the
+//                              log; 412 with CBOR [next] when it keeps none that far
+//                              (next: the sequence after the last event it keeps, 0 for
+//                              none), and the client sends from there (cosign_try)
+//   POST /catchup              CBOR [log, k, Ek, ..., Em]: co-signed events the witness
+//                              verifies and keeps, without co-signing anything, so that a
+//                              log longer than one request reaches it in parts; answers
+//                              CBOR [next], 412 as above
 //   POST /time                 a 32-byte nonce; answers CBOR [time, r || s] over
 //                              ["symbolon v1 witness time", nonce, time]: the witness
 //                              time devices and the cosigner measure delays by (SPEC 13.4)
@@ -157,6 +166,31 @@ pub List(Int) cosign_request_claimed(List(Int) l, List(List(Int)) events, Option
     Int extra = match c { None => 0, Some(_) => 1 };
     List(Int) a = cosign_items(events, 0, cbe_bytes(l, cbe_array(events.len() + 1 + extra, [])));
     return match c { None => a, Some(x) => a.concat(claim_cbor(x)) };
+}
+
+// The incremental form (SPEC 20.3, R3P-2): CBOR [log id, k, Ek, ..., En,
+// ? claim], `events` the log's events from sequence k on. The witness
+// verifies them on top of the state it keeps for the log; the same form
+// without a claim is a POST /catchup.
+pub List(Int) cosign_delta(List(Int) l, Int k, List(List(Int)) events, Option(RelayClaim) c) {
+    Int extra = match c { None => 0, Some(_) => 1 };
+    List(Int) a = cosign_items(events, 0, cbe_uint(k, cbe_bytes(l, cbe_array(events.len() + 2 + extra, []))));
+    return match c { None => a, Some(x) => a.concat(claim_cbor(x)) };
+}
+
+// The most a witness takes in one co-sign or catch-up request (413
+// beyond): it verifies what a request carries, so the cost of one is
+// bounded by its size.
+pub Int cosign_max_bytes() { return 2097152; }
+pub Int cosign_max_events() { return 2048; }
+
+// A witness's CBOR [next]: the sequence after the last event it keeps for
+// the log (0 for none); -1 when the body is not that.
+pub Int witness_next_of(List(Int) b) {
+    Rd a = rd(b, 0);
+    Rd n = rd(b, a.next);
+    Int v = if (a.major == 4 && a.val == 1 && n.major == 0 && n.next == b.len()) { n.val } else { -1 };
+    return v;
 }
 
 List(Int) cosign_items(List(List(Int)) es, Int i, List(Int) acc) {
@@ -564,7 +598,7 @@ pub type CosignOut = { Option(WitnessCosignature) cosig; List(Int) other; Option
 
 @requires(network, clock(readonly), declassify)
 pub CosignOut cosign_try(Endpoint e, List(Int) wkey, List(Int) l, UInt(64) seq, List(Int) d, List(List(Int)) events, Option(RelayClaim) c) {
-    HttpOut o = http_call_ep(e, "POST", "/cosign", cosign_request_claimed(l, events, c));
+    HttpOut o = cosign_post(e, l, events, c);
     if (o.status == 409) {
         Option(Held) h = held_of(o.body);
         return match h {
@@ -574,6 +608,88 @@ pub CosignOut cosign_try(Endpoint e, List(Int) wkey, List(Int) l, UInt(64) seq, 
     }
     Option(WitnessCosignature) w = if (o.status == 200) { cosig_of(o.body, wkey, l, seq, d) } else { None };
     return CosignOut {.cosig = w, .other = [], .other_claim = None};
+}
+
+// The co-sign request for the last of `events` (the log from E0, each as
+// the relay stores it), as small as the witness lets it be (SPEC 20.3,
+// R3P-2): cosign_first, then cosign_next on each answer until it is done;
+// the last answer is the witness's.
+@requires(network, clock(readonly), declassify)
+HttpOut cosign_post(Endpoint e, List(Int) l, List(List(Int)) events, Option(RelayClaim) c) {
+    HttpOut o = cosign_steps(e, l, events, c, cosign_first(l, events, c));
+    return o;
+}
+
+@requires(network, clock(readonly), declassify)
+HttpOut cosign_steps(Endpoint e, List(Int) l, List(List(Int)) events, Option(RelayClaim) c, CoStep s) {
+    HttpOut o = http_call_ep(e, "POST", s.path, s.body);
+    CoStep nx = cosign_next(l, events, c, s, o.status, o.body);
+    return if (nx.done) { o } else { cosign_steps(e, l, events, c, nx) };
+}
+
+// One request of the exchange: POST `path` with `body`, whose events run
+// from sequence `from`; `probe` for the first, the last two events;
+// `round` counts the /catchup parts; `done` when the last answer is final.
+pub type CoStep = { Str path; List(Int) body; Int from; Int round; Bool probe; Bool done; };
+
+CoStep co_done() { return CoStep {.path = "", .body = [], .from = 0, .round = 0, .probe = false, .done = true}; }
+
+// The first request: the last two events, from sequence n-1 (a witness
+// that co-signed event n-1 verified and kept the log before it); the whole
+// log when it is E0 alone.
+pub CoStep cosign_first(List(Int) l, List(List(Int)) events, Option(RelayClaim) c) {
+    Int n = events.len() - 1;
+    if (n <= 0) { return CoStep {.path = "/cosign", .body = cosign_request_claimed(l, events, c), .from = 0, .round = 0, .probe = false, .done = false}; }
+    return CoStep {.path = "/cosign", .body = cosign_delta(l, n - 1, events[n - 1..n + 1], c), .from = n - 1, .round = 0, .probe = true, .done = false};
+}
+
+// The request after the answer (`status`, `body`) to `s`. After the first: done unless the
+// witness keeps less (412, CBOR [next]: from where it keeps) or does not
+// know the incremental form (400: from E0). After a /catchup part: on
+// from where the witness keeps the log now, provided it moved on (or asks,
+// once, for an earlier start), at most cosign_max_rounds() parts. A
+// /cosign that is not the first is final. Whatever the witness answers
+// only steers what is sent: it verifies every event it is shown.
+pub CoStep cosign_next(List(Int) l, List(List(Int)) events, Option(RelayClaim) c, CoStep s, Int status, List(Int) body) {
+    Int n = events.len() - 1;
+    if (s.probe) {
+        if (status != 412 && status != 400) { return co_done(); }
+        Int from = if (status == 412) { witness_next_of(body) } else { 0 };
+        if (from < 0 || from >= n - 1) { return co_done(); }
+        CoStep p = cosign_plan(l, events, c, from, 0);
+        return p;
+    }
+    if (s.path != "/catchup") { return co_done(); }
+    Int next = if (status == 200 || status == 412) { witness_next_of(body) } else { -1 };
+    Bool on = next > s.from || (status == 412 && next >= 0 && next < s.from);
+    if (!on || next > n || s.round + 1 >= cosign_max_rounds()) { return co_done(); }
+    CoStep p2 = cosign_plan(l, events, c, next, s.round + 1);
+    return p2;
+}
+
+// From sequence `from`: the rest in one /cosign when it fits (the old
+// whole-log form from E0, which every witness takes), else the next part
+// of the co-signed events before the last as a /catchup.
+CoStep cosign_plan(List(Int) l, List(List(Int)) events, Option(RelayClaim) c, Int from, Int round) {
+    Int n = events.len() - 1;
+    Int fit = events_fitting(events, from, n + 1, 0, 0);
+    if (from + fit > n) {
+        List(Int) body = if (from == 0) { cosign_request_claimed(l, events, c) } else { cosign_delta(l, from, events[from..n + 1], c) };
+        return CoStep {.path = "/cosign", .body = body, .from = from, .round = round, .probe = false, .done = false};
+    }
+    Int upto = if (fit < 1) { from + 1 } else { from + fit };
+    return CoStep {.path = "/catchup", .body = cosign_delta(l, from, events[from..upto], None), .from = from, .round = round, .probe = false, .done = false};
+}
+
+pub Int cosign_max_rounds() { return 64; }
+
+// How many of events[i..upto] fit in one request (cosign_max_bytes(),
+// cosign_max_events()).
+Int events_fitting(List(List(Int)) es, Int i, Int upto, Int count, Int bytes) {
+    if (i >= upto || count >= cosign_max_events()) { return count; }
+    Int b = bytes + es[i].len() + 9;
+    if (b + 256 > cosign_max_bytes()) { return count; }
+    return events_fitting(es, i + 1, upto, count + 1, b);
 }
 
 Option(WitnessCosignature) cosig_of(List(Int) b, List(Int) wkey, List(Int) l, UInt(64) seq, List(Int) d) {

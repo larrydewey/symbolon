@@ -15,6 +15,17 @@
 //                  what the relay cannot hold back, a veto of what the kit
 //                  filed and the escape set-policies, core/log.resid
 //                  il_claimless, R3P-3); 400 when it does not parse.
+//                  Or CBOR [log id, k, Ek, ..., En, ? claim] (cosign_delta):
+//                  the events from sequence k on, verified on top of the
+//                  state this witness keeps for the log (below); 412 with
+//                  CBOR [next] when it keeps none reaching sequence k (next:
+//                  the sequence after the last event it keeps, 0 for none,
+//                  or 0 when it keeps the log past En: then the whole log).
+//   POST /catchup  CBOR [log id, k, Ek, ..., Em]: events with their
+//                  co-signatures, verified as above (from E0 when k is 0)
+//                  and kept, nothing co-signed; answers CBOR [next]; 412,
+//                  409, 403 as for /cosign. A log longer than one request
+//                  reaches the witness this way, in parts.
 //   POST /time     a 32-byte nonce; answers CBOR [time, r || s] over
 //                  ["symbolon v1 witness time", nonce, time] (SPEC 13.4)
 //   POST /head     a 32-byte nonce || a 32-byte log id; answers CBOR
@@ -27,11 +38,24 @@
 //                  the witnesses that co-signed it (agent/common.resid
 //                  witness_head_check).
 //
-// A /cosign request is at most max_cosign_bytes() and max_cosign_events()
-// events (413 beyond): it is verified whole on every request, and the
-// verifier tries only each party's and each witness's first signature and
-// refuses an event with more entries than could sign it (core/log.resid),
-// so its cost is bounded by its size.
+// A /cosign or /catchup request is at most max_cosign_bytes() and
+// max_cosign_events() events (413 beyond): what it carries is verified on
+// every request, and the verifier tries only each party's and each
+// witness's first signature and refuses an event with more entries than
+// could sign it (core/log.resid), so its cost is bounded by its size.
+//
+// The kept state (R3P-2): state/<log>, the verifier's state after the
+// longest stretch of the log, from E0, that this witness has verified
+// (core/logstate.resid), written whole (a temporary file renamed into
+// place) and only ever moved forward. It comes only from what the
+// witness verified itself, from E0 or on top of a state it kept: a
+// request says from which sequence its events run, never what the state
+// before them is. Before, every request carried the whole log, so a log
+// past the request limits (one stolen device appending events, or years
+// of honest ones) could never get another event co-signed, a remove-party
+// of that device included. Now a request carries the events after the
+// state kept (usually two), and a witness without one (first contact,
+// lost state) takes the log in parts.
 //
 // The witness co-signs an event only once the log before it verifies (as
 // every agent verifies it, SPEC 8.3) and the event passes every check of
@@ -46,7 +70,8 @@
 // approvals are not accepted, as the agents do not accept them yet
 // (agent/common.resid verified_events).
 //
-// Files: seen/<log>/c<seq>, the relay's claim it co-signed with (SPEC
+// Files: state/<log>, the kept state (above); seen/<log>/c<seq>, the
+// relay's claim it co-signed with (SPEC
 // 20.3); seen/<log>/<seq>, the digest the witness co-signed there (32
 // bytes) and its answer; written once (to a temporary file, then renamed
 // into place, so a write cut short never holds a sequence), never changed. A request re-verifies
@@ -55,6 +80,7 @@
 
 import "../types.resid";
 import "../core/log.resid";
+import "../core/logstate.resid";
 import "../core/event_decode.resid";
 import "../net/services.resid";
 import "state.resid";
@@ -80,17 +106,23 @@ pub HttpReply witness_handle(Str root, List(Secret(UInt(8))) wpriv, Int offset, 
         if (r.body.len() != 64) { return http_reply_status(400); }
         return witness_head(root, wpriv, offset, r.body[32..64], r.body[0..32]);
     }
-    if (r.method != "POST" || r.path != "/cosign") { return http_reply_status(404); }
+    if (r.method != "POST" || (r.path != "/cosign" && r.path != "/catchup")) { return http_reply_status(404); }
     if (r.body.len() > max_cosign_bytes()) { return http_reply_status(413); }
     Option(CoReq) oq = parse_cosign(r.body);
+    if (r.path == "/catchup") {
+        return match oq {
+            None => http_reply_status(400),
+            Some(q) => witness_catchup(root, q)
+        };
+    }
     return match oq {
         None => http_reply_status(400),
         Some(q) => witness_sign(root, wpriv, offset, q)
     };
 }
 
-pub Int max_cosign_bytes() { return 2097152; }
-pub Int max_cosign_events() { return 2048; }
+pub Int max_cosign_bytes() { return cosign_max_bytes(); }
+pub Int max_cosign_events() { return cosign_max_events(); }
 
 // The highest sequence of log `l` this witness co-signed, and the digest
 // there, signed for `nonce` (POST /head).
@@ -122,33 +154,45 @@ Bool decimal(Str s, Int i) {
     return c >= 48 && c <= 57 && decimal(s, i + 1);
 }
 
-type CoReq = { List(Int) l; List(SignedEvent) before; SignedEvent e; Option(RelayClaim) claim; };
+// `from`: the sequence of the first event carried (0 for the whole log).
+type CoReq = { List(Int) l; Int from; List(SignedEvent) before; SignedEvent e; Option(RelayClaim) claim; };
 
-// [bstr(32) log id, bstr event, ..., ? claim], at least one event, nothing
-// after; claim = [uint time, bstr(64) r || s], the relay's claim on the
-// last event (SPEC 20.3), an array where every other item is a byte string.
+// [bstr(32) log id, ? uint k, bstr event, ..., ? claim], at least one
+// event, nothing after; with k, the events run from sequence k, else from
+// E0; claim = [uint time, bstr(64) r || s], the relay's claim on the last
+// event (SPEC 20.3).
 Option(CoReq) parse_cosign(List(Int) b) {
     Rd h = rd(b, 0);
-    if (h.major != 4 || h.val < 2 || h.val > max_cosign_events() + 2) { return None; }
-    Option(Items) items = byte_strings(b, h.next, h.val, []);
+    if (h.major != 4 || h.val < 2 || h.val > max_cosign_events() + 3) { return None; }
+    Rd lh = rd(b, h.next);
+    if (lh.major != 2 || lh.val != 32 || lh.next + 32 > b.len()) { return None; }
+    List(Int) l = b[lh.next..lh.next + 32];
+    Rd kh = rd(b, lh.next + 32);
+    Bool delta = kh.major == 0;
+    Int from = if (delta) { kh.val } else { 0 };
+    Int p = if (delta) { kh.next } else { lh.next + 32 };
+    Int n = h.val - (if (delta) { 2 } else { 1 });
+    if (n < 1) { return None; }
+    Option(Items) items = byte_strings(b, p, n, []);
     return match items {
         None => None,
-        Some(xs) => coreq_items(xs)
+        Some(xs) => coreq_items(l, from, xs)
     };
 }
 
 type Items = { List(List(Int)) xs; Option(RelayClaim) claim; };
 
-Option(CoReq) coreq_items(Items it) {
+Option(CoReq) coreq_items(List(Int) l, Int from, Items it) {
     List(List(Int)) xs = it.xs;
-    if (xs.len() < 2 || xs.len() > max_cosign_events() + 1 || xs[0].len() != 32) { return None; }
-    return coreq_of(xs[0], events_of(xs, 1, []), it.claim);
+    if (xs.len() < 1 || xs.len() > max_cosign_events()) { return None; }
+    Option(CoReq) q = coreq_of(l, from, events_of(xs, 0, []), it.claim);
+    return q;
 }
 
-Option(CoReq) coreq_of(List(Int) l, Option(List(SignedEvent)) oes, Option(RelayClaim) c) {
+Option(CoReq) coreq_of(List(Int) l, Int from, Option(List(SignedEvent)) oes, Option(RelayClaim) c) {
     return match oes {
         None => None,
-        Some(es) => Some(CoReq {.l = l, .before = es[0..es.len() - 1], .e = es[es.len() - 1], .claim = c})
+        Some(es) => Some(CoReq {.l = l, .from = from, .before = es[0..es.len() - 1], .e = es[es.len() - 1], .claim = c})
     };
 }
 
@@ -179,7 +223,7 @@ Option(List(SignedEvent)) events_of(List(List(Int)) xs, Int i, List(SignedEvent)
 @requires(filesystem, clock(readonly), declassify)
 HttpReply witness_sign(Str root, List(Secret(UInt(8))) wpriv, Int offset, CoReq q) {
     UInt(64) seq = q.e.payload.sequence;
-    if ((Int)seq != q.before.len()) { return http_reply_status(400); }
+    if ((Int)seq != q.from + q.before.len()) { return http_reply_status(400); }
     List(Int) d = sha256_bytes(q.e.encoded);
     Str dir = root + "/seen/" + hex_encode(q.l);
     Str f = dir + "/" + f"{seq}";
@@ -189,15 +233,145 @@ HttpReply witness_sign(Str root, List(Secret(UInt(8))) wpriv, Int offset, CoReq 
         return http_reply_bytes(200, "application/cbor", held[32..held.len()]);
     }
     // The log shown must be the one this witness co-signed, where it did.
-    if (!seen_agree(dir, q.before, 0)) { return http_reply_status(409); }
+    if (!seen_agree(dir, q.before, 0, q.from)) { return http_reply_status(409); }
     Int t = clock_now_seconds() + offset;
+    if (seq == 0) {
+        Result(NextOk, SymbolonError) ok0 = il_next(q.l, [], q.e, t, lambda(p) { false });
+        return next_reply(ok0, f, dir, wpriv, q, seq, d);
+    }
+    // The state after the log before the event: from E0, or the kept
+    // state with the events after it.
+    Base b = base_of(root, q.l, q.from, q.before);
+    if (b.status != 200) { return base_reply(b); }
+    LogState s = b.s else { no_state() };
+    // A kept state past this sequence: only the whole log shows it.
+    if (il_state_next(s) != (Int)seq) { return need_from(0); }
+    _ = keep_state(root, q.l, s);
     // The time the event was checked at, never earlier than the last
     // event's (il_check_next), is the time signed (R2W-3).
-    Result(NextOk, SymbolonError) ok = il_next(q.l, q.before, q.e, t, lambda(p) { false });
+    Result(NextOk, SymbolonError) ok = il_next_from(q.l, s, q.e, t, lambda(p) { false });
+    return next_reply(ok, f, dir, wpriv, q, seq, d);
+}
+
+@requires(filesystem, declassify)
+HttpReply next_reply(Result(NextOk, SymbolonError) ok, Str f, Str dir, List(Secret(UInt(8))) wpriv, CoReq q, UInt(64) seq, List(Int) d) {
     return match ok {
-        Err(e) => http_reply_text(403, "text/plain", match e { ErrInvalidLog(why) => why, _ => "refused" }),
+        Err(e) => refused(e),
         Ok(at) => witness_claimed(f, dir, wpriv, q, seq, d, at)
     };
+}
+
+HttpReply refused(SymbolonError e) {
+    HttpReply r = http_reply_text(403, "text/plain", match e { ErrInvalidLog(why) => why, _ => "refused" });
+    return r;
+}
+
+// POST /catchup: co-signed events of the log, from sequence q.from,
+// verified (from E0, or on top of the kept state) and kept; CBOR [next].
+@requires(filesystem, declassify)
+HttpReply witness_catchup(Str root, CoReq q) {
+    List(SignedEvent) es = q.before.concat([q.e]);
+    if (opt_claim(q.claim) || (Int)q.e.payload.sequence != q.from + es.len() - 1) { return http_reply_status(400); }
+    if (!seen_agree(root + "/seen/" + hex_encode(q.l), es, 0, q.from)) { return http_reply_status(409); }
+    Base b = base_of(root, q.l, q.from, es);
+    if (b.status != 200) { return base_reply(b); }
+    LogState s = b.s else { no_state() };
+    Int next = keep_state(root, q.l, s);
+    return http_reply_bytes(200, "application/cbor", cbe_uint(next, cbe_array(1, [])));
+}
+
+Bool opt_claim(Option(RelayClaim) c) { return match c { None => false, Some(_) => true }; }
+
+// ─── The kept state (R3P-2) ─────────────────────────────────────
+
+// A state reached from the events of a request, or why not: `status` 200
+// with `s`, 412 with `next` (where the kept state ends), 409 (the events
+// are not the log this witness verified), 403 with `why`.
+type Base = { Int status; Int next; Str why; Option(LogState) s; };
+
+Base base_err(Int status, Int next, Str why) { return Base {.status = status, .next = next, .why = why, .s = None}; }
+
+Base base_result(Result(LogState, SymbolonError) r) {
+    return match r {
+        Err(e) => base_err(403, 0, match e { ErrInvalidLog(why) => why, _ => "refused" }),
+        Ok(s) => Base {.status = 200, .next = 0, .why = "", .s = Some(s)}
+    };
+}
+
+HttpReply base_reply(Base b) {
+    if (b.status == 412) { return need_from(b.next); }
+    if (b.status == 403) { return http_reply_text(403, "text/plain", b.why); }
+    return http_reply_status(b.status);
+}
+
+HttpReply need_from(Int next) {
+    HttpReply r = http_reply_bytes(412, "application/cbor", cbe_uint(next, cbe_array(1, [])));
+    return r;
+}
+
+// The state after `es`, the log's events from sequence `from` on: from
+// E0 when `from` is 0, else the kept state with those of `es` past it.
+// Nothing about the state before `from` is taken from the request.
+@requires(filesystem)
+Base base_of(Str root, List(Int) l, Int from, List(SignedEvent) es) {
+    if (from == 0) {
+        Base b0 = base_result(il_state(l, es));
+        return b0;
+    }
+    Option(LogState) kept = kept_state(root, l);
+    return match kept {
+        None => base_err(412, 0, ""),
+        Some(k) => base_on(l, k, from, es)
+    };
+}
+
+Base base_on(List(Int) l, LogState k, Int from, List(SignedEvent) es) {
+    Int h1 = il_state_next(k);
+    if (from > h1) { return base_err(412, h1, ""); }
+    Int skip = h1 - from;
+    // Every event shown is in the kept state already.
+    if (skip > es.len()) { return Base {.status = 200, .next = 0, .why = "", .s = Some(k)}; }
+    // The last event shown that the kept state holds must be its last.
+    if (skip > 0 && !bytes_eq(sha256_bytes(es[skip - 1].encoded), il_state_digest(k))) { return base_err(409, 0, ""); }
+    Base b = base_result(il_extend(k, l, es[skip..es.len()]));
+    return b;
+}
+
+Str state_file(Str root, List(Int) l) { return root + "/state/" + hex_encode(l); }
+
+@requires(filesystem)
+Option(LogState) kept_state(Str root, List(Int) l) {
+    Str f = state_file(root, l);
+    if (!filesystem.exists(f)) { return None; }
+    Option(LogState) s = logstate_of(filesystem.read_bytes(f));
+    return s;
+}
+
+// Keeps `s` unless the kept state already reaches as far; the sequence
+// after the last event of the state kept now.
+@requires(filesystem, declassify)
+Int keep_state(Str root, List(Int) l, LogState s) {
+    Option(LogState) old = kept_state(root, l);
+    Int have = match old { None => 0, Some(o) => il_state_next(o) };
+    if (il_state_next(s) <= have) { return have; }
+    List(Int) b = logstate_cbor(s);
+    if (b.len() == 0) { return have; }
+    _ = filesystem.create_dir(root + "/state");
+    Str tmp = root + "/state/." + hex_encode(l) + ".tmp-" + hex_encode(random_bytes(8));
+    if (!filesystem.write_bytes(tmp, b) || !filesystem.rename(tmp, state_file(root, l))) {
+        _ = filesystem.remove(tmp);
+        return have;
+    }
+    return il_state_next(s);
+}
+
+// Never read: base_of's 200 always carries a state.
+LogState no_state() {
+    Quorum q = Quorum {.parties = [], .t = 0, .root_pubkey = [], .epoch = 0, .transcript_digest = [], .kv_commits = []};
+    Policy p = Policy {.device_sigs_for_authority = 0, .recovery_delay_sec = 0, .guardians = [], .guardian_threshold = 0, .witnesses = [],
+                       .duress_window_sec = 0, .sequencer = [], .cosigner_policy = NoCosignerPolicy};
+    return LogState {.quorum = q, .policy = p, .recovery_digests = [], .proposed = [], .removed = [], .pending = [], .vetoes = 0,
+                     .prev_digest = [], .next_seq = 0, .last_time = 0, .last_cosigs = [], .rotated_to = [], .key_times = [], .slots = []};
 }
 
 // Only the event the log's relay claimed at this sequence (SPEC 20.3,
@@ -264,13 +438,15 @@ HttpReply witness_store(Str f, Str dir, List(Secret(UInt(8))) wpriv, List(Int) l
     return http_reply_bytes(200, "application/cbor", answer);
 }
 
+// Whether `es`, the log's events from sequence `from` on, are what this
+// witness co-signed at each sequence where it co-signed one.
 @requires(filesystem)
-Bool seen_agree(Str dir, List(SignedEvent) es, Int i) {
+Bool seen_agree(Str dir, List(SignedEvent) es, Int i, Int from) {
     if (i >= es.len()) { return true; }
-    Str f = dir + "/" + f"{i}";
+    Str f = dir + "/" + f"{from + i}";
     if (filesystem.exists(f)) {
         List(Int) held = filesystem.read_bytes(f);
         if (held.len() < 32 || !bytes_eq(held[0..32], sha256_bytes(es[i].encoded))) { return false; }
     }
-    return seen_agree(dir, es, i + 1);
+    return seen_agree(dir, es, i + 1, from);
 }

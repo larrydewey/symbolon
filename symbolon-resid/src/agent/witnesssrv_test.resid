@@ -472,3 +472,158 @@ test "the kit can drop the relay without its claim, in effect only after the rec
     expect(ask_claimed(w2, 8, l, [e0c, escc, rec2], Some(claim_by(30, "relay:1", l, 2, dig(rec2)))).status).toEqual(403);
     expect(ask_claimed(w2, 8, l, [e0c, escc, ev(after(l, 2, esc, VetoBody(1), [sha256_bytes(pubk(20))]), [3])], None).status).toEqual(200);
 }
+
+// ─── Incremental co-sign requests: the state a witness keeps (R3P-2) ───
+
+// The co-signatures of witnesses 8 and 11 (a majority of policy_with's
+// three) on event `e` at `seq`, at time `t`.
+List(WitnessCosignature) by_8_11(List(Int) l, UInt(64) seq, StoredEvent e, Int t) {
+    List(Int) d = dig(e);
+    return [WitnessCosignature {.log_id = l, .sequence = seq, .digest = d, .witness_key = pubk(8), .signature = sign(8, witness_message(l, seq, d)), .witness_time = (UInt(64))t},
+            WitnessCosignature {.log_id = l, .sequence = seq, .digest = d, .witness_key = pubk(11), .signature = sign(11, witness_message(l, seq, d)), .witness_time = (UInt(64))t}];
+}
+
+List(List(Int)) f6() { return [sha256_bytes(pubk(20))]; }
+
+// Device `who`'s party-key to key `k` at `seq`, after `prev`.
+StoredEvent key_ev(List(Int) l, Int seq, StoredEvent prev, Int who, Int k) {
+    return ev(after(l, (UInt(64))seq, prev, PartyKeyBody(id32(who), pubk(k)), f6()), [who]);
+}
+
+// Events `seq` to `upto` of a log of device 2's party-keys (keys 30 and
+// 31 in turn), each co-signed by witnesses 8 and 11 at time 1000 + seq
+// (before the release cutover: one device's party-keys were not limited).
+List(StoredEvent) key_log(List(Int) l, StoredEvent prev, Int seq, Int upto, List(StoredEvent) acc) {
+    if (seq > upto) { return acc; }
+    StoredEvent e = key_ev(l, seq, prev, 2, 30 + seq % 2);
+    return key_log(l, e, seq + 1, upto, acc.concat([with_cosigs(e, by_8_11(l, (UInt(64))seq, e, 1000 + seq))]));
+}
+
+@requires(filesystem, clock(readonly), declassify)
+HttpReply post_to(Str root, List(Secret(UInt(8))) wpriv, Str path, List(Int) body) { return witness_handle(root, wpriv, 0, post(path, body)); }
+
+Int next_in(HttpReply r) { return witness_next_of(r.body); }
+
+// The requests a client makes for the last of `shown` (net/services.resid
+// cosign_first, cosign_next), against this witness; the last answer, and
+// each request's path and status in `trace`.
+type Exchange = { HttpReply last; Str trace; };
+
+@requires(filesystem, clock(readonly), declassify)
+Exchange exchange(Str root, List(Secret(UInt(8))) wpriv, List(Int) l, List(List(Int)) shown) {
+    return steps(root, wpriv, l, shown, cosign_first(l, shown, None), "", 0);
+}
+
+@requires(filesystem, clock(readonly), declassify)
+Exchange steps(Str root, List(Secret(UInt(8))) wpriv, List(Int) l, List(List(Int)) shown, CoStep s, Str trace, Int k) {
+    HttpReply r = post_to(root, wpriv, s.path, s.body);
+    Str t = trace + s.path + f" {r.status};";
+    CoStep nx = cosign_next(l, shown, None, s, r.status, r.body);
+    return if (nx.done || k > 100) { Exchange {.last = r, .trace = t} } else { steps(root, wpriv, l, shown, nx, t, k + 1) };
+}
+
+@requires(filesystem, clock(readonly), declassify)
+test "a co-sign request may carry only the events after the state the witness keeps, never the state itself (R3P-2)" {
+    Str root = fresh_root();
+    List(Secret(UInt(8))) wpriv = random_secret(32);
+    List(Int) wpub = ec_public_keyg(P256, wpriv);
+    StoredEvent e0 = ev(e0_payload(wpub), [2, 3]);
+    List(Int) l = dig(e0);
+    StoredEvent e0c = with_cosigs(e0, by_8_11(l, 0, e0, 1000));
+    StoredEvent k1 = key_ev(l, 1, e0, 2, 30);
+    StoredEvent k1c = with_cosigs(k1, by_8_11(l, 1, k1, 1001));
+    StoredEvent k2 = key_ev(l, 2, k1, 3, 32);
+    // Nothing kept yet: the events from 1 on are not enough (412, from 0).
+    HttpReply n0 = post_to(root, wpriv, "/cosign", cosign_delta(l, 1, raws([k1c, k2], 0, []), None));
+    expect(n0.status).toEqual(412);
+    expect(next_in(n0)).toEqual(0);
+    // The whole log (the old form) is co-signed, and the witness keeps the
+    // state after E0 and event 1.
+    expect(answer_verifies(ask(root, wpriv, l, [e0c, k1c, k2]), wpub, l, 2, k2)).toBeTrue();
+    StoredEvent k2c = with_cosigs(k2, by_8_11(l, 2, k2, 1002));
+    StoredEvent k3 = key_ev(l, 3, k2, 2, 31);
+    // Then the last two events are enough: event 2, verified with its
+    // co-signatures on top of the kept state, and event 3.
+    HttpReply a3 = post_to(root, wpriv, "/cosign", cosign_delta(l, 2, raws([k2c, k3], 0, []), None));
+    expect(answer_verifies(a3, wpub, l, 3, k3)).toBeTrue();
+    // Events that start past what it keeps (it keeps up to 2 now): 412 with 3.
+    StoredEvent k3c = with_cosigs(k3, by_8_11(l, 3, k3, 1003));
+    StoredEvent k4 = key_ev(l, 4, k3, 3, 33);
+    StoredEvent k4c = with_cosigs(k4, by_8_11(l, 4, k4, 1004));
+    StoredEvent k5 = key_ev(l, 5, k4, 2, 30);
+    HttpReply g = post_to(root, wpriv, "/cosign", cosign_delta(l, 4, raws([k4c, k5], 0, []), None));
+    expect(g.status).toEqual(412);
+    expect(next_in(g)).toEqual(3);
+    // An event after the kept state without its co-signatures: refused.
+    expect(post_to(root, wpriv, "/cosign", cosign_delta(l, 3, raws([k3, k4c, k5], 0, []), None)).status).toEqual(403);
+    // With them: co-signed (events before the kept head are skipped).
+    expect(answer_verifies(post_to(root, wpriv, "/cosign", cosign_delta(l, 1, raws([k1c, k2c, k3c, k4c, k5], 0, []), None)), wpub, l, 5, k5)).toBeTrue();
+    // A sequence that does not add up, or a claim on a /catchup: 400.
+    expect(post_to(root, wpriv, "/cosign", cosign_delta(l, 2, raws([k4c, k5], 0, []), None)).status).toEqual(400);
+    expect(post_to(root, wpriv, "/catchup", cosign_delta(l, 1, raws([k1c], 0, []), Some(RelayClaim {.time = 1, .sig = rep64()}))).status).toEqual(400);
+}
+
+List(Int) rep64() { return sha256_bytes([1]).concat(sha256_bytes([2])); }
+
+@requires(filesystem, clock(readonly), declassify)
+test "a witness that never co-signed takes a log by /catchup, and refuses a fork of what it verified (R3P-2)" {
+    Str root = fresh_root();
+    List(Secret(UInt(8))) wpriv = random_secret(32);
+    List(Int) wpub = ec_public_keyg(P256, wpriv);
+    StoredEvent e0 = ev(e0_payload(wpub), [2, 3]);
+    List(Int) l = dig(e0);
+    StoredEvent e0c = with_cosigs(e0, by_8_11(l, 0, e0, 1000));
+    List(StoredEvent) log = [e0c].concat(key_log(l, e0, 1, 4, []));
+    // In parts: E0, then 1 and 2; one that starts past what it keeps: 412.
+    expect(next_in(post_to(root, wpriv, "/catchup", cosign_delta(l, 0, raws(log[0..1], 0, []), None)))).toEqual(1);
+    HttpReply gap = post_to(root, wpriv, "/catchup", cosign_delta(l, 3, raws(log[3..4], 0, []), None));
+    expect(gap.status).toEqual(412);
+    expect(next_in(gap)).toEqual(1);
+    expect(next_in(post_to(root, wpriv, "/catchup", cosign_delta(l, 1, raws(log[1..3], 0, []), None)))).toEqual(3);
+    // An event without its majority is not taken.
+    expect(post_to(root, wpriv, "/catchup", cosign_delta(l, 3, raws([with_cosigs(log[3], [])], 0, []), None)).status).toEqual(403);
+    // Another event 2, co-signed by the two other witnesses (a fork they
+    // made): this witness verified another 2, so 409.
+    StoredEvent x2 = key_ev(l, 2, log[1], 3, 40);
+    StoredEvent x3 = key_ev(l, 3, x2, 2, 30);
+    expect(post_to(root, wpriv, "/cosign", cosign_delta(l, 2, raws([with_cosigs(x2, by_8_11(l, 2, x2, 1002)), x3], 0, []), None)).status).toEqual(409);
+    // The real next event, with only the events after what it keeps.
+    StoredEvent k5 = key_ev(l, 5, log[4], 3, 34);
+    expect(answer_verifies(post_to(root, wpriv, "/cosign", cosign_delta(l, 3, raws([log[3], log[4], k5], 0, []), None)), wpub, l, 5, k5)).toBeTrue();
+    // What it keeps is a file of its own, beside seen/.
+    expect(filesystem.exists(root + "/state/" + hex_encode(l))).toBeTrue();
+}
+
+@requires(filesystem, clock(readonly), declassify)
+test "a log longer than one request gets its next event co-signed, in parts and then with only the last events (R3P-2)" {
+    Str root = fresh_root();
+    List(Secret(UInt(8))) wpriv = random_secret(32);
+    List(Int) wpub = ec_public_keyg(P256, wpriv);
+    StoredEvent e0 = ev(e0_payload(wpub), [2, 3]);
+    List(Int) l = dig(e0);
+    // 2100 events, more than the 2048 one request may carry: what a
+    // stolen device could append before a remove-party, or years of a
+    // household's events.
+    Int n = 2100;
+    List(StoredEvent) log = [with_cosigs(e0, by_8_11(l, 0, e0, 1000))].concat(key_log(l, e0, 1, n - 1, []));
+    expect(log.len()).toEqual(n);
+    StoredEvent nx = key_ev(l, n, log[n - 1], 3, 32);
+    List(List(Int)) shown = raws(log.concat([nx]), 0, []);
+    // The whole log in one request, as clients sent it before: refused.
+    Int whole = post_to(root, wpriv, "/cosign", cosign_request(l, shown)).status;
+    expect(whole == 400 || whole == 413).toBeTrue();
+    // A client's exchange: the last two events (412: nothing kept), the
+    // log in parts, then the rest with the new event.
+    Exchange x = exchange(root, wpriv, l, shown);
+    expect(answer_verifies(x.last, wpub, l, (UInt(64))n, nx)).toBeTrue();
+    expect(str_starts_with(x.trace, "/cosign 412;/catchup 200;")).toBeTrue();
+    expect(str_ends_with(x.trace, ";/cosign 200;")).toBeTrue();
+    // The next event: one request, of the last two events.
+    StoredEvent nxc = with_cosigs(nx, completed(x.last, wpub, l, (UInt(64))n, nx));
+    StoredEvent n2 = key_ev(l, n + 1, nx, 2, 30);
+    List(List(Int)) shown2 = shown[0..n].concat(raws([nxc, n2], 0, []));
+    Exchange y = exchange(root, wpriv, l, shown2);
+    expect(y.trace).toEqual("/cosign 200;");
+    expect(answer_verifies(y.last, wpub, l, (UInt(64))(n + 1), n2)).toBeTrue();
+    expect(cosign_first(l, shown2, None).body.len() < 4096).toBeTrue();
+}
