@@ -757,14 +757,24 @@ class Openings {
 }
 
 /// One line of `device pending`: "SEQ DIGEST READY confirmable|not-confirmable
-/// KIND; signed by LABELS".
+/// WHAT; signed by LABELS". WHAT says what the event changes (R5-6): the
+/// party a removal targets (label and id), the policy fields a set-policy
+/// changes (old -> new), the new kit's id for a kit replacement; an event
+/// one device signed alone that acts on another party or the kit ends in
+/// "(one device alone: ...)".
 class PendingEvent {
   final int seq;
-  final String digest;    // the first 16 hex digits
+  final String digest;    // the event's digest in hex: what a confirm signs (an older agent: its first 16 digits)
   final int readyAt;      // witness time (Unix seconds) it takes effect at, unless vetoed
   final bool confirmable; // not a recover, the kit's set-policy or a weakening set-policy
-  final String what;      // KIND; signed by LABELS
+  final String what;      // WHAT; signed by LABELS
   const PendingEvent({required this.seq, required this.digest, required this.readyAt, required this.confirmable, required this.what});
+
+  /// The digest's first 16 hex digits, for a list.
+  String get shortDigest => digest.length > 16 ? digest.substring(0, 16) : digest;
+
+  /// Signed by one device alone, and acting on another party or the kit.
+  bool get alone => what.contains('(one device alone');
 
   static PendingEvent? parse(String line) {
     final w = line.trim().split(' ');

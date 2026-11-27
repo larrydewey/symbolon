@@ -170,8 +170,25 @@ class _RecoveryPageState extends State<RecoveryPage> {
       context: context,
       builder: (ctx) => AlertDialog(
         title: Text('Approve change ${e.seq}?'),
-        content: Text('${e.what}\n\nAnother of your devices asked for this. Approve it only if you know who did and why: '
-            'it then takes effect now, and can no longer be stopped. If you do not recognise it, stop it instead.'),
+        // What the change does (R5-6): the device a removal takes out, the
+        // policy before and after, the new kit's id; and the digest this
+        // device's approval signs.
+        content: SingleChildScrollView(
+          child: Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
+            Text(e.what, key: const Key('approve-what')),
+            if (e.alone) ...[
+              const SizedBox(height: 12),
+              Text('Only one device asked for this. A stolen device carries its own name: if you did not ask for it from that device yourself, stop it instead.',
+                  key: const Key('approve-alone'), style: TextStyle(color: Theme.of(ctx).colorScheme.error)),
+            ],
+            const SizedBox(height: 12),
+            const Text('Your approval signs the change with digest:'),
+            SelectableText(e.digest, key: const Key('approve-digest'), style: const TextStyle(fontFamily: 'monospace')),
+            const SizedBox(height: 12),
+            const Text('Approve it only if you know who asked for it and why: it then takes effect now, and can no longer be stopped. '
+                'If you do not recognise it, stop it instead.'),
+          ]),
+        ),
         actions: [
           TextButton(onPressed: () => Navigator.of(ctx).pop(false), child: const Text('Cancel')),
           FilledButton(key: const Key('confirm-approve'), onPressed: () => Navigator.of(ctx).pop(true), child: const Text('Approve')),
@@ -248,7 +265,7 @@ class _RecoveryPageState extends State<RecoveryPage> {
                     key: Key('pending-${e.seq}'),
                     contentPadding: EdgeInsets.zero,
                     title: Text(e.what),
-                    subtitle: Text('Change ${e.seq} · ${e.digest}'),
+                    subtitle: Text('Change ${e.seq} · ${e.shortDigest}'),
                     trailing: e.confirmable
                         ? TextButton(key: Key('approve-${e.seq}'), onPressed: () => approve(e), child: const Text('Approve'))
                         : null,

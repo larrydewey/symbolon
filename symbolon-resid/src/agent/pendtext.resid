@@ -1,0 +1,140 @@
+// What a pending event does, as `device pending` and `device confirm`
+// print it and the app's Approve dialog shows it (R5-6). A confirm makes
+// the event take effect at once, so the person must see what it changes,
+// not only its kind: which party a removal targets, what a set-policy
+// changes, which kit a rotation installs, and the digest the confirm
+// signs. A thief's event signed by a stolen device carries that device's
+// label, which may be the owner's own phone; an event one device signed
+// alone is marked.
+
+import "../types.resid";
+import "../core/log.resid";
+import "crypto.resid";
+
+// One line: "SEQ DIGEST READY confirmable|not-confirmable WHAT; signed by
+// LABELS": DIGEST the event's full digest in hex (what a confirm signs),
+// READY the witness time it takes effect at unless vetoed. `ps` the
+// quorum's parties, `pol` the policy in force.
+pub Str pending_line(List(SignedEvent) es, List(Party) ps, Policy pol, PendingEvent p) {
+    Int s = (Int)p.seq;
+    SignedEvent e = es[s];
+    Str how = if (p.confirmable) { "confirmable" } else { "not-confirmable" };
+    Str alone = if (e.sigs.len() == 1 && targets_other(e, ps)) { " (one device alone: if that was not you, veto it)" } else { "" };
+    return f"{s} " + hex_encode(p.digest) + f" {p.ready_at} " + how + " " + event_what(e.payload, ps, pol) + "; signed by " + signer_labels(e.sigs, ps, 0, "") + alone;
+}
+
+// What the event does, in a few words.
+pub Str event_what(EventPayload pl, List(Party) ps, Policy pol) {
+    EventBody b = pl.body;
+    return match b {
+        ProposePartyBody(p, _) => "propose-party \"" + p.label + "\" (id " + short_id(p.id) + ")",
+        RemovePartyBody(id) => "remove-party " + party_named(ps, id) + " (id " + short_id(id) + ")",
+        SetPolicyBody(np) => "set-policy: " + policy_change(pol, np),
+        RotateRecoveryBody => "rotate-recovery: a new kit, id " + kit_ids(pl.next_recovery_key_digests, 0, ""),
+        RecoverBody(_) => "recover",
+        MigrateBody(_) => "migrate",
+        _ => "other"
+    };
+}
+
+// Whether the event acts on a party other than its signer: removing
+// another device, or replacing the kit.
+Bool targets_other(SignedEvent e, List(Party) ps) {
+    EventBody b = e.payload.body;
+    List(Int) by = e.sigs[0].signer;
+    return match b {
+        RemovePartyBody(id) => !bytes_eq(id, by),
+        RotateRecoveryBody => true,
+        SetPolicyBody(_) => true,
+        _ => false
+    };
+}
+
+// The first 16 hex digits of an id.
+pub Str short_id(List(Int) id) { Str h = hex_encode(id); return if (str_len(h) > 16) { str_slice(h, 0, 16) } else { h }; }
+
+Str kit_ids(List(List(Int)) ds, Int i, Str acc) {
+    if (i >= ds.len()) { return if (str_len(acc) == 0) { "?" } else { acc }; }
+    return kit_ids(ds, i + 1, if (str_len(acc) == 0) { short_id(ds[i]) } else { acc + ", " + short_id(ds[i]) });
+}
+
+Str party_named(List(Party) ps, List(Int) id) {
+    Option(Party) o = party_in(ps, id, 0);
+    return match o { None => "? (not of the quorum)", Some(p) => labelled(p) };
+}
+
+Str labelled(Party p) {
+    Str k = if (p.kind == party_kind_kit()) { " (the recovery kit)" } else { "" };
+    return "\"" + p.label + "\"" + k;
+}
+
+Option(Party) party_in(List(Party) ps, List(Int) id, Int i) {
+    if (i >= ps.len()) { return None; }
+    if (bytes_eq(ps[i].id, id)) { return Some(ps[i]); }
+    return party_in(ps, id, i + 1);
+}
+
+// The labels of the parties of `ps` that `sigs` name.
+pub Str signer_labels(List(EventSig) sigs, List(Party) ps, Int i, Str acc) {
+    if (i >= sigs.len()) { return acc; }
+    Option(Party) o = party_in(ps, sigs[i].signer, 0);
+    Str one = match o { None => "?", Some(p) => "\"" + p.label + "\"" };
+    return signer_labels(sigs, ps, i + 1, if (str_len(acc) == 0) { one } else { acc + ", " + one });
+}
+
+// The fields a set-policy changes, "OLD -> NEW" each; "no change" when none.
+pub Str policy_change(Policy a, Policy b) {
+    List(Str) cs = [
+        if (a.device_sigs_for_authority == b.device_sigs_for_authority) { "" } else { f"devices to authorize {a.device_sigs_for_authority} -> {b.device_sigs_for_authority}" },
+        if (a.recovery_delay_sec == b.recovery_delay_sec) { "" } else { f"recovery delay {a.recovery_delay_sec} s -> {b.recovery_delay_sec} s" },
+        if (same_ids(a.guardians, b.guardians, 0) && a.guardian_threshold == b.guardian_threshold) { "" } else {
+            "guardians " + guardians_text(a) + " -> " + guardians_text(b) },
+        if (same_refs(a.witnesses, b.witnesses, 0)) { "" } else { "witnesses " + refs_text(a.witnesses, 0, "") + " -> " + refs_text(b.witnesses, 0, "") },
+        if (a.duress_window_sec == b.duress_window_sec) { "" } else { f"duress window {a.duress_window_sec} s -> {b.duress_window_sec} s" },
+        if (cos_text(a.cosigner_policy) == cos_text(b.cosigner_policy)) { "" } else { "cosigner limits " + cos_text(a.cosigner_policy) + " -> " + cos_text(b.cosigner_policy) },
+        if (same_refs(a.sequencer, b.sequencer, 0)) { "" } else { "sequencing relay " + refs_text(a.sequencer, 0, "") + " -> " + refs_text(b.sequencer, 0, "") }
+    ];
+    Str r = join_set(cs, 0, "");
+    return if (str_len(r) == 0) { "no change" } else { r };
+}
+
+Str join_set(List(Str) xs, Int i, Str acc) {
+    if (i >= xs.len()) { return acc; }
+    if (str_len(xs[i]) == 0) { return join_set(xs, i + 1, acc); }
+    return join_set(xs, i + 1, if (str_len(acc) == 0) { xs[i] } else { acc + ", " + xs[i] });
+}
+
+Bool same_ids(List(List(Int)) a, List(List(Int)) b, Int i) {
+    if (a.len() != b.len()) { return false; }
+    if (i >= a.len()) { return true; }
+    return bytes_eq(a[i], b[i]) && same_ids(a, b, i + 1);
+}
+
+Bool same_refs(List(WitnessRef) a, List(WitnessRef) b, Int i) {
+    if (a.len() != b.len()) { return false; }
+    if (i >= a.len()) { return true; }
+    return a[i].url == b[i].url && bytes_eq(a[i].key, b[i].key) && same_refs(a, b, i + 1);
+}
+
+Str guardians_text(Policy p) { return f"{p.guardian_threshold} of " + ids_text(p.guardians, 0, ""); }
+
+Str ids_text(List(List(Int)) ids, Int i, Str acc) {
+    if (i >= ids.len()) { return "[" + acc + "]"; }
+    return ids_text(ids, i + 1, if (str_len(acc) == 0) { short_id(ids[i]) } else { acc + " " + short_id(ids[i]) });
+}
+
+// "url#key" for each, the key's first 8 hex digits: a witness moved to
+// another key under the same address shows.
+Str refs_text(List(WitnessRef) rs, Int i, Str acc) {
+    if (i >= rs.len()) { return "[" + acc + "]"; }
+    Str one = rs[i].url + "#" + str_slice(hex_encode(rs[i].key) + "00000000", 0, 8);
+    return refs_text(rs, i + 1, if (str_len(acc) == 0) { one } else { acc + " " + one });
+}
+
+Str cos_text(CosignerPolicy c) {
+    return match c {
+        NoCosignerPolicy => "none",
+        CosignerLimit(n) => f"sign {n}",
+        CosignerLimits(l) => f"sign {l.sign} eval {l.eval}"
+    };
+}

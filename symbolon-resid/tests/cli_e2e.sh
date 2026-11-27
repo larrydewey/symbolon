@@ -416,7 +416,9 @@ KIT=$(sed -n 's/^NEW RECOVERY KIT (write it down; it is shown once): //p' "$W/re
 grep -q '^kit replacement pending' "$W/renew.log" || fail "one device of two replaced the kit at once: $(cat "$W/renew.log")"
 run 120 "$BIN" device status "$W/dev2" | grep -q 'epoch 2 parties 4 threshold 2 pending 1' || fail "status with the replacement pending"
 run 120 "$BIN" device pending "$W/dev2" > "$W/pending.log" 2>&1 || fail "device pending: $(cat "$W/pending.log")"
-grep -Eq '^[0-9]+ [0-9a-f]{16} [0-9]+ confirmable rotate-recovery' "$W/pending.log" || fail "device pending: $(cat "$W/pending.log")"
+KID=$(sed -n 's/^new kit id \([0-9a-f]\{16\}\) .*/\1/p' "$W/renew.log")
+[ "${#KID}" = 16 ] || fail "kit renew did not print the new kit's id: $(cat "$W/renew.log")"
+grep -Eq "^[0-9]+ [0-9a-f]{64} [0-9]+ confirmable rotate-recovery: a new kit, id $KID; signed by .* \\(one device alone" "$W/pending.log" || fail "device pending: $(cat "$W/pending.log")"
 RSEQ=$(awk 'NR == 1 {print $1}' "$W/pending.log")
 printf '2468\ny\n' | run 600 "$BIN" device confirm "$W/dev" "$RSEQ" > "$W/confirm-self.log" 2>&1 && fail "the device that signed the kit replacement confirmed it itself"
 grep -q 'another device of the household must confirm it' "$W/confirm-self.log" || fail "self-confirm: $(cat "$W/confirm-self.log")"

@@ -29,6 +29,7 @@ import "vaultcli.resid";
 import "duresscli.resid";
 import "kvagent.resid";
 import "kitpass.resid";
+import "pendtext.resid";
 import "../vault/kvshare.resid";
 import "word.resid";
 import "crypto.resid";
@@ -249,33 +250,6 @@ Int kit_escaped(VerifiedHead vh) {
 // (core/log.resid do_confirm). Never for a recover, the kit's set-policy
 // or a set-policy that weakens the policy.
 
-// What a pending event is, in a word or two.
-Str event_kind(EventBody b) {
-    return match b {
-        ProposePartyBody(p, _) => "propose-party (\"" + p.label + "\")",
-        RemovePartyBody(_) => "remove-party",
-        SetPolicyBody(_) => "set-policy",
-        RotateRecoveryBody => "rotate-recovery (a new kit)",
-        RecoverBody(_) => "recover",
-        MigrateBody(_) => "migrate",
-        _ => "other"
-    };
-}
-
-// The labels of the parties of `ps` that `sigs` name.
-Str signer_labels(List(EventSig) sigs, List(Party) ps, Int i, Str acc) {
-    if (i >= sigs.len()) { return acc; }
-    Party p = pend_party(ps, sigs[i].signer, 0) else { none_party() };
-    Str one = if (p.id.len() == 0) { "?" } else { "\"" + p.label + "\"" };
-    return signer_labels(sigs, ps, i + 1, if (str_len(acc) == 0) { one } else { acc + ", " + one });
-}
-
-Option(Party) pend_party(List(Party) ps, List(Int) id, Int i) {
-    if (i >= ps.len()) { return None; }
-    if (bytes_eq(ps[i].id, id)) { return Some(ps[i]); }
-    return pend_party(ps, id, i + 1);
-}
-
 Bool pend_signed_by(List(EventSig) sigs, List(Int) id, Int i) {
     if (i >= sigs.len()) { return false; }
     return bytes_eq(sigs[i].signer, id) || pend_signed_by(sigs, id, i + 1);
@@ -288,18 +262,11 @@ List(PendingEvent) pend_live(List(PendingEvent) pe, List(UInt(64)) now, Int i, L
     return pend_live(pe, now, i + 1, if (now.contains(pe[i].seq)) { acc.concat([pe[i]]) } else { acc });
 }
 
-Str pending_line(List(SignedEvent) es, List(Party) ps, PendingEvent p) {
-    Int s = (Int)p.seq;
-    SignedEvent e = es[s];
-    EventBody b = e.payload.body;
-    Str d = str_slice(hex_encode(p.digest), 0, 16);
-    Str how = if (p.confirmable) { "confirmable" } else { "not-confirmable" };
-    return f"{s} " + d + f" {p.ready_at} " + how + " " + event_kind(b) + "; signed by " + signer_labels(e.sigs, ps, 0, "");
-}
-
 // `symbolon device pending DIR`: the log's pending events, one per line:
-// "SEQ DIGEST READY confirmable|not-confirmable KIND; signed by LABELS":
-// DIGEST the first 16 hex digits of the event's digest, READY the witness
+// "SEQ DIGEST READY confirmable|not-confirmable WHAT; signed by LABELS"
+// (pendtext.resid): DIGEST the event's digest, which a confirm signs, WHAT
+// what it changes (the party removed, the policy fields, the new kit's
+// id), READY the witness
 // time it takes effect at unless vetoed, and whether devices may confirm
 // it (a recover, the kit's set-policy or a weakening set-policy may only
 // be vetoed or left to run).
@@ -324,14 +291,14 @@ Int pending_list(DeviceConfig c, LogView v) {
     List(SignedEvent) es = v.events;
     List(PendingEvent) pe = pend_live(il_pending_events(c.log_id, es, 0, lambda(x) { false }), vh.pending, 0, []);
     if (pe.len() == 0) { println("nothing is pending"); return 0; }
-    pend_print(es, vh.head.quorum.parties, pe, 0);
+    pend_print(es, vh.head.quorum.parties, vh.head.policy, pe, 0);
     return 0;
 }
 
-Int pend_print(List(SignedEvent) es, List(Party) ps, List(PendingEvent) pe, Int i) {
+Int pend_print(List(SignedEvent) es, List(Party) ps, Policy pol, List(PendingEvent) pe, Int i) {
     if (i >= pe.len()) { return 0; }
-    println(pending_line(es, ps, pe[i]));
-    return pend_print(es, ps, pe, i + 1);
+    println(pending_line(es, ps, pol, pe[i]));
+    return pend_print(es, ps, pol, pe, i + 1);
 }
 
 // `symbolon device confirm DIR SEQ`: this device confirms the pending
@@ -367,7 +334,7 @@ Int confirm_target(DeviceConfig c, Unlocked u, VerifiedHead vh, List(SignedEvent
     PendingEvent p = at[0];
     if (!p.confirmable) { return dfail(f"event {seq} cannot be confirmed (a recover, the kit's set-policy or a set-policy that weakens the policy): veto it or let the delay run"); }
     if (pend_signed_by(es[(Int)seq].sigs, c.party, 0)) { return dfail(f"this device signed event {seq}: another device of the household must confirm it"); }
-    println("pending " + pending_line(es, vh.head.quorum.parties, p));
+    println("pending " + pending_line(es, vh.head.quorum.parties, vh.head.policy, p));
     eprintln(f"device: confirm event {seq}, so that it takes effect now? (y/N)");
     Str a = str_to_lower(str_trim(read_pin()));
     if (a != "y" && a != "yes") { return dfail("not confirmed"); }

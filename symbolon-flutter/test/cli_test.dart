@@ -39,6 +39,22 @@ void main() {
     expect(es[1].confirmable, isFalse);
   });
 
+  test('a pending line carries the full digest, what the event does, and a mark when one device signed it alone (R5-6)', () {
+    final es = PendingEvent.parseAll('7 0123456789abcdef 1796170000 confirmable rotate-recovery (a new kit); signed by "laptop"\n');
+    // What the agent prints since R5-6: the full digest, what the event
+    // does, and a mark on one signed by one device alone.
+    final d = 'ab' * 32;
+    final ns = PendingEvent.parseAll('5 $d 1796170000 confirmable set-policy: recovery delay 86400 s -> 172800 s; signed by "phone" (one device alone: if that was not you, veto it)\n'
+        '6 $d 1796170000 confirmable remove-party "laptop" (id 0202020202020202); signed by "phone", "tablet"\n');
+    expect(ns.length, 2);
+    expect(ns[0].digest, d);
+    expect(ns[0].shortDigest, 'ab' * 8);
+    expect(ns[0].what, startsWith('set-policy: recovery delay 86400 s -> 172800 s;'));
+    expect(ns[0].alone, isTrue);
+    expect(ns[1].alone, isFalse);
+    expect(es[0].shortDigest, '0123456789abcdef');
+  });
+
   test("a kit's passphrase goes to standard input, and only when the sheet is protected", () async {
     final plain = '9a' * 32, sealed = '01120301${'ab' * 64}';
     expect(kitIsProtected(plain), isFalse);

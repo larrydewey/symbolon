@@ -1,0 +1,54 @@
+// What `device pending` and `device confirm` print for a pending event
+// (src/agent/pendtext.resid, R5-6): the party a removal targets, the
+// policy fields a set-policy changes, the new kit's id, the full digest a
+// confirm signs, and a mark on an event one device signed alone.
+
+import "../types.resid";
+import "../core/log.resid";
+import "pendtext.resid";
+import "crypto.resid";
+
+List(Int) rep(Int b, Int n) { return if (n == 0) { [] } else { [b].concat(rep(b, n - 1)) }; }
+
+Party pty(Int n, UInt(8) kind, Str label) { return Party {.id = rep(n, 32), .kind = kind, .auth_key = [], .hpke_key = [], .label = label, .attestation = NoAttestation}; }
+
+List(Party) parties() { return [pty(1, party_kind_device(), "phone"), pty(2, party_kind_device(), "laptop"), pty(3, party_kind_kit(), "recovery kit")]; }
+
+Policy pol(UInt(64) delay, List(WitnessRef) ws) {
+    return Policy {.device_sigs_for_authority = 2, .recovery_delay_sec = delay, .guardians = [], .guardian_threshold = 0, .witnesses = ws,
+                   .duress_window_sec = 600, .sequencer = [], .cosigner_policy = NoCosignerPolicy};
+}
+
+List(WitnessRef) ws3(Str last) {
+    return [WitnessRef {.url = "https://w1", .key = rep(171, 65)}, WitnessRef {.url = "https://w2", .key = rep(187, 65)}, WitnessRef {.url = last, .key = rep(204, 65)}];
+}
+
+SignedEvent ev(UInt(64) seq, EventBody b, List(List(Int)) ds, List(Int) signers) {
+    List(EventSig) sigs = if (signers.len() == 1) { [EventSig {.signer = rep(signers[0], 32), .sig = []}] } else {
+        [EventSig {.signer = rep(signers[0], 32), .sig = []}, EventSig {.signer = rep(signers[1], 32), .sig = []}] };
+    return SignedEvent {.payload = EventPayload {.log_id = None, .sequence = seq, .predecessor_digest = None, .suite = 1, .body = b, .next_recovery_key_digests = ds, .advisory_time = 0},
+                        .encoded = [], .sigs = sigs, .cosigs = []};
+}
+
+PendingEvent pe(Int seq, Bool c) { return PendingEvent {.seq = (UInt(64))seq, .ready_at = 5000, .digest = rep(seq + 16, 32), .confirmable = c}; }
+
+test "device pending names the party a removal targets and marks an event one device signed alone (R5-6)" {
+    Policy p = pol(86400, ws3("https://w3"));
+    List(SignedEvent) es = [ev(0, MigrateBody(1), [], [1, 2]), ev(1, RemovePartyBody(rep(2, 32)), [], [1]), ev(2, RemovePartyBody(rep(9, 32)), [], [1, 2])];
+    expect(pending_line(es, parties(), p, pe(1, true))).toEqual(
+        "1 " + hex_encode(rep(17, 32)) + " 5000 confirmable remove-party \"laptop\" (id 0202020202020202); signed by \"phone\" (one device alone: if that was not you, veto it)");
+    expect(pending_line(es, parties(), p, pe(2, true))).toEqual(
+        "2 " + hex_encode(rep(18, 32)) + " 5000 confirmable remove-party ? (not of the quorum) (id 0909090909090909); signed by \"phone\", \"laptop\"");
+}
+
+test "device pending shows what a set-policy changes and the new kit's id (R5-6)" {
+    Policy p = pol(86400, ws3("https://w3"));
+    List(SignedEvent) es = [ev(0, MigrateBody(1), [], [1, 2]), ev(1, SetPolicyBody(pol(172800, ws3("https://evil"))), [], [2]),
+                            ev(2, RotateRecoveryBody, [rep(222, 32)], [2]), ev(3, SetPolicyBody(p), [], [1, 2])];
+    expect(pending_line(es, parties(), p, pe(1, false))).toEqual(
+        "1 " + hex_encode(rep(17, 32)) + " 5000 not-confirmable set-policy: recovery delay 86400 s -> 172800 s, witnesses "
+        + "[https://w1#abababab https://w2#bbbbbbbb https://w3#cccccccc] -> [https://w1#abababab https://w2#bbbbbbbb https://evil#cccccccc]; signed by \"laptop\" (one device alone: if that was not you, veto it)");
+    expect(pending_line(es, parties(), p, pe(2, true))).toEqual(
+        "2 " + hex_encode(rep(18, 32)) + " 5000 confirmable rotate-recovery: a new kit, id dededededededede; signed by \"laptop\" (one device alone: if that was not you, veto it)");
+    expect(event_what(es[3].payload, parties(), p)).toEqual("set-policy: no change");
+}

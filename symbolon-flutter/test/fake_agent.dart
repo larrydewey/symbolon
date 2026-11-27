@@ -252,6 +252,8 @@ recovery-request 00112233445566778899aabbccddeeff %s 1800000000
         echo "NEW RECOVERY KIT (write it down; it is shown once): 01120301abababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab"
         echo "kit replaced: the new kit is the quorum's; every sheet of the old kit is useless now." ;;
     esac ;;
+  "device pending")
+    [ -f "$D/pending-on" ] && echo '4 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef 1796170000 confirmable remove-party "laptop" (id 0202020202020202); signed by "phone" (one device alone: if that was not you, veto it)' ;;
   *) echo "device: unknown command" >&2; exit 2 ;;
 esac
 ''');

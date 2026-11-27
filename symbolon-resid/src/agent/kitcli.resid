@@ -191,8 +191,15 @@ Int new_kit(Str dir, DeviceConfig c, Unlocked u, VerifiedHead vh, Str pin, Str p
     if (!filesystem.write_all(dir + "/kit-next", next_kit_line(nk))) { return dfail("cannot store DIR/kit-next"); }
     return match publish_event(c, p, enc, [EventSig {.signer = c.party, .sig = sig}]) {
         Err(m) => dfail("rotate-recovery: " + m),
-        Ok(_) => rotated(dir, c, u, pin, primes_file, sheet)
+        Ok(_) => rotated(dir, c, u, pin, primes_file, sheet, recovery_key_digest(k.sign_pub))
     };
+}
+
+// The new kit's id (R5-6): `device pending` and the app's Approve dialog
+// show it on the replacement, so the person approves only their own.
+pub Str new_kit_id_note(List(Int) kit_id) {
+    Str h = hex_encode(kit_id);
+    return "new kit id " + str_slice(h, 0, 16) + " (the kit replacement shows it in `symbolon device pending` and the app: approve only a replacement with this id)";
 }
 
 // What the principal must do between the replacement and the re-share
@@ -206,9 +213,10 @@ pub Str rotation_window_note(Str dir) {
 }
 
 @requires(filesystem, network, device, declassify, clock, provision, environment)
-Int rotated(Str dir, DeviceConfig c, Unlocked u, Str pin, Str primes_file, List(Int) sheet) {
+Int rotated(Str dir, DeviceConfig c, Unlocked u, Str pin, Str primes_file, List(Int) sheet, List(Int) kit_id) {
     println("NEW RECOVERY KIT (write it down; it is shown once): " + kit_sheet_text(sheet));
     println(kit_sheet_note(sheet));
+    println(new_kit_id_note(kit_id));
     println("It replaces the old kit once the replacement is in force and the quorum has re-shared to it: then every old sheet, with or without a passphrase, is useless.");
     println(rotation_window_note(dir));
     return renew_step(dir, c, u, pin, primes_file, false);

@@ -549,6 +549,23 @@ void main() {
     expect(t.getTopLeft(find.byKey(const Key('recovery-pending'))).dy, lessThan(t.getTopLeft(find.text('Recover on a new device')).dy));
   });
 
+  testWidgets('approving a pending change shows what it does and the digest the approval signs (R5-6)', (t) async {
+    File('${agent.dir.path}/pending-on').writeAsStringSync('');
+    await start(t);
+    await t.tap(find.byKey(const Key('review-recovery')));
+    await t.pump(const Duration(milliseconds: 500));
+    await settle(t);
+    await t.ensureVisible(find.byKey(const Key('approve-4')));
+    await t.tap(find.byKey(const Key('approve-4')));
+    await t.pumpAndSettle();
+    expect(find.textContaining('remove-party "laptop" (id 0202020202020202)'), findsWidgets);
+    expect(find.byKey(const Key('approve-alone')), findsOneWidget);
+    expect((t.widget(find.byKey(const Key('approve-digest'))) as SelectableText).data, '0123456789abcdef' * 4);
+    await t.tap(find.text('Cancel'));
+    await t.pumpAndSettle();
+    expect(agent.argsLog.readAsStringSync(), isNot(contains('device confirm')));
+  });
+
   testWidgets('setup ends with the recovery sheet, checked from paper with the sheet out of sight', (t) async {
     await start(t);
     await t.tap(find.text('More').last);
