@@ -1,0 +1,221 @@
+// What the witnesses co-signed past the relay's log (R5-1): a relay that
+// works with whoever holds the kit cannot keep a recovery from the devices
+// nor a veto from the witnesses. The witnesses are called as their HTTP
+// handler (agent/witnesssrv.resid) over fresh directories under target/;
+// the device's side is common.resid (log_seen's parts) and enroll.resid
+// (publish_own's base: the log the device verified, not the relay's).
+
+import "../types.resid";
+import "../core/log.resid";
+import "../core/event.resid";
+import "../core/event_decode.resid";
+import "../net/services.resid";
+import "state.resid";
+import "common.resid";
+import "witnesssrv.resid";
+import "httpserv.resid";
+import "hash.resid";
+import "ecdsa.resid";
+import "crypto.resid";
+import "random.resid";
+
+List(Int) priv(Int n) { return [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, n]; }
+List(Int) pubk(Int n) { return ec_public_key(P256, priv(n)); }
+List(Int) sign(Int n, List(Int) msg) { return ecdsa_raw_of(P256, ecdsa_sign_digest(P256, Sha256, priv(n), hash_bytes(Sha256, msg))); }
+List(Int) id32(Int n) { return sha256_bytes(pubk(n)); }
+
+Party dev_party(Int n) {
+    return Party {.id = id32(n), .kind = party_kind_device(), .auth_key = pubk(n), .hpke_key = pubk(n), .label = "d", .attestation = NoAttestation};
+}
+
+List(EventSig) sigs(List(Int) who, List(Int) msg, Int i, List(EventSig) acc) {
+    if (i >= who.len()) { return acc; }
+    List(Int) signer = if (who[i] == 20) { sha256_bytes(pubk(20)) } else { id32(who[i]) };
+    return sigs(who, msg, i + 1, acc.concat([EventSig {.signer = signer, .sig = sign(who[i], msg)}]));
+}
+
+StoredEvent ev(EventPayload p, List(Int) who) {
+    List(Int) enc = payload_cbor(p) else { [] };
+    return StoredEvent {.encoded = enc, .sigs = sigs(who, enc, 0, []), .cosigs = []};
+}
+
+List(Int) dig(StoredEvent e) { return sha256_bytes(e.encoded); }
+
+EventPayload after(List(Int) l, UInt(64) seq, StoredEvent prev, EventBody b, List(List(Int)) field6) {
+    return EventPayload {.log_id = Some(l), .sequence = seq, .predecessor_digest = Some(dig(prev)), .suite = 1, .body = b,
+                         .next_recovery_key_digests = field6, .advisory_time = 0};
+}
+
+EventBody kit_recover(Int dev) {
+    return RecoverBody(RecoverBodyInner {.path = recover_path_kit(), .new_parties = [dev_party(dev)], .revealed_recovery_key = Some(pubk(20)), .guardian_approvals = []});
+}
+
+HttpRequest post(Str path, List(Int) body) {
+    Map(Str, Str) none = {};
+    return HttpRequest {.method = "POST", .target = path, .path = path, .query = "", .version = "HTTP/1.1", .headers = none, .body = body, .keep_alive = false, .ok = true, .status = 0};
+}
+
+List(List(Int)) raws(List(StoredEvent) es, Int i, List(List(Int)) acc) {
+    if (i >= es.len()) { return acc; }
+    return raws(es, i + 1, acc.concat([cbor_of_event(es[i])]));
+}
+
+StoredEvent with_cosigs(StoredEvent e, List(WitnessCosignature) cs) { return StoredEvent {.encoded = e.encoded, .sigs = e.sigs, .cosigs = cs}; }
+
+List(SignedEvent) signed_all(List(StoredEvent) xs, Int i, List(SignedEvent) acc) {
+    if (i >= xs.len()) { return acc; }
+    Option(SignedEvent) o = signed_of(xs[i]);
+    return signed_all(xs, i + 1, match o { Some(x) => acc.concat([x]), None => acc });
+}
+
+@requires(filesystem, clock(readonly), declassify)
+Str fresh_root() {
+    Str root = "target/witness-test-" + hex_encode(random_bytes(8));
+    _ = filesystem.create_dir("target");
+    _ = filesystem.create_dir(root);
+    return root;
+}
+
+// A sequenced log (relay key 30, "relay:1"), devices 2 and 3, the kit (key
+// 20) in field 6, witnesses 7, 8 and 11.
+WitnessRef relay_ref() { return WitnessRef {.url = "relay:1", .key = pubk(30)}; }
+
+EventPayload e0_seq() {
+    Quorum q = Quorum {.parties = [dev_party(2), dev_party(3)], .t = 2, .root_pubkey = pubk(9), .epoch = 0, .transcript_digest = id32(99), .kv_commits = []};
+    Policy p = Policy {.device_sigs_for_authority = 2, .recovery_delay_sec = 86400, .guardians = [], .guardian_threshold = 0,
+                       .witnesses = [WitnessRef {.url = "w1", .key = pubk(7)}, WitnessRef {.url = "w2", .key = pubk(8)}, WitnessRef {.url = "w3", .key = pubk(11)}],
+                       .duress_window_sec = 3600, .sequencer = [relay_ref()], .cosigner_policy = NoCosignerPolicy};
+    return EventPayload {.log_id = None, .sequence = 0, .predecessor_digest = None, .suite = 1, .body = InceptionBody(q, p),
+                         .next_recovery_key_digests = [sha256_bytes(pubk(20))], .advisory_time = 0};
+}
+
+RelayClaim claim_by(Int k, Str name, List(Int) l, Int n, List(Int) d) {
+    return RelayClaim {.time = 1000, .sig = sign(k, claim_message(name, l, n, d, 1000))};
+}
+
+@requires(filesystem, clock(readonly), declassify)
+HttpReply ask_raw(Str root, Int wk, List(Int) l, List(List(Int)) shown, Option(RelayClaim) c) {
+    return witness_handle(root, secret_bytes(priv(wk)), 0, post("/cosign", cosign_request_claimed(l, shown, c)));
+}
+
+StoredEvent e0_done(StoredEvent e0, List(Int) l) {
+    List(Int) d = dig(e0);
+    return with_cosigs(e0, [WitnessCosignature {.log_id = l, .sequence = 0, .digest = d, .witness_key = pubk(7), .signature = sign(7, witness_message(l, 0, d)), .witness_time = 1000},
+                            WitnessCosignature {.log_id = l, .sequence = 0, .digest = d, .witness_key = pubk(8), .signature = sign(8, witness_message(l, 0, d)), .witness_time = 1000}]);
+}
+
+@requires(filesystem, clock(readonly), declassify)
+Option(WitnessHead) head_at(Str root, Int wk, List(Int) l) {
+    List(Int) nonce = random_bytes(32);
+    return head_answer(witness_handle(root, secret_bytes(priv(wk)), 0, post("/head", nonce.concat(l))).body, pubk(wk), l, nonce);
+}
+
+// What witness `wk` (over `root`) co-signed at `seq`, checked under key
+// `as_key`.
+@requires(filesystem, clock(readonly), declassify)
+Option(WitEvent) event_at(Str root, Int wk, Int as_key, List(Int) l, Int seq) {
+    return event_answer(witness_handle(root, secret_bytes(priv(wk)), 0, post("/event", event_query(l, seq))).body, pubk(as_key), l, seq);
+}
+
+Bool some_ev(Option(WitEvent) o) { return match o { Some(_) => true, None => false }; }
+
+// The log the three witnesses hold: E0, then the kit's recover at 1,
+// claimed by the relay and co-signed by all three; the relay serves E0
+// alone.
+type Setup = { Str w1; Str w2; Str w3; List(Int) l; StoredEvent e0c; StoredEvent r1; };
+
+@requires(filesystem, clock(readonly), declassify)
+Setup hidden_recovery() {
+    Str w1 = fresh_root();
+    Str w2 = fresh_root();
+    Str w3 = fresh_root();
+    StoredEvent e0 = ev(e0_seq(), [2, 3]);
+    List(Int) l = dig(e0);
+    StoredEvent e0c = e0_done(e0, l);
+    StoredEvent r1 = ev(after(l, 1, e0, kit_recover(4), [id32(51)]), [20]);
+    Option(RelayClaim) c1 = Some(claim_by(30, "relay:1", l, 1, dig(r1)));
+    _ = ask_raw(w1, 7, l, raws([e0c, r1], 0, []), c1);
+    _ = ask_raw(w2, 8, l, raws([e0c, r1], 0, []), c1);
+    _ = ask_raw(w3, 11, l, raws([e0c, r1], 0, []), c1);
+    return Setup {.w1 = w1, .w2 = w2, .w3 = w3, .l = l, .e0c = e0c, .r1 = r1};
+}
+
+@requires(filesystem, clock(readonly), declassify)
+List(Option(WitEvent)) events_at(Setup s, Int seq) {
+    return [event_at(s.w1, 7, 7, s.l, seq), event_at(s.w2, 8, 8, s.l, seq), event_at(s.w3, 11, 11, s.l, seq)];
+}
+
+Int pending_n(Result(LogView, SymbolonError) r) { return match r { Ok(v) => v.vh.pending.len(), Err(_) => -1 }; }
+Int head_n(Result(LogView, SymbolonError) r) { return match r { Ok(v) => (Int)v.vh.head.sequence, Err(_) => -1 }; }
+
+LogView relay_view(List(Int) l, List(SignedEvent) es) {
+    Result(VerifiedHead, SymbolonError) r = il_verify(l, es, 1000, lambda(x) { false });
+    VerifiedHead vh = match r { Ok(x) => x, Err(_) => VerifiedHead {.head = LogHead {.log_id = [], .sequence = 0, .digest = [], .quorum = Quorum {.parties = [], .t = 1, .root_pubkey = [], .epoch = 0, .transcript_digest = [], .kv_commits = []}, .policy = e0_policy()}, .witness_cosigs = [], .pending = []} };
+    return LogView {.vh = vh, .events = es};
+}
+
+Policy e0_policy() { EventBody b = e0_seq().body; return match b { InceptionBody(_, p) => p, _ => Policy {.device_sigs_for_authority = 0, .recovery_delay_sec = 0, .guardians = [], .guardian_threshold = 0, .witnesses = [], .duress_window_sec = 0, .sequencer = [], .cosigner_policy = NoCosignerPolicy} }; }
+
+@requires(filesystem, clock(readonly), declassify)
+test "a device finds the witnesses past the relay's log, and takes the kit's recovery the relay hides from them (R5-1)" {
+    Setup s = hidden_recovery();
+    // The relay serves E0 alone; the witnesses' heads are at 1.
+    List(SignedEvent) served = signed_all([s.e0c], 0, []);
+    List(Option(WitnessHead)) hs = [head_at(s.w1, 7, s.l), head_at(s.w2, 8, s.l), head_at(s.w3, 11, s.l)];
+    expect(top_head(hs, 0, -1)).toEqual(1);
+    expect(top_head(hs, 0, -1) >= served.len()).toBeTrue();
+    // Each witness shows what it co-signed at 1, under its own key only.
+    List(Option(WitEvent)) at1 = events_at(s, 1);
+    expect(some_ev(at1[0]) && some_ev(at1[1]) && some_ev(at1[2])).toBeTrue();
+    expect(some_ev(event_at(s.w1, 7, 8, s.l, 1))).toBeFalse();
+    expect(some_ev(event_at(s.w1, 7, 7, s.l, 2))).toBeFalse();
+    expect(some_ev(event_at(s.w1, 7, 7, id32(1), 1))).toBeFalse();
+    expect(witness_handle(s.w1, secret_bytes(priv(7)), 0, post("/event", s.l)).status).toEqual(400);
+    // A majority co-signed it: taken, with their co-signatures, and the
+    // log with it verifies; the kit's recovery is pending, so the device
+    // shows it (`device pending`) and can veto it.
+    Option(SignedEvent) got = witnessed_at(at1, 3, 0);
+    SignedEvent r1w = got else { served[0] };
+    expect(hex_encode(sha256_bytes(r1w.encoded))).toEqual(hex_encode(dig(s.r1)));
+    expect(r1w.cosigs.len()).toEqual(3);
+    Result(LogView, SymbolonError) x = extended_view(s.l, relay_view(s.l, served), [r1w], 0);
+    expect(head_n(x)).toEqual(1);
+    expect(pending_n(x)).toEqual(1);
+    // One witness alone is not a majority: nothing is taken.
+    expect(match witnessed_at([at1[0], None, None], 3, 0) { Some(_) => true, None => false }).toBeFalse();
+}
+
+@requires(filesystem, clock(readonly), declassify)
+test "a device's veto is published from the log it verified, whatever log the relay serves; a veto that reached one witness reaches the cosigner from it (R5-1)" {
+    Setup s = hidden_recovery();
+    List(SignedEvent) served = signed_all([s.e0c], 0, []);
+    SignedEvent r1w = witnessed_at(events_at(s, 1), 3, 0) else { served[0] };
+    List(SignedEvent) mine = served.concat([r1w]);
+    StoredEvent veto = ev(after(s.l, 2, s.r1, VetoBody(1), [sha256_bytes(pubk(20))]), [2]);
+    // Shown after the relay's short log, the veto is no next event: what
+    // the device sent before R5-1 (its GET /log), refused.
+    expect(ask_raw(s.w1, 7, s.l, raws([s.e0c], 0, []).concat([cbor_of_event(veto)]), None).status).toEqual(400);
+    // After the log the device verified (publish_own's base), without the
+    // relay's claim: co-signed by the first witness.
+    List(List(Int)) base = raw_events(mine, 0, []);
+    expect(base.len()).toEqual(2);
+    expect(ask_raw(s.w1, 7, s.l, base.concat([cbor_of_event(veto)]), None).status).toEqual(200);
+    // Only that witness holds it so far: the cosigner, asking the witnesses
+    // at the log's next sequence, finds it there with no majority (loose),
+    // takes it as a veto sent to it, and publishes it to the others.
+    List(Option(WitEvent)) at2 = events_at(s, 2);
+    expect(match witnessed_at(at2, 3, 0) { Some(_) => true, None => false }).toBeFalse();
+    List(SignedEvent) loose = loose_at(at2, 0, []);
+    expect(loose.len()).toEqual(1);
+    expect(hex_encode(sha256_bytes(loose[0].encoded))).toEqual(hex_encode(dig(veto)));
+    List(List(Int)) again = base.concat([cbor_of_event(StoredEvent {.encoded = loose[0].encoded, .sigs = loose[0].sigs, .cosigs = []})]);
+    expect(ask_raw(s.w2, 8, s.l, again, None).status).toEqual(200);
+    expect(ask_raw(s.w3, 11, s.l, again, None).status).toEqual(200);
+    // Now a majority holds it: every device takes it from the witnesses,
+    // and the recovery is vetoed in the log they verify.
+    SignedEvent vw = witnessed_at(events_at(s, 2), 3, 0) else { served[0] };
+    Result(LogView, SymbolonError) x = extended_view(s.l, relay_view(s.l, served), [r1w, vw], 0);
+    expect(head_n(x)).toEqual(2);
+    expect(pending_n(x)).toEqual(0);
+    expect(match x { Ok(v) => v.vh.head.quorum.parties.len() == 2, Err(_) => false }).toBeTrue();
+}

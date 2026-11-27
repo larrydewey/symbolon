@@ -996,7 +996,7 @@ pub Int device_status(Str dir) {
     if (security_update_due(dir)) { println("security-update due"); eprintln(security_update_reminder(dir)); }
     return match oc {
         None => dfail("not set up"),
-        Some(c) => status_of(c)
+        Some(c) => status_of(dir, c)
     };
 }
 
@@ -1055,17 +1055,28 @@ Int evict_all(List(Int) hs, Int i, Int n) {
     return evict_all(hs, i + 1, match r { Ok(_) => n + 1, Err(_) => n });
 }
 
-@requires(network, clock(readonly), declassify)
-Int status_of(DeviceConfig c) {
+// The log as this device verified it, held against the witnesses (R5-1,
+// SPEC 13.4 "Notification"): the head and pending count include what a
+// majority of the witnesses co-signed past the relay's log, and a line
+// "hidden N" (with an ALARM on standard error) says the relay does not
+// serve N of those events.
+@requires(filesystem, network, clock(readonly), declassify)
+Int status_of(Str dir, DeviceConfig c) {
     println("party " + hex_encode(c.party));
     println(if (c.unprotected) { "profile UNPROTECTED (no TPM: the PIN alone protects this device, SPEC 9.1)" } else { if (on_keystore(c)) { "profile KEYSTORE (the Android Keystore holds the unlock keys and the device key)" } else { "profile TPM" } });
     if (c.log_id.len() == 0) { println("log none (run `symbolon device init`)"); return 0; }
     println("log " + hex_encode(c.log_id));
-    Result(VerifiedHead, SymbolonError) v = verified_log(relay_ep(c), c.log_id);
+    Result(WitnessedView, SymbolonError) v = log_seen(dir, relay_ep(c), c.log_id, "");
     return match v {
         Err(e) => dfail("log does not verify: " + err_text(e)),
-        Ok(vh) => print_head(vh)
+        Ok(s) => print_seen(s)
     };
+}
+
+Int print_seen(WitnessedView s) {
+    _ = print_head(s.view.vh);
+    if (s.hidden > 0) { println(f"hidden {s.hidden} event(s) the witnesses co-signed and the relay does not serve: the relay may be hiding them (check `device pending`)"); }
+    return 0;
 }
 
 Int print_head(VerifiedHead vh) {

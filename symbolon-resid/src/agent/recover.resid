@@ -122,41 +122,57 @@ Int veto_with(Str dir, DeviceConfig c, Str pin) {
     Unlocked u = unlock_dir(dir, c, pin);
     if (u.kind == 2) { return dfail(duress_refusal(dir, c)); }
     if (u.kind != 1) { return dfail("wrong PIN"); }
-    Result(VerifiedHead, SymbolonError) rv = verified_log(relay_ep(c), c.log_id);
+    // The log as this device verified it, held against the witnesses
+    // (R5-1): a recovery the relay hides from the devices is taken from the
+    // witnesses that co-signed it, and vetoed.
+    Result(WitnessedView, SymbolonError) rv = log_seen_any(dir, relay_ep(c), c.log_id, "");
     return match rv {
         Err(e) => dfail(err_text(e)),
-        Ok(vh) => if (vh.pending.len() == 0) { dfail("nothing is pending") } else { veto_target(dir, c, u, vh, vh.pending[vh.pending.len() - 1], pin) }
+        Ok(s) => if (s.view.vh.pending.len() == 0) { dfail("nothing is pending") } else { veto_target(dir, c, u, s.view, s.view.vh.pending[s.view.vh.pending.len() - 1], pin) }
     };
 }
 
 // A veto carries advisory time 0 (R3P-3): every device's veto of one
 // target at one sequence is then the same event, which the witnesses
 // co-sign without the relay's claim when it vetoes what the kit filed
-// (core/log.resid il_claimless). It also goes straight to the cosigner's
-// mailbox, so that a relay that keeps it out of the log cannot have the
-// kit's half released while the cosigner holds it (cosignerd.resid
-// on_veto).
+// (core/log.resid il_claimless). It is made after the log `v` this device
+// verified (its kept copy, the relay's events and what the witnesses
+// co-signed past them), and published from it to the witnesses, never
+// after the relay's answer to GET /log (R5-1). It also goes to the
+// cosigner's mailbox (cosignerd.resid on_veto); the cosigner takes it as
+// well from a witness that co-signed it (cosignerd.resid witness_watch).
 @requires(filesystem, network, device, declassify, clock, environment)
-Int veto_target(Str dir, DeviceConfig c, Unlocked u, VerifiedHead vh, UInt(64) target, Str pin) {
-    List(SignedEvent) es = fetch_log(relay_ep(c), c.log_id, 0, []);
+Int veto_target(Str dir, DeviceConfig c, Unlocked u, LogView v, UInt(64) target, Str pin) {
+    VerifiedHead vh = v.vh;
+    List(SignedEvent) es = v.events;
     EventPayload p = EventPayload {.log_id = Some(vh.head.log_id), .sequence = vh.head.sequence + 1, .predecessor_digest = Some(vh.head.digest),
                                    .suite = 1, .body = VetoBody(target), .next_recovery_key_digests = field6_in_force(es, vh.pending, es.len() - 1), .advisory_time = (UInt(64))0};
     List(Int) enc = payload_cbor(p) else { [] };
     Result(List(Int), Str) s = dk_sign(c, u.real, u.st, enc);
     return match s {
         Err(m) => dfail(m),
-        Ok(sig) => veto_publish(dir, c, u, vh.head.quorum.parties, p, enc, [EventSig {.signer = c.party, .sig = sig}], target)
+        Ok(sig) => veto_publish(dir, c, u, vh.head.quorum.parties, es, p, enc, [EventSig {.signer = c.party, .sig = sig}], target)
     };
 }
 
 @requires(filesystem, network, device, declassify, clock, environment)
-Int veto_publish(Str dir, DeviceConfig c, Unlocked u, List(Party) ps, EventPayload p, List(Int) enc, List(EventSig) sigs, UInt(64) target) {
+Int veto_publish(Str dir, DeviceConfig c, Unlocked u, List(Party) ps, List(SignedEvent) before, EventPayload p, List(Int) enc, List(EventSig) sigs, UInt(64) target) {
     Bool told = veto_to_cosigner(dir, c, u, ps, cbor_of_event(StoredEvent {.encoded = enc, .sigs = sigs, .cosigs = []}));
     if (!told) { eprintln("veto: could not leave the veto in the cosigner's mailbox"); }
-    return match publish_event(c, p, enc, sigs) {
-        Err(m) => dfail("veto: " + m + if (told) { " (the cosigner holds the veto and releases nothing for that recovery)" } else { "" }),
+    return match publish_own(c, before, p, enc, sigs) {
+        Err(m) => dfail("veto: " + m + veto_left(told)),
         Ok(vh2) => veto_done(target, vh2)
     };
+}
+
+// What a veto the witnesses did not co-sign yet still does (R5-1): the
+// cosigner keeps a copy that reached it while the recovery was pending,
+// publishes it to the witnesses itself, and releases nothing for that
+// recovery until the witnesses settle another event at the veto's
+// sequence. The copy goes through the relay's mailbox, which a relay can
+// drop, so the device should try again.
+Str veto_left(Bool told) {
+    return if (told) { " (a copy went to the cosigner's mailbox at the relay: if it arrives while the recovery is pending, the cosigner publishes it and releases nothing for that recovery until the witnesses settle another event at its sequence; try again)" } else { " (try again)" };
 }
 
 @requires(filesystem, network, device, declassify, clock, environment)
@@ -182,32 +198,36 @@ pub Int device_kit_escape(Str dir, Str seed_hex) {
         None => dfail("not set up"),
         Some(c) => match ok {
             None => dfail("that is not a kit seed"),
-            Some(kit) => kit_escape_with(c, kit)
+            Some(kit) => kit_escape_with(dir, c, kit)
         }
     };
 }
 
+// From the log as this device verified it, held against the witnesses, as
+// a veto (R5-1): the escape is what a relay that is gone or works with
+// whoever holds the kit must not hold back.
 @requires(filesystem, network, device, declassify, clock)
-Int kit_escape_with(DeviceConfig c, KitKeys kit) {
-    Result(VerifiedHead, SymbolonError) rv = verified_log(relay_ep(c), c.log_id);
+Int kit_escape_with(Str dir, DeviceConfig c, KitKeys kit) {
+    Result(WitnessedView, SymbolonError) rv = log_seen_any(dir, relay_ep(c), c.log_id, "");
     return match rv {
         Err(e) => dfail(err_text(e)),
-        Ok(vh) => kit_escape_at(c, kit, vh)
+        Ok(s) => kit_escape_at(c, kit, s.view)
     };
 }
 
 @requires(filesystem, network, device, declassify, clock)
-Int kit_escape_at(DeviceConfig c, KitKeys kit, VerifiedHead vh) {
+Int kit_escape_at(DeviceConfig c, KitKeys kit, LogView v) {
+    VerifiedHead vh = v.vh;
     Policy p0 = vh.head.policy;
     if (p0.sequencer.len() == 0) { println("the log's policy names no sequencing relay"); return 0; }
     Policy np = Policy {.device_sigs_for_authority = p0.device_sigs_for_authority, .recovery_delay_sec = p0.recovery_delay_sec, .guardians = p0.guardians,
                         .guardian_threshold = p0.guardian_threshold, .witnesses = p0.witnesses, .duress_window_sec = p0.duress_window_sec,
                         .sequencer = [], .cosigner_policy = p0.cosigner_policy};
-    List(SignedEvent) es = fetch_log(relay_ep(c), c.log_id, 0, []);
+    List(SignedEvent) es = v.events;
     EventPayload p = next_event(vh, SetPolicyBody(np), field6_in_force(es, vh.pending, es.len() - 1));
     List(Int) enc = payload_cbor(p) else { [] };
     if (enc.len() == 0) { return dfail("the policy does not encode"); }
-    return match publish_event(c, p, enc, [event_sig(recovery_key_digest(kit.sign_pub), kit.sign_priv, enc)]) {
+    return match publish_own(c, es, p, enc, [event_sig(recovery_key_digest(kit.sign_pub), kit.sign_priv, enc)]) {
         Err(m) => dfail("kit-escape: " + m),
         Ok(vh2) => kit_escaped(vh2)
     };
@@ -283,21 +303,25 @@ Str pending_line(List(SignedEvent) es, List(Party) ps, PendingEvent p) {
 // time it takes effect at unless vetoed, and whether devices may confirm
 // it (a recover, the kit's set-policy or a weakening set-policy may only
 // be vetoed or left to run).
+//
+// The log is the one this device verified, held against the witnesses
+// (R5-1): an event the relay hides (a recovery the kit filed) is taken
+// from the witnesses that co-signed it, listed, and reported (ALARM).
 @requires(filesystem, network, clock(readonly), declassify)
 pub Int device_pending(Str dir) {
     Option(DeviceConfig) oc = load_config(dir);
     return match oc {
         None => dfail("not set up"),
-        Some(c) => match verified_log(relay_ep(c), c.log_id) {
+        Some(c) => match log_seen_any(dir, relay_ep(c), c.log_id, "") {
             Err(e) => dfail(err_text(e)),
-            Ok(vh) => pending_list(c, vh)
+            Ok(s) => pending_list(c, s.view)
         }
     };
 }
 
-@requires(network, clock(readonly), declassify)
-Int pending_list(DeviceConfig c, VerifiedHead vh) {
-    List(SignedEvent) es = fetch_log(relay_ep(c), c.log_id, 0, []);
+Int pending_list(DeviceConfig c, LogView v) {
+    VerifiedHead vh = v.vh;
+    List(SignedEvent) es = v.events;
     List(PendingEvent) pe = pend_live(il_pending_events(c.log_id, es, 0, lambda(x) { false }), vh.pending, 0, []);
     if (pe.len() == 0) { println("nothing is pending"); return 0; }
     pend_print(es, vh.head.quorum.parties, pe, 0);

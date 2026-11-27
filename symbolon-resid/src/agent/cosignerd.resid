@@ -310,6 +310,10 @@ Int serve_once(Cosigner c0, List(List(UInt(64))) primes, List(List(UInt(64))) pr
     // Duress alerts (SPEC 14.4): a window that ran out, the queue, and
     // alerts other people's cosigners left for this person.
     _ = check_window(hc);
+    // Once per child (a minute): the log held against the witnesses, for
+    // events the relay hides and vetoes that reached only the witnesses
+    // (R5-1).
+    _ = if (n == 0) { witness_watch(hc) } else { 0 };
     // Held vetoes not in the log yet, published (R4-2).
     _ = spread_held(hc);
     _ = send_queued(hc.dir, relay);
@@ -522,6 +526,20 @@ Bool quorum_device(Result(VerifiedHead, SymbolonError) rv, List(Int) p) {
 Result(LogView, SymbolonError) cos_view(Cosigner c) {
     Result(LogView, SymbolonError) r = log_view_dir(c.dir, relay_of(c.cfg), c.cfg.log_id, local_host(c.dir));
     return match r { Err(e) => Err(e), Ok(v) => head_seen(c, v) };
+}
+
+// As cos_view, held against the witnesses, and when the relay does not
+// answer or serves no log that extends the kept copy, from the kept copy
+// alone (common.resid log_seen_any, R5-1): what the cosigner takes a veto
+// against and publishes it from, so that the relay's answer to GET /log
+// cannot keep a veto from it or from the witnesses.
+@requires(network, filesystem, clock(readonly), declassify)
+Result(WitnessedView, SymbolonError) cos_seen_any(Cosigner c) {
+    Result(WitnessedView, SymbolonError) r = log_seen_any(c.dir, relay_of(c.cfg), c.cfg.log_id, local_host(c.dir));
+    return match r {
+        Err(e) => Err(e),
+        Ok(s) => match head_seen(c, s.view) { Err(e) => Err(e), Ok(_) => Ok(s) }
+    };
 }
 
 @requires(network, filesystem, clock(readonly), declassify)
@@ -1140,10 +1158,13 @@ Cosigner veto_keep(Cosigner c, SignedEvent v, List(Int) raw) {
     if (target < 1) { return cos_fail(c, "not a veto"); }
     Str f = c.dir + "/veto-" + f"{target}-{v.payload.sequence}";
     if (filesystem.exists(f)) { return c; }
-    Result(LogView, SymbolonError) rv = cos_view(c);
+    // Checked against the log as the cosigner verified it, held against
+    // the witnesses (R5-1), never the relay's answer alone: a relay that
+    // hides the recovery from the cosigner cannot have the veto refused.
+    Result(WitnessedView, SymbolonError) rv = cos_seen_any(c);
     return match rv {
         Err(_) => cos_fail(c, "a veto arrived and the log does not verify"),
-        Ok(lv) => veto_check(c, lv, v, raw, f)
+        Ok(s) => veto_check(c, s.view, v, raw, f)
     };
 }
 
@@ -1178,8 +1199,8 @@ Int spread_held(Cosigner c) {
     if (c.cfg.log_id.len() == 0) { return 0; }
     List(HeldVeto) todo = held_open(c.dir, held_vetoes(c.dir), 0, []);
     if (todo.len() == 0) { return 0; }
-    Result(LogView, SymbolonError) rv = cos_view(c);
-    return match rv { Err(_) => 0, Ok(v) => spread_each(c, v, todo, 0) };
+    Result(WitnessedView, SymbolonError) rv = cos_seen_any(c);
+    return match rv { Err(_) => 0, Ok(s) => spread_each(c, s.view, todo, 0) };
 }
 
 Str spread_mark(Str dir, SignedEvent v) { return dir + "/spread-" + f"{target_of(v)}-{v.payload.sequence}"; }
@@ -1195,32 +1216,90 @@ List(HeldVeto) held_open(Str dir, List(HeldVeto) hs, Int i, List(HeldVeto) acc) 
 Int spread_each(Cosigner c, LogView v, List(HeldVeto) hs, Int i) {
     if (i >= hs.len()) { return 0; }
     Bool live = held_veto_live(c.cfg.log_id, v.events, v.vh.pending, hs[i]);
-    _ = if (live) { veto_spread(c, hs[i].veto) } else { filesystem.write_all(spread_mark(c.dir, hs[i].veto), "done\n") };
+    _ = if (live) { veto_spread(c, v, hs[i].veto) } else { filesystem.write_all(spread_mark(c.dir, hs[i].veto), "done\n") };
     return spread_each(c, v, hs, i + 1);
 }
 
-// One attempt to put the veto `v` in the log as its next event; whether
-// it is stored there now.
+// One attempt to put the veto `v` in the log `lv` as its next event;
+// whether it is stored there now. `lv` is the log as the cosigner verified
+// it, held against the witnesses (cos_seen_any), never the relay's answer
+// to GET /log (R5-1): a relay that serves a short log or an error cannot
+// keep the veto from the witnesses, who co-sign it without its claim.
 @requires(network, filesystem, clock(readonly), declassify)
-Bool veto_spread(Cosigner c, SignedEvent v) {
+Bool veto_spread(Cosigner c, LogView lv, SignedEvent v) {
     Endpoint relay = relay_of(c.cfg);
     List(Int) l = c.cfg.log_id;
-    List(List(Int)) before = log_raw(relay, l);
+    List(List(Int)) before = raw_events(lv.events, 0, []);
     UInt(64) seq = v.payload.sequence;
     if (before.len() != (Int)seq) { return false; }
     List(Int) bare = cbor_of_event(StoredEvent {.encoded = v.encoded, .sigs = v.sigs, .cosigs = []});
     List(Int) d = sha256_bytes(v.encoded);
     ClaimOut co = claim_post(relay, l, seq, bare);
     Option(RelayClaim) cl = if (co.status == 200) { co.claim } else { None };
-    List(WitnessRef) ws = witnesses_at(il_witnesses(l, events_of_raw(before, 0, [])), local_host(c.dir));
+    List(WitnessRef) ws = witnesses_at(il_witnesses(l, lv.events), local_host(c.dir));
     List(WitnessCosignature) cs = cosign_refs(ws, c.cfg.ca, l, seq, d, before.concat([bare]), cl, 0, []);
     if (cs.len() * 2 <= ws.len() || cs.len() < 2) {
         eprintln(f"cosigner: the veto it holds of event {target_of(v)} is not co-signed by a majority of the witnesses yet; trying again");
         return false;
     }
     Bool put = log_put(relay, l, seq, cbor_of_event(StoredEvent {.encoded = v.encoded, .sigs = v.sigs, .cosigs = cs}));
-    println(f"cosigner: published the veto it holds of event {target_of(v)} at sequence {seq}" + if (put) { "" } else { " (witnessed; the relay did not store it)" });
-    return put;
+    println(f"cosigner: published the veto it holds of event {target_of(v)} at sequence {seq}" + if (put) { "" } else { " (witnessed; the relay did not store it, the witnesses show it)" });
+    // Witnessed by a majority is in the log, whatever the relay does: the
+    // witnesses show it to every device and to the cosigner (log_seen).
+    return true;
+}
+
+// ─── The log held against the witnesses (R5-1) ──────────────────
+// Once a minute (serve_once): the cosigner asks the witnesses how far they
+// co-signed its person's log (common.resid log_seen_any). Events a
+// majority co-signed that the relay does not serve are taken from the
+// witnesses, given to the relay, and reported: an ALARM on standard error
+// and, once per sequence, the person's alerts (alerts.resid queue_alert,
+// DIR/hidden-<seq>). A veto that some witness co-signed at the log's next
+// sequence and no majority holds yet (it reached too few witnesses) is
+// taken from that witness and kept like one sent here directly
+// (veto_check: valid at witness time now, signed by a device of the
+// quorum), then published to the other witnesses (spread_held): the veto
+// reaches the cosigner by a route that avoids the relay. Bounded: one
+// event per witness at one sequence, at most 16 KiB each
+// (witnesssrv.resid max_kept_event).
+@requires(network, filesystem, declassify, clock)
+Int witness_watch(Cosigner c) {
+    if (c.cfg.log_id.len() == 0) { return 0; }
+    Result(WitnessedView, SymbolonError) rs = cos_seen_any(c);
+    return match rs { Err(_) => 0, Ok(s) => watch_seen(c, s) };
+}
+
+@requires(network, filesystem, declassify, clock)
+Int watch_seen(Cosigner c, WitnessedView s) {
+    _ = if (s.hidden > 0) { hidden_alert(c, s) } else { false };
+    _ = take_loose(c, s.view, s.loose, 0);
+    return 0;
+}
+
+@requires(filesystem, clock(readonly))
+Bool hidden_alert(Cosigner c, WitnessedView s) {
+    Int top = s.view.events.len() - 1;
+    Str mark = c.dir + "/hidden-" + f"{top}";
+    if (filesystem.exists(mark)) { return false; }
+    _ = filesystem.write_all(mark, "alerted\n");
+    eprintln(f"cosigner: ALARM: the relay does not serve {s.hidden} event(s) the witnesses co-signed (up to sequence {top}); taken from the witnesses");
+    return queue_alert(c.dir, "Symbolon: " + person_name(c) + "'s relay hides events of the log",
+        person_name(c) + f"'s Symbolon relay does not serve {s.hidden} event(s) of their log that the witnesses co-signed (up to sequence {top}). It may be hiding a recovery: check `symbolon device pending` on a device, and veto what you did not start. This alert comes from their Symbolon Home box.");
+}
+
+// The vetoes among `loose` (events some witness co-signed at the log's
+// next sequence) kept as held vetoes.
+@requires(network, filesystem, declassify, clock)
+Cosigner take_loose(Cosigner c, LogView lv, List(SignedEvent) loose, Int i) {
+    if (i >= loose.len()) { return c; }
+    SignedEvent v = loose[i];
+    Int target = target_of(v);
+    Str f = c.dir + "/veto-" + f"{target}-{v.payload.sequence}";
+    Bool take = target >= 1 && (Int)v.payload.sequence == lv.events.len() && !filesystem.exists(f);
+    List(Int) raw = cbor_of_event(StoredEvent {.encoded = v.encoded, .sigs = v.sigs, .cosigs = []});
+    Cosigner c2 = if (take) { veto_check(c, lv, v, raw, f) } else { c };
+    return take_loose(c2, lv, loose, i + 1);
 }
 
 // Each witness of `ws` asked to co-sign the event with digest `d` at `seq`.

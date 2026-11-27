@@ -225,9 +225,49 @@ pub Result(VerifiedHead, SymbolonError) verified_log_dir(Str dir, Endpoint relay
 pub type LogView = { VerifiedHead vh; List(SignedEvent) events; };
 
 // As verified_log_dir, with the events; the witnesses reached at `here`
-// when it is set (verified_log_at).
+// when it is set (verified_log_at). The log is the relay's, extended by
+// what the witnesses co-signed past it (log_seen).
 @requires(filesystem, network, clock(readonly), declassify)
 pub Result(LogView, SymbolonError) log_view_dir(Str dir, Endpoint relay, List(Int) l, Str here) {
+    Result(WitnessedView, SymbolonError) r = log_seen(dir, relay, l, here);
+    return match r { Ok(s) => Ok(s.view), Err(e) => Err(e) };
+}
+
+// The log as this device verified it from the relay (relay_view_dir), then
+// held against the witnesses (SPEC 13.4 "Notification", R5-1): every
+// witness of its policy is asked how far it co-signed the log (POST /head),
+// and the events a majority co-signed past what the relay serves are taken
+// from the witnesses themselves (POST /event, witness_fill). A relay that
+// keeps an event from the devices (a recovery the kit filed, a veto) cannot
+// keep it from the witnesses that co-signed it, so it cannot keep it from
+// the devices either.
+@requires(filesystem, network, clock(readonly), declassify)
+pub Result(WitnessedView, SymbolonError) log_seen(Str dir, Endpoint relay, List(Int) l, Str here) {
+    Result(LogView, SymbolonError) r = relay_view_dir(dir, relay, l, here);
+    return match r { Err(e) => Err(e), Ok(v) => Ok(witness_fill(dir, relay, l, here, v)) };
+}
+
+// As log_seen, and when the relay does not answer, or serves no log that
+// verifies with this device's kept copy, from the kept copy alone held
+// against the witnesses: what a device vetoes from, and what the cosigner
+// takes and publishes a veto from (R5-1), so that a relay that serves a
+// short log, an error or a fork cannot keep a veto from the witnesses.
+@requires(filesystem, network, clock(readonly), declassify)
+pub Result(WitnessedView, SymbolonError) log_seen_any(Str dir, Endpoint relay, List(Int) l, Str here) {
+    Result(WitnessedView, SymbolonError) r = log_seen(dir, relay, l, here);
+    if (match r { Ok(_) => true, Err(_) => false }) { return r; }
+    List(SignedEvent) kept = events_of_raw(cached_raw(dir + "/logcache/" + hex_encode(l), 0, []), 0, []);
+    if (kept.len() == 0) { return r; }
+    Result(VerifiedHead, SymbolonError) vk = verified_events(l, kept, relay.ca, here);
+    return match vk {
+        Err(_) => r,
+        Ok(vh) => Ok(witness_fill(dir, relay, l, here, LogView {.vh = vh, .events = kept}))
+    };
+}
+
+// The relay's log verified with this device's kept copy (verified_log_dir).
+@requires(filesystem, network, clock(readonly), declassify)
+Result(LogView, SymbolonError) relay_view_dir(Str dir, Endpoint relay, List(Int) l, Str here) {
     Str cd = dir + "/logcache/" + hex_encode(l);
     List(List(Int)) kept = cached_raw(cd, 0, []);
     // The witnesses the kept log names are asked while the rest of the log
@@ -540,6 +580,241 @@ pub Str freeze_check(List(WitnessEp) ws, Str ca, List(Int) l, UInt(64) seq) {
 pub List(WitnessRef) refs_of_eps(List(WitnessEp) ws, Int i, List(WitnessRef) acc) {
     if (i >= ws.len()) { return acc; }
     return refs_of_eps(ws, i + 1, acc.concat([WitnessRef {.url = ws[i].host + ":" + f"{ws[i].port}", .key = ws[i].key}]));
+}
+
+// ─── What the witnesses co-signed past the relay (R5-1) ─────────
+
+// A log view held against the witnesses (log_seen): `view`, the log with
+// the events a majority of its witnesses co-signed past the relay's;
+// `fetched`, how many of those came from the witnesses; `hidden`, how many
+// of them the relay still does not serve after this device gave them to it
+// (the alarm: the relay may be hiding them); `loose`, the events some
+// witness co-signed at the sequence after `view` that no majority holds
+// (a veto that reached too few witnesses, or one being co-signed now).
+pub type WitnessedView = { LogView view; Int fetched; Int hidden; List(SignedEvent) loose; };
+
+// One witness's answer to POST /event (agent/witnesssrv.resid): the event
+// it co-signed at (log, seq), without co-signatures, and its co-signature.
+pub type WitEvent = { SignedEvent e; WitnessCosignature cs; };
+
+// At most this many events are taken from the witnesses per view.
+pub Int max_fill() { return 32; }
+
+// POST /event's body: the log id, then the sequence (8 bytes, big-endian).
+pub List(Int) event_query(List(Int) l, Int seq) { return l.concat(seq_be8(seq, 8, [])); }
+
+List(Int) seq_be8(Int v, Int n, List(Int) acc) {
+    if (n == 0) { return acc; }
+    return seq_be8(v / 256, n - 1, [v % 256].concat(acc));
+}
+
+// A witness's answer to POST /event: CBOR [event, [time, r || s]], the
+// event as StoredEvent CBOR (no co-signatures) and the witness's answer to
+// its co-sign request; checked under its key `wkey` for log `l` and `seq`.
+// None when it does not parse, is another sequence or log, or the
+// co-signature does not verify.
+pub Option(WitEvent) event_answer(List(Int) b, List(Int) wkey, List(Int) l, Int seq) {
+    Rd a = rd(b, 0);
+    if (a.major != 4 || a.val != 2) { return None; }
+    Rd h = rd(b, a.next);
+    if (h.major != 2 || h.next + h.val > b.len()) { return None; }
+    Option(StoredEvent) se = event_of_cbor(b[h.next..h.next + h.val]);
+    Option(SignedEvent) oe = match se { None => None, Some(x) => signed_of(x) };
+    return match oe { None => None, Some(e) => event_cosigned(e, b[h.next + h.val..b.len()], wkey, l, seq) };
+}
+
+Option(WitEvent) event_cosigned(SignedEvent e, List(Int) ans, List(Int) wkey, List(Int) l, Int seq) {
+    if ((Int)e.payload.sequence != seq) { return None; }
+    if (seq > 0 && !opt_bytes_is(e.payload.log_id, l)) { return None; }
+    if (seq == 0 && !bytes_eq(sha256_bytes(e.encoded), l)) { return None; }
+    Option(WitnessCosignature) c = cosig_of(ans, wkey, l, (UInt(64))seq, sha256_bytes(e.encoded));
+    return match c {
+        None => None,
+        Some(x) => Some(WitEvent {.e = SignedEvent {.payload = e.payload, .encoded = e.encoded, .sigs = e.sigs, .cosigs = []}, .cs = x})
+    };
+}
+
+@requires(network, clock(readonly), declassify)
+Option(WitEvent) event_from(Endpoint e, List(Int) wkey, List(Int) l, Int seq) {
+    HttpOut o = http_call_ep(e, "POST", "/event", event_query(l, seq));
+    Option(WitEvent) w = if (o.status == 200) { event_answer(o.body, wkey, l, seq) } else { None };
+    return w;
+}
+
+// Each witness of `ws` asked for what it co-signed at `seq`, in the order
+// of `ws`; after `until` the rest count as not answering (R3P-4).
+@requires(network, clock(readonly), declassify)
+pub List(Option(WitEvent)) events_from(List(WitnessRef) ws, Str ca, List(Int) l, Int seq, Int i, List(Option(WitEvent)) acc, Int until) {
+    if (i >= ws.len()) { return acc; }
+    Option(Endpoint) oe = if (i > 0 && clock_now_seconds() > until) { None } else { endpoint_of_url(ws[i].url, ca) };
+    Option(WitEvent) w = match oe { None => None, Some(e) => event_from(e, ws[i].key, l, seq) };
+    return events_from(ws, ca, l, seq, i + 1, acc.concat([w]), until);
+}
+
+// The event a majority of the `n` witnesses co-signed, from their answers
+// `ans` (each checked under the key of the witness asked), with every
+// co-signature on it; None when no digest has a majority.
+pub Option(SignedEvent) witnessed_at(List(Option(WitEvent)) ans, Int n, Int i) {
+    if (i >= ans.len()) { return None; }
+    Option(WitEvent) o = ans[i];
+    Option(SignedEvent) here = match o { None => None, Some(x) => majority_on(ans, n, x.e) };
+    return match here { Some(e) => Some(e), None => witnessed_at(ans, n, i + 1) };
+}
+
+Option(SignedEvent) majority_on(List(Option(WitEvent)) ans, Int n, SignedEvent e) {
+    List(WitnessCosignature) cs = cosigs_on(ans, sha256_bytes(e.encoded), 0, []);
+    if (cs.len() * 2 <= n || cs.len() < 2) { return None; }
+    return Some(SignedEvent {.payload = e.payload, .encoded = e.encoded, .sigs = e.sigs, .cosigs = cs});
+}
+
+List(WitnessCosignature) cosigs_on(List(Option(WitEvent)) ans, List(Int) d, Int i, List(WitnessCosignature) acc) {
+    if (i >= ans.len()) { return acc; }
+    Option(WitEvent) o = ans[i];
+    List(WitnessCosignature) next = match o { None => acc, Some(x) => if (bytes_eq(sha256_bytes(x.e.encoded), d)) { acc.concat([x.cs]) } else { acc } };
+    return cosigs_on(ans, d, i + 1, next);
+}
+
+// The distinct events in `ans`.
+pub List(SignedEvent) loose_at(List(Option(WitEvent)) ans, Int i, List(SignedEvent) acc) {
+    if (i >= ans.len()) { return acc; }
+    Option(WitEvent) o = ans[i];
+    List(SignedEvent) next = match o { None => acc, Some(x) => if (has_digest(acc, sha256_bytes(x.e.encoded), 0)) { acc } else { acc.concat([x.e]) } };
+    return loose_at(ans, i + 1, next);
+}
+
+Bool has_digest(List(SignedEvent) es, List(Int) d, Int i) {
+    if (i >= es.len()) { return false; }
+    return bytes_eq(sha256_bytes(es[i].encoded), d) || has_digest(es, d, i + 1);
+}
+
+// The highest sequence a witness reports having co-signed, or `best`.
+pub Int top_head(List(Option(WitnessHead)) hs, Int i, Int best) {
+    if (i >= hs.len()) { return best; }
+    Option(WitnessHead) o = hs[i];
+    Int s = match o { None => -1, Some(h) => if (h.digest.len() == 32) { h.seq } else { -1 } };
+    return top_head(hs, i + 1, if (s > best) { s } else { best });
+}
+
+// Every witness's answer to POST /head, three at a time (as
+// witness_times_par): a device asks on every view of the log.
+@requires(network, clock(readonly), declassify)
+pub List(Option(WitnessHead)) witness_heads_par(List(WitnessRef) ws, Str ca, List(Int) l) {
+    List(Option(WitnessHead)) hs = heads_batched(ws, ca, l, random_bytes(32), 0, [], clock_now_seconds() + witness_deadline_secs());
+    return hs;
+}
+
+@requires(network, clock(readonly), declassify)
+List(Option(WitnessHead)) heads_batched(List(WitnessRef) ws, Str ca, List(Int) l, List(Int) nonce, Int i, List(Option(WitnessHead)) acc, Int until) {
+    if (i >= ws.len() || (i > 0 && clock_now_seconds() > until)) { return acc; }
+    Result(Option(WitnessHead), RegionError) a = spawn (network, clock(readonly), declassify) { return head_of(ws, i, ca, l, nonce); };
+    Result(Option(WitnessHead), RegionError) b = spawn (network, clock(readonly), declassify) { return head_of(ws, i + 1, ca, l, nonce); };
+    Result(Option(WitnessHead), RegionError) c = spawn (network, clock(readonly), declassify) { return head_of(ws, i + 2, ca, l, nonce); };
+    List(Option(WitnessHead)) here = [head_got(a), head_got(b), head_got(c)];
+    return heads_batched(ws, ca, l, nonce, i + 3, acc.concat(here), until);
+}
+
+Option(WitnessHead) head_got(Result(Option(WitnessHead), RegionError) r) { return match r { Err(_) => None, Ok(o) => o }; }
+
+@requires(network, clock(readonly), declassify)
+Option(WitnessHead) head_of(List(WitnessRef) ws, Int i, Str ca, List(Int) l, List(Int) nonce) {
+    if (i >= ws.len()) { return None; }
+    Option(Endpoint) oe = endpoint_of_url(ws[i].url, ca);
+    Option(WitnessHead) h = match oe { None => None, Some(e) => head_from(e, ws[i].key, l, nonce) };
+    return h;
+}
+
+// The view `v` of the relay's log held against the witnesses its policy
+// names (reached at `here`): when one reports a head past it, the events a
+// majority co-signed from there on are taken from them (at most
+// max_fill()), and the whole log is verified again; then kept with the
+// device's copy and given to the relay. An event that no majority holds is
+// never taken (`loose` reports those at the first such sequence). A relay
+// that still does not serve them is reported (ALARM, `hidden`).
+@requires(filesystem, network, clock(readonly), declassify)
+pub WitnessedView witness_fill(Str dir, Endpoint relay, List(Int) l, Str here, LogView v) {
+    List(WitnessRef) ws = witnesses_at(v.vh.head.policy.witnesses, here);
+    Int have = v.events.len();
+    Int top = top_head(witness_heads_par(ws, relay.ca, l), 0, -1);
+    if (top < have) { return WitnessedView {.view = v, .fetched = 0, .hidden = 0, .loose = []}; }
+    Took t = take_witnessed(ws, relay.ca, l, have, top, []);
+    return fill_with(dir, relay, l, here, v, t);
+}
+
+pub type Took = { List(SignedEvent) events; List(SignedEvent) loose; };
+
+// The events a majority of `ws` co-signed from `seq` on, up to `top`.
+@requires(network, clock(readonly), declassify)
+Took take_witnessed(List(WitnessRef) ws, Str ca, List(Int) l, Int seq, Int top, List(SignedEvent) acc) {
+    if (seq > top || acc.len() >= max_fill()) { return Took {.events = acc, .loose = []}; }
+    List(Option(WitEvent)) ans = events_from(ws, ca, l, seq, 0, [], clock_now_seconds() + witness_deadline_secs());
+    Option(SignedEvent) e = witnessed_at(ans, ws.len(), 0);
+    return match e {
+        None => Took {.events = acc, .loose = loose_at(ans, 0, [])},
+        Some(x) => take_witnessed(ws, ca, l, seq + 1, top, acc.concat([x]))
+    };
+}
+
+// The log `v` extended by `t`'s events when the whole verifies: the
+// witnesses' events with a log that does not lead to them are refused.
+pub Result(LogView, SymbolonError) extended_view(List(Int) l, LogView v, List(SignedEvent) more, Int now) {
+    List(SignedEvent) all = v.events.concat(more);
+    Result(VerifiedHead, SymbolonError) r = il_verify(l, all, at_least(now, last_time(all, policy_of_e0(all))), lambda(p) { false });
+    return match r { Err(e) => Err(e), Ok(vh) => Ok(LogView {.vh = vh, .events = all}) };
+}
+
+@requires(filesystem, network, clock(readonly), declassify)
+WitnessedView fill_with(Str dir, Endpoint relay, List(Int) l, Str here, LogView v, Took t) {
+    if (t.events.len() == 0) { return WitnessedView {.view = v, .fetched = 0, .hidden = 0, .loose = t.loose}; }
+    Int now = witness_now(witnesses_at(v.vh.head.policy.witnesses, here), relay.ca, random_bytes(32));
+    Result(LogView, SymbolonError) r = extended_view(l, v, t.events, now);
+    return match r {
+        Err(e) => unverified_fill(v, e),
+        Ok(x) => filled(dir, relay, l, x, v.events.len(), t)
+    };
+}
+
+WitnessedView unverified_fill(LogView v, SymbolonError e) {
+    eprintln("ALARM: the witnesses co-signed events past the relay's log that do not verify with it (" + match e { ErrInvalidLog(s) => s, _ => "error" } + "); possible fork (SPEC 20.4)");
+    return WitnessedView {.view = v, .fetched = 0, .hidden = 0, .loose = []};
+}
+
+@requires(filesystem, network, clock(readonly), declassify)
+WitnessedView filled(Str dir, Endpoint relay, List(Int) l, LogView v, Int have, Took t) {
+    List(List(Int)) raw = raw_events(v.events, 0, []);
+    Str cd = dir + "/logcache/" + hex_encode(l);
+    _ = filesystem.create_dir(dir + "/logcache");
+    _ = filesystem.create_dir(cd);
+    _ = cache_from(cd, raw, have);
+    // Given to the relay: one that only lagged then serves them.
+    _ = put_from(relay, l, raw, have);
+    Bool served = relay_serves(relay, l, (UInt(64))have, sha256_bytes(t.events[0].encoded));
+    Int hidden = if (served) { 0 } else { t.events.len() };
+    if (hidden > 0) {
+        eprintln(f"ALARM: the witnesses co-signed {hidden} event(s) of the log that the relay does not serve (sequence {have} to {have + hidden - 1}); taken from the witnesses: the relay may be hiding them (SPEC 13.4, 20.4)");
+    }
+    return WitnessedView {.view = v, .fetched = t.events.len(), .hidden = hidden, .loose = t.loose};
+}
+
+// Each event as the relay stores it (StoredEvent CBOR).
+pub List(List(Int)) raw_events(List(SignedEvent) es, Int i, List(List(Int)) acc) {
+    if (i >= es.len()) { return acc; }
+    return raw_events(es, i + 1, acc.concat([cbor_of_event(StoredEvent {.encoded = es[i].encoded, .sigs = es[i].sigs, .cosigs = es[i].cosigs})]));
+}
+
+@requires(network, clock(readonly), declassify)
+Bool put_from(Endpoint relay, List(Int) l, List(List(Int)) raw, Int i) {
+    if (i >= raw.len()) { return true; }
+    if (!log_put(relay, l, (UInt(64))i, raw[i])) { return false; }
+    return put_from(relay, l, raw, i + 1);
+}
+
+// Whether the relay serves the event with digest `d` at `seq`.
+@requires(network, clock(readonly), declassify)
+pub Bool relay_serves(Endpoint relay, List(Int) l, UInt(64) seq, List(Int) d) {
+    HttpOut o = log_get_out(relay, l, seq);
+    if (o.status != 200) { return false; }
+    Option(StoredEvent) se = event_of_cbor(o.body);
+    return match se { None => false, Some(x) => bytes_eq(sha256_bytes(x.encoded), d) };
 }
 
 // ─── The relay's sign-in message (SPEC 29.4) ────────────────────

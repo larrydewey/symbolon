@@ -96,9 +96,30 @@ pub EventPayload next_event(VerifiedHead vh, EventBody b, List(List(Int)) digest
 // set-policy (core/log.resid il_claimless), and refuse anything else.
 @requires(network, clock(readonly), declassify)
 pub Result(VerifiedHead, Str) publish_event(DeviceConfig c, EventPayload p, List(Int) enc, List(EventSig) sigs) {
-    List(List(Int)) before = log_raw(relay_ep(c), c.log_id);
+    return publish_on(c, log_raw(relay_ep(c), c.log_id), false, p, enc, sigs);
+}
+
+// As publish_event, after the log `before` this device verified itself
+// (common.resid log_seen_any: its kept copy, the relay's events and what
+// the witnesses co-signed past them), never the relay's answer to GET
+// /log (R5-1): what a veto, or the kit's escape, is published from. A
+// relay that serves a short log, an error or a fork then cannot keep
+// them from the witnesses, who co-sign them without its claim (core/log
+// il_claimless). Once a majority co-signed the event it is the log's next
+// event whether or not the relay stores it: the witnesses show it (POST
+// /head, /event) to every device and to the cosigner. The head returned
+// is then this device's own verification of the log with the event.
+@requires(network, clock(readonly), declassify)
+pub Result(VerifiedHead, Str) publish_own(DeviceConfig c, List(SignedEvent) before, EventPayload p, List(Int) enc, List(EventSig) sigs) {
+    return publish_on(c, raw_events(before, 0, []), true, p, enc, sigs);
+}
+
+@requires(network, clock(readonly), declassify)
+Result(VerifiedHead, Str) publish_on(DeviceConfig c, List(List(Int)) before, Bool own, EventPayload p, List(Int) enc, List(EventSig) sigs) {
     Int have = before.len();
-    if (have != (Int)p.sequence) { return Err(f"the relay's log has {have} events, not the {p.sequence} this event follows"); }
+    if (have != (Int)p.sequence) {
+        return Err(if (own) { f"the log has {have} events, not the {p.sequence} this event follows" } else { f"the relay's log has {have} events, not the {p.sequence} this event follows" });
+    }
     List(Int) bare = cbor_of_event(StoredEvent {.encoded = enc, .sigs = sigs, .cosigs = []});
     List(Int) d = sha256_bytes(enc);
     ClaimOut co = claim_post(relay_ep(c), c.log_id, p.sequence, bare);
@@ -121,11 +142,22 @@ pub Result(VerifiedHead, Str) publish_event(DeviceConfig c, EventPayload p, List
         Str none = if (co.status == 200) { "" } else { f" (the relay gave no claim on the event: {co.status})" };
         return Err(if (str_len(frozen) > 0) { frozen } else { "too few witnesses co-signed" + none });
     }
-    Bool put = log_put(relay_ep(c), c.log_id, p.sequence, cbor_of_event(StoredEvent {.encoded = enc, .sigs = sigs, .cosigs = cs}));
+    List(Int) full = cbor_of_event(StoredEvent {.encoded = enc, .sigs = sigs, .cosigs = cs});
+    Bool put = log_put(relay_ep(c), c.log_id, p.sequence, full);
     // The relay may have stored it already (it carries what it claims to
     // the witnesses itself, agent/relaysrv.resid claim_complete).
-    if (!put && !relay_holds(relay_ep(c), c.log_id, p.sequence, d)) { return Err("the relay refused the event"); }
+    Bool stored = put || relay_holds(relay_ep(c), c.log_id, p.sequence, d);
+    if (!stored && !own) { return Err("the relay refused the event"); }
+    if (!stored) { eprintln(f"the witnesses co-signed the event at sequence {p.sequence}; the relay did not store it (the witnesses show it to every device and to the cosigner)"); }
+    if (own) { return own_head(c, before.concat([full])); }
     return match verified_log(relay_ep(c), c.log_id) { Ok(v) => Ok(v), Err(e) => Err("the log does not verify: " + err_text(e)) };
+}
+
+// The log `raw` (this device's, with the event it published) verified now.
+@requires(network, clock(readonly), declassify)
+Result(VerifiedHead, Str) own_head(DeviceConfig c, List(List(Int)) raw) {
+    Result(VerifiedHead, SymbolonError) mine = verified_events(c.log_id, events_of_raw(raw, 0, []), c.ca, "");
+    return match mine { Ok(v) => Ok(v), Err(e) => Err("the log does not verify: " + err_text(e)) };
 }
 
 // The witnesses whose co-signatures the event after the log `before`
