@@ -1,0 +1,202 @@
+// After the Paillier nonce fix (migrate.resid): the rotation advice, the
+// key refresh's state, and which re-share invitations a device joins as
+// its household's refresh.
+
+import "../types.resid";
+import "../core/log.resid";
+import "../cosigner/cosigner.resid";
+import "../threshold/threshold.resid";
+import "../net/proto.resid";
+import "migrate.resid";
+import "enroll.resid";
+import "ecdsa.resid";
+import "crypto.resid";
+
+List(Int) priv(Int n) {
+    List(Int) z = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    return z.concat([n]);
+}
+List(Int) pubk(Int n) { return ec_public_key(P256, priv(n)); }
+List(Int) pid(Int n) { return sha256_bytes(pubk(n)); }
+
+Party dev(Int n) { return Party {.id = pid(n), .kind = party_kind_device(), .auth_key = pubk(n), .hpke_key = pubk(n + 40), .label = "d", .attestation = NoAttestation}; }
+Party kit() { return Party {.id = pid(20), .kind = party_kind_kit(), .auth_key = pubk(20), .hpke_key = pubk(21), .label = "k", .attestation = NoAttestation}; }
+Party cos() { return Party {.id = pid(30), .kind = party_kind_cosigner(), .auth_key = pubk(30), .hpke_key = pubk(31), .label = "c", .attestation = NoAttestation}; }
+
+List(Int) logid() { return [7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7]; }
+List(Int) sid() { return [5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5]; }
+
+// Device 1, the kit, the cosigner, device 2: epoch 4, 2 of them sign.
+Quorum q4() { return Quorum {.parties = [dev(1), kit(), cos(), dev(2)], .t = 2, .root_pubkey = pubk(9), .epoch = 4, .transcript_digest = [], .kv_commits = []}; }
+
+ScanSeen never() { return scan_none(); }
+
+AdviceIn legacy() {
+    return AdviceIn {.log_ok = true, .hidden = 0, .born = false, .prefix_reshares = 0, .sigs = -1, .lost_log = false, .lost = false, .incident = false, .scan = never()};
+}
+
+AdviceIn with_sigs(AdviceIn a, Int n, Int rs) {
+    return AdviceIn {.log_ok = a.log_ok, .hidden = a.hidden, .born = a.born, .prefix_reshares = rs, .sigs = n, .lost_log = a.lost_log, .lost = a.lost, .incident = a.incident, .scan = a.scan};
+}
+
+AdviceIn with_flags(AdviceIn a, Bool log_ok, Bool lost_log, Bool lost, Bool incident, ScanSeen sc) {
+    return AdviceIn {.log_ok = log_ok, .hidden = a.hidden, .born = a.born, .prefix_reshares = a.prefix_reshares, .sigs = a.sigs, .lost_log = lost_log, .lost = lost, .incident = incident, .scan = sc};
+}
+
+AdviceIn born() { return AdviceIn {.log_ok = true, .hidden = 0, .born = true, .prefix_reshares = 0, .sigs = 0, .lost_log = false, .lost = false, .incident = false, .scan = never()}; }
+
+Bool has_line(List(Str) ls, Str l, Int i) { return i < ls.len() && (ls[i] == l || has_line(ls, l, i + 1)); }
+
+test "a household made before the fix: replace the master key, strongly, because the signatures were never counted" {
+    Advice a = security_advice(legacy(), "/d");
+    expect(a.level).toEqual("strongly-recommended");
+    expect(a.rollover).toEqual("ok");
+    expect(a.lines[0]).toEqual(adv_what());
+    expect(a.lines[1]).toEqual(adv_do_strong());
+    expect(has_line(a.lines, adv_why_unknown(), 0)).toEqual(true);
+    expect(has_line(a.lines, adv_rollover_ok(), 0)).toEqual(true);
+    expect(has_line(a.lines, adv_scan_never("/d"), 0)).toEqual(true);
+}
+
+test "recommended under 300 known signatures; strongly above them, or after a re-share before the fix" {
+    expect(security_advice(with_sigs(legacy(), 120, 0), "/d").level).toEqual("recommended");
+    expect(security_advice(with_sigs(legacy(), 120, 0), "/d").lines[1]).toEqual(adv_do_rec());
+    Advice many = security_advice(with_sigs(legacy(), 301, 0), "/d");
+    expect(many.level).toEqual("strongly-recommended");
+    expect(has_line(many.lines, adv_why_many(), 0)).toEqual(true);
+    Advice rs = security_advice(with_sigs(legacy(), 12, 1), "/d");
+    expect(rs.level).toEqual("strongly-recommended");
+    expect(has_line(rs.lines, adv_why_reshare(), 0)).toEqual(true);
+}
+
+test "a recover or removal in the log, a reported lost device or cosigner incident: no rollover, each site's own recovery" {
+    Advice l = security_advice(with_flags(with_sigs(legacy(), 10, 0), true, true, false, false, never()), "/d");
+    expect(l.level).toEqual("strongly-recommended");
+    expect(l.rollover).toEqual("avoid");
+    expect(has_line(l.lines, adv_avoid_lost(), 0)).toEqual(true);
+    expect(has_line(l.lines, adv_rollover_avoid(), 0)).toEqual(true);
+    expect(has_line(l.lines, adv_rollover_ok(), 0)).toEqual(false);
+    expect(security_advice(with_flags(legacy(), true, false, true, false, never()), "/d").rollover).toEqual("avoid");
+    Advice i = security_advice(with_flags(legacy(), true, false, false, true, never()), "/d");
+    expect(i.rollover).toEqual("avoid");
+    expect(has_line(i.lines, adv_avoid_incident(), 0)).toEqual(true);
+}
+
+test "a scan hit: compromised, replace the master key now, through each site's recovery" {
+    ScanSeen hit = ScanSeen {.checked = 40, .hits = 1, .unreadable = 0};
+    Advice a = security_advice(with_flags(with_sigs(legacy(), 5, 0), true, false, false, false, hit), "/d");
+    expect(a.level).toEqual("compromised");
+    expect(a.rollover).toEqual("avoid");
+    expect(a.lines[1]).toEqual(adv_compromised());
+    expect(a.lines[2]).toEqual(adv_do_now());
+    // Even a household made after the fix (a hit cannot be explained away).
+    expect(security_advice(with_flags(born(), true, false, false, false, hit), "/d").level).toEqual("compromised");
+}
+
+test "a clean scan says only what it read; a household made after the fix has nothing to do" {
+    ScanSeen clean = ScanSeen {.checked = 40, .hits = 0, .unreadable = 3};
+    Advice a = security_advice(with_flags(legacy(), true, false, false, false, clean), "/d");
+    expect(a.level).toEqual("strongly-recommended");
+    expect(has_line(a.lines, "The check of your recent messages found nothing in the 40 it could read (3 could not be read). That lowers the risk but does not rule it out: older messages are gone.", 0)).toEqual(true);
+    Advice b = security_advice(born(), "/d");
+    expect(b.level).toEqual("none");
+    expect(b.lines.len()).toEqual(1);
+    expect(b.lines[0]).toEqual(adv_born());
+}
+
+// R-5 (the relay hides the log to keep the advice mild): without a
+// verified log, nothing relaxes the advice.
+test "red team: without a verified log the advice is the strictest, never none, and rollover is not advised" {
+    AdviceIn hidden = with_flags(born(), false, false, false, false, never());
+    Advice a = security_advice(hidden, "/d");
+    expect(a.level).toEqual("strongly-recommended");
+    expect(a.rollover).toEqual("avoid");
+    expect(has_line(a.lines, adv_avoid_unchecked(), 0)).toEqual(true);
+    AdviceIn some_hidden = AdviceIn {.log_ok = true, .hidden = 2, .born = false, .prefix_reshares = 0, .sigs = 10, .lost_log = false, .lost = false, .incident = false, .scan = never()};
+    expect(security_advice(some_hidden, "/d").rollover).toEqual("avoid");
+}
+
+// R-1 (a relay that serves none of the mail the scan needs): a scan that
+// read nothing is no check; it is never shown as "found nothing", and no
+// scan result lowers the advice.
+test "red team: a scan that read nothing reads as not run, and a clean scan never lowers the advice" {
+    ScanSeen empty = ScanSeen {.checked = 0, .hits = 0, .unreadable = 0};
+    Advice a = security_advice(with_flags(legacy(), true, false, false, false, empty), "/d");
+    expect(has_line(a.lines, adv_scan_never("/d"), 0)).toEqual(true);
+    ScanSeen clean = ScanSeen {.checked = 500, .hits = 0, .unreadable = 0};
+    expect(security_advice(with_flags(legacy(), true, false, false, false, clean), "/d").level).toEqual("strongly-recommended");
+    expect(security_advice(with_flags(with_sigs(legacy(), 5, 0), true, true, false, false, clean), "/d").rollover).toEqual("avoid");
+}
+
+test "the refresh's state: done, waiting for the cosigner's or a device's update, or due" {
+    List(Int) c = pid(30);
+    expect(reshare_state(true, "", c)).toEqual("done");
+    expect(reshare_state(false, old_build_refusal("party " + hex_encode(c[0..8]), 0), c)).toEqual("waiting-cosigner");
+    expect(reshare_state(false, old_build_refusal("party " + hex_encode(pid(2)[0..8]), 0), c)).toEqual("waiting-device");
+    expect(reshare_state(false, "cannot reach the relay", c)).toEqual("due");
+    expect(reshare_state(false, "", c)).toEqual("due");
+}
+
+test "reports and the scan's file read back" {
+    Reports r = reports_parse("lost 1700000000\n");
+    expect(r.lost).toEqual(true);
+    expect(r.incident).toEqual(false);
+    expect(reports_parse("lost 1\ncosigner 2\n").incident).toEqual(true);
+    expect(reports_parse("").lost).toEqual(false);
+    ScanSeen s = scan_seen_parse("checked 12 hits 0 unreadable 1 time 99");
+    expect(s.checked).toEqual(12);
+    expect(s.unreadable).toEqual(1);
+    expect(scan_seen_parse("junk").checked).toEqual(-1);
+}
+
+// ─── Which invitation is the household's refresh ────────────────
+
+ReshareInvite invite(List(Party) np, List(Int) dealers, Int degree, Int epoch, Int by, Int proto) {
+    ReshareInvite i0 = ReshareInvite {.session_id = sid(), .log_id = logid(), .new_parties = np, .dealers = dealers, .receivers = receivers_of(np, 0, []),
+        .offline = offline_of(np, 0, []), .degree = degree, .epoch = epoch, .requester = pid(by), .sig = [], .proto = proto};
+    List(Int) sig = ecdsa_sign_raw(P256, Sha256, priv(by), request_tbs(sid(), reshare_message(i0), (UInt(32))(epoch - 1), pid(by), request_reshare()));
+    return ReshareInvite {.session_id = sid(), .log_id = logid(), .new_parties = np, .dealers = dealers, .receivers = i0.receivers,
+        .offline = i0.offline, .degree = degree, .epoch = epoch, .requester = pid(by), .sig = sig, .proto = proto};
+}
+
+test "device 2 joins device 1's refresh of the same quorum" {
+    expect(refresh_problem(invite(q4().parties, [1, 3], 1, 5, 1, session_proto()), logid(), pid(2), q4(), [])).toEqual("");
+}
+
+// R-2 (a thief with an unlocked device races the refresh with a plan of
+// its own): anything but a refresh of the quorum in force is refused.
+test "red team: an invitation that adds a party, changes the threshold or the dealers is not joined" {
+    List(Party) more = q4().parties.concat([dev(6)]);
+    expect(refresh_problem(invite(more, [1, 3], 1, 5, 1, session_proto()), logid(), pid(2), q4(), [])).toEqual("the invitation changes who is in the household: it is not a refresh, refused");
+    List(Party) fewer = [dev(1), kit(), cos()];
+    expect(refresh_problem(invite(fewer, [1, 3], 1, 5, 1, session_proto()), logid(), pid(2), q4(), [])).toEqual("the invitation changes who is in the household: it is not a refresh, refused");
+    List(Party) swapped = [dev(1), Party {.id = pid(20), .kind = party_kind_kit(), .auth_key = pubk(22), .hpke_key = pubk(23), .label = "k", .attestation = NoAttestation}, cos(), dev(2)];
+    expect(refresh_problem(invite(swapped, [1, 3], 1, 5, 1, session_proto()), logid(), pid(2), q4(), [])).toEqual("the invitation changes who is in the household: it is not a refresh, refused");
+    expect(refresh_problem(invite(q4().parties, [1, 4], 1, 5, 1, session_proto()), logid(), pid(2), q4(), [])).toEqual("the invitation changes the dealers or the threshold: refused");
+    expect(refresh_problem(invite(q4().parties, [1, 3], 2, 5, 1, session_proto()), logid(), pid(2), q4(), [])).toEqual("the invitation changes the dealers or the threshold: refused");
+    expect(refresh_problem(invite(q4().parties, [1, 3], 1, 7, 1, session_proto()), logid(), pid(2), q4(), [])).toEqual("the invitation is for another log or epoch");
+}
+
+test "red team: an invitation from no device of the household, or not signed by the one it names, is not joined" {
+    ReshareInvite good = invite(q4().parties, [1, 3], 1, 5, 1, session_proto());
+    ReshareInvite forged = ReshareInvite {.session_id = good.session_id, .log_id = good.log_id, .new_parties = good.new_parties, .dealers = good.dealers, .receivers = good.receivers,
+        .offline = good.offline, .degree = good.degree, .epoch = good.epoch, .requester = pid(1), .sig = invite(q4().parties, [1, 3], 1, 5, 6, session_proto()).sig, .proto = good.proto};
+    expect(refresh_problem(forged, logid(), pid(2), q4(), [])).toEqual("the invitation is not signed by the device it names");
+    expect(refresh_problem(invite(q4().parties, [3, 3], 1, 5, 30, session_proto()), logid(), pid(2), q4(), [])).toEqual("the invitation is not from another device of this household");
+    // Its own invitation, replayed to it, is not joined either.
+    expect(refresh_problem(good, logid(), pid(1), q4(), [])).toEqual("the invitation is not from another device of this household");
+}
+
+// R-3 (an old, unfixed party): its invitation is refused before the session.
+test "red team: an invitation from a build before the fix is refused, naming the upgrade" {
+    expect(refresh_problem(invite(q4().parties, [1, 3], 1, 5, 1, 0), logid(), pid(2), q4(), [])).toEqual(old_build_refusal("the inviting device", 0));
+}
+
+test "a party removed in force is left out of the refresh" {
+    Quorum q5 = Quorum {.parties = q4().parties.concat([dev(3)]), .t = 2, .root_pubkey = pubk(9), .epoch = 4, .transcript_digest = [], .kv_commits = []};
+    List(Party) kept = kept_parties(q5.parties, [pid(3)], 0, []);
+    expect(kept.len()).toEqual(4);
+    expect(refresh_problem(invite(kept, [1, 3], 1, 5, 1, session_proto()), logid(), pid(2), q5, [pid(3)])).toEqual("");
+    // The removed device is not dropped by an invitation that keeps it.
+    expect(refresh_problem(invite(q5.parties, [1, 3], 1, 5, 1, session_proto()), logid(), pid(2), q5, [pid(3)])).toEqual("the invitation changes who is in the household: it is not a refresh, refused");
+}

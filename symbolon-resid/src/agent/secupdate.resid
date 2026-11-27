@@ -39,6 +39,7 @@ import "device.resid";
 import "fidokey.resid";
 import "duresscli.resid";
 import "enroll.resid";
+import "migrate.resid";
 import "orgcore.resid";
 import "sharecli.resid";
 import "hpkeg.resid";
@@ -48,12 +49,22 @@ import "clock.resid";
 import "dev/tpm.resid";
 
 @requires(filesystem, network, device, declassify, clock, provision, environment)
-pub Int device_security_update(Str dir) {
+pub Int device_security_update(Str dir, Str primes) {
     Option(DeviceConfig) oc = load_config(dir);
     return match oc {
         None => dfail("not set up"),
-        Some(c) => update_with(dir, c, read_pin(), read_pin())
+        Some(c) => update_then_refresh(dir, c, read_pin(), read_pin(), primes)
     };
+}
+
+// The update, then the household's key refresh after the Paillier nonce
+// fix (migrate.resid, SPEC 6.2.2), which runs once per household.
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+pub Int update_then_refresh(Str dir, DeviceConfig c, Str pin, Str dpin, Str primes) {
+    Int r = update_with(dir, c, pin, dpin);
+    if (r != 0) { return r; }
+    Int k = nonce_reshare(dir, pin, primes);
+    return k;
 }
 
 @requires(filesystem, network, device, declassify, clock, provision, environment)

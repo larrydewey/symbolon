@@ -435,6 +435,55 @@ so `c = 1 (mod N)` exactly when `r = 1`. Therefore:
   batches it could check. The counts are kept in `DIR/nonce-scan`
   (`checked N hits N unreadable N time T`).
 
+#### 6.2.2 After the nonce fix: one key refresh, and the rotation advice
+
+A household that signed or re-shared before the fix may have sent a
+ciphertext of 6.2.1 to its counterparty, and nothing kept says whether it
+did. Two steps follow the upgrade.
+
+- **The key refresh.** Once per household, its quorum re-shares to itself
+  (the same parties, less parties removed in force; this device and the
+  cosigner deal; every online party receives and signs the reshare event,
+  as in 8.2): new Paillier keys and shares, so a part of a secret seen
+  before is of no use. It is the re-share a device may already ask for,
+  checked by the cosigner against the log; no new authority, no new event
+  kind. It runs from `device security-update` under the PIN (never under
+  the duress PIN), after the cosigner is upgraded: an old cosigner or
+  device ends it (6.2.1) and the device then reports that it waits for
+  that party's update. With several devices, the quorum's first device
+  leads at once and each other device, when it runs the update, joins an
+  invitation that is a refresh of the quorum in force (same parties and
+  keys, the requester and the cosigner dealing, the threshold kept,
+  version 2 or later, signed by the requester's device key) or, after two
+  minutes without one, leads. A device already in the quorum refuses a
+  chain code or vault key other than its own from the leader.
+  It is done on a device once that device holds a **nonce-fix marker**:
+  its device key's signature over the log id, an epoch, that epoch's
+  transcript digest and its own id, written by this build after each
+  epoch it made (the inception, or a re-share it took part in), the first
+  kept. A marker counts only when it verifies under this device's key in
+  the quorum in force, and the verified log holds the event that made that
+  epoch with that transcript. The enrolling device hands its marker to a
+  new device (`EnrollSecrets.fix_mark`); there it counts only as an
+  inception marker signed by the inception's device. A missing marker
+  makes the refresh run again, never less.
+- **The rotation advice.** The refresh does not undo a root key already
+  worked out, so a household made before the fix (no inception marker)
+  is advised to replace its root key: a new identity, then each Threshold
+  credential re-registered (26.5). The advice is "strongly recommended"
+  when the household made more than 300 signatures before the fix, or
+  when that is not known (no build before the fix counted them: it is
+  never known for such a household), or when it re-shared before the fix
+  (reshare events below the marker's epoch), or someone else may hold a
+  device. When a recover or a remove-party is in the log (the log keeps
+  no reason, so every removal counts), the person reports a device lost
+  or stolen, or the cosigner's operator reported an incident, or the log
+  cannot be verified now, or a mail scan found a ciphertext of 6.2.1, the
+  rollover (26.5 method 1) is not advised: each relying party's own
+  recovery (A-19). A scan hit makes the advice "compromised". The advice
+  rests on the verified log and the device's own files only; without a
+  verified log it is the strictest.
+
 ---
 
 ## 7. Data model

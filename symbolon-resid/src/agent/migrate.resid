@@ -1,0 +1,452 @@
+// After the Paillier nonce fix (SPEC 6.2.1, 6.2.2): the household's one
+// re-share, and the root-key rotation advice.
+//
+// Before the fix, a signature or re-share could carry a Paillier
+// ciphertext with the nonce 1, which shows its plaintext to the party that
+// receives it: in some cases the counterparty (the cosigner, or a device)
+// could work out the household's root key. Nothing kept tells whether it
+// happened (only the relay's mail of the last 30 days, which the scan in
+// leakscan.resid reads).
+//
+// 1. The re-share. Once per household after the upgrade, its own quorum
+//    re-shares to itself (enroll.resid reshare_in: this device and the
+//    cosigner deal, every online party receives, the reshare event is
+//    signed by them all as every re-share is, SPEC 8.2): fresh Paillier
+//    keys and shares, so a value leaked in part is of no use. No new
+//    authority: it is the re-share a device can already ask for, with the
+//    same party set (less parties removed in force), checked by the
+//    cosigner against the log (reshare_plan_problem). It runs from
+//    `device security-update` (the PIN), never under the duress PIN, and is
+//    done once this device holds a valid nonce-fix marker (nfmark.resid);
+//    until then it can run again at any time, and a run cut short or
+//    refused is simply run again. Every party of the session must run the
+//    fixed build (session protocol 2, SPEC 6.2.1): an old cosigner or
+//    device makes it fail with the party to upgrade, which `device status`
+//    then says (`security-reshare waiting-cosigner`).
+//    With other devices in the household, each one joins when it runs the
+//    update: the first device of the quorum leads at once, any other
+//    waits two minutes for an invitation and then leads. An invitation is
+//    joined only when it is a refresh of this quorum (refresh_problem): a
+//    device that sent anything else (a party added, another threshold,
+//    other dealers) is refused, and a leader that sends another chain code
+//    or vault key than this device holds is refused (enroll.resid
+//    keeps_secrets).
+//
+// 2. The advice (security_advice): the re-share does not undo a root key
+//    that was already worked out, so every household made before the fix
+//    is told, in plain words, to replace its root key (a new identity,
+//    then each passkey re-registered, SPEC 26.5), "strongly" when it
+//    signed more than 300 times or re-shared before the fix, or when that
+//    is not known (no build before the fix counted signatures: it is
+//    never known for a household made before the fix). Where someone else
+//    may hold a device or the root key (a recover or a removed party in
+//    the log, a device reported lost, an incident the cosigner's operator
+//    reported, or a scan hit) the passkey rollover must not be used (an
+//    attacker with the root key can roll over too, SPEC 26.5, A-19): each
+//    site's own account recovery instead. Everything the advice rests on
+//    is the verified log and this device's own files: the relay can hide
+//    the log (then the advice is the strictest) but cannot write a word of
+//    it.
+
+import "../types.resid";
+import "../core/log.resid";
+import "../cosigner/cosigner.resid";
+import "../threshold/threshold.resid";
+import "../net/proto.resid";
+import "../net/services.resid";
+import "state.resid";
+import "common.resid";
+import "session.resid";
+import "cosignerd.resid";
+import "device.resid";
+import "enroll.resid";
+import "nfmark.resid";
+import "ecdsa.resid";
+import "crypto.resid";
+import "clock.resid";
+
+// ─── What the user reported (DIR/security-reports) ──────────────
+// `device security-advice DIR --report lost|cosigner`: a device of the
+// household lost or stolen, or the cosigner's operator reported a security
+// incident. One line each, "lost TIME" / "cosigner TIME". A report only
+// makes the advice stricter, so it needs no PIN.
+
+pub Str reports_file(Str dir) { return dir + "/security-reports"; }
+
+pub type Reports = { Bool lost; Bool incident; };
+
+pub Reports reports_parse(Str s) {
+    List(Str) ls = str_split(s, "\n");
+    return Reports {.lost = has_report(ls, "lost", 0), .incident = has_report(ls, "cosigner", 0)};
+}
+
+Bool has_report(List(Str) ls, Str kind, Int i) {
+    if (i >= ls.len()) { return false; }
+    List(Str) f = str_split(str_trim(ls[i]), " ");
+    return (f.len() >= 1 && f[0] == kind) || has_report(ls, kind, i + 1);
+}
+
+@requires(filesystem)
+pub Reports reports_of(Str dir) {
+    Reports r = if (filesystem.exists(reports_file(dir))) { reports_parse(filesystem.read_all(reports_file(dir))) } else { Reports {.lost = false, .incident = false} };
+    return r;
+}
+
+// ─── The mail scan's result (leakscan.resid writes DIR/nonce-scan) ──
+
+pub type ScanSeen = { Int checked; Int hits; Int unreadable; };
+
+pub ScanSeen scan_none() { return ScanSeen {.checked = -1, .hits = -1, .unreadable = -1}; }
+
+// "checked N hits N unreadable N time T"
+pub ScanSeen scan_seen_parse(Str s) {
+    List(Str) f = str_split(str_trim(s), " ");
+    if (f.len() < 6 || f[0] != "checked" || f[2] != "hits" || f[4] != "unreadable") { return scan_none(); }
+    return ScanSeen {.checked = str_parse_int(f[1]), .hits = str_parse_int(f[3]), .unreadable = str_parse_int(f[5])};
+}
+
+@requires(filesystem)
+pub ScanSeen scan_seen(Str dir) {
+    ScanSeen r = if (filesystem.exists(dir + "/nonce-scan")) { scan_seen_parse(filesystem.read_all(dir + "/nonce-scan")) } else { scan_none() };
+    return r;
+}
+
+// ─── The advice ─────────────────────────────────────────────────
+
+// log_ok: the log verified now; hidden: events the witnesses co-signed
+// that the relay does not serve; born: the household was made by a fixed
+// build (nfmark); prefix_reshares: re-shares before the fix; sigs: the
+// signatures before the fix, -1 when not known; lost_log: a recover or a
+// removed party in the log; lost, incident: what the user reported; scan:
+// the mail scan (-1: it has not run).
+pub type AdviceIn = { Bool log_ok; Int hidden; Bool born; Int prefix_reshares; Int sigs; Bool lost_log; Bool lost; Bool incident; ScanSeen scan; };
+
+// level: "none", "recommended", "strongly-recommended" or "compromised";
+// rollover: "ok" or "avoid".
+pub type Advice = { Str level; Str rollover; List(Str) lines; };
+
+pub Int many_sigs() { return 300; }
+
+pub Str adv_what() {
+    return "What happened: an error in Symbolon's signing software, now fixed, could in rare cases let your cosigner or one of your devices work out your household's master key, while signing in somewhere or while a device was added. Nobody can tell for sure whether it happened to your household.";
+}
+pub Str adv_compromised() {
+    return "A check of your recent messages found that your master key was exposed. Treat your household as compromised: someone else may be able to sign in as you.";
+}
+pub Str adv_do_strong() {
+    return "What to do: replace your master key. This is strongly recommended for your household. Set up a new identity (a new master key) and move each of your passkeys to it.";
+}
+pub Str adv_do_rec() {
+    return "What to do: replacing your master key is recommended. Set up a new identity (a new master key) and move each of your passkeys to it.";
+}
+pub Str adv_do_now() {
+    return "What to do now: set up a new identity (a new master key) and move each of your passkeys to it as soon as you can.";
+}
+pub Str adv_why_unknown() { return "Why strongly: Symbolon did not count signatures before the fix, so it cannot tell how often your key was used."; }
+pub Str adv_why_many() { return "Why strongly: your key signed more than 300 times before the fix."; }
+pub Str adv_why_reshare() { return "Why strongly: a device was added, or your keys were refreshed, before the fix."; }
+pub Str adv_why_lost() { return "Why strongly: someone else may hold one of your devices (see below)."; }
+pub Str adv_rollover_ok() {
+    return "How to move a passkey: on each website, sign in, add a passkey from your new identity in the website's security settings, check that it works, then remove the old passkey.";
+}
+pub Str adv_rollover_avoid() {
+    return "How to move a passkey: do not use the automatic passkey move (rollover) in the browser extension, because someone else could use it too. On each website, use the website's own account recovery or support to remove the old passkey and add the new one.";
+}
+pub Str adv_avoid_lost() { return "Your identity log shows a recovery or a removed device, so someone else may hold one of your devices."; }
+pub Str adv_avoid_reported() { return "You reported a lost or stolen device."; }
+pub Str adv_avoid_incident() { return "Your cosigner's operator reported a security incident."; }
+pub Str adv_avoid_unchecked() { return "Symbolon could not check your identity log just now, so it cannot rule out a lost device. Until it can, follow the stricter advice."; }
+pub Str adv_scan_never(Str dir) {
+    return "Check your recent messages soon: the relay keeps them for 30 days only. Run `symbolon device scan-leaks " + dir + "` (it asks for your PIN), or tap \"Check recent messages\" in the app.";
+}
+pub Str adv_scan_clean(ScanSeen s) {
+    Str part = if (s.unreadable > 0) { f" ({s.unreadable} could not be read)" } else { "" };
+    return f"The check of your recent messages found nothing in the {s.checked} it could read{part}. That lowers the risk but does not rule it out: older messages are gone.";
+}
+pub Str adv_born() { return "Your identity was made after the fix: nothing to do."; }
+
+pub Advice security_advice(AdviceIn a, Str dir) {
+    Bool hit = a.scan.hits > 0;
+    Bool other_hands = a.lost_log || a.lost || a.incident;
+    if (a.born && a.log_ok && !hit) { return Advice {.level = "none", .rollover = "ok", .lines = [adv_born()]}; }
+    Bool avoid = hit || other_hands || !a.log_ok || a.hidden > 0;
+    Str level = if (hit) { "compromised" } else {
+        if (a.prefix_reshares > 0 || a.sigs < 0 || a.sigs > many_sigs() || other_hands || !a.log_ok) { "strongly-recommended" } else { "recommended" } };
+    List(Str) why = if (level != "strongly-recommended") { [] } else {
+        if (other_hands) { [adv_why_lost()] } else { if (a.prefix_reshares > 0) { [adv_why_reshare()] } else { if (a.sigs < 0) { [adv_why_unknown()] } else { [adv_why_many()] } } } };
+    List(Str) head = if (hit) { [adv_what(), adv_compromised(), adv_do_now()] } else { [adv_what(), if (level == "recommended") { adv_do_rec() } else { adv_do_strong() }] };
+    List(Str) reasons = (if (a.lost_log) { [adv_avoid_lost()] } else { [] }).concat(if (a.lost) { [adv_avoid_reported()] } else { [] })
+        .concat(if (a.incident) { [adv_avoid_incident()] } else { [] }).concat(if (!a.log_ok || a.hidden > 0) { [adv_avoid_unchecked()] } else { [] });
+    List(Str) scan = if (hit) { [] } else { if (a.scan.checked <= 0) { [adv_scan_never(dir)] } else { [adv_scan_clean(a.scan)] } };
+    List(Str) lines = head.concat(why).concat(reasons).concat([if (avoid) { adv_rollover_avoid() } else { adv_rollover_ok() }]).concat(scan);
+    return Advice {.level = level, .rollover = if (avoid) { "avoid" } else { "ok" }, .lines = lines};
+}
+
+// ─── The re-share's state ───────────────────────────────────────
+
+// "done" (a valid marker), "waiting-cosigner" (the last re-share ended on
+// the cosigner's old build), "waiting-device" (on another party's old
+// build), or "due".
+pub Str reshare_state(Bool done, Str fail, List(Int) cos) {
+    if (done) { return "done"; }
+    if (!str_starts_with(str_trim(fail), old_build_prefix())) { return "due"; }
+    Str short = hex_encode(if (cos.len() > 8) { cos[0..8] } else { cos });
+    return if (str_len(short) > 0 && str_contains(fail, short)) { "waiting-cosigner" } else { "waiting-device" };
+}
+
+pub Str reshare_words(Str state, Str dir) {
+    if (state == "done") { return "Your household's keys were refreshed after the fix."; }
+    if (state == "waiting-cosigner") {
+        return "The key refresh is waiting for your cosigner to be updated. Whoever runs your cosigner (your Symbolon Home box, or your provider) must install the update first; then finish the security update here again.";
+    }
+    if (state == "waiting-device") {
+        return "The key refresh is waiting for another of your devices to be updated. Update Symbolon on each of your devices, then finish the security update here again.";
+    }
+    return "Symbolon needs to refresh your household's keys once after a fix to its signing software. It takes a few minutes with your cosigner: run `symbolon device security-update " + dir + "` (or tap \"Finish the update\" in the app), with your other devices at hand.";
+}
+
+// The reminder after every device command (main.resid): files only, the
+// same under either PIN.
+@requires(filesystem)
+pub Bool reshare_due_here(Str dir) {
+    Option(DeviceConfig) oc = load_config(dir);
+    return match oc { None => false, Some(c) => c.log_id.len() > 0 && !fix_mark_present(dir) };
+}
+
+pub Str reshare_reminder(Str dir) {
+    return "Finish the security update: run `symbolon device security-update " + dir + "`. It refreshes your household's keys once after a fix to the signing software; then see `symbolon device security-advice " + dir + "`.";
+}
+
+// ─── What the device knows now ──────────────────────────────────
+
+pub type Known = { Bool log_ok; Advice advice; Str reshare; };
+
+@requires(filesystem, network, clock(readonly), declassify)
+pub Known known_now(Str dir, DeviceConfig c) {
+    Result(WitnessedView, SymbolonError) rv = log_seen(dir, relay_ep(c), c.log_id, "");
+    Reports rp = reports_of(dir);
+    Str fail = filesystem.read_all(reshare_fail_file(dir));
+    return match rv {
+        Err(_) => Known {.log_ok = false, .reshare = if (fix_mark_present(dir)) { "unknown" } else { reshare_state(false, fail, []) },
+            .advice = security_advice(AdviceIn {.log_ok = false, .hidden = 0, .born = false, .prefix_reshares = 0, .sigs = -1, .lost_log = false, .lost = rp.lost, .incident = rp.incident, .scan = scan_seen(dir)}, dir)},
+        Ok(w) => known_in(dir, c, w, rp, fail)
+    };
+}
+
+@requires(filesystem)
+Known known_in(Str dir, DeviceConfig c, WitnessedView w, Reports rp, Str fail) {
+    Quorum q = w.view.vh.head.quorum;
+    FixState st = fix_mark_check(fix_mark_read(dir), c.log_id, c.party, q, w.view.events);
+    FixFacts f = fix_facts(w.view.events, st);
+    Party cos = cosigner_of(q.parties, 0) else { none_party() };
+    AdviceIn a = AdviceIn {.log_ok = true, .hidden = w.hidden, .born = st.ok && st.born, .prefix_reshares = f.prefix_reshares, .sigs = if (st.ok && st.born) { 0 } else { -1 },
+                           .lost_log = f.recovers + f.removals > 0, .lost = rp.lost, .incident = rp.incident, .scan = scan_seen(dir)};
+    return Known {.log_ok = true, .advice = security_advice(a, dir), .reshare = reshare_state(st.ok, fail, cos.id)};
+}
+
+// ─── `device status` and `device security-advice` ──────────────
+
+// `device status`, then the migration's lines (each "key value"):
+//   security-reshare done|due|waiting-cosigner|waiting-device|unknown
+//   rotation none|recommended|strongly-recommended|compromised
+//   rotation-rollover ok|avoid
+@requires(filesystem, network, clock(readonly), declassify)
+pub Int device_status_plus(Str dir) {
+    Int r = device_status(dir);
+    Option(DeviceConfig) oc = load_config(dir);
+    return match oc { None => r, Some(c) => if (c.log_id.len() == 0) { r } else { status_lines(dir, known_now(dir, c), r) } };
+}
+
+Int status_lines(Str dir, Known k, Int r) {
+    println("security-reshare " + k.reshare);
+    println("rotation " + k.advice.level);
+    println("rotation-rollover " + k.advice.rollover);
+    if (k.advice.level != "none") { eprintln("Your household should act after a security fix: see `symbolon device security-advice " + dir + "`."); }
+    return r;
+}
+
+// `device security-advice DIR [--report lost|cosigner]`: the advice in
+// words; a report is kept first.
+@requires(filesystem, network, clock, declassify)
+pub Int device_security_advice(Str dir, Str report) {
+    Option(DeviceConfig) oc = load_config(dir);
+    if (match oc { None => true, Some(_) => false }) { return dfail("not set up"); }
+    if (str_len(report) > 0 && report != "lost" && report != "cosigner") { return dfail("--report takes lost (a device lost or stolen) or cosigner (an incident your cosigner's operator reported)"); }
+    if (str_len(report) > 0) {
+        Str before = if (filesystem.exists(reports_file(dir))) { filesystem.read_all(reports_file(dir)) } else { "" };
+        if (!filesystem.write_all(reports_file(dir), before + report + f" {clock_now_seconds()}\n")) { return dfail("cannot store the report"); }
+        println("report kept: the advice below takes it into account");
+    }
+    return match oc { None => dfail("not set up"), Some(c) => advice_for(dir, c) };
+}
+
+@requires(filesystem, network, clock(readonly), declassify)
+Int advice_for(Str dir, DeviceConfig c) {
+    if (c.log_id.len() == 0) { println("Not in an identity yet: nothing to do."); return 0; }
+    Known k = known_now(dir, c);
+    println(reshare_words(k.reshare, dir));
+    return print_lines(k.advice.lines, 0);
+}
+
+Int print_lines(List(Str) ls, Int i) {
+    if (i >= ls.len()) { return 0; }
+    println(ls[i]);
+    return print_lines(ls, i + 1);
+}
+
+// ─── The re-share (`device security-update`, after the update) ──
+
+// Whether `inv` may be joined as this household's refresh: for log `l`
+// and the quorum `q` in force (`removed`: parties removed in force), from
+// another device of q that signed it, at session protocol 2 or later, with
+// the same parties (less those removed), the requester and the cosigner
+// dealing, the threshold kept. "" when it may.
+pub Str refresh_problem(ReshareInvite inv, List(Int) l, List(Int) me, Quorum q, List(List(Int)) removed) {
+    if (!bytes_eq(inv.log_id, l) || inv.epoch != (Int)q.epoch + 1) { return "the invitation is for another log or epoch"; }
+    if (inv.proto < session_proto_min()) { return old_build_refusal("the inviting device", inv.proto); }
+    Party rq = party_of_id(q.parties, inv.requester, 0) else { none_party() };
+    if (rq.id.len() == 0 || rq.kind != party_kind_device() || bytes_eq(rq.id, me)) { return "the invitation is not from another device of this household"; }
+    if (!ecdsa_verify_raw(P256, Sha256, rq.auth_key, request_tbs(inv.session_id, reshare_message(inv), q.epoch, inv.requester, request_reshare()), inv.sig)) {
+        return "the invitation is not signed by the device it names";
+    }
+    List(Party) keep = kept_parties(q.parties, removed, 0, []);
+    if (!same_parties_as(inv.new_parties, keep, 0)) { return "the invitation changes who is in the household: it is not a refresh, refused"; }
+    Party cos = cosigner_of(q.parties, 0) else { none_party() };
+    List(Int) dealers = [pos1(q.parties, inv.requester, 0), pos1(q.parties, cos.id, 0)];
+    if (cos.id.len() == 0 || !ints_same(inv.dealers, dealers) || inv.degree != (Int)q.t - 1) { return "the invitation changes the dealers or the threshold: refused"; }
+    if (!ints_same(inv.receivers, receivers_of(inv.new_parties, 0, [])) || !ints_same(inv.offline, offline_of(inv.new_parties, 0, []))) { return "the invitation's receivers do not follow the parties: refused"; }
+    if (pos1(inv.new_parties, me, 0) == 0) { return "this device is not in that re-share"; }
+    return "";
+}
+
+Option(Party) party_of_id(List(Party) ps, List(Int) id, Int i) {
+    if (i >= ps.len()) { return None; }
+    if (bytes_eq(ps[i].id, id)) { return Some(ps[i]); }
+    return party_of_id(ps, id, i + 1);
+}
+
+pub List(Party) kept_parties(List(Party) ps, List(List(Int)) removed, Int i, List(Party) acc) {
+    if (i >= ps.len()) { return acc; }
+    return kept_parties(ps, removed, i + 1, if (id_in(removed, ps[i].id, 0)) { acc } else { acc.concat([ps[i]]) });
+}
+
+Bool id_in(List(List(Int)) xs, List(Int) id, Int i) { return i < xs.len() && (bytes_eq(xs[i], id) || id_in(xs, id, i + 1)); }
+
+Bool same_parties_as(List(Party) a, List(Party) b, Int i) {
+    if (a.len() != b.len()) { return false; }
+    if (i >= a.len()) { return true; }
+    Bool same = bytes_eq(a[i].id, b[i].id) && a[i].kind == b[i].kind && bytes_eq(a[i].auth_key, b[i].auth_key) && bytes_eq(a[i].hpke_key, b[i].hpke_key);
+    return same && same_parties_as(a, b, i + 1);
+}
+
+Bool ints_same(List(Int) a, List(Int) b) { return a.len() == b.len() && ints_same_from(a, b, 0); }
+
+Bool ints_same_from(List(Int) a, List(Int) b, Int i) { return i >= a.len() || (a[i] == b[i] && ints_same_from(a, b, i + 1)); }
+
+// The other devices of the quorum (removed ones left out), as remotes.
+List(Remote) other_devices(List(Party) ps, List(Int) me, Int i, List(Remote) acc) {
+    if (i >= ps.len()) { return acc; }
+    Bool other = ps[i].kind == party_kind_device() && !bytes_eq(ps[i].id, me);
+    return other_devices(ps, me, i + 1, if (other) { acc.concat([Remote {.party = ps[i].id, .cg = 0, .hpke_pub = ps[i].hpke_key}]) } else { acc });
+}
+
+// Whether `me` is the quorum's first device (it leads at once).
+Bool first_device(List(Party) ps, List(Int) me, Int i) {
+    if (i >= ps.len()) { return false; }
+    if (ps[i].kind == party_kind_device()) { return bytes_eq(ps[i].id, me); }
+    return first_device(ps, me, i + 1);
+}
+
+pub Int invite_wait_s() { return 120; }
+
+// The re-share step of `device security-update DIR` (secupdate.resid),
+// after the update itself. Done already: says so, under any PIN (a check of
+// the verified log and this device's marker, nothing else). Otherwise
+// under the PIN only: the duress PIN fails as a change does (SPEC 14).
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+pub Int nonce_reshare(Str dir, Str pin, Str primes) {
+    Option(DeviceConfig) oc = load_config(dir);
+    return match oc { None => dfail("not set up"), Some(c) => if (c.log_id.len() == 0) { 0 } else { reshare_with_log(dir, c, pin, primes) } };
+}
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+Int reshare_with_log(Str dir, DeviceConfig c, Str pin, Str primes) {
+    Result(LogView, SymbolonError) rv = log_view_dir(dir, relay_ep(c), c.log_id, "");
+    return match rv {
+        Err(e) => dfail("the key refresh needs your identity log, which does not verify now: " + err_text(e)),
+        Ok(v) => reshare_at(dir, c, v, pin, primes)
+    };
+}
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+Int reshare_at(Str dir, DeviceConfig c, LogView v, Str pin, Str primes) {
+    if (fix_mark_check(fix_mark_read(dir), c.log_id, c.party, v.vh.head.quorum, v.events).ok) { println("security re-share: done already"); return 0; }
+    Unlocked u = unlock_dir(dir, c, pin);
+    if (u.kind == 2) { return dfail(duress_refusal(dir, c)); }
+    if (u.kind != 1) { return dfail("wrong PIN"); }
+    Option(CgConfig) cg = load_share(dir, u.real.dek);
+    return match cg { None => dfail("no share"), Some(x) => reshare_or_join(dir, c, u, x, v, pin, primes) };
+}
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+Int reshare_or_join(Str dir, DeviceConfig c, Unlocked u, CgConfig x, LogView v, Str pin, Str primes) {
+    Quorum q = v.vh.head.quorum;
+    Party cos = cosigner_of(q.parties, 0) else { none_party() };
+    if (cos.id.len() == 0) { return dfail("this identity has no cosigner: nothing to refresh with"); }
+    Int t_last = last_time(v.events, policy_of_e0(v.events));
+    Int t_wit = witness_now(v.vh.head.policy.witnesses, relay_ep(c).ca, random_bytes(32));
+    Option(Membership) om = il_membership(c.log_id, v.events, if (t_wit > t_last) { t_wit } else { t_last }, lambda(p) { false });
+    return match om { None => dfail("the identity log does not verify now"), Some(mem) => reshare_in_force(dir, c, u, x, v, pin, primes, mem) };
+}
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+Int reshare_in_force(Str dir, DeviceConfig c, Unlocked u, CgConfig x, LogView v, Str pin, Str primes, Membership mem) {
+    Quorum q = v.vh.head.quorum;
+    if (mem.rotated_to.len() > 0) { return dfail("a recovery kit replacement is under way: finish it first (`symbolon device kit renew " + dir + "`); its re-share is the key refresh"); }
+    List(Remote) others = other_devices(kept_parties(q.parties, mem.removed, 0, []), c.party, 0, []);
+    if (others.len() == 0) { return lead(dir, c, u, x, v.vh, q, mem, pin, primes); }
+    Local me = Local {.party = c.party, .cg = 0, .hpke_sk = device_transport(c, u.real.dek).sk};
+    Int wait = if (first_device(q.parties, c.party, 0)) { 0 } else { invite_wait_s() };
+    if (wait > 0) { println(f"security re-share: waiting up to {wait} s for another of your devices to start it..."); }
+    Waited w = wait_wire(mail_ep(dir, c, u), me, others, Cursor {.party = c.party, .next = c.mbox_next}, clock_now_seconds(), wait, 1);
+    Option(Packet) ow = w.w;
+    return match ow {
+        None => lead(dir, c, u, x, v.vh, q, mem, pin, primes),
+        Some(p) => match p { WReshare(inv) => join_refresh(dir, c, u, inv, w, q, mem, pin, primes), _ => lead(dir, c, u, x, v.vh, q, mem, pin, primes) }
+    };
+}
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+Int join_refresh(Str dir, DeviceConfig c, Unlocked u, ReshareInvite inv, Waited w, Quorum q, Membership mem, Str pin, Str primes) {
+    Str bad = refresh_problem(inv, c.log_id, c.party, q, mem.removed);
+    if (str_len(bad) > 0) { return dfail("security re-share: " + bad); }
+    Party rq = party_of_id(q.parties, inv.requester, 0) else { none_party() };
+    println("security re-share: joining the refresh another of your devices started...");
+    Int r = join_session(dir, c, u, Remote {.party = rq.id, .cg = 0, .hpke_pub = rq.hpke_key}, inv, w, pin, primes);
+    return done_or(dir, r);
+}
+
+@requires(filesystem, network, device, declassify, clock, provision, environment)
+Int lead(Str dir, DeviceConfig c, Unlocked u, CgConfig x, VerifiedHead vh, Quorum q, Membership mem, Str pin, Str primes) {
+    List(Party) np = kept_parties(q.parties, mem.removed, 0, []);
+    if (other_devices(np, c.party, 0, []).len() > 0) {
+        println("security re-share: your other devices take part: on each, finish the security update now (`symbolon device security-update DIR`, or \"Finish the update\" in the app).");
+    }
+    println("security re-share: refreshing your household's keys with the cosigner (this can take minutes)...");
+    Int r = reshare_in(dir, c, u, x, vh, np, pin, primes, kv_mode_of(dir, u, q, c.party, false));
+    return done_or(dir, r);
+}
+
+@requires(filesystem, network, clock(readonly), declassify)
+Int done_or(Str dir, Int r) {
+    if (r == 0) { println("security re-share: done"); return 0; }
+    Option(DeviceConfig) oc = load_config(dir);
+    List(Int) cos = match oc { None => [], Some(c) => cos_id_of(verified_log(relay_ep(c), c.log_id)) };
+    eprintln(reshare_words(reshare_state(false, filesystem.read_all(reshare_fail_file(dir)), cos), dir));
+    return r;
+}
+
+List(Int) cos_id_of(Result(VerifiedHead, SymbolonError) rv) {
+    Party p = match rv { Ok(vh) => cosigner_of(vh.head.quorum.parties, 0) else { none_party() }, Err(_) => none_party() };
+    return p.id;
+}

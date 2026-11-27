@@ -63,7 +63,39 @@ printf '2468\n' | run 1800 "$BIN" device init "$W/dev" "$COS" "${WS[0]}" "${WS[1
 LOG=$(awk '/^log / {print $2}' "$W/init.log")
 OLD=$(sed -n 's/^RECOVERY KIT (write it down; it is shown once): //p' "$W/init.log")
 [ ${#OLD} -eq 64 ] || fail "no plain kit printed"
-run 120 "$BIN" device status "$W/dev" | grep -q 'epoch 1 parties 3 threshold 2' || fail "status after inception"
+run 120 "$BIN" device status "$W/dev" > "$W/status1.log" 2>&1 || fail "status after inception"
+grep -q 'epoch 1 parties 3 threshold 2' "$W/status1.log" || fail "status after inception: $(cat "$W/status1.log")"
+
+# After the Paillier nonce fix (SPEC 6.2.2): a household made by this build
+# needs no key refresh and no rotation.
+grep -qx 'security-reshare done' "$W/status1.log" && grep -qx 'rotation none' "$W/status1.log" || fail "status of a household made after the fix: $(cat "$W/status1.log")"
+# One made before it has no marker: the refresh is due and the master key
+# should be replaced (its signatures were never counted), with a reminder
+# after every device command.
+mv "$W/dev/nonce-fix" "$W/nonce-fix.born"
+run 120 "$BIN" device status "$W/dev" > "$W/status-old.log" 2>&1 || fail "status (before the fix)"
+grep -qx 'security-reshare due' "$W/status-old.log" && grep -qx 'rotation strongly-recommended' "$W/status-old.log" && grep -qx 'rotation-rollover ok' "$W/status-old.log" \
+  || fail "status of a household from before the fix: $(cat "$W/status-old.log")"
+run 60 "$BIN" device kit status "$W/dev" 2>&1 | grep -q "symbolon device security-update $W/dev" || fail "no reminder of the key refresh"
+run 120 "$BIN" device security-advice "$W/dev" > "$W/advice.log" 2>&1 || fail "security-advice"
+grep -q 'This is strongly recommended for your household' "$W/advice.log" && grep -q 'did not count signatures before the fix' "$W/advice.log" || fail "advice: $(cat "$W/advice.log")"
+echo "key refresh after the nonce fix (a re-share with the cosigner; a minute or two)..."
+printf '9999\n\n' | run 300 "$BIN" device security-update "$W/dev" "$W/devrs.primes" > "$W/refresh-pin.log" 2>&1 && fail "the key refresh ran under a wrong PIN"
+printf '2468\n\n' | run 1800 "$BIN" device security-update "$W/dev" "$W/devrs.primes" > "$W/refresh.log" 2>&1 || fail "security-update (key refresh): $(tail -3 "$W/refresh.log")"
+grep -q '^security re-share: done$' "$W/refresh.log" || fail "key refresh: $(cat "$W/refresh.log")"
+run 120 "$BIN" device status "$W/dev" > "$W/status-fixed.log" 2>&1 || fail "status after the key refresh"
+grep -q 'epoch 2 parties 3 threshold 2' "$W/status-fixed.log" && grep -qx 'security-reshare done' "$W/status-fixed.log" || fail "status after the key refresh: $(cat "$W/status-fixed.log")"
+# Still from before the fix: the refresh does not undo a leaked key.
+grep -qx 'rotation strongly-recommended' "$W/status-fixed.log" || fail "the refresh cleared the rotation advice: $(cat "$W/status-fixed.log")"
+printf '2468\n\n' | run 300 "$BIN" device security-update "$W/dev" > "$W/refresh2.log" 2>&1 || fail "security-update again"
+grep -q '^security re-share: done already$' "$W/refresh2.log" || fail "the key refresh ran twice: $(cat "$W/refresh2.log")"
+# A device reported lost: no rollover, each site's own recovery.
+run 60 "$BIN" device security-advice "$W/dev" --report lost > "$W/advice-lost.log" 2>&1 || fail "security-advice --report lost"
+grep -q "use the website's own account recovery" "$W/advice-lost.log" || fail "advice after a lost device: $(cat "$W/advice-lost.log")"
+run 120 "$BIN" device status "$W/dev" | grep -qx 'rotation-rollover avoid' || fail "rollover still advised after a lost device"
+rm "$W/dev/security-reports"; mv "$W/nonce-fix.born" "$W/dev/nonce-fix"
+run 120 "$BIN" device status "$W/dev" | grep -qx 'rotation none' || fail "the household's inception marker no longer counts"
+echo "nonce fix: the key refresh ran once (epoch 2), the advice follows the marker and the reports"
 printf '2468\n' | run 300 "$BIN" device register "$W/dev" login.example.com > "$W/reg.log" 2>&1 || fail "register"
 CID=$(awk '/^credential-id/ {print $2}' "$W/reg.log"); PUB=$(awk '/^public-key/ {print $2}' "$W/reg.log")
 [ ${#CID} -eq 64 ] && [ ${#PUB} -eq 130 ] || fail "register output"
@@ -75,7 +107,7 @@ run 60 "$BIN" device kit status "$W/dev" > "$W/kstat.log" 2>&1 || fail "kit stat
 # The replacement: a wrong PIN changes nothing; mismatched passphrases make nothing.
 printf '9999\nx\nx\n' | run 300 "$BIN" device kit renew "$W/dev" > "$W/renew-pin.log" 2>&1 && fail "renewed under a wrong PIN"
 printf '2468\nonce\ntwice\n' | run 300 "$BIN" device kit renew "$W/dev" > "$W/renew-mm.log" 2>&1 && fail "renewed with passphrases that differ"
-run 120 "$BIN" device status "$W/dev" | grep -q 'head sequence 0 ' || fail "a refused renewal changed the log"
+run 120 "$BIN" device status "$W/dev" | grep -q 'head sequence 1 ' || fail "a refused renewal changed the log"
 KP='lantern orchard pebble'
 echo "kit replacement (rotate-recovery, then a re-share; a minute or two)..."
 printf '2468\n%s\n%s\n' "$KP" "$KP" | run 1800 "$BIN" device kit renew "$W/dev" "$W/devrs.primes" > "$W/renew.log" 2>&1 || fail "kit renew: $(tail -3 "$W/renew.log")"
@@ -83,7 +115,7 @@ NEW=$(sed -n 's/^NEW RECOVERY KIT (write it down; it is shown once): //p' "$W/re
 [ ${#NEW} -eq 136 ] && [ "${NEW:0:2}" = 01 ] || fail "the new kit is not a protected sheet: $NEW"
 grep -q '^kit replaced' "$W/renew.log" || fail "kit renew: $(cat "$W/renew.log")"
 run 120 "$BIN" device status "$W/dev" > "$W/status2.log" 2>&1 || fail "status"
-grep -q 'head sequence 2 epoch 2 parties 3 threshold 2 pending 0' "$W/status2.log" || fail "status after the replacement: $(cat "$W/status2.log")"
+grep -q 'head sequence 3 epoch 3 parties 3 threshold 2 pending 0' "$W/status2.log" || fail "status after the replacement: $(cat "$W/status2.log")"
 [ "$(run 60 "$BIN" device kit status "$W/dev" | head -1)" = "kit: protected by a passphrase" ] || fail "kit status after the replacement"
 # Run again: nothing is under way, so it would make another kit; with no
 # passphrase lines it makes one without (not wanted here), so it is not run.
@@ -97,7 +129,7 @@ echo "kit replaced: rotate-recovery in force, re-shared to epoch 2 with the new 
 DEV3=$(printf '3333\n\n' | run 120 "$BIN" device new "$W/dev3" 127.0.0.1 "$RP" --unprotected --fast-kdf) || fail "device new (recovering)"
 printf '\n' | run 600 "$BIN" device recover "$W/dev3" "$OLD" "$LOG" > "$W/recover-old.log" 2>&1 && fail "the old kit started a recovery"
 grep -q 'recover' "$W/recover-old.log" || fail "old kit: $(cat "$W/recover-old.log")"
-run 120 "$BIN" device status "$W/dev" | grep -q 'head sequence 2 .*pending 0' || fail "the old kit's recover reached the log"
+run 120 "$BIN" device status "$W/dev" | grep -q 'head sequence 3 .*pending 0' || fail "the old kit's recover reached the log"
 printf '3333\n' | run 300 "$BIN" device recover-release "$W/dev3" > "$W/rel-old.log" 2>&1 && fail "the cosigner released its half to the old kit"
 echo "old sheet: its recover is refused and nothing is released"
 
@@ -114,7 +146,10 @@ for i in 1 2 3; do
 done
 echo "recovery finish with the new kit (release, kit share, re-share; a minute or two)..."
 printf '3333\n%s\n' "$KP" | run 1800 "$BIN" device recover-finish "$W/dev3" "$NEW" "$W/dev3.primes" > "$W/finish.log" 2>&1 || fail "recover-finish: $(tail -3 "$W/finish.log")"
-run 120 "$BIN" device status "$W/dev3" | grep -q 'parties 3 threshold 2' || fail "status after recovery"
+run 120 "$BIN" device status "$W/dev3" > "$W/status3.log" 2>&1 || fail "status after recovery"
+grep -q 'parties 3 threshold 2' "$W/status3.log" || fail "status after recovery: $(cat "$W/status3.log")"
+# A recover is in the log: the passkeys must not be moved by rollover.
+grep -qx 'rotation-rollover avoid' "$W/status3.log" || fail "rollover advised after a recovery: $(cat "$W/status3.log")"
 MSG3=$(python3 -c 'import hashlib; print(hashlib.sha256(b"recovered with the new kit").hexdigest())')
 printf '3333\n' | run 600 "$BIN" device sign "$W/dev3" login.example.com "$CID" "$MSG3" > "$W/sign3.log" 2>&1 || fail "sign from the recovered device: $(tail -2 "$W/sign3.log")"
 verify "$PUB" "$MSG3" "$(tail -1 "$W/sign3.log")" || fail "the recovered device's signature does not verify"
