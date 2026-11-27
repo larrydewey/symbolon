@@ -7,6 +7,18 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+/// Whether a kit as written (hex, any spacing) is a protected sheet: 68
+/// bytes, version 1 (SPEC 13.2). A plain kit is its 32-byte seed.
+bool kitIsProtected(String kit) {
+  final k = kit.replaceAll(RegExp(r'[\s-]'), '').toLowerCase();
+  return k.length == 136 && k.startsWith('01');
+}
+
+/// The lines a new kit's passphrase takes on standard input: it and the
+/// same again, or none (an empty line when [explicitNone]: something
+/// follows, or the agent would read on).
+List<String> newKitPassLines(String pass, {bool explicitNone = false}) => pass.isEmpty ? [if (explicitNone) ''] : [pass, pass];
+
 String _hex(String s) => utf8.encode(s).map((b) => b.toRadixString(16).padLeft(2, '0')).join();
 
 class CliResult {
@@ -174,9 +186,12 @@ class SymbolonCli {
         input: [pin, duressPin], timeout: const Duration(minutes: 5));
   }
 
-  /// Inception: [witnesses] as host:port:keyhex.
-  Future<CliResult> deviceInit(String dir, String cosignerKeys, List<String> witnesses, String pin, {String devicePrimes = '', String kitPrimes = ''}) {
-    return run(['device', 'init', dir, cosignerKeys, ...witnesses, if (devicePrimes.isNotEmpty) ...[devicePrimes, kitPrimes]], input: [pin]);
+  /// Inception: [witnesses] as host:port:keyhex. [kitPassphrase] seals the
+  /// recovery kit's sheet (SPEC 13.2); empty for none.
+  Future<CliResult> deviceInit(String dir, String cosignerKeys, List<String> witnesses, String pin,
+      {String devicePrimes = '', String kitPrimes = '', String kitPassphrase = ''}) {
+    return run(['device', 'init', dir, cosignerKeys, ...witnesses, if (devicePrimes.isNotEmpty) ...[devicePrimes, kitPrimes]],
+        input: [pin, ...newKitPassLines(kitPassphrase)]);
   }
 
   Future<CliResult> status(String dir) => run(['device', 'status', dir], timeout: const Duration(minutes: 2));
@@ -487,15 +502,30 @@ class SymbolonCli {
   Future<CliResult> join(String dir, String enrollerKeys, String pin, {String primes = ''}) =>
       run(['device', 'join', dir, enrollerKeys, if (primes.isNotEmpty) primes], input: [pin]);
 
-  Future<CliResult> recover(String dir, String kitSeed, String logId) =>
-      run(['device', 'recover', dir, kitSeed, logId], timeout: const Duration(minutes: 5));
+  /// Starts a kit recovery. [kitPassphrase]: the old kit's, when its sheet
+  /// is protected; [newKitPassphrase] seals the new kit's sheet ("" none).
+  Future<CliResult> recover(String dir, String kit, String logId, {String kitPassphrase = '', String newKitPassphrase = ''}) =>
+      run(['device', 'recover', dir, kit, logId],
+          input: [if (kitIsProtected(kit)) kitPassphrase, ...newKitPassLines(newKitPassphrase, explicitNone: true)], timeout: const Duration(minutes: 20));
 
   Future<CliResult> veto(String dir, String pin) => run(['device', 'veto', dir], input: [pin], timeout: const Duration(minutes: 5));
 
   Future<CliResult> recoverRelease(String dir, String pin) => run(['device', 'recover-release', dir], input: [pin], timeout: const Duration(minutes: 5));
 
-  Future<CliResult> recoverFinish(String dir, String kitSeed, String pin, {String primes = ''}) =>
-      run(['device', 'recover-finish', dir, kitSeed, if (primes.isNotEmpty) primes], input: [pin]);
+  Future<CliResult> recoverFinish(String dir, String kit, String pin, {String kitPassphrase = '', String primes = ''}) =>
+      run(['device', 'recover-finish', dir, kit, if (primes.isNotEmpty) primes], input: [pin, if (kitIsProtected(kit)) kitPassphrase]);
+
+  /// "protected", "plain" or "unknown" (a kit made before passphrases).
+  Future<String> kitStatus(String dir) async {
+    final r = await run(['device', 'kit', 'status', dir], timeout: const Duration(minutes: 1));
+    final l = r.ok ? r.out : '';
+    return l.contains('protected by a passphrase') ? 'protected' : l.contains('no passphrase') ? 'plain' : 'unknown';
+  }
+
+  /// The same kit written again under [newPassphrase]: prints a new
+  /// "RECOVERY KIT" line. [kitPassphrase] when the kit given is protected.
+  Future<CliResult> kitRenew(String dir, String kit, String newPassphrase, {String kitPassphrase = ''}) =>
+      run(['device', 'kit', 'renew', dir], input: [kit, if (kitIsProtected(kit)) kitPassphrase, newPassphrase, newPassphrase], timeout: const Duration(minutes: 20));
 
   // Duress alerts (SPEC 14.4).
 

@@ -25,6 +25,35 @@ void main() {
     expect(await agent.stdinLog.readAsString(), '2468\nhunter2\n--\n');
   });
 
+  test("a kit's passphrase goes to standard input, and only when the sheet is protected", () async {
+    final plain = '9a' * 32, sealed = '01120301${'ab' * 64}';
+    expect(kitIsProtected(plain), isFalse);
+    expect(kitIsProtected(sealed), isTrue);
+    expect(kitIsProtected('0112 0301-${'AB' * 64}'), isTrue);   // as written, in groups
+    expect(newKitPassLines(''), isEmpty);
+    expect(newKitPassLines('', explicitNone: true), ['']);
+    expect(newKitPassLines('lantern orchard'), ['lantern orchard', 'lantern orchard']);
+    await cli.deviceInit('/d', 'cc', ['w1', 'w2', 'w3'], '2468', kitPassphrase: 'lantern orchard');
+    await cli.recover('/d', sealed, '0f' * 32, kitPassphrase: 'old words here', newKitPassphrase: 'new words here');
+    await cli.recover('/d', plain, '0f' * 32);
+    await cli.recoverFinish('/d', sealed, '2468', kitPassphrase: 'old words here');
+    await cli.recoverFinish('/d', plain, '2468', kitPassphrase: 'ignored');
+    expect(await cli.kitStatus('/d'), 'plain');
+    await cli.kitRenew('/d', plain, 'new words here');
+    final args = await agent.argsLog.readAsString();
+    expect(args, isNot(contains('words')));
+    expect(args, isNot(contains('lantern')));
+    expect(await agent.stdinLog.readAsString(),
+        '2468\nlantern orchard\nlantern orchard\n--\n'
+        'old words here\nnew words here\nnew words here\n--\n'
+        '\n--\n'
+        '2468\nold words here\n--\n'
+        '2468\n--\n'
+        '\n--\n'
+        '$plain\nnew words here\nnew words here\n--\n');
+    expect(await cli.kitStatus('/d'), 'protected');
+  });
+
   test('device status is parsed', () async {
     final s = DeviceStatus.parse(await cli.status('/d'))!;
     expect(s.party, startsWith('0011'));

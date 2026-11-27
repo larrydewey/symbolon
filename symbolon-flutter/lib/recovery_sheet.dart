@@ -60,6 +60,11 @@ class RecoverySheetCard extends StatelessWidget {
           value(sheet.log.isEmpty ? 'Recovery kit' : '2. Recovery kit', sheet.kit, secret: true, key: const Key('sheet-kit')),
           const SizedBox(height: 8),
           Text('Both are needed. ${groupsOf(sheet.log).length + groupsOf(sheet.kit).length} groups of four in all.', style: t.bodySmall?.copyWith(color: _ink)),
+          if (sheet.protected) ...[
+            const SizedBox(height: 4),
+            Text('The kit is sealed under your passphrase, which is not on the sheet: recovery needs it too. Keep it apart from the sheet.',
+                key: const Key('sheet-protected'), style: t.bodySmall?.copyWith(color: _ink)),
+          ],
         ]),
       ),
     );
@@ -124,7 +129,7 @@ Future<Uint8List> sheetPng(RecoverySheet sheet, {DateTime? made}) async {
   y = (qrTop + side + 60 > y ? qrTop + side + 60 : y);
   y += text('With this sheet you can get your identity back if you lose every device: on a new device, open Symbolon, choose '
           '"Lost every device? Recover with your kit", and scan the code above, or type both values in. Anyone who has this '
-          'sheet can start a recovery of your identity; your devices are told, and can stop it.',
+          '${sheet.protected ? 'sheet and your passphrase can start a recovery of your identity. The kit is sealed under that passphrase, which is not written here: keep it apart from this sheet. If it is forgotten, the kit cannot be used.' : 'sheet can start a recovery of your identity; your devices are told, and can stop it.'}',
           28) +
       44;
   for (final (label, v) in [('1. Identity log', sheet.log), ('2. Recovery kit', sheet.kit)]) {
@@ -262,4 +267,45 @@ class _SheetPageState extends State<SheetPage> {
       ),
     );
   }
+}
+
+/// Asks for a new kit's passphrase (SPEC 13.2), with the plain warning
+/// that a forgotten one makes the kit useless. "" when the person chooses
+/// none (only if [optional]); null when cancelled.
+Future<String?> askKitPassphrase(BuildContext context, {bool optional = true, String title = 'A passphrase for your kit'}) {
+  final a = TextEditingController(), b = TextEditingController();
+  String? problem;
+  return showDialog<String>(
+    context: context,
+    builder: (ctx) => StatefulBuilder(
+      builder: (ctx, set) {
+        void ok() {
+          final p = a.text;
+          if (p.length < 10) return set(() => problem = 'At least 10 characters; a few unrelated words are easiest to remember');
+          if (p != b.text) return set(() => problem = 'The passphrases differ');
+          Navigator.of(ctx).pop(p);
+        }
+        return AlertDialog(
+          title: Text(title),
+          content: SizedBox(
+            width: 380,
+            child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+              const Text('With a passphrase, the kit alone is no use to whoever finds it: recovering needs both. If you forget the '
+                  'passphrase, the kit cannot be used and nobody can reset it, so keep it where you will find it, apart from the kit.'),
+              const SizedBox(height: 12),
+              TextField(key: const Key('kit-pass-new'), controller: a, obscureText: true, autocorrect: false, enableSuggestions: false,
+                  decoration: const InputDecoration(labelText: 'Passphrase')),
+              TextField(key: const Key('kit-pass-new2'), controller: b, obscureText: true, autocorrect: false, enableSuggestions: false,
+                  decoration: InputDecoration(labelText: 'Passphrase again', errorText: problem), onSubmitted: (_) => ok()),
+            ]),
+          ),
+          actions: [
+            TextButton(onPressed: () => Navigator.of(ctx).pop(), child: const Text('Cancel')),
+            if (optional) TextButton(key: const Key('kit-pass-none'), onPressed: () => Navigator.of(ctx).pop(''), child: const Text('No passphrase')),
+            FilledButton(key: const Key('kit-pass-ok'), onPressed: ok, child: const Text('Use this passphrase')),
+          ],
+        );
+      },
+    ),
+  );
 }

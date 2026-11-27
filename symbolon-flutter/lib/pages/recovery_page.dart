@@ -11,7 +11,9 @@ import '../widgets.dart';
 import 'scan_page.dart';
 
 /// Kit recovery (SPEC 13.2): start it on a new device, veto it from a
-/// device you still hold, and finish it after the delay.
+/// device you still hold, and finish it after the delay. On a device with
+/// an identity whose kit has no passphrase, an offer to write the kit again
+/// under one (`device kit renew`).
 class RecoveryPage extends StatefulWidget {
   final App app;
   const RecoveryPage({super.key, required this.app});
@@ -25,6 +27,7 @@ class _RecoveryPageState extends State<RecoveryPage> {
   final kitC = TextEditingController();
   int pending = 0;       // delayed events waiting on this identity, from device status
   bool setUp = false;    // whether this device has an identity
+  String kitKind = 'protected';   // until known: "plain", "unknown" (made before passphrases) or "protected"
 
   App get app => widget.app;
 
@@ -38,8 +41,49 @@ class _RecoveryPageState extends State<RecoveryPage> {
           pending = s.pending ?? 0;
           setUp = s.log != null;
         });
+        if (s.log != null) {
+          app.cli.kitStatus(app.dir).then((k) => mounted ? setState(() => kitKind = k) : null);
+        }
       }
     });
+  }
+
+  String clean(String s) => s.replaceAll(RegExp(r'[\s-]'), '').toLowerCase();
+
+  /// The kit's passphrase when [k] is a protected sheet: "" when it is not
+  /// needed, null when the person cancelled.
+  Future<String?> kitPassFor(String k) async {
+    if (!kitIsProtected(k)) return '';
+    return askSecret(context, title: 'Kit passphrase', label: 'Passphrase', numeric: false, action: 'Continue',
+        note: 'This kit is sealed under a passphrase. A wrong one is refused, and nothing is sent.');
+  }
+
+  /// Writes the kit again under a passphrase: the same kit, so the old sheet
+  /// must be destroyed after.
+  Future<void> renew() async {
+    final k = await askSecret(context, title: 'Your recovery kit', label: 'Kit (item 2 on your sheet)', numeric: false, action: 'Continue');
+    if (k == null || !mounted) return;
+    final kit = clean(k);
+    if (v.hex(kit) != null) return toast(context, 'The kit is 0-9 and a-f: item 2 on your recovery sheet.');
+    final old = await kitPassFor(kit);
+    if (old == null || !mounted) return;
+    final pass = await askKitPassphrase(context, optional: false);
+    if (pass == null || pass.isEmpty || !mounted) return;
+    final r = await runTask(context, 'Sealing your kit', () => app.cli.kitRenew(app.dir, kit, pass, kitPassphrase: old),
+        detail: 'Your passphrase is stretched so that guessing it is slow.', usually: 'about a minute');
+    if (!r.ok || !mounted) return;
+    final fresh = r.lines.where((l) => l.startsWith('RECOVERY KIT')).map((l) => l.split(': ').last.trim().toLowerCase()).firstOrNull;
+    if (fresh == null) return;
+    final log = DeviceStatus.parse(await app.cli.status(app.dir))?.log ?? '';
+    if (!mounted) return;
+    await Navigator.of(context).push(MaterialPageRoute<void>(
+        fullscreenDialog: true,
+        builder: (_) => SheetPage(
+            sheet: RecoverySheet(log, fresh),
+            title: 'Your protected recovery sheet',
+            intro: 'This is the same kit, now sealed under your passphrase. Write it down or print it, then destroy the old sheet: '
+                'it still works for whoever has it.')));
+    if (mounted) setState(() => kitKind = 'protected');
   }
 
   @override
@@ -49,7 +93,7 @@ class _RecoveryPageState extends State<RecoveryPage> {
     super.dispose();
   }
 
-  String get kit => kitC.text.replaceAll(RegExp(r'\s'), '').toLowerCase();
+  String get kit => clean(kitC.text);
 
   Future<void> scan() async {
     final text = await Navigator.of(context).push<String>(MaterialPageRoute(
@@ -69,7 +113,13 @@ class _RecoveryPageState extends State<RecoveryPage> {
     final log = logId.text.replaceAll(RegExp(r'\s'), '').toLowerCase();
     if (!RegExp(r'^[0-9a-f]{64}$').hasMatch(log)) return toast(context, 'The identity log is 64 characters, 0-9 and a-f: item 1 on your recovery sheet.');
     if (v.hex(kit) != null) return toast(context, 'The kit is 0-9 and a-f: item 2 on your recovery sheet.');
-    final r = await runTask(context, 'Starting recovery', () => app.cli.recover(app.dir, kit, log), usually: 'a few seconds');
+    final old = await kitPassFor(kit);
+    if (old == null || !mounted) return;
+    // The new kit this recovery makes: a passphrase recommended, not required.
+    final pass = await askKitPassphrase(context, title: 'A passphrase for your new kit');
+    if (pass == null || !mounted) return;
+    final r = await runTask(context, 'Starting recovery', () => app.cli.recover(app.dir, kit, log, kitPassphrase: old, newKitPassphrase: pass),
+        usually: old.isEmpty && pass.isEmpty ? 'a few seconds' : 'about a minute');
     if (!r.ok || !mounted) return;
     final fresh = r.lines.where((l) => l.startsWith('NEW RECOVERY KIT')).map((l) => l.split(': ').last.trim().toLowerCase()).firstOrNull;
     await showOutput(context, 'Recovery started', r.lines.where((l) => !l.startsWith('NEW RECOVERY KIT')).join('\n'));
@@ -89,10 +139,12 @@ class _RecoveryPageState extends State<RecoveryPage> {
     if (seed.isEmpty) {
       final s = await askSecret(context, title: 'Recovery kit', label: 'Kit (the old one)', numeric: false, action: 'Continue');
       if (s == null || !mounted) return;
-      seed = s.replaceAll(RegExp(r'\s'), '').toLowerCase();
+      seed = clean(s);
     }
     if (v.hex(seed) != null) return toast(context, 'The kit is 0-9 and a-f: item 2 on your recovery sheet.');
-    final r = await app.withPin(context, (p) => runTask(context, 'Finishing recovery', () => app.cli.recoverFinish(app.dir, seed, p), usually: '1-3 minutes'));
+    final old = await kitPassFor(seed);
+    if (old == null || !mounted) return;
+    final r = await app.withPin(context, (p) => runTask(context, 'Finishing recovery', () => app.cli.recoverFinish(app.dir, seed, p, kitPassphrase: old), usually: '1-5 minutes'));
     if (r != null && r.ok && mounted) await showOutput(context, 'Recovered', r.out.trim());
   }
 
@@ -166,9 +218,35 @@ class _RecoveryPageState extends State<RecoveryPage> {
           const SizedBox(height: 8),
           WideButton('2. Finish recovery', onPressed: finish),
         ]);
+    // A kit without a passphrase (or made before there were any): offer to
+    // write it again under one.
+    final offer = setUp && kitKind != 'protected'
+        ? Card(
+            key: const Key('kit-renew-offer'),
+            margin: const EdgeInsets.only(bottom: 16),
+            child: Padding(
+              padding: const EdgeInsets.all(16),
+              child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+                Row(children: [
+                  const Icon(Icons.lock_outline),
+                  const SizedBox(width: 12),
+                  Expanded(child: Text('Add a passphrase to your recovery kit', style: t.titleMedium)),
+                ]),
+                const SizedBox(height: 8),
+                Text(kitKind == 'plain'
+                    ? 'Your kit has no passphrase, so whoever reads your sheet holds it. With one, the sheet alone is no use to them.'
+                    : 'Your kit was made before kits could have a passphrase. With one, the sheet alone is no use to whoever finds it.'),
+                const SizedBox(height: 8),
+                const Text('You need your sheet at hand. If you forget the passphrase, the kit cannot be used.'),
+                const SizedBox(height: 12),
+                WideButton('Add a passphrase', key: const Key('kit-renew'), icon: Icons.lock_outline, tonal: true, onPressed: renew),
+              ]),
+            ),
+          )
+        : null;
     return Scaffold(
       appBar: AppBar(title: const Text('Recovery')),
-      body: PageBody(children: setUp || pending > 0 ? [stop, recover] : [recover, stop]),
+      body: PageBody(children: [if (offer != null && pending == 0) offer, ...(setUp || pending > 0 ? [stop, recover] : [recover, stop])]),
     );
   }
 }

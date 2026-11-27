@@ -34,8 +34,12 @@ class OrgInvite {
 
 class RecoverySheet {
   final String log;   // the identity log, 64 hex digits
-  final String kit;   // the kit seed, hex
+  final String kit;   // the kit's sheet, hex: its seed, or the seed sealed under a passphrase
   const RecoverySheet(this.log, this.kit);
+
+  /// Whether the kit is sealed under a passphrase (SPEC 13.2: 68 bytes,
+  /// version 1); a plain kit is its 32-byte seed.
+  bool get protected => kit.length == 136 && kit.startsWith('01');
 
   String get link => 'symbolon://recover?l=$log&k=$kit';
 

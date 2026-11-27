@@ -19,8 +19,9 @@ import 'join_page.dart';
 import 'scan_page.dart';
 
 /// Setting up this device, as a guided flow: where the services are, a PIN,
-/// then one step that creates the device, pairs it with the cosigner and
-/// runs the inception, and last the recovery kit to write down.
+/// a passphrase for the recovery kit (recommended, skippable), then one step
+/// that creates the device, pairs it with the cosigner and runs the
+/// inception, and last the recovery kit to write down.
 class SetupPage extends StatefulWidget {
   final App app;
   const SetupPage({super.key, required this.app});
@@ -59,7 +60,11 @@ class _SetupPageState extends State<SetupPage> {
   bool get hasHardware => hardware == HardwareState.ready || hardware == HardwareState.keystore;
   bool get unprotected => !hasHardware || !useTpm;
 
-  // 3. The kit.
+  // 3. The kit's passphrase (SPEC 13.2): seals the sheet; "" for none.
+  final kitPass = TextEditingController();
+  final kitPass2 = TextEditingController();
+
+  // 4. The kit.
   RecoverySheet? sheet;   // the kit, with the identity log it recovers
   bool checking = false;  // the sheet hidden, two of its groups asked back
   bool keptKit = false;   // checked: setup may close
@@ -85,7 +90,7 @@ class _SetupPageState extends State<SetupPage> {
 
   @override
   void dispose() {
-    for (final c in [homeLinkText, demoUrl, relayHost, relayPort, ca, cosignerKeys, ...ws, pin, pin2, duressPin]) {
+    for (final c in [homeLinkText, demoUrl, relayHost, relayPort, ca, cosignerKeys, ...ws, pin, pin2, duressPin, kitPass, kitPass2]) {
       c.dispose();
     }
     super.dispose();
@@ -192,16 +197,37 @@ class _SetupPageState extends State<SetupPage> {
   // The Keystore counts no wrong PINs, unlike a TPM: as long a PIN as without one.
   int get minPin => unprotected || hardware == HardwareState.keystore ? 6 : 4;
 
-  Future<void> create() async {
-    FocusScope.of(context).unfocus();
+  String? pinProblem() {
     final bad = v.pin(pin.text, min: minPin);
-    if (bad != null) return fail('PIN: $bad.');
-    if (pin.text != pin2.text) return fail('The two PINs differ.');
+    if (bad != null) return 'PIN: $bad.';
+    if (pin.text != pin2.text) return 'The two PINs differ.';
     if (duressPin.text.isNotEmpty) {
       final d = v.pin(duressPin.text, min: minPin);
-      if (d != null) return fail('Duress PIN: $d.');
-      if (duressPin.text == pin.text) return fail('The duress PIN must differ from your PIN.');
+      if (d != null) return 'Duress PIN: $d.';
+      if (duressPin.text == pin.text) return 'The duress PIN must differ from your PIN.';
     }
+    return null;
+  }
+
+  static const minKitPass = 10;
+
+  String? kitPassProblem(String s) {
+    if (s.length < minKitPass) return 'At least $minKitPass characters; a few unrelated words are easiest to remember';
+    if (s == pin.text || s == duressPin.text) return 'Not your PIN';
+    return null;
+  }
+
+  // [withPassphrase] false: the person chose to go without one.
+  Future<void> create({bool withPassphrase = true}) async {
+    FocusScope.of(context).unfocus();
+    final bad = pinProblem();
+    if (bad != null) return fail(bad);
+    if (withPassphrase) {
+      final b = kitPassProblem(kitPass.text);
+      if (b != null) return fail('Passphrase: $b.');
+      if (kitPass.text != kitPass2.text) return fail('The two passphrases differ.');
+    }
+    final kp = withPassphrase ? kitPass.text : '';
     final p = pin.text;
     final hasDevice = File('${app.dir}/config.cbor').existsSync();
     if (!hasDevice) {
@@ -234,11 +260,11 @@ class _SetupPageState extends State<SetupPage> {
         context,
         'Creating your identity',
         () => app.cli.deviceInit(app.dir, cosignerKeys.text.trim(), [for (final w in ws) w.text.trim()], p,
-            devicePrimes: dp == null ? '' : '$dp/device.primes', kitPrimes: dp == null ? '' : '$dp/kit.primes'),
+            devicePrimes: dp == null ? '' : '$dp/device.primes', kitPrimes: dp == null ? '' : '$dp/kit.primes', kitPassphrase: kp),
         detail: dp == null
             ? 'This device and your Symbolon Home box make your key together. It is real work for the phone: keep the app open.'
             : 'This device and the cosigner generate a key together, and the witnesses record the result.',
-        usually: dp == null ? '1-4 minutes' : '1-2 minutes');
+        usually: kp.isNotEmpty ? (dp == null ? '2-6 minutes' : '1-3 minutes') : (dp == null ? '1-4 minutes' : '1-2 minutes'));
     if (!r.ok || !mounted) return;
     if (bio.supported && bio.biometric && useBio) await Bio.enroll(p);
     if (!mounted) return;
@@ -247,25 +273,27 @@ class _SetupPageState extends State<SetupPage> {
     pin.clear();
     pin2.clear();
     duressPin.clear();
+    kitPass.clear();
+    kitPass2.clear();
     // The identity log goes on the sheet with the kit: recovery needs both.
     final log = DeviceStatus.parse(await app.cli.status(app.dir))?.log;
     if (!mounted) return;
     setState(() {
       final kit = r.lines.where((l) => l.startsWith('RECOVERY KIT')).map((l) => l.split(': ').last.trim().toLowerCase()).firstOrNull;
       sheet = kit == null ? null : RecoverySheet(log ?? '', kit);
-      step = 2;
+      step = 3;
     });
   }
 
   @override
   Widget build(BuildContext context) {
-    final steps = [connectStep, pinStep, kitStep];
+    final steps = [connectStep, pinStep, passphraseStep, kitStep];
     return PopScope(
-      canPop: step != 2 || keptKit,
+      canPop: step != 3 || keptKit,
       child: Scaffold(
         appBar: AppBar(
           title: const Text('Set up this device'),
-          bottom: PreferredSize(preferredSize: const Size.fromHeight(4), child: LinearProgressIndicator(value: (step + 1) / 3)),
+          bottom: PreferredSize(preferredSize: const Size.fromHeight(4), child: LinearProgressIndicator(value: (step + 1) / 4)),
         ),
         body: PageBody(children: [steps[step]()]),
       ),
@@ -275,7 +303,7 @@ class _SetupPageState extends State<SetupPage> {
   Widget connectStep() {
     final t = Theme.of(context).textTheme;
     return Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
-      Text('Step 1 of 3 · Connect', style: t.labelLarge),
+      Text('Step 1 of 4 · Connect', style: t.labelLarge),
       const SizedBox(height: 4),
       Text('Connect to your Symbolon Home', style: t.headlineSmall),
       const SizedBox(height: 8),
@@ -321,7 +349,7 @@ class _SetupPageState extends State<SetupPage> {
   Widget pinStep() {
     final t = Theme.of(context).textTheme;
     return Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
-      Text('Step 2 of 3 · PIN', style: t.labelLarge),
+      Text('Step 2 of 4 · PIN', style: t.labelLarge),
       const SizedBox(height: 4),
       Text('Choose your PIN', style: t.headlineSmall),
       const SizedBox(height: 8),
@@ -367,8 +395,63 @@ class _SetupPageState extends State<SetupPage> {
           child: Text('Demo stack: test keys, for trying Symbolon out only.', style: TextStyle(color: Colors.orange)),
         ),
       const SizedBox(height: 8),
-      WideButton('Create my identity', key: const Key('create'), icon: Icons.fingerprint, onPressed: create),
+      WideButton('Next', key: const Key('pin-next'), icon: Icons.arrow_forward, onPressed: () {
+        FocusScope.of(context).unfocus();
+        final bad = pinProblem();
+        bad == null ? setState(() => step = 2) : fail(bad);
+      }),
       TextButton(onPressed: () => setState(() => step = 0), child: const Text('Back')),
+    ]);
+  }
+
+  // The recovery kit's passphrase (SPEC 13.2): recommended, not required.
+  Widget passphraseStep() {
+    final t = Theme.of(context).textTheme;
+    return Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+      Text('Step 3 of 4 · Kit passphrase', style: t.labelLarge),
+      const SizedBox(height: 4),
+      Text('Protect your recovery kit', style: t.headlineSmall),
+      const SizedBox(height: 8),
+      const Text('Next you get a recovery kit to write down. With a passphrase, a kit someone finds or photographs is no use to '
+          'them: recovering needs the kit and the passphrase together. We recommend one.'),
+      const SizedBox(height: 12),
+      Card(
+        key: const Key('kit-pass-warning'),
+        margin: EdgeInsets.zero,
+        child: const ListTile(
+          leading: Icon(Icons.info_outline),
+          title: Text('Keep the passphrase where you will find it'),
+          subtitle: Text('If you forget it, the kit cannot be used, and nobody can reset it for you. Keep it apart from the kit: '
+              'in your memory, or written down somewhere else.'),
+        ),
+      ),
+      const SizedBox(height: 12),
+      Field(kitPass, 'Passphrase', helper: 'At least $minKitPass characters; a few unrelated words work well', obscure: true, fieldKey: const Key('kit-pass'),
+          check: (s) => kitPassProblem(s)),
+      Field(kitPass2, 'Passphrase again', obscure: true, fieldKey: const Key('kit-pass2'), action: TextInputAction.done,
+          check: (s) => s == kitPass.text ? null : 'The passphrases differ'),
+      const SizedBox(height: 8),
+      WideButton('Create my identity', key: const Key('create'), icon: Icons.fingerprint, onPressed: create),
+      TextButton(
+        key: const Key('kit-pass-skip'),
+        onPressed: () async {
+          final go = await showDialog<bool>(
+            context: context,
+            builder: (ctx) => AlertDialog(
+              title: const Text('Go without a passphrase?'),
+              content: const Text('Then whoever reads your recovery kit holds it, so keep the kit somewhere private. '
+                  'You can add a passphrase later, from More › Recovery.'),
+              actions: [
+                TextButton(onPressed: () => Navigator.of(ctx).pop(false), child: const Text('Back')),
+                TextButton(key: const Key('kit-pass-skip-yes'), onPressed: () => Navigator.of(ctx).pop(true), child: const Text('No passphrase')),
+              ],
+            ),
+          );
+          if (go == true && mounted) await create(withPassphrase: false);
+        },
+        child: const Text('Continue without a passphrase'),
+      ),
+      TextButton(onPressed: () => setState(() => step = 1), child: const Text('Back')),
     ]);
   }
 
@@ -438,7 +521,7 @@ class _SetupPageState extends State<SetupPage> {
       );
     }
     return Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
-      Text('Step 3 of 3 · Recovery sheet', style: t.labelLarge),
+      Text('Step 4 of 4 · Recovery sheet', style: t.labelLarge),
       const SizedBox(height: 16),
       Center(
         child: TweenAnimationBuilder<double>(

@@ -583,6 +583,22 @@ void main() {
     await settle(t);
     await t.enterText(find.byKey(const Key('pin')), '246813');
     await t.enterText(find.byKey(const Key('pin2')), '246813');
+    await t.ensureVisible(find.byKey(const Key('pin-next')));
+    await t.pumpAndSettle();
+    await t.tap(find.byKey(const Key('pin-next')));
+    await t.pumpAndSettle();
+    // The kit's passphrase: recommended, with the warning that a forgotten
+    // one makes the kit useless; a short one is refused.
+    expect(find.byKey(const Key('kit-pass-warning')), findsOneWidget);
+    await t.enterText(find.byKey(const Key('kit-pass')), 'short');
+    await t.enterText(find.byKey(const Key('kit-pass2')), 'short');
+    await t.ensureVisible(find.byKey(const Key('create')));
+    await t.pumpAndSettle();
+    await t.tap(find.byKey(const Key('create')));
+    await t.pump();
+    expect(find.byKey(const Key('setup-done')), findsNothing);
+    await t.enterText(find.byKey(const Key('kit-pass')), 'lantern orchard pebble');
+    await t.enterText(find.byKey(const Key('kit-pass2')), 'lantern orchard pebble');
     await t.ensureVisible(find.byKey(const Key('create')));
     await t.pumpAndSettle();
     await t.tap(find.byKey(const Key('create')));
@@ -592,6 +608,9 @@ void main() {
     }
     // Both values, in full: the identity log from device status, the kit from init.
     expect(find.byKey(const Key('setup-done')), findsOneWidget);
+    // init got the PIN, then the kit's passphrase twice, on standard input
+    final input = (await t.runAsync(() => agent.stdinLog.readAsString()))!;
+    expect(input, contains('246813\nlantern orchard pebble\nlantern orchard pebble\n'));
     const kit = '9f3a1c0e7b2d4f68a1c3e5079b2d4f6810e2c4a6', log = 'fa8f008b293b5457ef989520c8bbcbc959a09c0a8619b1d190f78271bf6b5795';
     expect(find.text('9f3a'), findsOneWidget);
     expect(find.text('fa8f'), findsOneWidget);
@@ -627,6 +646,10 @@ void main() {
     await t.enterText(find.byKey(const Key('recover-kit')), '9F3A 1C0E');
     await t.ensureVisible(find.byKey(const Key('recover-start')));
     await t.tap(find.byKey(const Key('recover-start')));
+    await t.pumpAndSettle();
+    // The new kit's passphrase is offered, with its warning; this one goes without.
+    expect(find.textContaining('If you forget the passphrase, the kit cannot be used'), findsOneWidget);
+    await t.tap(find.byKey(const Key('kit-pass-none')));
     await t.pump();
     await settle(t);
     expect(agent.argsLog.readAsStringSync(), contains('9f3a1c0e fa8f008b293b5457ef989520c8bbcbc959a09c0a8619b1d190f78271bf6b5795'));
